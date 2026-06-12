@@ -16,6 +16,16 @@
     palette.textDim = get('--text-dim', '#98a2b3');
   }
   const AXIS_FONT = '10px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+  // Compact speed label for axes ("1.2M/s", "850K/s", "0") — narrower than the
+  // full fmtBytes form, so it fits the Y gutter without clipping.
+  function fmtRate(n) {
+    if (n < 1) return '0';
+    if (n < 1024) return Math.round(n) + 'B/s';
+    const units = ['K', 'M', 'G', 'T'];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return (n >= 10 ? Math.round(n) : n.toFixed(1)) + units[i] + '/s';
+  }
   function applyTheme(theme) {
     const th = theme === 'light' ? 'light' : 'dark';
     // Mirror to localStorage so theme-init.js can set it before first paint
@@ -40,7 +50,9 @@
     // (Y) and time (X) labels drawn alongside the plot; otherwise the plot
     // fills the canvas (inner axes are drawn over it).
     function plotRect(W, H) {
-      if (axes === 'outer') return { x0: 48, y0: 6, x1: W - 8, y1: H - 16 };
+      // Wider left gutter so speed labels never clip; right gutter keeps the
+      // "now" tick and the latest point off the edge.
+      if (axes === 'outer') return { x0: 58, y0: 9, x1: W - 16, y1: H - 18 };
       return { x0: 0, y0: 0, x1: W, y1: H };
     }
 
@@ -88,7 +100,7 @@
         ctx.lineTo(p.x1, gy);
         ctx.stroke();
         ctx.globalAlpha = 1;
-        ctx.fillText(fmtBytes(top * (1 - f)) + '/s', p.x0 - 4, gy);
+        ctx.fillText(fmtRate(top * (1 - f)), p.x0 - 5, gy);
       }
       ctx.textBaseline = 'top';
       const marks = [
@@ -110,7 +122,7 @@
       ctx.globalAlpha = 0.7;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'top';
-      ctx.fillText(fmtBytes(top) + '/s', p.x0 + 2, p.y0 + 1);
+      ctx.fillText(fmtRate(top), p.x0 + 2, p.y0 + 1);
       ctx.textAlign = 'right';
       ctx.textBaseline = 'bottom';
       ctx.fillText(size + 's', p.x1 - 2, p.y1 - 1);

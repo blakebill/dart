@@ -1,6 +1,6 @@
 {
   "name": "dart",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "sing-box based Windows proxy client with airport subscription and Clash config conversion",
   "main": "src/main/index.js",
   "author": "singbox-gui",
@@ -25,7 +25,7 @@
     "electron-builder": "^26.0.0"
   },
   "build": {
-    "appId": "com.singboxgui.app",
+    "appId": "com.dart.app",
     "productName": "Dart",
     "directories": {
       "output": "release",
@@ -65,6 +65,7 @@
     },
     "nsis": {
       "oneClick": false,
+      "include": "build/installer.nsh",
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
       "createDesktopShortcut": true,

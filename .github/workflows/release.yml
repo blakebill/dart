@@ -19,11 +19,11 @@ on:
       tag:
         description: 'Release tag to publish'
         required: false
-        default: 'v0.2.8-pre'
+        default: ''
       prerelease:
         description: 'Mark as prerelease'
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -52,7 +52,7 @@ jobs:
         run: npm test
 
       - name: Sync package version to release tag
-        # The installer file name (SingBox.GUI.Setup.<version>.exe) is derived
+        # The installer file name (Dart.Setup.<version>.exe) is derived
         # from package.json "version". Align it with the release tag so the
         # artifact name always matches the tag (e.g. v0.1.2-pre -> 0.1.2).
         shell: bash
@@ -81,7 +81,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: singbox-gui-windows
+          name: dart-windows
           path: |
             release/*.exe
             release/*.blockmap

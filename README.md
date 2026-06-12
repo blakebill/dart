@@ -1,4 +1,4 @@
-# SingBox GUI
+# Dart
 
 A Windows GUI client for the [sing-box](https://github.com/SagerNet/sing-box) core. Built with Electron.
 

@@ -1,0 +1,21 @@
+node_modules/
+release/
+dist/
+*.log
+.DS_Store
+
+# sing-box core binary (downloaded at runtime or placed manually)
+bin/sing-box.exe
+bin/sing-box
+
+# user data generated at runtime
+runtime/
+
+# generated icon preview (only icon.ico is needed for builds)
+build/icon.png
+
+# sing-box sidecar libraries (bundled at build time)
+bin/*.dll
+bin/*.so
+bin/*.dylib
+bin/*.srs

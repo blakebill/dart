@@ -1,0 +1,536 @@
+'use strict';
+
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const { app } = require('electron');
+
+const { state, runtimeDir, sendLog, sendStatus, refreshTray } = require('./state');
+const { isWindowsAdmin, ensureAdminForTun } = require('./admin');
+const { startTrafficStream, stopTrafficStream } = require('./traffic');
+const { buildSingboxConfig, buildRoute, ruleListToSingboxRule } = require('./converter');
+const subscription = require('./subscription');
+const proxy = require('./proxy');
+const fetch = require('./fetch');
+
+/**
+ * Core control: everything that drives the sing-box core — building the
+ * config from the active profile + settings, start/stop/restart, the system
+ * proxy guard, the Clash API client, proxy-mode switching, and the
+ * subscription auto-update timer.
+ */
+
+// Reuse sockets for the frequent Clash API calls (connection polling, latency
+// tests) instead of opening a fresh TCP connection each time.
+const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+
+// Locally served control panel: sing-box hosts zashboard at
+// http://127.0.0.1:<api-port>/ui/ — the same origin as the Clash API. That
+// sidesteps every remote-panel failure mode at once: mixed content, CORS,
+// and Chrome blocking public-site requests to 127.0.0.1 ("failed to fetch").
+// The core downloads the UI zip on first start through its own proxy outbound.
+const PANEL_UI_URL = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip';
+
+/** The control panel served at /ui: { dir, downloadUrl }. */
+function panelUiInfo() {
+  return {
+    dir: path.join(runtimeDir, 'ui', 'zashboard'),
+    downloadUrl: PANEL_UI_URL,
+  };
+}
+
+/** The local proxy port to tunnel rule-set downloads through (0 = direct). */
+function currentProxyPort() {
+  return state.singbox && state.singbox.isRunning() ? state.store.getSettings().mixedPort || 0 : 0;
+}
+
+/** The id of the subscription (profile) currently in use; falls back to the first. */
+function getActiveSubId() {
+  const subs = state.store.get('subscriptions') || [];
+  if (!subs.length) return null;
+  const active = state.store.get('activeSub');
+  if (active && subs.some((s) => s.id === active)) return active;
+  // Legacy stores (pre-profiles) or a stale pointer: pin the fallback choice.
+  // Left unpinned, `activeSub` stays null while the core runs subs[0] — and
+  // the next sub:add would silently make the NEW subscription active without
+  // a restart (UI shows its nodes, the Clash API doesn't know them: delay
+  // tests "time out" and selecting a node fails with 400).
+  state.store.set('activeSub', subs[0].id);
+  return subs[0].id;
+}
+
+/** Nodes + Clash rules of the active subscription only (do not lump profiles together). */
+function activeSubData() {
+  const subs = state.store.get('subscriptions') || [];
+  const sub = subs.find((s) => s.id === getActiveSubId());
+  return { nodes: (sub && sub.nodes) || [], rules: (sub && sub.clashRules) || [] };
+}
+
+/** Turn a stored local rule into a sing-box route rule object. */
+function buildLocalRuleObject(lr) {
+  const vals = (lr.values || []).map((v) => String(v).trim()).filter(Boolean);
+  if (!vals.length || !lr.matchType) return null;
+  const rule = { [lr.matchType]: vals };
+  if (lr.target === 'direct') rule.outbound = 'direct';
+  else if (lr.target === 'reject') rule.action = 'reject';
+  else rule.outbound = '🚀 Proxy';
+  return rule;
+}
+
+/**
+ * Build extraRules/extraRuleSets from the user's local rules + pre-processed
+ * custom rule-sets. Local rules come first (most specific user intent).
+ */
+function collectCustomRules() {
+  const extraRules = [];
+  const extraRuleSets = [];
+  for (const lr of state.store.get('localRules') || []) {
+    if (lr.enabled === false) continue;
+    const rule = buildLocalRuleObject(lr);
+    if (rule) extraRules.push(rule);
+  }
+  for (const c of state.store.get('customRuleSets') || []) {
+    if (c.enabled === false) continue;
+    if (c.kind === 'inline' && c.rule) {
+      extraRules.push(c.rule);
+    } else if (c.kind === 'ruleset') {
+      const p = path.join(runtimeDir, 'bin', 'custom-' + c.id + '.srs');
+      if (state.singbox._validSrs(p)) {
+        const tag = 'custom-' + c.id;
+        extraRuleSets.push({ type: 'local', tag, format: 'binary', path: p.replace(/\\/g, '/') });
+        const rule = { rule_set: [tag] };
+        if (c.target === 'direct') rule.outbound = 'direct';
+        else if (c.target === 'reject') rule.action = 'reject';
+        else rule.outbound = '🚀 Proxy';
+        extraRules.push(rule);
+      }
+    }
+  }
+  return { extraRules, extraRuleSets };
+}
+
+/** Download + convert one custom rule-set, returning the processed record. */
+async function processCustomRuleSet(c) {
+  const proxyPort = currentProxyPort();
+  if (c.format === 'sing-box') {
+    const dest = path.join(runtimeDir, 'bin', 'custom-' + c.id + '.srs');
+    if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
+    await fetch.downloadWithFallback(c.url, dest, { proxyPort });
+    if (!state.singbox._validSrs(dest)) {
+      try { fs.unlinkSync(dest); } catch (_) {}
+      throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
+    }
+    return { ...c, kind: 'ruleset', count: null, error: null, updatedAt: Date.now() };
+  }
+  const { body } = await fetch.getBufferWithFallback(c.url, {
+    proxyPort,
+    headers: { 'User-Agent': 'clash-verge/v2.0.2' },
+  });
+  const { rule, count } = ruleListToSingboxRule(body.toString('utf-8'), c.target);
+  if (!rule) throw new Error('no rules parsed from the list (unsupported format?)');
+  return { ...c, kind: 'inline', rule, count, error: null, updatedAt: Date.now() };
+}
+
+function buildCurrentConfig() {
+  const settings = state.store.getSettings();
+  // Use only the active subscription's nodes (profiles are not merged).
+  const { nodes: allNodes, rules: allRules } = activeSubData();
+  if (allNodes.length === 0) {
+    throw new Error('No nodes available. Add a subscription first.');
+  }
+  const { extraRules, extraRuleSets } = collectCustomRules();
+  const ui = panelUiInfo();
+  try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
+  const config = buildSingboxConfig(allNodes, {
+    mixedPort: settings.mixedPort,
+    clashApiPort: settings.clashApiPort,
+    clashApiSecret: state.clashApiSecret,
+    externalUiDir: ui.dir.replace(/\\/g, '/'),
+    externalUiDownloadUrl: ui.downloadUrl,
+    enableTun: settings.enableTun,
+    enableClashApi: settings.enableClashApi,
+    logLevel: settings.logLevel,
+    ruleSetDir: state.singbox.resolveRuleSetDir(),
+    selected: state.store.get('selected'),
+    clashMode: settings.clashMode,
+    clashRules: allRules,
+    enableIpv6: settings.enableIpv6,
+    dnsRemote: settings.dnsRemote,
+    dnsLocal: settings.dnsLocal,
+    dnsStrategy: settings.dnsStrategy,
+    extraRules,
+    extraRuleSets,
+  });
+  return { config, settings };
+}
+
+/** Build the route info (rules + rule-sets) from the current config, without running. */
+function currentRouteInfo() {
+  const { rules } = activeSubData();
+  const { extraRules, extraRuleSets } = collectCustomRules();
+  // Only the route is needed here, so skip converting every node to an outbound.
+  const route = buildRoute({
+    ruleSetDir: state.singbox.resolveRuleSetDir(),
+    clashRules: rules,
+    extraRules,
+    extraRuleSets,
+  });
+  return { rules: route.rules, ruleSets: route.rule_set };
+}
+
+async function startCore() {
+  const { config, settings } = buildCurrentConfig();
+  if (settings.enableTun && !(await isWindowsAdmin())) {
+    if (await ensureAdminForTun()) return; // relaunching elevated
+  }
+  await state.singbox.start(config);
+  if (settings.autoSetSystemProxy && !settings.enableTun) {
+    try {
+      await proxy.enableSystemProxy('127.0.0.1', settings.mixedPort);
+      state.systemProxyOn = true;
+      startProxyGuard(settings.mixedPort);
+    } catch (e) {
+      sendLog('[gui] failed to set system proxy: ' + e.message);
+    }
+  }
+  state.store.set('lastRunning', true);
+  sendStatus();
+  startTrafficStream();
+  maybeFetchGeodata();
+}
+
+// Self-heal for installs that booted without geodata (e.g. dev runs, or a
+// build whose bundling didn't land): the config above already degrades
+// gracefully (no geoip-cn/geosite-cn rules), so the core is up. Fetch the
+// rule-sets in the background — now that the proxy is available — so the next
+// start gets the full CN-direct routing. Best-effort and non-blocking; it
+// does not restart the running core.
+let geodataFetchTried = false;
+function maybeFetchGeodata() {
+  if (geodataFetchTried || state.singbox.resolveRuleSetDir()) return;
+  geodataFetchTried = true;
+  const proxyPort = currentProxyPort();
+  state.singbox
+    .updateGeoData(() => {}, proxyPort)
+    .then(() => sendLog('[gui] geodata fetched; restart to enable CN direct routing'))
+    .catch((e) => {
+      geodataFetchTried = false; // let a later start retry
+      sendLog('[gui] background geodata fetch failed (non-fatal): ' + e.message);
+    });
+}
+
+/**
+ * Stop the core. When `remember` is true (an explicit user stop) we also clear
+ * the auto-resume flag, so the app does not start itself on the next launch.
+ */
+async function stopCore(remember) {
+  stopTrafficStream();
+  stopProxyGuard();
+  if (state.systemProxyOn) {
+    try {
+      await proxy.disableSystemProxy();
+    } catch (e) {
+      sendLog('[gui] failed to disable system proxy: ' + e.message);
+    }
+    state.systemProxyOn = false;
+  }
+  await state.singbox.stop();
+  if (remember) state.store.set('lastRunning', false);
+  sendStatus();
+}
+
+/**
+ * Guard the system proxy: some software (or a network change) can overwrite the
+ * Windows proxy registry. While we own it, re-assert it if it gets changed.
+ */
+let proxyGuard = null;
+function startProxyGuard(port) {
+  stopProxyGuard();
+  const server = '127.0.0.1:' + port;
+  proxyGuard = setInterval(async () => {
+    if (!state.systemProxyOn) return;
+    try {
+      if (!(await proxy.isSystemProxyActive(server))) {
+        await proxy.enableSystemProxy('127.0.0.1', port);
+        sendLog('[gui] system proxy was changed by another app; restored');
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }, 30000); // re-assert at most twice a minute (each check spawns reg.exe)
+}
+function stopProxyGuard() {
+  if (proxyGuard) {
+    clearInterval(proxyGuard);
+    proxyGuard = null;
+  }
+}
+
+async function cleanup() {
+  try {
+    await stopCore();
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+/** Restart the core if it is running, so config changes (e.g. rules) apply. */
+async function restartIfRunning() {
+  if (!state.singbox.isRunning()) return;
+  try {
+    await stopCore();
+    await startCore();
+    sendLog('[gui] core restarted to apply changes');
+  } catch (e) {
+    sendLog('[gui] restart to apply changes failed: ' + e.message);
+  }
+}
+
+/**
+ * Query the latency of a node via the sing-box Clash API.
+ * @param {string} name outbound tag (node name)
+ * @returns {Promise<number>} delay in ms
+ */
+function testNodeDelay(name) {
+  return new Promise((resolve, reject) => {
+    const settings = state.store.getSettings();
+    const testUrl = encodeURIComponent('https://www.gstatic.com/generate_204');
+    const reqPath = `/proxies/${encodeURIComponent(name)}/delay?timeout=5000&url=${testUrl}`;
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: settings.clashApiPort,
+        path: reqPath,
+        method: 'GET',
+        timeout: 8000,
+        agent: clashAgent,
+        headers: { Authorization: 'Bearer ' + state.clashApiSecret },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+            if (typeof data.delay === 'number') resolve(data.delay);
+            else reject(new Error(data.message || 'timeout'));
+          } catch (e) {
+            reject(new Error('timeout'));
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+/** Generic Clash API request (sing-box external controller). Resolves parsed JSON. */
+function clashApi(method, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    const settings = state.store.getSettings();
+    const payload = body ? JSON.stringify(body) : null;
+    const headers = { Authorization: 'Bearer ' + state.clashApiSecret };
+    if (payload) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+    const req = http.request(
+      { host: '127.0.0.1', port: settings.clashApiPort, path: apiPath, method, headers, timeout: 6000, agent: clashAgent },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error('clash api ' + res.statusCode));
+          }
+          const text = Buffer.concat(chunks).toString('utf-8');
+          try {
+            resolve(text ? JSON.parse(text) : {});
+          } catch (e) {
+            resolve({});
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+/** Switch the proxy selector to a given outbound live via the Clash API. */
+function setClashSelector(name) {
+  return clashApi('PUT', '/proxies/' + encodeURIComponent('🚀 Proxy'), { name });
+}
+
+/**
+ * Set the proxy mode (rule / global / direct). Persists it, applies it live via
+ * the Clash API when running, refreshes the tray, and notifies the renderer.
+ */
+async function setProxyMode(mode) {
+  state.store.updateSettings({ clashMode: mode });
+  if (state.singbox.isRunning()) {
+    try {
+      await clashApi('PATCH', '/configs', { mode });
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  refreshTray();
+  if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+    state.mainWindow.webContents.send('mode:changed', mode);
+  }
+  return mode;
+}
+
+/** Refresh subscriptions + custom rule-sets whose auto-update interval is due (one tick). */
+async function autoUpdateTick() {
+  const subs = state.store.get('subscriptions') || [];
+  let changed = false;
+  let activeNodesChanged = false;
+  for (const sub of subs) {
+    const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
+    if (mins > 0 && sub.url && Date.now() - (sub.updatedAt || 0) >= mins * 60000) {
+      try {
+        const proxyPort = sub.updateViaProxy ? currentProxyPort() : 0;
+        const r = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
+        if (r.nodes.length) {
+          const nodesChanged = JSON.stringify(sub.nodes) !== JSON.stringify(r.nodes);
+          sub.nodes = r.nodes;
+          sub.format = r.format;
+          sub.clashRules = r.rules || [];
+          sub.raw = r.raw || sub.raw || '';
+          sub.userInfo = r.userInfo || sub.userInfo;
+          sub.updatedAt = Date.now();
+          changed = true;
+          if (nodesChanged && sub.id === getActiveSubId()) activeNodesChanged = true;
+          sendLog('[gui] auto-updated subscription: ' + sub.name);
+        }
+      } catch (e) {
+        sendLog('[gui] auto-update failed for ' + sub.name + ': ' + e.message);
+      }
+    }
+  }
+  if (changed) {
+    state.store.set('subscriptions', subs);
+    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+      state.mainWindow.webContents.send('subs:changed');
+    }
+    // The live profile's node list changed: restart so the core serves the
+    // same outbounds the UI shows (custom rule-set auto-update already does
+    // this; subscriptions must too, or selection/delay tests start failing).
+    if (activeNodesChanged) await restartIfRunning();
+  }
+
+  // Custom rule-sets on a schedule: re-download + convert, then restart the
+  // running core once so the refreshed rules actually apply (same as a manual
+  // refresh).
+  const crs = state.store.get('customRuleSets') || [];
+  let crsChanged = false;
+  for (let i = 0; i < crs.length; i++) {
+    const c = crs[i];
+    const mins = parseInt(c.autoUpdateMinutes || 0, 10);
+    if (mins > 0 && c.enabled !== false && c.url && Date.now() - (c.updatedAt || 0) >= mins * 60000) {
+      try {
+        crs[i] = await processCustomRuleSet(c);
+        crsChanged = true;
+        sendLog('[gui] auto-updated rule-set: ' + c.name);
+      } catch (e) {
+        sendLog('[gui] rule-set auto-update failed for ' + c.name + ': ' + e.message);
+      }
+    }
+  }
+  if (crsChanged) {
+    state.store.set('customRuleSets', crs);
+    await restartIfRunning();
+  }
+}
+
+// Arm the once-a-minute timer only while at least one subscription or custom
+// rule-set actually has auto-update enabled; otherwise no periodic wakeup.
+let autoUpdateTimer = null;
+function rescheduleAutoUpdate() {
+  const hasDue = (list) => (list || []).some((x) => parseInt(x.autoUpdateMinutes || 0, 10) > 0 && x.url);
+  const need =
+    hasDue(state.store.get('subscriptions')) || hasDue(state.store.get('customRuleSets'));
+  if (need && !autoUpdateTimer) {
+    autoUpdateTimer = setInterval(autoUpdateTick, 60000);
+  } else if (!need && autoUpdateTimer) {
+    clearInterval(autoUpdateTimer);
+    autoUpdateTimer = null;
+  }
+}
+
+// Weekly geodata refresh. The rule-sets are bundled (and self-heal on start),
+// but stay fresh on their own: once a week re-download geoip-cn/geosite-cn.
+const GEO_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+let geoTimer = null;
+
+async function checkGeoUpdate() {
+  let last = state.store.get('geoCheckedAt') || 0;
+  if (!last) {
+    // First run on this version: seed the clock from the last known update
+    // (or now for bundled geodata) so we don't re-download immediately.
+    const meta = state.singbox.geoMeta();
+    const stamps = Object.values(meta).map((m) => (m && m.updatedAt) || 0);
+    last = Math.max(0, ...stamps) || Date.now();
+    state.store.set('geoCheckedAt', last);
+  }
+  if (Date.now() - last < GEO_UPDATE_INTERVAL_MS) return;
+  // Advance the clock first, so a failure retries next week — not every tick.
+  state.store.set('geoCheckedAt', Date.now());
+  try {
+    await state.singbox.updateGeoData(() => {}, currentProxyPort());
+    sendLog('[gui] geodata weekly auto-update complete');
+    await restartIfRunning();
+  } catch (e) {
+    sendLog('[gui] geodata weekly auto-update failed: ' + e.message);
+  }
+}
+
+/** Start the weekly geodata refresh: a check shortly after boot, then every 6h. */
+function startGeoAutoUpdate() {
+  if (geoTimer) return;
+  setTimeout(() => checkGeoUpdate().catch(() => {}), 30000);
+  geoTimer = setInterval(() => checkGeoUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
+}
+
+/** Apply the auto-launch (login item) setting on supported platforms. */
+function applyAutoLaunch(enable) {
+  if (process.platform === 'linux' && !process.env.APPIMAGE) {
+    // setLoginItemSettings has limited support on plain Linux; best-effort only.
+    return;
+  }
+  app.setLoginItemSettings({
+    openAtLogin: !!enable,
+    path: process.execPath,
+    args: [],
+  });
+}
+
+module.exports = {
+  currentProxyPort,
+  getActiveSubId,
+  activeSubData,
+  buildLocalRuleObject,
+  collectCustomRules,
+  processCustomRuleSet,
+  buildCurrentConfig,
+  currentRouteInfo,
+  startCore,
+  stopCore,
+  restartIfRunning,
+  cleanup,
+  startProxyGuard,
+  stopProxyGuard,
+  testNodeDelay,
+  clashApi,
+  setClashSelector,
+  setProxyMode,
+  rescheduleAutoUpdate,
+  startGeoAutoUpdate,
+  applyAutoLaunch,
+};

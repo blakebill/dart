@@ -1,0 +1,1256 @@
+:root {
+  --bg: #0d1017;
+  --bg-alt: #141821;
+  --panel: #1a1f2b;
+  --panel-hover: #222837;
+  --border: #2a3140;
+  --text: #e8eaf0;
+  --text-dim: #98a2b3;
+  --accent: #3b82f6;
+  --accent-2: #6366f1;
+  --on-accent: #ffffff;
+  --green: #22c55e;
+  --red: #ef4444;
+  --yellow: #f59e0b;
+  --code-bg: #0b0e14;
+  --code-text: #cbd5e1;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f6fa;
+  --bg-alt: #ffffff;
+  --panel: #ffffff;
+  --panel-hover: #eef2f8;
+  --border: #e2e7f0;
+  --text: #1a2233;
+  --text-dim: #5b6573;
+  --accent: #2563eb;
+  --accent-2: #4f46e5;
+  --on-accent: #ffffff;
+  --green: #16a34a;
+  --red: #dc2626;
+  --yellow: #d97706;
+  --code-bg: #ffffff;
+  --code-text: #1f2937;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+  /* Pin text rendering across Chromium upgrades: no synthesized bold/italic
+     (weight differences between real and faux bold read as "the font
+     changed"), and no optical-size adaptation when "Segoe UI" resolves to
+     the Segoe UI Variable font on Windows 11. */
+  font-synthesis: none;
+  font-optical-sizing: none;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 200px;
+  background: var(--bg-alt);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 12px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 20px;
+  font-weight: 700;
+  font-size: 16px;
+}
+.logo-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+/* While the core runs, the logo dot breathes — a smooth glow that swells and
+   recedes with a gentle scale. Reads as "alive", not a blinking alarm. */
+.logo-dot.running {
+  animation: logoBreathe 2.6s ease-in-out infinite;
+}
+@keyframes logoBreathe {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 10px 2px rgba(59, 130, 246, 0.6);
+  }
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+}
+.nav-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+.nav-item:hover {
+  background: var(--panel-hover);
+  color: var(--text);
+}
+.nav-item.active {
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.sidebar-footer {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.theme-switch {
+  margin-bottom: 10px;
+}
+.theme-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.theme-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 10px;
+  font-size: 13px;
+}
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.status-dot.on {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+.status-dot.off {
+  background: var(--text-dim);
+}
+.power-btn {
+  width: 100%;
+  padding: 10px;
+  border: none;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: var(--on-accent);
+  font-weight: 700;
+  cursor: pointer;
+  font-size: 14px;
+}
+.power-btn.running {
+  background: var(--red);
+}
+
+/* Content area */
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 28px;
+}
+.tab {
+  display: none;
+}
+.tab.active {
+  display: block;
+}
+h1 {
+  font-size: 22px;
+  margin-bottom: 18px;
+}
+h2 {
+  font-size: 15px;
+  margin-bottom: 12px;
+  color: var(--text);
+}
+
+/* Cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 20px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.card-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.card-value {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px;
+  margin-bottom: 18px;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+/* Headings / hints inside a flex row: drop their block margins so they align
+   vertically with the buttons next to them. */
+.row > h2 {
+  margin-bottom: 0;
+  flex: 1;
+}
+.row > .hint {
+  margin-top: 0;
+}
+.hint.grow {
+  flex: 1;
+}
+.form-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 8px;
+  align-items: center;
+}
+
+.input,
+.textarea,
+select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 14px;
+  outline: none;
+  font-family: inherit;
+}
+.input:focus,
+.textarea:focus {
+  border-color: var(--accent);
+}
+.input.grow {
+  flex: 1;
+}
+.input.small {
+  width: 140px;
+}
+.textarea {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  font-family: "Consolas", "Menlo", monospace;
+  margin-bottom: 10px;
+}
+
+.btn {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 9px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.15s;
+}
+.btn:hover {
+  border-color: var(--accent);
+  background: var(--panel-hover);
+}
+.btn.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.btn.danger {
+  color: var(--red);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.hint {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+/* Subscription list */
+.sub-list,
+.node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sub-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+.sub-info {
+  flex: 1;
+}
+.sub-name {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.sub-meta {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.sub-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Nodes */
+.node-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.node-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.node-item:hover {
+  border-color: var(--accent);
+}
+.node-item.active {
+  border-color: var(--accent);
+  background: var(--panel-hover);
+}
+.node-active {
+  font-size: 12px;
+  color: var(--green);
+  font-weight: 600;
+}
+.node-name {
+  font-weight: 500;
+}
+.node-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--bg-alt);
+  color: var(--accent);
+  margin-left: 8px;
+}
+.node-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.node-delay {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  min-width: 56px;
+  text-align: right;
+}
+.node-delay.good {
+  color: var(--green);
+}
+.node-delay.mid {
+  color: var(--yellow);
+}
+.node-delay.bad {
+  color: var(--red);
+}
+.node-delay.testing {
+  color: var(--text-dim);
+}
+.node-test-btn {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.node-test-btn:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* Code / logs */
+.code,
+.log-box {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  font-family: "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+.code,
+.log-box {
+  color: var(--code-text);
+}
+.code {
+  max-height: 50vh;
+}
+.log-box {
+  height: 62vh;
+}
+
+/* JSON syntax colors for the conversion preview (VS Code-like palettes) */
+.json-key { color: #9cdcfe; }
+.json-str { color: #ce9178; }
+.json-num { color: #b5cea8; }
+.json-bool,
+.json-null { color: #569cd6; }
+:root[data-theme='light'] .json-key { color: #0451a5; }
+:root[data-theme='light'] .json-str { color: #a31515; }
+:root[data-theme='light'] .json-num { color: #098658; }
+:root[data-theme='light'] .json-bool,
+:root[data-theme='light'] .json-null { color: #0000ff; }
+
+/* Log lines: bold timestamps, one color per level (terminal-style palette) */
+.log-time {
+  font-weight: 700;
+  color: var(--code-text);
+}
+.log-lv {
+  font-weight: 700;
+}
+.log-lv.trace { color: #8b93a7; }
+.log-lv.debug { color: #22d3ee; }
+.log-lv.info  { color: #34d399; }
+.log-lv.warn  { color: #fbbf24; }
+.log-lv.error { color: #f87171; }
+.log-lv.fatal,
+.log-lv.panic {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.25);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.log-gui { color: #818cf8; font-weight: 600; }
+:root[data-theme='light'] .log-lv.trace { color: #6b7280; }
+:root[data-theme='light'] .log-lv.debug { color: #0e7490; }
+:root[data-theme='light'] .log-lv.info  { color: #059669; }
+:root[data-theme='light'] .log-lv.warn  { color: #b45309; }
+:root[data-theme='light'] .log-lv.error { color: #dc2626; }
+:root[data-theme='light'] .log-lv.fatal,
+:root[data-theme='light'] .log-lv.panic {
+  color: #991b1b;
+  background: rgba(239, 68, 68, 0.16);
+}
+:root[data-theme='light'] .log-gui { color: #4f46e5; }
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.setting-row:last-of-type {
+  border-bottom: none;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+}
+
+.progress {
+  height: 8px;
+  background: var(--bg);
+  border-radius: 4px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+.progress .bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.2s;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-alt);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  padding: 12px 20px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  max-width: 80%;
+}
+.toast.err {
+  border-color: var(--red);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+/* Proxy mode switch */
+.mode-switch .mode-btn {
+  min-width: 92px;
+}
+/* Block mode (reject everything): red when selected, red-tinted otherwise */
+.mode-btn.mode-block {
+  color: var(--red);
+}
+.mode-btn.mode-block.primary {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+
+/* Rules */
+.rule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 64vh;
+  overflow-y: auto;
+}
+/* Scroll containers clip the hover lift/shadow of the first and last rows;
+   leave breathing room inside instead of clipping. */
+.rule-list,
+.conn-list,
+.node-list {
+  padding: 6px 4px 10px;
+}
+.rule-item {
+  display: grid;
+  grid-template-columns: 110px 1fr 160px;
+  gap: 12px;
+  align-items: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.rule-type {
+  color: var(--accent);
+  font-weight: 600;
+}
+.rule-payload {
+  color: var(--text);
+  word-break: break-all;
+  user-select: text;
+}
+.rule-proxy {
+  color: var(--text-dim);
+  text-align: right;
+}
+
+/* Connections */
+.conn-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 66vh;
+  overflow-y: auto;
+}
+.conn-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  gap: 12px;
+}
+.conn-main {
+  display: flex;
+  align-items: baseline;
+  gap: 10px; /* space the domain from the network tag / rule */
+  flex-wrap: wrap;
+  min-width: 0;
+  /* Absorb all free width so the chain/traffic block sits hard right; with
+     three flex children, space-between alone floated it to the middle. */
+  flex: 1;
+}
+.conn-host {
+  font-weight: 500;
+  word-break: break-all;
+  user-select: text;
+}
+.conn-sub {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+/* Network-type tag (TCP/UDP): a faint pill, color-coded to tell them apart */
+.conn-net {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--bg-alt);
+  color: var(--text-dim);
+}
+.conn-net.tcp {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+}
+.conn-net.udp {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 16%, transparent);
+}
+.conn-right {
+  text-align: right;
+  white-space: nowrap;
+}
+.conn-chains {
+  display: block;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+/* Vertical spacing between a panel's description hint and the content below it */
+.panel > .hint {
+  margin-bottom: 14px;
+}
+.rule-list,
+.conn-list {
+  margin-top: 4px;
+}
+.log-box,
+.code {
+  margin-top: 12px;
+}
+.setting-row {
+  padding: 12px 0;
+  gap: 16px;
+}
+/* Left side of a setting row: label with an optional sub-line (e.g. install path) */
+.setting-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.setting-label .hint {
+  margin-top: 0;
+  word-break: break-all;
+}
+/* Keep the trailing control (button/input/select) from shrinking or wrapping */
+.setting-row > .btn,
+.setting-row > .input,
+.setting-row > select,
+.setting-row > .btn-group {
+  flex-shrink: 0;
+}
+.btn-group {
+  display: flex;
+  gap: 8px;
+}
+/* A bit more room under control rows that sit above a list/output */
+.panel > .row {
+  margin-bottom: 4px;
+}
+/* Extra separation between the last setting and the action buttons below it */
+.save-row {
+  margin-top: 16px;
+}
+
+/* ---------- Live traffic chart (dashboard) ---------- */
+.traffic-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.traffic-now {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+}
+.traffic-stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+}
+.traffic-stat b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.traffic-stat .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.traffic-stat.down .dot {
+  background: var(--green);
+}
+.traffic-stat.up .dot {
+  background: var(--accent);
+}
+.traffic-chart {
+  width: 100%;
+  height: 160px;
+  display: block;
+}
+
+/* ============================================================
+   WinUI 3 / Fluent-style motion
+   ============================================================ */
+:root {
+  --ease-fluent: cubic-bezier(0.1, 0.9, 0.2, 1); /* decelerate (entrance) */
+  --ease-soft: cubic-bezier(0.33, 0, 0.2, 1);
+  --dur-fast: 130ms;
+  --dur-normal: 300ms;
+}
+
+/* Page (tab) entrance: subtle rise + fade, like WinUI page transitions */
+@keyframes fluentPageIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.tab.active {
+  animation: fluentPageIn var(--dur-normal) var(--ease-fluent) both;
+}
+
+/* Dashboard cards: staggered entrance */
+@keyframes fluentRise {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); }
+  to   { opacity: 1; transform: none; }
+}
+.cards .card {
+  animation: fluentRise 360ms var(--ease-fluent) both;
+}
+.cards .card:nth-child(1) { animation-delay: 30ms; }
+.cards .card:nth-child(2) { animation-delay: 70ms; }
+.cards .card:nth-child(3) { animation-delay: 110ms; }
+.cards .card:nth-child(4) { animation-delay: 150ms; }
+
+/* Hover lift for surfaces */
+.card,
+.sub-item,
+.node-item,
+.rule-item,
+.conn-item {
+  transition: transform var(--dur-fast) var(--ease-soft),
+    border-color var(--dur-fast) var(--ease-soft),
+    background var(--dur-fast) var(--ease-soft),
+    box-shadow var(--dur-fast) var(--ease-soft);
+}
+.card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+}
+.sub-item:hover,
+.node-item:hover,
+.rule-item:hover,
+.conn-item:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  background: var(--panel-hover);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+}
+
+/* Buttons: smooth states + WinUI-like press shrink */
+.btn,
+.power-btn,
+.nav-item,
+.node-test-btn {
+  transition: transform var(--dur-fast) var(--ease-soft),
+    background var(--dur-fast) var(--ease-soft),
+    border-color var(--dur-fast) var(--ease-soft),
+    color var(--dur-fast) var(--ease-soft),
+    filter var(--dur-fast) var(--ease-soft);
+}
+.btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.btn:active:not(:disabled),
+.power-btn:active,
+.node-test-btn:active {
+  transform: scale(0.96);
+}
+.nav-item:active {
+  transform: scale(0.98);
+}
+
+/* Nav selection indicator (sliding accent pill, WinUI NavigationView style) */
+.nav-item {
+  position: relative;
+}
+.nav-item::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 3px;
+  height: 0;
+  border-radius: 3px;
+  background: var(--on-accent);
+  transform: translateY(-50%);
+  transition: height var(--dur-normal) var(--ease-fluent);
+}
+.nav-item.active::before {
+  height: 16px;
+}
+
+/* Power button pulse when running */
+.power-btn.running {
+  animation: fluentPulse 2.4s ease-in-out infinite;
+}
+@keyframes fluentPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.0); }
+  50% { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.18); }
+}
+
+/* Status dot smooth color change */
+.status-dot {
+  transition: background var(--dur-normal) var(--ease-soft),
+    box-shadow var(--dur-normal) var(--ease-soft);
+}
+
+/* Toast: slide up + fade (InfoBar-like) */
+.toast:not(.hidden) {
+  animation: fluentToastIn 260ms var(--ease-fluent) both;
+}
+@keyframes fluentToastIn {
+  from { opacity: 0; transform: translate(-50%, 16px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* Theme variable transitions for a smooth light/dark switch */
+body,
+.sidebar,
+.panel,
+.card,
+.btn,
+.input,
+.textarea,
+select {
+  transition: background-color var(--dur-normal) var(--ease-soft),
+    color var(--dur-normal) var(--ease-soft),
+    border-color var(--dur-normal) var(--ease-soft);
+}
+
+/* Respect reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  .tab.active,
+  .cards .card,
+  .power-btn.running,
+  .toast:not(.hidden) {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ---------- v0.2.3: button colors + mini traffic ---------- */
+/* Power button: green to start, red to stop */
+.power-btn {
+  background: var(--green);
+}
+.power-btn.running {
+  background: var(--red);
+}
+/* Quick-action start (green) / stop (red) */
+.btn.success {
+  background: var(--green);
+  border-color: var(--green);
+  color: #fff;
+  font-weight: 600;
+}
+.btn.stop {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* Mini live traffic graph in the sidebar footer */
+.mini-traffic {
+  margin: 8px 0 4px;
+}
+#miniTraffic {
+  width: 100%;
+  height: 40px;
+  display: block;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.mini-traffic-stats {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.mini-traffic-stats b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subscription edit panel uses the same look as settings rows */
+#subEditPanel .setting-row label {
+  min-width: 110px;
+}
+
+/* ---------- v0.2.4: traffic usage panel ---------- */
+.usage-item { margin-bottom: 12px; }
+.usage-item:last-child { margin-bottom: 0; }
+.usage-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.usage-bar {
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.usage-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width var(--dur-normal, 300ms) var(--ease-soft, ease);
+}
+
+/* ---------- v0.2.5: version label ---------- */
+.app-version {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-weight: 500;
+  margin-left: 2px;
+}
+/* "NEW" badge next to the version when a newer release is available. */
+.version-new {
+  margin-left: 4px;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-radius: 4px;
+  padding: 1px 4px;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+.logo { flex-wrap: wrap; align-items: baseline; }
+.hidden { display: none !important; }
+
+/* ---------- v0.2.6: dashboard split (mode | usage) ---------- */
+.dash-split {
+  display: flex;
+  gap: 18px;
+  align-items: stretch;
+}
+.dash-split > .panel {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 18px;
+}
+@media (max-width: 760px) {
+  .dash-split { flex-direction: column; gap: 0; }
+}
+
+/* ---------- v0.2.8: keep list rows tidy with long URLs ---------- */
+.sub-item { gap: 10px; }
+.sub-info { min-width: 0; }
+.sub-name,
+.sub-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.sub-actions { flex-shrink: 0; }
+
+/* ---------- v0.2.9: modal dialog (local rules) ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: modal-fade 0.15s ease;
+}
+.modal.hidden { display: none; }
+.modal-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 22px 22px 18px;
+  width: 440px;
+  max-width: 92vw;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  animation: modal-pop 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+.modal-card h3 { margin: 0 0 14px; }
+.modal-card .setting-row { margin-bottom: 10px; }
+.modal-label {
+  display: block;
+  margin: 6px 0 4px;
+  font-size: 13px;
+  color: var(--text-dim, #8b93a7);
+}
+.modal-card .textarea {
+  width: 100%;
+  min-height: 120px;
+  box-sizing: border-box;
+}
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* External link shown in place of long rule-set URLs */
+a.ext-link { color: var(--accent, #6c8cff); text-decoration: none; cursor: pointer; }
+a.ext-link:hover { text-decoration: underline; }
+
+/* Active profile row accent */
+.sub-item.active { border-color: var(--accent, #6c8cff); }
+
+/* ---------- v0.3.0: UWP loopback tool ---------- */
+.modal-lg { width: 560px; }
+/* ---------- v0.3.3 / v0.5.0: full-height editor modals ---------- */
+/* Conversion + raw-content editors fill the window so there is real room to
+   read and edit; the output/editor area absorbs all remaining height. */
+.modal-card.modal-xl {
+  width: min(1020px, 94vw);
+  height: 92vh;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-xl .textarea { min-height: 120px; }
+.convert-output-head { margin-top: 4px; }
+.convert-output {
+  margin-top: 4px;
+  flex: 1;
+  min-height: 120px;
+  max-height: none;
+}
+/* Highlighted editor: a colorized <pre> mirror sits under a transparent-text
+   <textarea>. Both layers must share identical typography and box metrics or
+   the glyphs (and caret) drift apart; scrollbar-gutter keeps their wrap
+   widths equal whether or not the textarea is scrolling. */
+.editor-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.editor-wrap .raw-editor,
+.editor-highlight {
+  font-family: "Consolas", "Menlo", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  scrollbar-gutter: stable;
+}
+.editor-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  overflow: hidden;
+  background: var(--code-bg);
+  color: var(--code-text);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+.editor-wrap .raw-editor {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text);
+  border-color: transparent;
+  resize: none;
+  overflow: auto;
+}
+.editor-wrap .raw-editor:focus {
+  border-color: var(--accent);
+}
+/* Very large profiles skip highlighting: show the textarea text directly. */
+.editor-wrap.plain .editor-highlight {
+  visibility: hidden;
+}
+.editor-wrap.plain .raw-editor {
+  color: var(--code-text);
+  background: var(--code-bg);
+  border-color: var(--border);
+}
+.editor-wrap.plain .raw-editor:focus {
+  border-color: var(--accent);
+}
+/* YAML/share-link tokens not covered by the json-* palette */
+.yml-comment { color: #6a9955; font-style: italic; }
+.lnk-scheme { color: #c586c0; font-weight: 600; }
+:root[data-theme='light'] .yml-comment { color: #008000; }
+:root[data-theme='light'] .lnk-scheme { color: #af00db; }
+.uwp-list {
+  max-height: 360px;
+  overflow-y: auto;
+  margin: 6px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.uwp-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.uwp-item:last-child { border-bottom: none; }
+.uwp-item:hover { background: var(--panel-hover); }
+.uwp-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+/* ---------- v0.3.5 ---------- */
+/* Modals: breathing room between the control rows (UWP tool, editors); the
+   bare .row has no vertical margin, which left buttons jammed together. */
+.modal-card > .hint {
+  margin: 0 0 14px;
+}
+.modal-card .row {
+  margin-bottom: 12px;
+}
+.modal-card .row.save-row {
+  margin-bottom: 0;
+  margin-top: 16px;
+}
+.uwp-list {
+  margin-top: 10px;
+}
+
+/* Per-connection close button */
+.conn-close {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  transition: border-color var(--dur-fast) var(--ease-soft),
+    color var(--dur-fast) var(--ease-soft),
+    background var(--dur-fast) var(--ease-soft);
+}
+.conn-close:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+}
+.conn-close:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+

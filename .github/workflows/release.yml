@@ -1,0 +1,109 @@
+name: Build & Release
+
+# Build the Windows installer and publish it to a GitHub Release.
+# Triggers:
+#   - pushing a tag like v0.1.0      -> publishes a release (prerelease if the
+#                                       tag contains a hyphen, e.g. v0.1.0-pre)
+#   - manual run (workflow_dispatch) -> builds and publishes a prerelease at the
+#                                       given tag (default v0.1.0-pre)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      singbox_version:
+        description: 'sing-box core version to bundle (empty = latest)'
+        required: false
+        default: ''
+      tag:
+        description: 'Release tag to publish'
+        required: false
+        default: 'v0.2.8-pre'
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        # Check out the launching ref: the pushed tag on a tag push, or the
+        # selected branch on a manual run. (We intentionally do NOT pin to the
+        # input tag, since for a new release that tag does not exist yet — it is
+        # created by the publish step below.)
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run self-tests
+        run: npm test
+
+      - name: Sync package version to release tag
+        # The installer file name (SingBox.GUI.Setup.<version>.exe) is derived
+        # from package.json "version". Align it with the release tag so the
+        # artifact name always matches the tag (e.g. v0.1.2-pre -> 0.1.2).
+        shell: bash
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"        # strip leading "v"
+          VERSION="${VERSION%%-*}"  # strip any prerelease suffix (e.g. "-pre")
+          echo "Setting package.json version to $VERSION (from tag $TAG)"
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n');" "$VERSION"
+
+      - name: Download sing-box core
+        env:
+          SINGBOX_VERSION: ${{ github.event.inputs.singbox_version }}
+          SINGBOX_OS: windows
+          SINGBOX_ARCH: amd64
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run fetch-core
+
+      - name: Build Windows installer
+        env:
+          # electron-builder publishes when given a token; we upload via the
+          # release step below instead, so disable auto-publish here.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist -- --publish never
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: singbox-gui-windows
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2.3.2
+        with:
+          # On a tag push use that tag; on manual dispatch use the input tag.
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          # When the tag does not exist yet (manual dispatch), create it at the
+          # commit this run built — not at the default branch's HEAD.
+          target_commitish: ${{ github.sha }}
+          # Manual dispatch: use the 'prerelease' input. Tag push: prerelease when
+          # the tag contains a hyphen (e.g. v0.1.0-pre).
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
+          files: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

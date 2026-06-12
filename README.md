@@ -1,4 +1,4 @@
-# SingBox GUI
+# Dart
 
 A Windows GUI client for the [sing-box](https://github.com/SagerNet/sing-box) core. Built with Electron.
 
@@ -69,4 +69,4 @@ npm test
 
 ## 📄 License
 
-MIT
+GPL v3

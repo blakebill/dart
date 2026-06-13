@@ -1,198 +1,282 @@
 'use strict';
 
 /**
- * Generate the Dart app icon (build/icon.ico) with no external deps.
+ * Generate the Dart icons from the designed source art (build/icon-source.webp,
+ * a glassy crystal swift on a gradient-white rounded square).
  *
- * Draws a rounded-rectangle with a blue/indigo gradient and a white dart
- * (a sharp arrow streaking to the upper-right — "to dart"), encodes it as
- * PNG, and wraps the PNG in an ICO container (PNG-in-ICO, Windows Vista+).
- * Also prints a 32px tray PNG as a data URL for src/main/tray.js.
+ *   - build/icon.ico  — app/installer icon, multi-size (16/32/48/256). A lightly
+ *                       flattened version of the source (glassy micro-gradients
+ *                       banded into flatter colour regions, blues nudged up),
+ *                       with the corners rounded to transparency so it shows as
+ *                       a rounded icon rather than a white square.
+ *   - build/icon.png  — 256px PNG of the same (gitignored; a convenience copy).
+ *   - tray data URL   — printed to stdout: a SOLID blue swift silhouette lifted
+ *                       from the source (keyed by saturation, morphologically
+ *                       closed, largest blob kept), so it stays legible on light
+ *                       AND dark system trays. 32x32. Paste into src/main/tray.js.
+ *
+ * Needs `sharp` (a dev-only tool, not a runtime dependency). If it isn't
+ * installed, run:  npm i -D sharp
  *
  * Run: node scripts/make-icon.js
  */
 
 const fs = require('fs');
 const path = require('path');
-const zlib = require('zlib');
 
-const SIZE = 256;
-
-// CRC32 (for PNG chunks)
-const CRC_TABLE = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+let sharp;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  console.error('This script needs sharp to process the source art.');
+  console.error('Install it with:  npm i -D sharp');
+  process.exit(1);
 }
 
-function lerp(a, b, t) {
-  return Math.round(a + (b - a) * t);
-}
+const BUILD = path.join(__dirname, '..', 'build');
+const SRC = path.join(BUILD, 'icon-source.webp');
+const ICO_SIZES = [16, 32, 48, 256];
+const WORK = 1024; // working resolution for the app icon
+const MARGIN = 16; // rounded-mask inset (WORK space)
+const RADIUS = 232; // rounded-mask corner radius (WORK space)
 
-// The dart: a sharp arrow, defined pointing right in a unit space centered at
-// the origin, then rotated 45° to streak toward the upper-right. The notched
-// tail gives it a thrown-dart silhouette rather than a plain arrow.
-const DART = [
-  [1.0, 0.0], // tip
-  [0.16, -0.62], // upper barb
-  [0.16, -0.24], // upper neck
-  [-0.96, -0.24], // upper tail
-  [-0.66, 0.0], // tail notch
-  [-0.96, 0.24], // lower tail
-  [0.16, 0.24], // lower neck
-  [0.16, 0.62], // lower barb
-];
-const ANG = -Math.PI / 4; // rotate to point up-right
-const COS = Math.cos(ANG);
-const SIN = Math.sin(ANG);
-
-/** Map the unit dart polygon into pixel space for a given canvas size. */
-function dartPolygon(size) {
-  const scale = size * 0.36;
-  const cx = size / 2;
-  const cy = size / 2;
-  return DART.map(([x, y]) => [cx + (x * COS - y * SIN) * scale, cy + (x * SIN + y * COS) * scale]);
-}
-
-/** Even-odd ray cast: is point (px,py) inside polygon? */
-function inPolygon(px, py, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const [xi, yi] = poly[i];
-    const [xj, yj] = poly[j];
-    if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside;
-  }
-  return inside;
-}
-
-/** Build a size×size RGBA pixel buffer: gradient rounded-rect + white dart. */
-function renderPixels(size) {
-  const px = Buffer.alloc(size * size * 4);
-  const top = [96, 165, 250]; // #60a5fa
-  const bottom = [99, 102, 241]; // #6366f1
-  const radius = Math.round(size * 0.2);
-  const poly = dartPolygon(size);
-  const SS = 3; // supersampling factor for dart-edge anti-aliasing
-
-  for (let y = 0; y < size; y++) {
-    const tg = y / (size - 1);
-    const bgR = lerp(top[0], bottom[0], tg);
-    const bgG = lerp(top[1], bottom[1], tg);
-    const bgB = lerp(top[2], bottom[2], tg);
-    for (let x = 0; x < size; x++) {
-      const i = (y * size + x) * 4;
-
-      // Rounded-rect mask: alpha 0 outside the rounded corners.
-      let alpha = 255;
-      const rx = Math.min(x, size - 1 - x);
-      const ry = Math.min(y, size - 1 - y);
-      if (rx < radius && ry < radius) {
-        const dx = radius - rx;
-        const dy = radius - ry;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist > radius) alpha = 0;
-        else if (dist > radius - 1.5) alpha = Math.round(((radius - dist) / 1.5) * 255);
-      }
-
-      // Dart coverage via supersampling, then blend white over the gradient.
-      let hits = 0;
-      for (let sy = 0; sy < SS; sy++) {
-        for (let sx = 0; sx < SS; sx++) {
-          if (inPolygon(x + (sx + 0.5) / SS, y + (sy + 0.5) / SS, poly)) hits++;
-        }
-      }
-      const mix = hits / (SS * SS);
-      px[i] = lerp(bgR, 255, mix);
-      px[i + 1] = lerp(bgG, 255, mix);
-      px[i + 2] = lerp(bgB, 255, mix);
-      px[i + 3] = alpha;
-    }
-  }
-  return px;
-}
-
-/** Encode a size×size RGBA buffer as a PNG buffer. */
-function encodePng(rgba, size) {
-  function chunk(type, data) {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length, 0);
-    const typeBuf = Buffer.from(type, 'ascii');
-    const crc = Buffer.alloc(4);
-    crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
-    return Buffer.concat([len, typeBuf, data, crc]);
-  }
-
-  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(size, 0);
-  ihdr.writeUInt32BE(size, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // color type RGBA
-  ihdr[10] = 0; // compression
-  ihdr[11] = 0; // filter
-  ihdr[12] = 0; // interlace
-
-  // Add a filter byte (0 = none) at the start of each scanline.
-  const raw = Buffer.alloc(size * (size * 4 + 1));
-  for (let y = 0; y < size; y++) {
-    raw[y * (size * 4 + 1)] = 0;
-    rgba.copy(raw, y * (size * 4 + 1) + 1, y * size * 4, (y + 1) * size * 4);
-  }
-  const idat = zlib.deflateSync(raw, { level: 9 });
-
-  return Buffer.concat([
-    sig,
-    chunk('IHDR', ihdr),
-    chunk('IDAT', idat),
-    chunk('IEND', Buffer.alloc(0)),
-  ]);
-}
-
-/** Wrap a PNG buffer into an ICO container (single image). */
-function wrapIco(png) {
+/** Wrap PNG buffers into a multi-image ICO container (PNG-in-ICO, Vista+). */
+function wrapIco(entries) {
   const header = Buffer.alloc(6);
   header.writeUInt16LE(0, 0); // reserved
   header.writeUInt16LE(1, 2); // type 1 = icon
-  header.writeUInt16LE(1, 4); // image count
+  header.writeUInt16LE(entries.length, 4);
 
-  const entry = Buffer.alloc(16);
-  entry[0] = 0; // width 0 => 256
-  entry[1] = 0; // height 0 => 256
-  entry[2] = 0; // colors in palette
-  entry[3] = 0; // reserved
-  entry.writeUInt16LE(1, 4); // color planes
-  entry.writeUInt16LE(32, 6); // bits per pixel
-  entry.writeUInt32LE(png.length, 8); // image size
-  entry.writeUInt32LE(6 + 16, 12); // offset to image data
-
-  return Buffer.concat([header, entry, png]);
+  const dirs = [];
+  let offset = 6 + 16 * entries.length;
+  for (const { png, size } of entries) {
+    const e = Buffer.alloc(16);
+    e[0] = size >= 256 ? 0 : size; // 0 => 256
+    e[1] = size >= 256 ? 0 : size;
+    e.writeUInt16LE(1, 4); // colour planes
+    e.writeUInt16LE(32, 6); // bits per pixel
+    e.writeUInt32LE(png.length, 8);
+    e.writeUInt32LE(offset, 12);
+    offset += png.length;
+    dirs.push(e);
+  }
+  return Buffer.concat([header, ...dirs, ...entries.map((x) => x.png)]);
 }
 
-function main() {
-  const buildDir = path.join(__dirname, '..', 'build');
-  if (!fs.existsSync(buildDir)) fs.mkdirSync(buildDir, { recursive: true });
+/**
+ * The app icon: the source artwork (a vivid solid-blue swift with speed lines
+ * on white) used as-is, with only a small saturation nudge, and a rounded-rect
+ * alpha mask so the corners are transparent (the source is an opaque square)
+ * and it shows as a proper rounded icon. Returns a WORK-sized RGBA PNG buffer.
+ */
+async function appIcon() {
+  const mask = Buffer.from(
+    `<svg width="${WORK}" height="${WORK}"><rect x="${MARGIN}" y="${MARGIN}" ` +
+      `width="${WORK - 2 * MARGIN}" height="${WORK - 2 * MARGIN}" ` +
+      `rx="${RADIUS}" ry="${RADIUS}" fill="#fff"/></svg>`
+  );
+  return sharp(SRC)
+    .resize(WORK, WORK)
+    .modulate({ saturation: 1.06 })
+    .composite([{ input: mask, blend: 'dest-in' }])
+    .png()
+    .toBuffer();
+}
 
-  const png = encodePng(renderPixels(SIZE), SIZE);
-  const ico = wrapIco(png);
-  fs.writeFileSync(path.join(buildDir, 'icon.ico'), ico);
-  fs.writeFileSync(path.join(buildDir, 'icon.png'), png);
-  console.log('Wrote build/icon.ico (' + ico.length + ' bytes) and build/icon.png');
+// --- tiny morphology on a binary mask (Uint8Array, S×S) -------------------
+function dilate(src, S, R) {
+  const dst = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      let v = 0;
+      for (let dy = -R; dy <= R && !v; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= S) continue;
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= S) continue;
+          if (src[yy * S + xx]) {
+            v = 1;
+            break;
+          }
+        }
+      }
+      dst[y * S + x] = v;
+    }
+  }
+  return dst;
+}
+function erode(src, S, R) {
+  const dst = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      let v = 1;
+      for (let dy = -R; dy <= R && v; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= S) {
+          v = 0;
+          break;
+        }
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= S || !src[yy * S + xx]) {
+            v = 0;
+            break;
+          }
+        }
+      }
+      dst[y * S + x] = v;
+    }
+  }
+  return dst;
+}
 
-  // The tray icon is embedded in src/main/tray.js as a 32px data URL; print it
-  // here so a future icon change can be copied straight in.
-  const tray = encodePng(renderPixels(32), 32);
+/** Keep only the largest 4-connected blob of a binary mask. */
+function largestBlob(src, S) {
+  const lab = new Int32Array(S * S);
+  const sizes = [0];
+  const st = [];
+  let cur = 0;
+  for (let i = 0; i < S * S; i++) {
+    if (src[i] && !lab[i]) {
+      cur++;
+      sizes.push(0);
+      st.length = 0;
+      st.push(i);
+      lab[i] = cur;
+      while (st.length) {
+        const p = st.pop();
+        sizes[cur]++;
+        const x = p % S;
+        const y = (p / S) | 0;
+        if (x > 0 && src[p - 1] && !lab[p - 1]) { lab[p - 1] = cur; st.push(p - 1); }
+        if (x < S - 1 && src[p + 1] && !lab[p + 1]) { lab[p + 1] = cur; st.push(p + 1); }
+        if (y > 0 && src[p - S] && !lab[p - S]) { lab[p - S] = cur; st.push(p - S); }
+        if (y < S - 1 && src[p + S] && !lab[p + S]) { lab[p + S] = cur; st.push(p + S); }
+      }
+    }
+  }
+  let best = 1;
+  for (let c = 1; c < sizes.length; c++) if (sizes[c] > sizes[best]) best = c;
+  const out = new Uint8Array(S * S);
+  for (let i = 0; i < S * S; i++) out[i] = lab[i] === best ? 1 : 0;
+  return out;
+}
+
+/** Fill interior holes: flood the background in from the border; unreached
+ * background pixels are enclosed holes and get set. */
+function fillHoles(src, S) {
+  const reach = new Uint8Array(S * S);
+  const st = [];
+  const seed = (i) => {
+    if (!src[i] && !reach[i]) {
+      reach[i] = 1;
+      st.push(i);
+    }
+  };
+  for (let x = 0; x < S; x++) { seed(x); seed(x + (S - 1) * S); }
+  for (let y = 0; y < S; y++) { seed(y * S); seed(y * S + S - 1); }
+  while (st.length) {
+    const p = st.pop();
+    const x = p % S;
+    const y = (p / S) | 0;
+    if (x > 0) seed(p - 1);
+    if (x < S - 1) seed(p + 1);
+    if (y > 0) seed(p - S);
+    if (y < S - 1) seed(p + S);
+  }
+  const out = new Uint8Array(S * S);
+  for (let i = 0; i < S * S; i++) out[i] = src[i] || !reach[i] ? 1 : 0;
+  return out;
+}
+
+/**
+ * A solid swift silhouette, full-canvas at `S`×`S` and aligned to the source.
+ * The bird is keyed by "blueness" (b − (r+g)/2): the near-neutral white panel
+ * scores ~5–11 while every part of the bird — including the very pale upper
+ * wing — scores ≥18, so a threshold of 20 captures the whole bird where a
+ * saturation key dropped the pale wing. Keeping the largest connected blob
+ * drops the detached speed-line dashes (a morphological close is deliberately
+ * NOT applied first, since dilating would reconnect them); a close afterward
+ * and a hole-fill tidy the bird's own edges and seams. Filled flat brand-blue.
+ * Used as the app-icon overlay (at WORK) and, trimmed/centred, as the tray.
+ */
+async function swiftSilhouette(S = 512) {
+  const { data } = await sharp(SRC)
+    .resize(S, S)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const bin = new Uint8Array(S * S);
+  for (let i = 0; i < S * S; i++) {
+    const r = data[i * 4];
+    const g = data[i * 4 + 1];
+    const b = data[i * 4 + 2];
+    bin[i] = b - (r + g) / 2 > 20 ? 1 : 0;
+  }
+
+  let m = largestBlob(bin, S); // drop the disconnected speed-line dashes
+  const R = Math.max(1, Math.round((2 * S) / 512));
+  m = fillHoles(erode(dilate(m, S, R), S, R), S); // close seams, fill holes
+
+  // Flat brand blue, identical for the app icon and the tray so they match
+  // exactly. This is Display-P3 (50,150,250) converted to sRGB; that P3 blue
+  // is outside the sRGB gamut, so R/B clamp and it lands on #0099ff.
+  const FILL = [0, 153, 255];
+  const out = Buffer.alloc(S * S * 4);
+  for (let i = 0; i < S * S; i++) {
+    out[i * 4] = FILL[0];
+    out[i * 4 + 1] = FILL[1];
+    out[i * 4 + 2] = FILL[2];
+    out[i * 4 + 3] = m[i] ? 255 : 0;
+  }
+  return sharp(out, { raw: { width: S, height: S, channels: 4 } }).blur(0.7).png().toBuffer();
+}
+
+/** Trim transparent border, square with a little padding, resize to `size`. */
+async function squareResize(png, size, pad = 1.12) {
+  const trimmed = await sharp(png).trim({ threshold: 10 }).toBuffer();
+  const m = await sharp(trimmed).metadata();
+  const side = Math.round(Math.max(m.width, m.height) * pad);
+  // Materialise the padded square before resizing: in a single sharp pipeline
+  // resize runs BEFORE extend regardless of call order, which would pad the
+  // already-shrunk icon and blow the dimensions out. Two passes avoid that.
+  const padded = await sharp(trimmed)
+    .extend({
+      top: Math.floor((side - m.height) / 2),
+      bottom: Math.ceil((side - m.height) / 2),
+      left: Math.floor((side - m.width) / 2),
+      right: Math.ceil((side - m.width) / 2),
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+  return sharp(padded).resize(size, size, { fit: 'fill' }).png({ compressionLevel: 9 }).toBuffer();
+}
+
+async function main() {
+  if (!fs.existsSync(SRC)) {
+    console.error('Missing source art: ' + SRC);
+    process.exit(1);
+  }
+
+  const icon = await appIcon();
+  const entries = [];
+  for (const size of ICO_SIZES) {
+    entries.push({ size, png: await sharp(icon).resize(size, size).png({ compressionLevel: 9 }).toBuffer() });
+  }
+  const ico = wrapIco(entries);
+  fs.writeFileSync(path.join(BUILD, 'icon.ico'), ico);
+  fs.writeFileSync(path.join(BUILD, 'icon.png'), entries.find((e) => e.size === 256).png);
+  console.log('Wrote build/icon.ico (' + ico.length + ' bytes, ' + ICO_SIZES.join('/') + ') and build/icon.png');
+
+  const tray = await squareResize(await swiftSilhouette(), 32);
   console.log('\nTray data URL (paste into src/main/tray.js):');
   console.log('data:image/png;base64,' + tray.toString('base64'));
 }
 
-main();
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

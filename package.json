@@ -1,7 +1,7 @@
 {
   "name": "dart",
-  "version": "0.7.1",
-  "description": "sing-box based Windows proxy client with airport subscription and Clash config conversion",
+  "version": "0.7.2",
+  "description": "sing-box based Windows proxy client",
   "main": "src/main/index.js",
   "author": "singbox-gui",
   "license": "MIT",

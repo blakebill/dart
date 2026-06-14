@@ -31,7 +31,14 @@ function prefersHardwareAccel() {
   }
 }
 if (!prefersHardwareAccel()) app.disableHardwareAcceleration();
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=256');
+// V8 tuning for the renderer (the heaviest process):
+//   --max-old-space-size=192  caps the heap; the UI doesn't need 256MB, and a
+//                             tighter cap nudges V8 to GC sooner. 192 keeps
+//                             margin for very large subscription / node lists.
+//   --expose-gc               exposes window.gc() so the renderer can run a
+//                             collection on visibilitychange:hidden, freeing
+//                             heap promptly when minimized to the tray.
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=192 --expose-gc');
 
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
@@ -41,6 +48,8 @@ const { createTray } = require('./tray');
 const { stopTrafficStream } = require('./traffic');
 const core = require('./core-control');
 const { registerIpc } = require('./ipc');
+const { notify } = require('./notify');
+const proxy = require('./proxy');
 
 // Safety net: a stray socket error (e.g. ECONNRESET when the proxy is torn down
 // during a core update) must never crash the app with a fatal error dialog.
@@ -89,12 +98,29 @@ if (!gotLock) {
       onExit: () => {
         stopTrafficStream();
         sendStatus();
+        // Unexpected exit (not a stop/restart we triggered, not during quit):
+        // alert the user — the proxy is now down, which is easy to miss when
+        // the app is sitting in the tray.
+        if (!state.coreStopping && !app.isQuitting) {
+          const zh = (state.store.getSettings().language || 'zh') === 'zh';
+          notify(
+            zh ? '内核已停止' : 'Core stopped',
+            zh ? '内核意外退出，代理可能已失效。' : 'sing-box exited unexpectedly; the proxy may be down.'
+          );
+        }
       },
     });
     registerIpc();
+    const settings = state.store.getSettings();
     // Sync the OS login-item state with the saved setting.
-    core.applyAutoLaunch(state.store.getSettings().autoLaunch);
-    createWindow();
+    core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
+    // Clear a system proxy left dangling by a previous unclean exit (so the
+    // machine isn't left offline). Non-blocking; skips itself if we auto-resume.
+    core.healStaleSystemProxy();
+    // Silent start: keep the window in the tray when the setting is on, or when
+    // launched at login with --hidden (set on the login item by applyAutoLaunch).
+    const startHidden = !!settings.silentStart || process.argv.includes('--hidden');
+    createWindow(startHidden);
     createTray();
     core.rescheduleAutoUpdate();
     core.startGeoAutoUpdate();
@@ -122,6 +148,16 @@ if (!gotLock) {
       e.preventDefault();
       await core.cleanup();
       app.quit();
+    }
+  });
+
+  // Windows shutdown / log-off: the OS gives only a brief window before killing
+  // the app, too short for the async cleanup above. Flip the system proxy off
+  // synchronously so the machine isn't left offline on next boot. (Stopping the
+  // core itself isn't needed — the OS is tearing everything down regardless.)
+  app.on('session-end', () => {
+    if (state.systemProxyOn) {
+      try { proxy.disableSystemProxySync(); } catch (_) { /* best-effort */ }
     }
   });
 }

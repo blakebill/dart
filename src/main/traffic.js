@@ -12,12 +12,36 @@ const { state } = require('./state');
 
 let trafficReq = null;
 
+// Human-readable rate for the tray tooltip (e.g. "1.2 MB/s", "840 KB/s").
+function fmtRate(n) {
+  if (!n || n < 1) return '0 B/s';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return (n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)) + ' ' + units[i] + '/s';
+}
+
+// Show the live throughput on the tray icon's tooltip, so it's visible even
+// when the window is hidden in the tray (pairs with silent start).
+function updateTrayTooltip(up, down) {
+  if (!state.tray || (state.tray.isDestroyed && state.tray.isDestroyed())) return;
+  try {
+    state.tray.setToolTip(`Dart\n↑ ${fmtRate(up)}   ↓ ${fmtRate(down)}`);
+  } catch (_) {
+    /* tray may be gone during shutdown */
+  }
+}
+
 function startTrafficStream() {
   stopTrafficStream();
   const settings = state.store.getSettings();
   if (!settings.enableClashApi) return;
-  // No window to display it: the stream restarts on window 'show'.
-  if (!state.mainWindow || state.mainWindow.isDestroyed() || !state.mainWindow.isVisible()) return;
+  // Runs whenever the core is up (independent of window visibility) so the tray
+  // tooltip keeps showing live speed while minimized.
+  if (!state.singbox || !state.singbox.isRunning()) return;
   const req = http.request(
     {
       host: '127.0.0.1',
@@ -38,8 +62,11 @@ function startTrafficStream() {
           if (!line) continue;
           try {
             const t = JSON.parse(line);
+            const up = t.up || 0;
+            const down = t.down || 0;
+            updateTrayTooltip(up, down);
             if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-              state.mainWindow.webContents.send('singbox:traffic', { up: t.up || 0, down: t.down || 0 });
+              state.mainWindow.webContents.send('singbox:traffic', { up, down });
             }
           } catch (_) {
             /* ignore malformed line */

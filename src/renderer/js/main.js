@@ -18,6 +18,7 @@
     App.renderSubs();
     App.renderNodes();
     App.renderCoreStatus(App.state.status);
+    if (App.renderThemeLabel) App.renderThemeLabel();
   }
 
   // ---------- Tab switching ----------
@@ -62,13 +63,18 @@
   }
 
   // While hidden (minimized to tray), stop polling and drawing; the traffic
-  // history still accumulates, so the charts catch up when shown again.
+  // history still accumulates, so the charts catch up when shown again. We also
+  // ask V8 for a collection (window.gc is exposed by the main process's
+  // --expose-gc flag) so the heap promptly returns memory to the OS rather than
+  // waiting for the next allocation to trip a GC, which can be many minutes
+  // while the window is in the tray.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (connTimer) {
         clearInterval(connTimer);
         connTimer = null;
       }
+      try { if (window.gc) window.gc(); } catch (_) { /* gc unavailable */ }
     } else {
       onTabShown(App.currentTab);
       App.trafficChart.draw();

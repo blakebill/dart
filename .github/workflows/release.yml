@@ -24,6 +24,10 @@ on:
         description: 'Mark as prerelease'
         type: boolean
         default: false
+      publish:
+        description: 'Publish a GitHub Release (off = build-only, artifact uploaded)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -55,9 +59,23 @@ jobs:
         # The installer file name (Dart.Setup.<version>.exe) is derived
         # from package.json "version". Align it with the release tag so the
         # artifact name always matches the tag (e.g. v0.1.2-pre -> 0.1.2).
+        # For a manual build-only run with an empty tag, skip the sync and keep
+        # the version that is already in package.json.
         shell: bash
         run: |
-          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          # On a tag push, github.ref_name is the tag. On a manual run it's the
+          # branch, so take the tag only from the input. (Don't use the GHA
+          # "A && B || C" idiom here: when inputs.tag is empty it falls through
+          # to the branch name, which then gets mangled into a bogus version.)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "No tag supplied; keeping current package.json version."
+            exit 0
+          fi
           VERSION="${TAG#v}"        # strip leading "v"
           VERSION="${VERSION%%-*}"  # strip any prerelease suffix (e.g. "-pre")
           echo "Setting package.json version to $VERSION (from tag $TAG)"
@@ -89,7 +107,11 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        # Tag pushes always publish. Manual runs publish only when the `publish`
+        # input is on (defaults true to preserve previous behaviour); set it to
+        # false for a build-only run that just uploads the installer as an
+        # Actions artifact.
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
         uses: softprops/action-gh-release@v2.3.2
         with:
           # On a tag push use that tag; on manual dispatch use the input tag.

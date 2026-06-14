@@ -75,6 +75,8 @@ const electronStub = {
   Tray: FakeTray,
   Menu: { buildFromTemplate: (tpl) => tpl },
   nativeImage: { createFromDataURL: () => ({}) },
+  nativeTheme: { shouldUseDarkColors: false },
+  Notification: class { static isSupported() { return false; } show() {} on() {} },
   shell: { openExternal: () => {}, openPath: () => {}, showItemInFolder: () => {} },
   dialog: {
     showErrorBox: () => {},

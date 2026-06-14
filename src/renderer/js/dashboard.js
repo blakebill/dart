@@ -109,12 +109,20 @@
   });
   $('#quickPanel').addEventListener('click', () => api.openClashApi());
 
-  // Theme toggle (dark <-> light), persisted.
+  // Theme toggle: cycles dark → light → system, persisted. The button label
+  // shows the current mode.
+  const THEME_ORDER = ['dark', 'light', 'system'];
+  function renderThemeLabel() {
+    const span = $('#themeLabel');
+    if (span) span.textContent = t('theme.' + (App.themePref || 'dark'));
+  }
   $('#themeBtn').addEventListener('click', async () => {
-    const next = (App.state.settings.theme === 'light') ? 'dark' : 'light';
+    const cur = App.themePref || App.state.settings.theme || 'dark';
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(cur) + 1) % THEME_ORDER.length];
     App.applyTheme(next);
     App.state.settings = await call(api.updateSettings, { theme: next });
   });
+  App.renderThemeLabel = renderThemeLabel;
 
   // Proxy mode switch (rule / global / direct / block)
   $$('.mode-btn').forEach((b) => {

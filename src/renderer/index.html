@@ -36,7 +36,7 @@
         </nav>
         <div class="sidebar-footer">
           <div class="theme-switch">
-            <button id="themeBtn" class="theme-btn" title="theme">🌓 <span data-i18n="theme.toggle">主题</span></button>
+            <button id="themeBtn" class="theme-btn" title="theme">🌓 <span id="themeLabel">主题</span></button>
           </div>
           <div class="mini-traffic">
             <canvas id="miniTraffic"></canvas>
@@ -345,6 +345,14 @@
             <div class="setting-row">
               <label data-i18n="settings.autoLaunch">开机自启</label>
               <input id="setAutoLaunch" type="checkbox" />
+            </div>
+            <div class="setting-row">
+              <label data-i18n="settings.silentStart">静默启动（启动时最小化到托盘）</label>
+              <input id="setSilentStart" type="checkbox" />
+            </div>
+            <div class="setting-row">
+              <label data-i18n="settings.notifications">桌面通知（内核异常、新版本）</label>
+              <input id="setNotifications" type="checkbox" />
             </div>
             <div class="setting-row">
               <label data-i18n="settings.hwAccel">硬件加速（重启后生效，关闭可降低内存占用）</label>

@@ -717,6 +717,5 @@ module.exports = {
   buildRoute,
   clashRulesToSingbox,
   dnsServerFromAddress,
-  parseRuleList,
   ruleListToSingboxRule,
 };

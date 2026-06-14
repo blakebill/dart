@@ -218,6 +218,5 @@ function isClashConfig(content) {
 
 module.exports = {
   parseClashConfig,
-  normalizeClashProxy,
   isClashConfig,
 };

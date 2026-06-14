@@ -31,6 +31,11 @@ function createTray() {
 function updateTrayMenu() {
   if (!state.tray) return;
   const running = state.singbox && state.singbox.isRunning();
+  // While running, the traffic stream keeps the tooltip showing live speed;
+  // reset it to the plain name once stopped so it doesn't show stale numbers.
+  if (!running) {
+    try { state.tray.setToolTip('Dart'); } catch (_) { /* tray gone */ }
+  }
   const currentMode = (state.store && state.store.getSettings().clashMode) || 'rule';
   const menu = Menu.buildFromTemplate([
     { label: 'Dart', enabled: false },
@@ -76,4 +81,4 @@ function updateTrayMenu() {
   state.tray.setContextMenu(menu);
 }
 
-module.exports = { createTray, updateTrayMenu };
+module.exports = { createTray };

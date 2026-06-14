@@ -1,6 +1,6 @@
 'use strict';
 
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 
 /**
  * Windows system proxy settings (via the registry).
@@ -39,6 +39,27 @@ async function disableSystemProxy() {
   await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 0 /f`);
   await refreshSettings();
   return true;
+}
+
+/**
+ * Disable the system proxy synchronously. On OS shutdown / log-off the app gets
+ * only a brief window before it's killed, too short for the async path above to
+ * finish — so flip ProxyEnable to 0 with a blocking reg write (skipping the
+ * WinINet refresh, which doesn't matter when the session is ending anyway). The
+ * persisted registry value is what keeps the next boot online.
+ */
+function disableSystemProxySync() {
+  if (process.platform !== 'win32') return false;
+  try {
+    execSync(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 0 /f`, {
+      windowsHide: true,
+      timeout: 3000,
+      stdio: 'ignore',
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -86,5 +107,6 @@ async function refreshSettings() {
 module.exports = {
   enableSystemProxy,
   disableSystemProxy,
+  disableSystemProxySync,
   isSystemProxyActive,
 };

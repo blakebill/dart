@@ -26,14 +26,46 @@
     do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
     return (n >= 10 ? Math.round(n) : n.toFixed(1)) + units[i] + '/s';
   }
-  function applyTheme(theme) {
-    const th = theme === 'light' ? 'light' : 'dark';
-    // Mirror to localStorage so theme-init.js can set it before first paint
-    // on the next launch (avoids the dark→light flash).
+  // Resolve a preference ('dark' | 'light' | 'system') to the effective theme,
+  // consulting the OS for 'system'.
+  function effectiveTheme(pref) {
+    if (pref === 'system') {
+      try {
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      } catch (_) {
+        return 'dark';
+      }
+    }
+    return pref === 'light' ? 'light' : 'dark';
+  }
+
+  // Paint the resolved theme: set data-theme, refresh the chart palette, and
+  // mirror the effective value to localStorage so theme-init.js can match it
+  // before first paint next launch (avoids the dark→light flash).
+  function paintTheme(pref) {
+    const th = effectiveTheme(pref);
     try { localStorage.setItem('theme', th); } catch (e) { /* ignore */ }
-    if (document.documentElement.getAttribute('data-theme') === th) return;
-    document.documentElement.setAttribute('data-theme', th);
-    refreshPalette();
+    if (document.documentElement.getAttribute('data-theme') !== th) {
+      document.documentElement.setAttribute('data-theme', th);
+      refreshPalette();
+    }
+  }
+
+  let osThemeBound = false;
+  function applyTheme(theme) {
+    App.themePref = theme === 'light' || theme === 'system' ? theme : 'dark';
+    // Re-paint automatically when the OS light/dark setting changes, but only
+    // while following the system.
+    if (!osThemeBound) {
+      osThemeBound = true;
+      try {
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+          if (App.themePref === 'system') paintTheme('system');
+        });
+      } catch (_) { /* matchMedia unavailable */ }
+    }
+    paintTheme(App.themePref);
+    if (App.renderThemeLabel) App.renderThemeLabel();
   }
 
   function makeChart(sel, opts) {
@@ -46,13 +78,12 @@
     const pad = fill ? 8 : 2;
     const base = fill ? 4 : 1;
 
-    // Plot rect inside the canvas. 'outer' axes reserve gutters for the speed
-    // (Y) and time (X) labels drawn alongside the plot; otherwise the plot
-    // fills the canvas (inner axes are drawn over it).
+    // Plot rect inside the canvas. The canvas already spans the panel's content
+    // width (left-aligned with the heading), so 'outer' only keeps a 2px safety
+    // inset (the line stroke is 2px wide) plus room at the bottom for the time
+    // labels; the speed labels are drawn as an overlay, not in a gutter.
     function plotRect(W, H) {
-      // Wider left gutter so speed labels never clip; right gutter keeps the
-      // "now" tick and the latest point off the edge.
-      if (axes === 'outer') return { x0: 58, y0: 9, x1: W - 16, y1: H - 18 };
+      if (axes === 'outer') return { x0: 2, y0: 10, x1: W - 2, y1: H - 16 };
       return { x0: 0, y0: 0, x1: W, y1: H };
     }
 
@@ -82,14 +113,12 @@
       ctx.stroke();
     }
 
-    // Outer axes: gridlines with speed labels (Y, dynamic) at left and time
-    // marks (X) along the bottom — a 1/s push cadence makes `size` ≈ seconds.
+    // Outer axes: full-width gridlines with the speed labels (Y, dynamic) drawn
+    // as a faint overlay just inside the left edge — no reserved gutter — and
+    // time marks (X) along the bottom. A 1/s push cadence makes `size` ≈ secs.
     function drawOuterAxes(p, top) {
-      ctx.fillStyle = palette.textDim;
       ctx.font = AXIS_FONT;
       ctx.strokeStyle = palette.border;
-      ctx.textAlign = 'right';
-      ctx.textBaseline = 'middle';
       for (let i = 0; i <= 2; i++) {
         const f = i / 2; // 0 (top) .. 1 (bottom)
         const gy = p.y0 + (p.y1 - p.y0) * f;
@@ -99,10 +128,16 @@
         ctx.moveTo(p.x0, gy);
         ctx.lineTo(p.x1, gy);
         ctx.stroke();
-        ctx.globalAlpha = 1;
-        ctx.fillText(fmtRate(top * (1 - f)), p.x0 - 5, gy);
+        // Label sits inside the plot at the left, hugging its gridline: the top
+        // one below its line, the rest above, so none clip the canvas edges.
+        ctx.globalAlpha = 0.75;
+        ctx.fillStyle = palette.textDim;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = i === 0 ? 'top' : 'bottom';
+        ctx.fillText(fmtRate(top * (1 - f)), p.x0 + 3, gy + (i === 0 ? 2 : -2));
       }
-      ctx.textBaseline = 'top';
+      ctx.globalAlpha = 0.75;
+      ctx.textBaseline = 'bottom';
       const marks = [
         [p.x0, 'left', '-' + size + 's'],
         [(p.x0 + p.x1) / 2, 'center', '-' + Math.round(size / 2) + 's'],
@@ -110,8 +145,9 @@
       ];
       for (const [mx, align, label] of marks) {
         ctx.textAlign = align;
-        ctx.fillText(label, mx, p.y1 + 4);
+        ctx.fillText(label, mx, p.y1 + 14);
       }
+      ctx.globalAlpha = 1;
     }
 
     // Inner axes: peak speed (Y reference) top-left and the time span

@@ -25,7 +25,9 @@ const DICT = {
     'status.running': '运行中',
     'status.stopped': '已停止',
     'power.start': '启动',
-    'theme.toggle': '主题',
+    'theme.dark': '深色',
+    'theme.light': '浅色',
+    'theme.system': '跟随系统',
     'power.stop': '停止',
     'state.on': '开启',
     'state.off': '关闭',
@@ -184,6 +186,8 @@ const DICT = {
     'settings.autoProxy': '启动时自动设置系统代理',
     'settings.clashApi': '启用 Clash API',
     'settings.autoLaunch': '开机自启',
+    'settings.silentStart': '静默启动（启动时最小化到托盘）',
+    'settings.notifications': '桌面通知（内核异常、新版本）',
     'settings.hwAccel': '硬件加速（重启后生效，关闭可降低内存占用）',
     'settings.ipv6': '启用 IPv6（关闭则仅 IPv4）',
     'settings.save': '保存设置',
@@ -206,6 +210,7 @@ const DICT = {
     'about.checking': '检查中...',
     'about.upToDate': '已是最新版本',
     'about.newVersion': '发现新版本 {0}（当前 {1}）',
+    'notify.updateTitle': '有新版本可用',
     'about.download': '下载并安装',
     'about.downloading': '下载中...',
     'about.installing': '安装程序已启动，应用即将退出',
@@ -280,7 +285,9 @@ const DICT = {
     'status.running': 'Running',
     'status.stopped': 'Stopped',
     'power.start': 'Start',
-    'theme.toggle': 'Theme',
+    'theme.dark': 'Dark',
+    'theme.light': 'Light',
+    'theme.system': 'System',
     'power.stop': 'Stop',
     'state.on': 'On',
     'state.off': 'Off',
@@ -430,6 +437,8 @@ const DICT = {
     'settings.autoProxy': 'Set System Proxy on Start',
     'settings.clashApi': 'Enable Clash API',
     'settings.autoLaunch': 'Launch at Login',
+    'settings.silentStart': 'Silent start (minimized to tray)',
+    'settings.notifications': 'Desktop notifications (core errors, new versions)',
     'settings.hwAccel': 'Hardware acceleration (applies after restart; off lowers RAM)',
     'settings.ipv6': 'Enable IPv6 (off = IPv4 only)',
     'settings.save': 'Save Settings',
@@ -452,6 +461,7 @@ const DICT = {
     'about.checking': 'Checking...',
     'about.upToDate': 'You are on the latest version',
     'about.newVersion': 'New version {0} available (current {1})',
+    'notify.updateTitle': 'Update available',
     'about.download': 'Download & install',
     'about.downloading': 'Downloading...',
     'about.installing': 'Installer launched; the app will quit',
@@ -537,5 +547,6 @@ function applyI18n() {
   document.title = t('appName');
 }
 
+// DICT is exported for the i18n parity test (test/unit.test.js).
 window.i18n = { t, setLang, getLang, applyI18n, DICT };
 })();

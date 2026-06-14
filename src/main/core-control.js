@@ -66,15 +66,19 @@ function activeSubData() {
   return { nodes: (sub && sub.nodes) || [], rules: (sub && sub.clashRules) || [] };
 }
 
+/** Point a route rule at a target ('direct' | 'reject' | proxy), in place. */
+function applyRuleTarget(rule, target) {
+  if (target === 'direct') rule.outbound = 'direct';
+  else if (target === 'reject') rule.action = 'reject';
+  else rule.outbound = '🚀 Proxy';
+  return rule;
+}
+
 /** Turn a stored local rule into a sing-box route rule object. */
 function buildLocalRuleObject(lr) {
   const vals = (lr.values || []).map((v) => String(v).trim()).filter(Boolean);
   if (!vals.length || !lr.matchType) return null;
-  const rule = { [lr.matchType]: vals };
-  if (lr.target === 'direct') rule.outbound = 'direct';
-  else if (lr.target === 'reject') rule.action = 'reject';
-  else rule.outbound = '🚀 Proxy';
-  return rule;
+  return applyRuleTarget({ [lr.matchType]: vals }, lr.target);
 }
 
 /**
@@ -98,11 +102,7 @@ function collectCustomRules() {
       if (state.singbox._validSrs(p)) {
         const tag = 'custom-' + c.id;
         extraRuleSets.push({ type: 'local', tag, format: 'binary', path: p.replace(/\\/g, '/') });
-        const rule = { rule_set: [tag] };
-        if (c.target === 'direct') rule.outbound = 'direct';
-        else if (c.target === 'reject') rule.action = 'reject';
-        else rule.outbound = '🚀 Proxy';
-        extraRules.push(rule);
+        extraRules.push(applyRuleTarget({ rule_set: [tag] }, c.target));
       }
     }
   }
@@ -224,6 +224,9 @@ function maybeFetchGeodata() {
  * the auto-resume flag, so the app does not start itself on the next launch.
  */
 async function stopCore(remember) {
+  // Mark the stop as intentional so the exit handler doesn't fire a "core
+  // crashed" notification for a stop/restart we initiated.
+  state.coreStopping = true;
   stopTrafficStream();
   stopProxyGuard();
   if (state.systemProxyOn) {
@@ -235,6 +238,7 @@ async function stopCore(remember) {
     state.systemProxyOn = false;
   }
   await state.singbox.stop();
+  state.coreStopping = false;
   if (remember) state.store.set('lastRunning', false);
   sendStatus();
 }
@@ -498,17 +502,46 @@ function startGeoAutoUpdate() {
   geoTimer = setInterval(() => checkGeoUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
 }
 
-/** Apply the auto-launch (login item) setting on supported platforms. */
-function applyAutoLaunch(enable) {
+/**
+ * Apply the auto-launch (login item) setting on supported platforms. When
+ * `silent` is set, the login launch starts hidden in the tray: pass `--hidden`
+ * (read at startup) and openAsHidden (the macOS equivalent).
+ */
+function applyAutoLaunch(enable, silent) {
   if (process.platform === 'linux' && !process.env.APPIMAGE) {
     // setLoginItemSettings has limited support on plain Linux; best-effort only.
     return;
   }
   app.setLoginItemSettings({
     openAtLogin: !!enable,
+    openAsHidden: !!silent,
     path: process.execPath,
-    args: [],
+    args: silent ? ['--hidden'] : [],
   });
+}
+
+/**
+ * Startup safety net: if a previous run exited uncleanly (crash, force-kill, or
+ * a shutdown too fast for cleanup), the Windows system proxy can be left
+ * pointing at our local port — which means no network until the app runs again.
+ * On boot, when we are NOT about to auto-resume the core, clear the proxy if it
+ * is still pointing at us. (If we will auto-resume, startCore re-asserts it.)
+ */
+async function healStaleSystemProxy() {
+  if (process.platform !== 'win32') return;
+  const willResume = state.store.get('lastRunning') && state.singbox.isCoreInstalled();
+  if (willResume) return;
+  try {
+    const settings = state.store.getSettings();
+    const ours = await proxy.isSystemProxyActive(`127.0.0.1:${settings.mixedPort}`);
+    if (ours) {
+      await proxy.disableSystemProxy();
+      state.systemProxyOn = false;
+      sendLog('[gui] cleared a stale system proxy left from a previous session');
+    }
+  } catch (_) {
+    /* best-effort */
+  }
 }
 
 module.exports = {
@@ -533,4 +566,5 @@ module.exports = {
   rescheduleAutoUpdate,
   startGeoAutoUpdate,
   applyAutoLaunch,
+  healStaleSystemProxy,
 };

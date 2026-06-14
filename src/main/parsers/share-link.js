@@ -36,6 +36,11 @@ function isProbablyBase64(str) {
   return /(vmess|vless|trojan|ss|ssr|hysteria2?|tuic|hy2|anytls):\/\//i.test(decoded);
 }
 
+/** Split a comma-separated alpn value into a trimmed, non-empty list. */
+function splitAlpn(v) {
+  return String(v).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
 /** Parse a URL query string into an object. */
 function parseQuery(search) {
   const params = {};
@@ -88,7 +93,7 @@ function parseVmess(uri) {
   if (cfg.tls === 'tls' || cfg.tls === true) {
     node.tls = true;
     node.servername = cfg.sni || cfg.host || '';
-    if (cfg.alpn) node.alpn = String(cfg.alpn).split(',').map((s) => s.trim()).filter(Boolean);
+    if (cfg.alpn) node.alpn = splitAlpn(cfg.alpn);
   }
   // Transport layer
   const host = cfg.host || '';
@@ -125,7 +130,7 @@ function parseVless(uri) {
   if (security === 'tls' || security === 'xtls' || security === 'reality') {
     node.tls = true;
     node.servername = params.sni || params.peer || '';
-    if (params.alpn) node.alpn = params.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+    if (params.alpn) node.alpn = splitAlpn(params.alpn);
     if (params.fp) node.clientFingerprint = params.fp;
     if (security === 'reality') {
       node.reality = {
@@ -165,7 +170,7 @@ function parseTrojan(uri) {
     servername: params.sni || params.peer || u.hostname,
     network: params.type || 'tcp',
   };
-  if (params.alpn) node.alpn = params.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+  if (params.alpn) node.alpn = splitAlpn(params.alpn);
   if (params.fp) node.clientFingerprint = params.fp;
   if (params['allowInsecure'] === '1' || params.allowInsecure === 'true') node.skipCertVerify = true;
   const host = params.host || '';
@@ -266,7 +271,7 @@ function parseHysteria2(uri) {
     obfsPassword: params['obfs-password'] || '',
     servername: params.sni || '',
     skipCertVerify: params.insecure === '1' || params.insecure === 'true',
-    alpn: params.alpn ? params.alpn.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+    alpn: params.alpn ? splitAlpn(params.alpn) : undefined,
   };
 }
 
@@ -289,7 +294,7 @@ function parseTuic(uri) {
     congestionControl: params.congestion_control || 'bbr',
     udpRelayMode: params.udp_relay_mode || 'native',
     servername: params.sni || '',
-    alpn: params.alpn ? params.alpn.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+    alpn: params.alpn ? splitAlpn(params.alpn) : undefined,
     skipCertVerify: params.allow_insecure === '1' || params.insecure === '1',
   };
 }
@@ -311,7 +316,7 @@ function parseAnytls(uri) {
     password: decodeURIComponent(u.username || '') || params.password || '',
     servername: params.sni || params.peer || '',
     skipCertVerify: params.insecure === '1' || params.insecure === 'true' || params.allowInsecure === '1',
-    alpn: params.alpn ? params.alpn.split(',').map((s) => s.trim()).filter(Boolean) : undefined,
+    alpn: params.alpn ? splitAlpn(params.alpn) : undefined,
     clientFingerprint: params.fp,
   };
 }

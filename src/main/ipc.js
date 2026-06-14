@@ -7,13 +7,14 @@ const { app, ipcMain, shell, dialog } = require('electron');
 
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, coreStatusInfo } = require('./state');
 const core = require('./core-control');
-const { isWindowsAdmin, relaunchElevated } = require('./admin');
+const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
 const update = require('./update');
 const { buildSingboxConfig } = require('./converter');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
 const fetch = require('./fetch');
+const { notify } = require('./notify');
 
 /** Validate an IPC payload field: must be a non-empty string. */
 function reqStr(v, name) {
@@ -51,8 +52,8 @@ const VALID_CRS_FORMATS = ['clash', 'surge', 'loon', 'quantumultx', 'sing-box'];
 // a malformed payload cannot pollute the persisted store.
 const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'enableTun', 'enableClashApi', 'logLevel',
-  'autoSetSystemProxy', 'autoLaunch', 'enableIpv6', 'dnsRemote', 'dnsLocal',
-  'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
+  'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
+  'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
@@ -283,10 +284,23 @@ function registerIpc() {
       Object.entries(patch && typeof patch === 'object' ? patch : {}).filter(([k]) => SETTING_KEYS.has(k))
     );
     const settings = state.store.updateSettings(patch);
-    if (Object.prototype.hasOwnProperty.call(patch, 'autoLaunch')) {
-      core.applyAutoLaunch(settings.autoLaunch);
+    // The login item carries the --hidden flag when silent start is on, so a
+    // change to either setting must re-register it.
+    if (
+      Object.prototype.hasOwnProperty.call(patch, 'autoLaunch') ||
+      Object.prototype.hasOwnProperty.call(patch, 'silentStart')
+    ) {
+      core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
     }
     return settings;
+  });
+
+  // Show a desktop notification (renderer-triggered, already localized). Gated
+  // by the `notifications` setting inside notify().
+  ipcMain.handle('app:notify', (_e, payload) => {
+    const { title, body } = payload && typeof payload === 'object' ? payload : {};
+    notify(title, body);
+    return true;
   });
 
   // Test a single node's latency via the Clash API.
@@ -613,17 +627,7 @@ function registerIpc() {
   ipcMain.handle('tun:set', async (_e, { enable }) => {
     state.store.updateSettings({ enableTun: !!enable });
     if (enable && process.platform === 'win32' && !(await isWindowsAdmin())) {
-      const { response } = await dialog.showMessageBox(state.mainWindow, {
-        type: 'warning',
-        buttons: ['Restart as administrator', 'Cancel'],
-        defaultId: 0,
-        cancelId: 1,
-        noLink: true,
-        message: 'TUN mode requires administrator rights',
-        detail: 'Restart Dart as administrator to enable TUN mode?',
-      });
-      if (response === 0) {
-        relaunchElevated();
+      if (await promptRestartForTun()) {
         return { restarting: true, settings: state.store.getSettings() };
       }
       // Declined: revert the setting so the UI stays consistent.

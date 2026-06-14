@@ -188,4 +188,4 @@ async function getBufferWithFallback(urlStr, opts = {}) {
   return getBuffer(urlStr, { ...rest, proxyPort: 0 });
 }
 
-module.exports = { getBuffer, download, downloadWithFallback, getBufferWithFallback };
+module.exports = { download, downloadWithFallback, getBufferWithFallback };

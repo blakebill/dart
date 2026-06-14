@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld('api', {
   // Settings
   updateSettings: (patch) => ipcRenderer.invoke('settings:update', patch),
 
+  // Desktop notification (renderer passes already-localized text)
+  notify: (title, body) => ipcRenderer.invoke('app:notify', { title, body }),
+
   // Node latency test
   testNodeDelay: (name) => ipcRenderer.invoke('node:delay', { name }),
 

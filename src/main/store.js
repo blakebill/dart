@@ -18,6 +18,8 @@ const DEFAULT_SETTINGS = {
   logLevel: 'info',
   autoSetSystemProxy: true,
   autoLaunch: false,
+  silentStart: false,
+  notifications: true,
   enableIpv6: true,
   dnsRemote: 'https://1.1.1.1/dns-query',
   dnsLocal: 'https://223.5.5.5/dns-query',

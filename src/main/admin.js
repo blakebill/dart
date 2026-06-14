@@ -46,29 +46,39 @@ function relaunchElevated() {
 }
 
 /**
+ * Show the "TUN needs admin" prompt. On accept, trigger an elevated relaunch and
+ * return true; on decline (or when there's no window to anchor the dialog),
+ * return false. Shared by the tun:set IPC handler and ensureAdminForTun.
+ */
+async function promptRestartForTun() {
+  if (!state.mainWindow || state.mainWindow.isDestroyed()) return false;
+  const { response } = await dialog.showMessageBox(state.mainWindow, {
+    type: 'warning',
+    buttons: ['Restart as administrator', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+    message: 'TUN mode requires administrator rights',
+    detail: 'Restart Dart as administrator to enable TUN mode?',
+  });
+  if (response === 0) {
+    relaunchElevated();
+    return true;
+  }
+  return false;
+}
+
+/**
  * If TUN is enabled but we are not elevated, offer to restart as administrator.
- * Returns true when the caller should abort (a relaunch was triggered or denied).
+ * Returns true when the caller should abort (a relaunch was triggered); throws
+ * if the user declines (or there's no window).
  */
 async function ensureAdminForTun() {
   const settings = state.store.getSettings();
   if (!settings.enableTun) return false;
   if (await isWindowsAdmin()) return false;
-  if (process.platform === 'win32' && state.mainWindow && !state.mainWindow.isDestroyed()) {
-    const { response } = await dialog.showMessageBox(state.mainWindow, {
-      type: 'warning',
-      buttons: ['Restart as administrator', 'Cancel'],
-      defaultId: 0,
-      cancelId: 1,
-      noLink: true,
-      message: 'TUN mode requires administrator rights',
-      detail: 'Restart Dart as administrator to enable TUN mode?',
-    });
-    if (response === 0) {
-      relaunchElevated();
-      return true;
-    }
-  }
+  if (await promptRestartForTun()) return true;
   throw new Error('TUN mode requires administrator rights.');
 }
 
-module.exports = { isWindowsAdmin, relaunchElevated, ensureAdminForTun };
+module.exports = { isWindowsAdmin, relaunchElevated, promptRestartForTun, ensureAdminForTun };

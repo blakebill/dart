@@ -15,6 +15,8 @@
     $('#setAutoProxy').checked = !!s.autoSetSystemProxy;
     $('#setClashApi').checked = !!s.enableClashApi;
     $('#setAutoLaunch').checked = !!s.autoLaunch;
+    $('#setSilentStart').checked = !!s.silentStart;
+    $('#setNotifications').checked = s.notifications !== false;
     $('#setHwAccel').checked = !!s.hardwareAcceleration;
     $('#setIpv6').checked = !!s.enableIpv6;
     $('#setLanguage').value = s.language || 'zh';
@@ -57,6 +59,8 @@
       autoSetSystemProxy: $('#setAutoProxy').checked,
       enableClashApi: $('#setClashApi').checked,
       autoLaunch: $('#setAutoLaunch').checked,
+      silentStart: $('#setSilentStart').checked,
+      notifications: $('#setNotifications').checked,
       hardwareAcceleration: $('#setHwAccel').checked,
       enableIpv6: $('#setIpv6').checked,
       language: $('#setLanguage').value,
@@ -153,7 +157,13 @@
         if (status) status.textContent = t('about.newVersion', 'v' + r.latest, 'v' + r.current);
         if (dl) dl.classList.remove('hidden');
         if (badge) badge.classList.remove('hidden'); // NEW marker by the logo version
-        if (silent) toast(t('about.newVersion', 'v' + r.latest, 'v' + r.current));
+        if (silent) {
+          const msg = t('about.newVersion', 'v' + r.latest, 'v' + r.current);
+          toast(msg);
+          // Desktop notification too, since the silent check often runs while
+          // the window is hidden in the tray.
+          try { api.notify(t('notify.updateTitle'), msg); } catch (_) {}
+        }
       } else {
         if (badge) badge.classList.add('hidden');
         if (status && !silent) status.textContent = t('about.upToDate');

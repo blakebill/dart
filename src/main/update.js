@@ -41,4 +41,4 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}) {
   }
 }
 
-module.exports = { UPDATE_REPO, compareVersions: github.compareTags, checkUpdate };
+module.exports = { checkUpdate };

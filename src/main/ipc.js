@@ -284,13 +284,17 @@ function registerIpc() {
       Object.entries(patch && typeof patch === 'object' ? patch : {}).filter(([k]) => SETTING_KEYS.has(k))
     );
     const settings = state.store.updateSettings(patch);
-    // The login item carries the --hidden flag when silent start is on, so a
-    // change to either setting must re-register it.
+    // The login item carries the --hidden flag when silent start is on, and on
+    // Windows the auto-launch mechanism depends on whether TUN is on (elevated
+    // logon task vs plain Run item), so a change to any of these must re-register
+    // it. interactive: this is an explicit user action, so a one-time UAC prompt
+    // is acceptable here.
     if (
       Object.prototype.hasOwnProperty.call(patch, 'autoLaunch') ||
-      Object.prototype.hasOwnProperty.call(patch, 'silentStart')
+      Object.prototype.hasOwnProperty.call(patch, 'silentStart') ||
+      Object.prototype.hasOwnProperty.call(patch, 'enableTun')
     ) {
-      core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
+      core.applyAutoLaunch(settings.autoLaunch, settings.silentStart, { interactive: true });
     }
     return settings;
   });
@@ -634,6 +638,11 @@ function registerIpc() {
       state.store.updateSettings({ enableTun: false });
       return { enabled: false, settings: state.store.getSettings() };
     }
+    // TUN changed: if auto-launch is on, this flips the Windows mechanism between
+    // the plain Run item and the elevated logon task. We are already admin on the
+    // enable path here (the non-admin case relaunched above), so it is silent.
+    const s = state.store.getSettings();
+    if (s.autoLaunch) core.applyAutoLaunch(s.autoLaunch, s.silentStart, { interactive: true });
     if (state.singbox.isRunning()) await core.restartIfRunning();
     return { enabled: !!enable, settings: state.store.getSettings() };
   });

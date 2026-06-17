@@ -502,22 +502,177 @@ function startGeoAutoUpdate() {
   geoTimer = setInterval(() => checkGeoUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
 }
 
-/**
- * Apply the auto-launch (login item) setting on supported platforms. When
- * `silent` is set, the login launch starts hidden in the tray: pass `--hidden`
- * (read at startup) and openAsHidden (the macOS equivalent).
- */
-function applyAutoLaunch(enable, silent) {
-  if (process.platform === 'linux' && !process.env.APPIMAGE) {
-    // setLoginItemSettings has limited support on plain Linux; best-effort only.
-    return;
+// Name of the Windows logon task used for elevated auto-start (see below).
+const AUTOSTART_TASK = 'Dart-AutoStart';
+
+/** True if the current Windows process already holds administrator rights. */
+function isAdminSync() {
+  if (process.platform !== 'win32') return true;
+  try {
+    const { spawnSync } = require('child_process');
+    return spawnSync('net', ['session'], { windowsHide: true }).status === 0;
+  } catch (_) {
+    return false;
   }
+}
+
+/** Set (or clear) the plain HKCU "Run" login item via Electron. */
+function setRunItem(enable, silent) {
   app.setLoginItemSettings({
     openAtLogin: !!enable,
     openAsHidden: !!silent,
     path: process.execPath,
     args: silent ? ['--hidden'] : [],
   });
+}
+
+/** True if our scheduled logon task exists (read-only query; no elevation). */
+function autostartTaskExists() {
+  try {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('schtasks.exe', ['/query', '/tn', AUTOSTART_TASK], {
+      windowsHide: true,
+      encoding: 'utf-8',
+    });
+    return r.status === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Run a schtasks command, elevating via UAC only when we are not already admin.
+ * Returns true on success (exit 0). When `elevate` is true and the user declines
+ * UAC, Start-Process throws and PowerShell exits non-zero, so we return false.
+ */
+function runSchtasks(args, elevate) {
+  const { spawnSync } = require('child_process');
+  if (!elevate) {
+    const r = spawnSync('schtasks.exe', args, { windowsHide: true, encoding: 'utf-8' });
+    return !r.error && r.status === 0;
+  }
+  const argList = args.map((a) => `'${String(a).replace(/'/g, "''")}'`).join(',');
+  const ps = `$p = Start-Process -FilePath 'schtasks.exe' -ArgumentList @(${argList}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode`;
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+    windowsHide: true,
+    encoding: 'utf-8',
+  });
+  return !r.error && r.status === 0;
+}
+
+/**
+ * Task Scheduler XML for a logon task that runs Dart with highest privileges.
+ * The command is just the exe path (no --hidden): silent start is driven by the
+ * persisted `silentStart` setting at startup, so toggling it never needs the
+ * task to be rebuilt. ExecutionTimeLimit is disabled (PT0S) so the long-running
+ * GUI is never killed by the default 72h task limit.
+ */
+function buildAutostartTaskXml() {
+  const esc = (s) =>
+    String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const user = `${process.env.USERDOMAIN || process.env.COMPUTERNAME || ''}\\${process.env.USERNAME || ''}`;
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Dart auto-start (elevated for TUN mode)</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${esc(user)}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>${esc(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>${esc(process.execPath)}</Command></Exec></Actions>
+</Task>`;
+}
+
+/** (Re)create the elevated logon task. Returns true on success. */
+function createAutostartTask() {
+  const os = require('os');
+  const tmp = path.join(os.tmpdir(), `dart-autostart-${process.pid}.xml`);
+  try {
+    // UTF-16LE + BOM (﻿) to match the XML declaration schtasks expects.
+    fs.writeFileSync(tmp, '﻿' + buildAutostartTaskXml(), { encoding: 'utf16le' });
+    const ok = runSchtasks(['/create', '/tn', AUTOSTART_TASK, '/xml', tmp, '/f'], !isAdminSync());
+    sendLog('[gui] autostart task ' + (ok ? '(re)created' : 'create failed'));
+    return ok;
+  } catch (e) {
+    sendLog('[gui] autostart task error: ' + e.message);
+    return false;
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+}
+
+/** Delete the elevated logon task if present. */
+function deleteAutostartTask() {
+  if (runSchtasks(['/delete', '/tn', AUTOSTART_TASK, '/f'], !isAdminSync())) {
+    sendLog('[gui] autostart task removed');
+  }
+}
+
+/**
+ * Windows: pick the auto-launch mechanism. TUN needs administrator rights, and a
+ * plain HKCU "Run" entry can never start elevated (by UAC design), so when both
+ * auto-launch and TUN are on we register a Task Scheduler logon task with
+ * highest privileges instead — it starts Dart elevated at login with no UAC
+ * prompt. Creating/removing such a task itself needs admin: when we are already
+ * elevated it happens silently; otherwise it costs a single UAC prompt, which we
+ * only pay on an explicit user action (`interactive`), never at startup.
+ */
+function applyAutoLaunchWindows(enable, silent, interactive) {
+  const wantTask = !!enable && !!state.store.getSettings().enableTun;
+  if (wantTask) {
+    const admin = isAdminSync();
+    if (admin) {
+      // (Re)create silently to keep the stored exe path current (e.g. post-update).
+      createAutostartTask();
+      setRunItem(false);
+      return;
+    }
+    if (interactive && createAutostartTask()) {
+      setRunItem(false);
+      return;
+    }
+    if (autostartTaskExists()) {
+      setRunItem(false);
+      return;
+    }
+    // Not elevated and no task yet (e.g. a background startup sync): fall back to
+    // a plain Run item so the app still auto-launches; TUN then prompts as before.
+    setRunItem(enable, silent);
+    return;
+  }
+  // No elevated task wanted: drop any we created, use the plain Run item.
+  if (autostartTaskExists() && (isAdminSync() || interactive)) deleteAutostartTask();
+  setRunItem(enable, silent);
+}
+
+/**
+ * Apply the auto-launch (login item) setting on supported platforms. When
+ * `silent` is set, the login launch starts hidden in the tray: pass `--hidden`
+ * (read at startup) and openAsHidden (the macOS equivalent). On Windows, an
+ * elevated logon task is used instead when TUN is on (see applyAutoLaunchWindows).
+ * `interactive` is set for explicit user actions, gating the one-time UAC prompt.
+ */
+function applyAutoLaunch(enable, silent, { interactive = false } = {}) {
+  if (process.platform === 'linux' && !process.env.APPIMAGE) {
+    // setLoginItemSettings has limited support on plain Linux; best-effort only.
+    return;
+  }
+  if (process.platform === 'win32') {
+    applyAutoLaunchWindows(enable, silent, interactive);
+    return;
+  }
+  setRunItem(enable, silent);
 }
 
 /**

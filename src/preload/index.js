@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // Rules / connections / proxy mode
   getRules: () => ipcRenderer.invoke('rules:get'),
+  getRuleGroups: () => ipcRenderer.invoke('rules:groups'),
   getConnections: () => ipcRenderer.invoke('connections:get'),
   closeAllConnections: () => ipcRenderer.invoke('connections:closeAll'),
   closeConnection: (id) => ipcRenderer.invoke('connections:close', { id }),

@@ -5,10 +5,12 @@ const fs = require('fs');
 const http = require('http');
 const { app } = require('electron');
 
-const { state, runtimeDir, sendLog, sendStatus, refreshTray } = require('./state');
+const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
-const { buildSingboxConfig, buildRoute, ruleListToSingboxRule } = require('./converter');
+const { buildSingboxConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, parseRuleList } = require('./converter');
+const { geoDataUrls } = require('./singbox');
+const crypto = require('crypto');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const fetch = require('./fetch');
@@ -59,11 +61,15 @@ function getActiveSubId() {
   return subs[0].id;
 }
 
-/** Nodes + Clash rules of the active subscription only (do not lump profiles together). */
+/** Nodes + Clash rules (+ rule-providers) of the active subscription only. */
 function activeSubData() {
   const subs = state.store.get('subscriptions') || [];
   const sub = subs.find((s) => s.id === getActiveSubId());
-  return { nodes: (sub && sub.nodes) || [], rules: (sub && sub.clashRules) || [] };
+  return {
+    nodes: (sub && sub.nodes) || [],
+    rules: (sub && sub.clashRules) || [],
+    providers: (sub && sub.clashRuleProviders) || {},
+  };
 }
 
 /** Point a route rule at a target ('direct' | 'reject' | proxy), in place. */
@@ -134,14 +140,20 @@ async function processCustomRuleSet(c) {
 function buildCurrentConfig() {
   const settings = state.store.getSettings();
   // Use only the active subscription's nodes (profiles are not merged).
-  const { nodes: allNodes, rules: allRules } = activeSubData();
+  const { nodes: allNodes, rules: allRules, providers } = activeSubData();
   if (allNodes.length === 0) {
     throw new Error('No nodes available. Add a subscription first.');
   }
+  // Built-in rules mode: ignore the subscription's own Clash rules (which often
+  // route nearly everything through the proxy) and fall back to the app's clean
+  // default — CN/private direct, everything else proxied — so the user's local
+  // rules and custom rule-sets are what actually steer routing.
+  const clashRules = settings.useBuiltinRules ? [] : allRules;
   const { extraRules, extraRuleSets } = collectCustomRules();
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
   const config = buildSingboxConfig(allNodes, {
+    ruleOverrides: settings.ruleOverrides,
     mixedPort: settings.mixedPort,
     clashApiPort: settings.clashApiPort,
     clashApiSecret: state.clashApiSecret,
@@ -153,7 +165,9 @@ function buildCurrentConfig() {
     ruleSetDir: state.singbox.resolveRuleSetDir(),
     selected: state.store.get('selected'),
     clashMode: settings.clashMode,
-    clashRules: allRules,
+    clashRules,
+    geoAvailable: availableGeoSet(clashRules),
+    ruleSetData: loadRuleSetData(clashRules, providers),
     enableIpv6: settings.enableIpv6,
     dnsRemote: settings.dnsRemote,
     dnsLocal: settings.dnsLocal,
@@ -166,16 +180,33 @@ function buildCurrentConfig() {
 
 /** Build the route info (rules + rule-sets) from the current config, without running. */
 function currentRouteInfo() {
-  const { rules } = activeSubData();
+  const { rules, providers } = activeSubData();
+  // Mirror buildCurrentConfig: in built-in rules mode the subscription's own
+  // rules are dropped so the Rules view shows what actually runs.
+  const settings = state.store.getSettings();
+  const clashRules = settings.useBuiltinRules ? [] : rules;
   const { extraRules, extraRuleSets } = collectCustomRules();
   // Only the route is needed here, so skip converting every node to an outbound.
   const route = buildRoute({
     ruleSetDir: state.singbox.resolveRuleSetDir(),
-    clashRules: rules,
+    clashRules,
     extraRules,
     extraRuleSets,
+    ruleOverrides: settings.ruleOverrides,
+    geoAvailable: availableGeoSet(clashRules),
+    ruleSetData: loadRuleSetData(clashRules, providers),
   });
   return { rules: route.rules, ruleSets: route.rule_set };
+}
+
+/**
+ * The active subscription's policy groups + the user's current outbound
+ * overrides, for the rules UI. Empty when built-in rules mode drops them.
+ */
+function ruleGroupInfo() {
+  const settings = state.store.getSettings();
+  const groups = settings.useBuiltinRules ? [] : extractRuleGroups(activeSubData().rules);
+  return { groups, overrides: settings.ruleOverrides || {} };
 }
 
 async function startCore() {
@@ -197,6 +228,12 @@ async function startCore() {
   sendStatus();
   startTrafficStream();
   maybeFetchGeodata();
+  // Pull anything the subscription's rules reference but that isn't on disk yet
+  // — GEOSITE/GEOIP categories and RULE-SET providers — now that the proxy can
+  // carry the download. Best-effort, non-blocking; applies on the next start.
+  const rules = effectiveClashRules();
+  maybeFetchGeoCategories(rules);
+  maybeFetchRuleProviders(rules, activeSubData().providers);
 }
 
 // Self-heal for installs that booted without geodata (e.g. dev runs, or a
@@ -217,6 +254,163 @@ function maybeFetchGeodata() {
       geodataFetchTried = false; // let a later start retry
       sendLog('[gui] background geodata fetch failed (non-fatal): ' + e.message);
     });
+}
+
+/** Writable dir holding all geo rule-sets (base + downloaded categories). */
+function geoBinDir() {
+  return path.join(runtimeDir, 'bin');
+}
+
+/**
+ * Ensure the bundled CN rule-sets live in the writable runtime bin, so every
+ * geo .srs (base + any downloaded GEOSITE/GEOIP category) sits in the one
+ * directory resolveRuleSetDir() returns. Idempotent, best-effort.
+ */
+function ensureGeoBaseWritable() {
+  const dir = geoBinDir();
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  for (const file of ['geoip-cn.srs', 'geosite-cn.srs']) {
+    const dest = path.join(dir, file);
+    if (state.singbox._validSrs(dest)) continue;
+    try {
+      const src = path.join(resourcesBinDir, file);
+      if (state.singbox._validSrs(src)) fs.copyFileSync(src, dest);
+    } catch (_) { /* best-effort */ }
+  }
+}
+
+/** Effective subscription rules feeding the route (none in built-in mode). */
+function effectiveClashRules() {
+  return state.store.getSettings().useBuiltinRules ? [] : activeSubData().rules;
+}
+
+/**
+ * Geo rule-set tags backed by a real local .srs right now: the CN pair plus any
+ * GEOSITE/GEOIP category the rules reference that has been downloaded. Passed to
+ * the converter so it only references rule-sets that actually exist on disk.
+ */
+function availableGeoSet(clashRules) {
+  ensureGeoBaseWritable();
+  const dir = state.singbox.resolveRuleSetDir();
+  const avail = new Set();
+  if (!dir) return avail;
+  const tags = new Set(['geoip-cn', 'geosite-cn', ...extractGeoCategories(clashRules).map((c) => c.tag)]);
+  for (const tag of tags) {
+    if (state.singbox._validSrs(path.join(dir, tag + '.srs'))) avail.add(tag);
+  }
+  return avail;
+}
+
+/**
+ * After the core is up (so downloads can use the proxy), fetch any GEOSITE/GEOIP
+ * .srs the subscription references but that aren't on disk yet. Best-effort and
+ * non-blocking; newly fetched sets apply on the next start (like base geodata).
+ */
+function maybeFetchGeoCategories(clashRules) {
+  const cats = extractGeoCategories(clashRules);
+  if (!cats.length) return;
+  ensureGeoBaseWritable();
+  const dir = geoBinDir();
+  const missing = cats.filter((c) => !state.singbox._validSrs(path.join(dir, c.file)));
+  if (!missing.length) return;
+  const proxyPort = currentProxyPort();
+  (async () => {
+    let got = 0;
+    for (const c of missing) {
+      const dest = path.join(dir, c.file);
+      const tmp = dest + '.tmp';
+      for (const url of geoDataUrls(c.repo, c.file)) {
+        try {
+          await fetch.downloadWithFallback(url, tmp, { proxyPort });
+        } catch (_) {
+          try { fs.unlinkSync(tmp); } catch (_) {}
+          continue;
+        }
+        if (state.singbox._validSrs(tmp)) {
+          try { fs.renameSync(tmp, dest); got += 1; } catch (_) {}
+          break;
+        }
+        try { fs.unlinkSync(tmp); } catch (_) {}
+      }
+    }
+    if (got) sendLog(`[gui] fetched ${got} subscription rule-set(s); restart to apply`);
+  })().catch((e) => sendLog('[gui] subscription rule-set fetch failed (non-fatal): ' + e.message));
+}
+
+/** Distinct rule-provider names referenced by `RULE-SET,<name>,...` rules. */
+function extractRuleSetRefs(clashRules) {
+  const names = new Set();
+  for (const raw of clashRules || []) {
+    if (typeof raw !== 'string') continue;
+    const parts = raw.split(',').map((s) => s.trim());
+    if ((parts[0] || '').toUpperCase() === 'RULE-SET' && parts[1]) names.add(parts[1]);
+  }
+  return names;
+}
+
+/** Cache path for a rule-provider's parsed matchers (keyed by its URL). */
+function ruleProviderCacheFile(url) {
+  const h = crypto.createHash('sha1').update(String(url)).digest('hex').slice(0, 16);
+  return path.join(geoBinDir(), `rp-${h}.json`);
+}
+
+/**
+ * Load the parsed matcher arrays for every RULE-SET provider the rules
+ * reference and that has already been downloaded + cached. Returns a map
+ * name -> { domain, domain_suffix, ip_cidr, ... } for the converter; providers
+ * not yet cached are simply absent (their RULE-SET rule is then skipped).
+ */
+function loadRuleSetData(clashRules, providers) {
+  const data = {};
+  for (const name of extractRuleSetRefs(clashRules)) {
+    const p = providers && providers[name];
+    if (!p || !p.url) continue;
+    try {
+      const f = ruleProviderCacheFile(p.url);
+      if (fs.existsSync(f)) {
+        const m = JSON.parse(fs.readFileSync(f, 'utf-8'));
+        if (m && typeof m === 'object') data[name] = m;
+      }
+    } catch (_) { /* skip a corrupt cache entry */ }
+  }
+  return data;
+}
+
+/**
+ * After the core is up, download any referenced rule-providers not cached yet,
+ * parse them into matcher arrays, and cache them. Best-effort and non-blocking;
+ * applies on the next start. `file`/`inline` providers (no URL) and binary
+ * `mrs` rule-sets are skipped (nothing fetchable / not parseable here).
+ */
+function maybeFetchRuleProviders(clashRules, providers) {
+  const todo = [];
+  for (const name of extractRuleSetRefs(clashRules)) {
+    const p = providers && providers[name];
+    if (!p || !/^https?:\/\//i.test(p.url || '')) continue;
+    if ((p.format || '').toLowerCase() === 'mrs') continue;
+    const f = ruleProviderCacheFile(p.url);
+    if (!fs.existsSync(f)) todo.push({ p, f });
+  }
+  if (!todo.length) return;
+  const proxyPort = currentProxyPort();
+  (async () => {
+    let got = 0;
+    for (const { p, f } of todo) {
+      try {
+        const { body } = await fetch.getBufferWithFallback(p.url, {
+          proxyPort,
+          headers: { 'User-Agent': 'clash-verge/v2.0.2' },
+        });
+        const m = parseRuleList(body.toString('utf-8'));
+        const total = Object.values(m).reduce((n, a) => n + a.length, 0);
+        if (total > 0) {
+          fs.writeFileSync(f, JSON.stringify(m), 'utf-8');
+          got += 1;
+        }
+      } catch (_) { /* best-effort; a failed provider is just skipped */ }
+    }
+    if (got) sendLog(`[gui] fetched ${got} rule-provider(s); restart to apply`);
+  })().catch((e) => sendLog('[gui] rule-provider fetch failed (non-fatal): ' + e.message));
 }
 
 /**
@@ -298,7 +492,14 @@ async function restartIfRunning() {
 function testNodeDelay(name) {
   return new Promise((resolve, reject) => {
     const settings = state.store.getSettings();
-    const testUrl = encodeURIComponent('https://www.gstatic.com/generate_204');
+    // Configurable test target (default: the HTTP — not HTTPS — generate_204,
+    // the Clash-ecosystem default). The core dials a fresh outbound per test, so
+    // an HTTPS target would add a full TLS handshake to the destination on every
+    // probe; that cost is amortized away by connection reuse during real
+    // browsing, so an HTTP target better tracks the latency users actually feel
+    // and has lower variance. Empty/blank falls back to the default.
+    const url = (settings.testUrl || '').trim() || 'http://www.gstatic.com/generate_204';
+    const testUrl = encodeURIComponent(url);
     const reqPath = `/proxies/${encodeURIComponent(name)}/delay?timeout=5000&url=${testUrl}`;
     const req = http.request(
       {
@@ -708,6 +909,7 @@ module.exports = {
   processCustomRuleSet,
   buildCurrentConfig,
   currentRouteInfo,
+  ruleGroupInfo,
   startCore,
   stopCore,
   restartIfRunning,

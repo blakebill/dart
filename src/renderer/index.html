@@ -129,6 +129,14 @@
           </div>
           <div class="panel">
             <div class="row">
+              <h2 data-i18n="rulegroups.section">订阅策略组出站</h2>
+              <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
+            </div>
+            <p class="hint" data-i18n="rulegroups.hint"></p>
+            <div id="ruleGroupList" class="sub-list"></div>
+          </div>
+          <div class="panel">
+            <div class="row">
               <input id="ruleFilter" class="input grow" data-i18n-ph="rules.searchPh" />
               <span class="hint" id="ruleCount"></span>
               <button id="ruleRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
@@ -361,6 +369,18 @@
             <div class="setting-row">
               <label data-i18n="settings.ipv6">启用 IPv6（关闭则仅 IPv4）</label>
               <input id="setIpv6" type="checkbox" />
+            </div>
+            <div class="setting-row">
+              <label data-i18n="settings.builtinRules">使用内置规则（忽略订阅自带规则）</label>
+              <input id="setBuiltinRules" type="checkbox" />
+            </div>
+            <div class="setting-row">
+              <label data-i18n="settings.testUrl">测速地址</label>
+              <input id="setTestUrl" class="input" data-i18n-ph="settings.testUrlPh" />
+            </div>
+            <div class="setting-row">
+              <label data-i18n="settings.testConcurrency">测速并发数（全部测速，1–32）</label>
+              <input id="setTestConcurrency" class="input small" type="number" min="1" max="32" />
             </div>
             <div class="row save-row">
               <button id="saveSettings" class="btn primary" data-i18n="settings.save">保存设置</button>

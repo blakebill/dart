@@ -19,6 +19,9 @@
     $('#setNotifications').checked = s.notifications !== false;
     $('#setHwAccel').checked = !!s.hardwareAcceleration;
     $('#setIpv6').checked = !!s.enableIpv6;
+    $('#setBuiltinRules').checked = !!s.useBuiltinRules;
+    $('#setTestUrl').value = s.testUrl || '';
+    $('#setTestConcurrency').value = s.testConcurrency || 8;
     $('#setLanguage').value = s.language || 'zh';
     $('#setDnsRemote').value = s.dnsRemote || '';
     $('#setDnsLocal').value = s.dnsLocal || '';
@@ -63,6 +66,9 @@
       notifications: $('#setNotifications').checked,
       hardwareAcceleration: $('#setHwAccel').checked,
       enableIpv6: $('#setIpv6').checked,
+      useBuiltinRules: $('#setBuiltinRules').checked,
+      testUrl: $('#setTestUrl').value.trim(),
+      testConcurrency: Math.max(1, Math.min(32, parseInt($('#setTestConcurrency').value, 10) || 8)),
       language: $('#setLanguage').value,
     };
     const hwChanged = !!App.state.settings.hardwareAcceleration !== patch.hardwareAcceleration;

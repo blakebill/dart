@@ -169,8 +169,9 @@
       return;
     }
     const names = activeNodes().map((n) => n.name);
-    // Limited-concurrency pool to avoid hammering the core.
-    const concurrency = 8;
+    // Limited-concurrency pool to avoid hammering the core (and any shared
+    // upstream server). User-configurable; clamp to a sane range.
+    const concurrency = Math.max(1, Math.min(32, parseInt(App.state.settings.testConcurrency, 10) || 8));
     let idx = 0;
     names.forEach((nm) => {
       delays.set(nm, 'testing');

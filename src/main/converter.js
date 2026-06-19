@@ -343,13 +343,82 @@ function dnsServerFromAddress(addr, tag, detour) {
   return out;
 }
 
-/** Map a Clash rule target (proxy/group name) to a sing-box outbound tag. */
-function mapClashTarget(name) {
+/**
+ * Map a Clash rule target (proxy/group name) to a sing-box outbound tag.
+ * `overrides` lets the user remap a subscription policy group by name to
+ * 'direct' | 'proxy' | 'reject' (so the sub's matching is kept but its
+ * outbound is the user's choice). DIRECT/REJECT in the rule itself always win.
+ */
+function mapClashTarget(name, overrides) {
   const n = String(name || '').trim();
   if (/^DIRECT$/i.test(n)) return 'direct';
   if (/^REJECT/i.test(n)) return 'reject'; // handled as an action below
+  if (overrides) {
+    const ov = overrides[n];
+    if (ov === 'direct') return 'direct';
+    if (ov === 'reject') return 'reject';
+    // 'proxy' (or unknown) falls through to the selector below.
+  }
   // All proxy groups / node references collapse onto our single selector.
   return '🚀 Proxy';
+}
+
+/**
+ * Distinct subscription policy-group names referenced by proxy-bound rules
+ * (i.e. excluding DIRECT/REJECT and MATCH/FINAL). These are the groups the user
+ * can remap via `overrides`. Returned sorted for a stable UI.
+ */
+function extractRuleGroups(clashRules) {
+  const groups = new Set();
+  for (const raw of clashRules || []) {
+    if (typeof raw !== 'string') continue;
+    const parts = raw.split(',').map((s) => s.trim());
+    const type = (parts[0] || '').toUpperCase();
+    if (type === 'MATCH' || type === 'FINAL') continue;
+    const n = String(parts[2] || '').trim();
+    if (!n || /^DIRECT$/i.test(n) || /^REJECT/i.test(n)) continue;
+    groups.add(n);
+  }
+  return Array.from(groups).sort();
+}
+
+/**
+ * The sing-box rule-set tag for a GEOSITE/GEOIP category, or null when the
+ * category name is exotic (e.g. `geolocation-!cn`). Restricting to
+ * [a-z0-9-] keeps tags/filenames sane; the skipped "!cn = foreign" categories
+ * usually route to the proxy anyway, which is already the route's final.
+ */
+function geoTag(kind, cat) {
+  const c = String(cat || '').trim().toLowerCase();
+  if (!/^[a-z0-9-]+$/.test(c)) return null;
+  return `${kind}-${c}`;
+}
+
+/** Default set of available geo tags: the bundled CN pair when geodata exists. */
+function defaultGeoAvailable(hasGeo) {
+  return new Set(hasGeo ? ['geoip-cn', 'geosite-cn'] : []);
+}
+
+/**
+ * Distinct GEOSITE/GEOIP rule-sets a subscription references, as
+ * { repo, file, tag } — so the caller can ensure each .srs is on disk before
+ * the config references it. Exotic category names are skipped (see geoTag).
+ */
+function extractGeoCategories(clashRules) {
+  const seen = new Map();
+  for (const raw of clashRules || []) {
+    if (typeof raw !== 'string') continue;
+    const parts = raw.split(',').map((s) => s.trim());
+    const type = (parts[0] || '').toUpperCase();
+    let kind = null;
+    let repo = null;
+    if (type === 'GEOSITE') { kind = 'geosite'; repo = 'sing-geosite'; }
+    else if (type === 'GEOIP') { kind = 'geoip'; repo = 'sing-geoip'; }
+    else continue;
+    const tag = geoTag(kind, parts[1]);
+    if (tag) seen.set(tag, { repo, file: tag + '.srs', tag });
+  }
+  return [...seen.values()];
 }
 
 /**
@@ -357,24 +426,39 @@ function mapClashTarget(name) {
  * Unsupported rule types are skipped gracefully. MATCH/FINAL is ignored (the
  * generated config keeps its own final outbound).
  * @param {string[]} clashRules
- * @param {boolean} hasGeo  whether the geoip-cn/geosite-cn rule-sets exist; when
- *   false, GEOIP,CN rules are skipped so the config never references a rule-set
- *   that isn't defined (sing-box treats an unknown rule_set as a fatal error).
- * @returns {{ rules: object[] }}
+ * @param {boolean} hasGeo  whether the bundled geoip-cn/geosite-cn exist.
+ * @param {object|null} overrides  policy-group outbound overrides.
+ * @param {Set<string>|null} geoAvailable  geo rule-set tags backed by a real
+ *   local .srs. A GEOSITE/GEOIP rule is only emitted when its tag is in here,
+ *   so the config never references an undefined rule_set (a fatal error in
+ *   sing-box). Defaults to the bundled CN pair when hasGeo.
+ * @param {object|null} ruleSetData  RULE-SET provider name -> parsed matcher
+ *   arrays ({domain, domain_suffix, ip_cidr, ...}). A RULE-SET rule is only
+ *   emitted when its provider has been downloaded + parsed into here.
+ * @returns {{ rules: object[], usedGeoTags: Set<string> }}
  */
-function clashRulesToSingbox(clashRules, hasGeo = true) {
+function clashRulesToSingbox(clashRules, hasGeo = true, overrides = null, geoAvailable = null, ruleSetData = null) {
+  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
   const out = [];
+  const usedGeoTags = new Set();
   for (const raw of clashRules || []) {
     if (typeof raw !== 'string') continue;
     const parts = raw.split(',').map((s) => s.trim());
     const type = (parts[0] || '').toUpperCase();
     const value = parts[1];
     const targetRaw = type === 'MATCH' || type === 'FINAL' ? parts[1] : parts[2];
-    const target = mapClashTarget(targetRaw);
+    const target = mapClashTarget(targetRaw, overrides);
     const apply = (rule) => {
       if (target === 'reject') rule.action = 'reject';
       else rule.outbound = target;
       out.push(rule);
+    };
+    const applyGeo = (kind) => {
+      const tag = geoTag(kind, value);
+      if (tag && avail.has(tag)) {
+        apply({ rule_set: [tag] });
+        usedGeoTags.add(tag);
+      }
     };
     const port = () => parseInt(value, 10);
     switch (type) {
@@ -405,16 +489,33 @@ function clashRulesToSingbox(clashRules, hasGeo = true) {
         if (value) apply({ process_name: [value] });
         break;
       case 'GEOIP':
-        // Only CN is backed by a rule-set, and only when geodata is present;
-        // otherwise the reference would point at an undefined rule_set.
-        if (hasGeo && String(value).toUpperCase() === 'CN') apply({ rule_set: ['geoip-cn'] });
+        // Any country whose geoip-<cc>.srs is on disk; CN ships bundled.
+        applyGeo('geoip');
         break;
+      case 'GEOSITE':
+        // Any category whose geosite-<cat>.srs is on disk (downloaded on demand).
+        applyGeo('geosite');
+        break;
+      case 'RULE-SET': {
+        // The referenced rule-provider, downloaded + parsed into matcher arrays.
+        // Emit one rule per matcher field: different fields in a single sing-box
+        // rule are AND-combined, so separate rules give the OR we want across
+        // a provider's mixed domain/ip entries.
+        const data = ruleSetData && ruleSetData[value];
+        if (data) {
+          for (const field of ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name']) {
+            const vals = data[field];
+            if (Array.isArray(vals) && vals.length) apply({ [field]: vals.slice() });
+          }
+        }
+        break;
+      }
       default:
-        // RULE-SET, GEOSITE, PROCESS-PATH, MATCH/FINAL, etc. -> skipped.
+        // PROCESS-PATH, MATCH/FINAL, etc. -> skipped.
         break;
     }
   }
-  return { rules: out };
+  return { rules: out, usedGeoTags };
 }
 
 /**
@@ -516,7 +617,7 @@ function dedupeTags(outbounds) {
  * converting every node.
  */
 function buildRoute(opts = {}) {
-  const { ruleSetDir = null, clashRules = [], extraRules = [], extraRuleSets = [] } = opts;
+  const { ruleSetDir = null, clashRules = [], extraRules = [], extraRuleSets = [], ruleOverrides = null, geoAvailable = null, ruleSetData = null } = opts;
   // Local .srs only. A `remote` rule-set would be fetched during start-up via
   // download_detour, and sing-box treats a failed fetch as FATAL — so a fresh
   // install with no geodata (and raw.githubusercontent.com blocked, or no
@@ -525,17 +626,21 @@ function buildRoute(opts = {}) {
   // clean (all traffic via the proxy), and the rule-set returns once geodata
   // is bundled or downloaded.
   const hasGeo = !!ruleSetDir;
-  const convertedRules = clashRulesToSingbox(clashRules, hasGeo).rules;
+  // Which geo rule-sets are backed by a real local .srs. Defaults to the bundled
+  // CN pair; the caller passes a wider set once extra category .srs are on disk.
+  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
+  const { rules: convertedRules, usedGeoTags } = clashRulesToSingbox(clashRules, hasGeo, ruleOverrides, avail, ruleSetData);
 
-  const RS = [
-    { tag: 'geoip-cn', file: 'geoip-cn.srs' },
-    { tag: 'geosite-cn', file: 'geosite-cn.srs' },
-  ];
-  const geoRuleSets = hasGeo
-    ? RS.map((r) => ({ type: 'local', tag: r.tag, format: 'binary', path: (ruleSetDir + '/' + r.file).replace(/\\/g, '/') }))
-    : [];
-  // The "CN traffic goes direct" rule only when its rule-sets are defined.
-  const geoDirectRule = hasGeo ? [{ rule_set: ['geoip-cn', 'geosite-cn'], outbound: 'direct' }] : [];
+  // Define a local rule_set for every geo tag that is both available and used,
+  // plus the CN pair (needed by the direct fallback + DNS). The file is always
+  // <tag>.srs in ruleSetDir. Tags are unique so this also dedupes.
+  const baseCn = ['geoip-cn', 'geosite-cn'].filter((t) => avail.has(t));
+  const geoTags = [...new Set([...baseCn, ...usedGeoTags])];
+  const geoRuleSets = geoTags.map((tag) => ({
+    type: 'local', tag, format: 'binary', path: (ruleSetDir + '/' + tag + '.srs').replace(/\\/g, '/'),
+  }));
+  // The "CN traffic goes direct" fallback only when both CN rule-sets exist.
+  const geoDirectRule = baseCn.length === 2 ? [{ rule_set: ['geoip-cn', 'geosite-cn'], outbound: 'direct' }] : [];
 
   return {
     rules: [
@@ -582,6 +687,9 @@ function buildSingboxConfig(nodes, opts = {}) {
     selected = null,
     clashMode = 'rule',
     clashRules = [],
+    ruleOverrides = null, // { [policyGroupName]: 'direct'|'proxy'|'reject' }
+    geoAvailable = null, // Set of geo rule-set tags backed by a local .srs
+    ruleSetData = null, // RULE-SET provider name -> parsed matcher arrays
     enableIpv6 = true,
     dnsRemote = 'https://1.1.1.1/dns-query',
     dnsLocal = 'https://223.5.5.5/dns-query',
@@ -644,7 +752,8 @@ function buildSingboxConfig(nodes, opts = {}) {
     listen_port: mixedPort,
   });
 
-  const route = buildRoute({ ruleSetDir, clashRules, extraRules, extraRuleSets });
+  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(!!ruleSetDir);
+  const route = buildRoute({ ruleSetDir, clashRules, extraRules, extraRuleSets, ruleOverrides, geoAvailable: avail, ruleSetData });
 
   const config = {
     log: {
@@ -661,7 +770,7 @@ function buildSingboxConfig(nodes, opts = {}) {
         { clash_mode: 'Global', server: 'proxy-dns' },
         // Resolve CN domains with the local resolver — only when the rule-set
         // exists (see buildRoute: a missing geosite-cn must not be referenced).
-        ...(ruleSetDir ? [{ rule_set: 'geosite-cn', server: 'local-dns' }] : []),
+        ...(avail.has('geosite-cn') ? [{ rule_set: 'geosite-cn', server: 'local-dns' }] : []),
       ],
       final: 'proxy-dns',
       // When IPv6 is disabled, force IPv4-only resolution regardless of the
@@ -716,6 +825,9 @@ module.exports = {
   buildSingboxConfig,
   buildRoute,
   clashRulesToSingbox,
+  extractRuleGroups,
+  extractGeoCategories,
+  parseRuleList,
   dnsServerFromAddress,
   ruleListToSingboxRule,
 };

@@ -44,6 +44,7 @@
     if (tab === 'rules') {
       App.loadRules();
       App.loadLocalRules();
+      App.loadRuleGroups();
     } else if (tab === 'ruleset') {
       App.loadRuleSets();
       App.loadCustomRuleSets();

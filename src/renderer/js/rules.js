@@ -68,6 +68,67 @@
   $('#ruleFilter').addEventListener('input', renderRules);
   $('#ruleRefresh').addEventListener('click', loadRules);
 
+  // ---------- Subscription policy-group outbound overrides ----------
+  // The subscription's own rules keep their matching, but the user picks where
+  // each policy group routes (proxy / direct / reject). Saved as a name->target
+  // map in settings; the core restarts to apply.
+  async function loadRuleGroups() {
+    const list = $('#ruleGroupList');
+    if (!list) return;
+    let info;
+    try {
+      info = await api.getRuleGroups();
+    } catch (e) {
+      return;
+    }
+    const groups = info.groups || [];
+    const overrides = info.overrides || {};
+    if (!groups.length) {
+      list.innerHTML = `<p class="hint">${t('rulegroups.empty')}</p>`;
+      return;
+    }
+    const opts = [
+      ['proxy', t('customrs.targetProxy')],
+      ['direct', t('customrs.targetDirect')],
+      ['reject', t('customrs.targetReject')],
+    ];
+    list.innerHTML = '';
+    for (const g of groups) {
+      const cur = overrides[g] || 'proxy';
+      const div = document.createElement('div');
+      div.className = 'sub-item';
+      const sel = opts
+        .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
+        .join('');
+      div.innerHTML = `
+        <div class="sub-info">
+          <div class="sub-name">${escapeHtml(g)}</div>
+        </div>
+        <div class="sub-actions">
+          <select class="input small" data-group="${escapeHtml(g)}">${sel}</select>
+        </div>`;
+      list.appendChild(div);
+    }
+    list.querySelectorAll('select[data-group]').forEach((sel) => {
+      sel.addEventListener('change', async () => {
+        const next = { ...(info.overrides || {}) };
+        const g = sel.dataset.group;
+        if (sel.value === 'proxy') delete next[g]; // proxy is the default; keep the map small
+        else next[g] = sel.value;
+        sel.disabled = true;
+        try {
+          App.state.settings = await call(api.updateSettings, { ruleOverrides: next });
+          info.overrides = next;
+          toast(t('settings.saved'));
+          if (App.state.status && App.state.status.running) loadRules();
+        } finally {
+          sel.disabled = false;
+        }
+      });
+    });
+  }
+  $('#ruleGroupRefresh').addEventListener('click', loadRuleGroups);
+
   // ---------- Local rules ----------
   const MATCH_LABELS = {
     domain: 'DOMAIN',
@@ -176,4 +237,5 @@
 
   App.loadRules = loadRules;
   App.loadLocalRules = loadLocalRules;
+  App.loadRuleGroups = loadRuleGroups;
 })();

@@ -201,8 +201,29 @@ function parseClashConfig(content) {
 
   const groups = Array.isArray(doc['proxy-groups']) ? doc['proxy-groups'] : [];
   const rules = Array.isArray(doc.rules) ? doc.rules : [];
+  const ruleProviders = normalizeRuleProviders(doc['rule-providers']);
 
-  return { nodes, groups, rules, isClash };
+  return { nodes, groups, rules, ruleProviders, isClash };
+}
+
+/**
+ * Normalize a Clash `rule-providers:` map into { name: {type, behavior, url,
+ * format} }. Only the fields we need to download + parse remote lists; `file`
+ * and `inline` providers (no fetchable URL) are kept but carry no url.
+ */
+function normalizeRuleProviders(rp) {
+  const out = {};
+  if (!rp || typeof rp !== 'object') return out;
+  for (const [name, def] of Object.entries(rp)) {
+    if (!def || typeof def !== 'object') continue;
+    out[name] = {
+      type: def.type || 'http',
+      behavior: def.behavior || 'classical',
+      url: def.url || '',
+      format: def.format || 'yaml',
+    };
+  }
+  return out;
 }
 
 /** Whether the content is a Clash config (YAML containing a proxies field). */

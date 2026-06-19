@@ -28,6 +28,19 @@ const DEFAULT_SETTINGS = {
   theme: 'dark',
   clashMode: 'rule',
   hardwareAcceleration: false,
+  // When true, ignore the subscription's own Clash rules and use the app's
+  // built-in routing (CN/private direct, rest proxied) plus the user's local
+  // rules — so the user controls routing instead of the subscription.
+  useBuiltinRules: false,
+  // Per-policy-group outbound overrides for the subscription's own rules:
+  // { [groupName]: 'direct'|'proxy'|'reject' }. Keeps the sub's matching but
+  // lets the user change where each group routes. Unlisted groups -> proxy.
+  ruleOverrides: {},
+  // Node latency test: the URL the core fetches per node, and how many probes
+  // run at once during "Test All". HTTP (not HTTPS) avoids a per-test TLS
+  // handshake to the target that real browsing amortizes away (see testNodeDelay).
+  testUrl: 'http://www.gstatic.com/generate_204',
+  testConcurrency: 8,
 };
 
 class Store {

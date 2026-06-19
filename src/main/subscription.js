@@ -29,7 +29,7 @@ function parseSubscriptionContent(content) {
   if (/proxies\s*:/.test(text)) {
     try {
       const r = clashParser.parseClashConfig(text);
-      if (r.isClash) return { nodes: r.nodes, groups: r.groups, rules: r.rules, format: 'clash' };
+      if (r.isClash) return { nodes: r.nodes, groups: r.groups, rules: r.rules, ruleProviders: r.ruleProviders, format: 'clash' };
     } catch (e) {
       /* not valid YAML; fall through to the link parser */
     }
@@ -43,8 +43,8 @@ function parseSubscriptionContent(content) {
 
   // Fallback: try parsing as Clash again (some configs without a proxies: comment)
   try {
-    const { nodes: cn, groups, rules } = clashParser.parseClashConfig(text);
-    if (cn.length > 0) return { nodes: cn, groups, rules, format: 'clash' };
+    const { nodes: cn, groups, rules, ruleProviders } = clashParser.parseClashConfig(text);
+    if (cn.length > 0) return { nodes: cn, groups, rules, ruleProviders, format: 'clash' };
   } catch (e) {
     /* ignore */
   }

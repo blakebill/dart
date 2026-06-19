@@ -13,6 +13,8 @@ const {
   buildSingboxConfig,
   buildRoute,
   clashRulesToSingbox,
+  extractRuleGroups,
+  extractGeoCategories,
   dnsServerFromAddress,
   ruleListToSingboxRule,
 } = require('../src/main/converter');
@@ -474,6 +476,120 @@ test('parse anytls:// share link', () => {
   assert.strictEqual(node.password, 'pw');
   assert.strictEqual(node.servername, 'a.com');
   assert.strictEqual(node.skipCertVerify, true);
+});
+
+console.log('\nSubscription rule policy-group overrides:');
+
+test('extractRuleGroups returns distinct proxy groups, excluding DIRECT/REJECT/MATCH', () => {
+  const rules = [
+    'DOMAIN-SUFFIX,netflix.com,Streaming',
+    'DOMAIN-SUFFIX,google.com,ProxyPick',
+    'DOMAIN-SUFFIX,youtube.com,Streaming', // dup group
+    'GEOIP,CN,DIRECT',
+    'DOMAIN-KEYWORD,ad,REJECT',
+    'MATCH,ProxyPick',
+  ];
+  assert.deepStrictEqual(extractRuleGroups(rules), ['ProxyPick', 'Streaming']);
+});
+
+test('clashRulesToSingbox honors per-group outbound overrides', () => {
+  const rules = [
+    'DOMAIN-SUFFIX,netflix.com,Streaming',
+    'DOMAIN-SUFFIX,google.com,ProxyPick',
+    'DOMAIN-KEYWORD,ad,Ads',
+    'DOMAIN,example.cn,DIRECT',
+  ];
+  const overrides = { Streaming: 'direct', Ads: 'reject' };
+  const out = clashRulesToSingbox(rules, true, overrides).rules;
+  assert.strictEqual(out[0].outbound, 'direct'); // Streaming -> direct
+  assert.strictEqual(out[1].outbound, '🚀 Proxy'); // ProxyPick -> default selector
+  assert.strictEqual(out[2].action, 'reject'); // Ads -> reject
+  assert.ok(!out[2].outbound, 'reject sets action, not outbound');
+  assert.strictEqual(out[3].outbound, 'direct'); // explicit DIRECT untouched
+});
+
+console.log('\nGEOSITE / GEOIP categories:');
+
+test('extractGeoCategories collects geosite/geoip refs, dedupes, skips exotic names', () => {
+  const cats = extractGeoCategories([
+    'GEOSITE,cn,DIRECT',
+    'GEOSITE,category-ads-all,REJECT',
+    'GEOSITE,cn,Proxy', // dup tag
+    'GEOIP,JP,Proxy',
+    'GEOSITE,geolocation-!cn,Proxy', // exotic "!" -> skipped
+    'DOMAIN,x.com,DIRECT', // not geo
+  ]);
+  const tags = cats.map((c) => c.tag).sort();
+  assert.deepStrictEqual(tags, ['geoip-jp', 'geosite-category-ads-all', 'geosite-cn']);
+  const ads = cats.find((c) => c.tag === 'geosite-category-ads-all');
+  assert.strictEqual(ads.repo, 'sing-geosite');
+  assert.strictEqual(ads.file, 'geosite-category-ads-all.srs');
+  assert.strictEqual(cats.find((c) => c.tag === 'geoip-jp').repo, 'sing-geoip');
+});
+
+test('clashRulesToSingbox emits GEOSITE/GEOIP only for available tags', () => {
+  const rules = [
+    'GEOSITE,category-ads-all,REJECT',
+    'GEOSITE,cn,DIRECT',
+    'GEOIP,JP,Proxy',
+    'GEOSITE,netflix,Proxy', // not available -> dropped
+  ];
+  const avail = new Set(['geosite-cn', 'geosite-category-ads-all', 'geoip-jp']);
+  const { rules: out, usedGeoTags } = clashRulesToSingbox(rules, true, null, avail);
+  assert.deepStrictEqual(out[0], { rule_set: ['geosite-category-ads-all'], action: 'reject' });
+  assert.deepStrictEqual(out[1], { rule_set: ['geosite-cn'], outbound: 'direct' });
+  assert.deepStrictEqual(out[2], { rule_set: ['geoip-jp'], outbound: '🚀 Proxy' });
+  assert.strictEqual(out.length, 3, 'the unavailable geosite-netflix rule is dropped');
+  assert.deepStrictEqual([...usedGeoTags].sort(), ['geoip-jp', 'geosite-category-ads-all', 'geosite-cn']);
+});
+
+test('buildRoute defines a local rule_set for each used geo category', () => {
+  const route = buildRoute({
+    ruleSetDir: '/geo',
+    clashRules: ['GEOSITE,category-ads-all,REJECT', 'GEOSITE,cn,DIRECT'],
+    geoAvailable: new Set(['geoip-cn', 'geosite-cn', 'geosite-category-ads-all']),
+  });
+  const tags = route.rule_set.map((rs) => rs.tag).sort();
+  assert.deepStrictEqual(tags, ['geoip-cn', 'geosite-category-ads-all', 'geosite-cn']);
+  assert.ok(route.rule_set.every((rs) => rs.type === 'local' && rs.path.endsWith(rs.tag + '.srs')));
+});
+
+console.log('\nRULE-SET providers:');
+
+test('parseClashConfig extracts rule-providers (type/behavior/url/format)', () => {
+  const yaml = [
+    'proxies:',
+    '  - {name: A, type: trojan, server: a.com, port: 443, password: p}',
+    'rule-providers:',
+    '  reject:',
+    '    type: http',
+    '    behavior: domain',
+    '    url: https://example.com/reject.yaml',
+    '    format: yaml',
+    'rules:',
+    '  - RULE-SET,reject,REJECT',
+  ].join('\n');
+  const r = clashParser.parseClashConfig(yaml);
+  assert.ok(r.ruleProviders.reject, 'reject provider parsed');
+  assert.strictEqual(r.ruleProviders.reject.behavior, 'domain');
+  assert.strictEqual(r.ruleProviders.reject.url, 'https://example.com/reject.yaml');
+});
+
+test('clashRulesToSingbox emits RULE-SET as one rule per matcher field (OR), honoring target', () => {
+  const ruleSetData = {
+    direct: { domain_suffix: ['cn', 'qq.com'], ip_cidr: ['1.1.1.0/24'], domain: [], domain_keyword: [], process_name: [] },
+  };
+  const { rules } = clashRulesToSingbox(['RULE-SET,direct,DIRECT'], true, null, null, ruleSetData);
+  // Separate rules for domain_suffix and ip_cidr (single field each) → OR.
+  assert.deepStrictEqual(rules, [
+    { domain_suffix: ['cn', 'qq.com'], outbound: 'direct' },
+    { ip_cidr: ['1.1.1.0/24'], outbound: 'direct' },
+  ]);
+});
+
+test('clashRulesToSingbox drops RULE-SET whose provider is not yet cached', () => {
+  const { rules } = clashRulesToSingbox(['RULE-SET,missing,DIRECT'], true, null, null, {});
+  assert.deepStrictEqual(rules, []);
 });
 
 console.log('\nGeoData mirrors:');

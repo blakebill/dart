@@ -54,6 +54,7 @@ const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'enableTun', 'enableClashApi', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
+  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides',
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
@@ -99,6 +100,7 @@ function registerIpc() {
       format: result.format,
       nodes: result.nodes,
       clashRules: result.rules || [],
+      clashRuleProviders: result.ruleProviders || {},
       raw: result.raw || '',
       autoUpdateMinutes: 0,
       userInfo: result.userInfo || null,
@@ -126,6 +128,7 @@ function registerIpc() {
     sub.nodes = result.nodes;
     sub.format = result.format;
     sub.clashRules = result.rules || [];
+    sub.clashRuleProviders = result.ruleProviders || {};
     sub.raw = result.raw || sub.raw || '';
     sub.userInfo = result.userInfo || sub.userInfo;
     sub.updatedAt = Date.now();
@@ -184,6 +187,7 @@ function registerIpc() {
       sub.nodes = result.nodes;
       sub.format = result.format;
       sub.clashRules = result.rules || [];
+      sub.clashRuleProviders = result.ruleProviders || {};
       sub.raw = result.raw || '';
       sub.userInfo = result.userInfo || sub.userInfo;
       sub.updatedAt = Date.now();
@@ -210,6 +214,7 @@ function registerIpc() {
       format: result.format,
       nodes: result.nodes,
       clashRules: result.rules || [],
+      clashRuleProviders: result.ruleProviders || {},
       raw: String(content || ''),
       autoUpdateMinutes: 0,
       userInfo: null,
@@ -241,6 +246,7 @@ function registerIpc() {
     sub.nodes = result.nodes;
     sub.format = result.format;
     sub.clashRules = result.rules || [];
+    sub.clashRuleProviders = result.ruleProviders || {};
     sub.raw = String(content);
     sub.updatedAt = Date.now();
     state.store.set('subscriptions', subs);
@@ -279,7 +285,7 @@ function registerIpc() {
     return filePath;
   });
 
-  ipcMain.handle('settings:update', (_e, patch) => {
+  ipcMain.handle('settings:update', async (_e, patch) => {
     patch = Object.fromEntries(
       Object.entries(patch && typeof patch === 'object' ? patch : {}).filter(([k]) => SETTING_KEYS.has(k))
     );
@@ -295,6 +301,15 @@ function registerIpc() {
       Object.prototype.hasOwnProperty.call(patch, 'enableTun')
     ) {
       core.applyAutoLaunch(settings.autoLaunch, settings.silentStart, { interactive: true });
+    }
+    // These change routing, so rebuild and restart the core (when running) for
+    // them to take effect immediately.
+    if (
+      (Object.prototype.hasOwnProperty.call(patch, 'useBuiltinRules') ||
+        Object.prototype.hasOwnProperty.call(patch, 'ruleOverrides')) &&
+      state.singbox.isRunning()
+    ) {
+      await core.restartIfRunning();
     }
     return settings;
   });
@@ -359,6 +374,9 @@ function registerIpc() {
     const fromConfig = live && live.length ? { rules: [], ruleSets: [] } : core.currentRouteInfo();
     return { ...fromConfig, live, running };
   });
+
+  // The active subscription's policy groups + the user's outbound overrides.
+  ipcMain.handle('rules:groups', () => core.ruleGroupInfo());
 
   // Live connections from the Clash API.
   ipcMain.handle('connections:get', async () => {

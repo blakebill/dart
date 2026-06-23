@@ -114,9 +114,11 @@ if (!gotLock) {
     const settings = state.store.getSettings();
     // Sync the OS login-item state with the saved setting.
     core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
-    // Clear a system proxy left dangling by a previous unclean exit (so the
-    // machine isn't left offline). Non-blocking; skips itself if we auto-resume.
-    core.healStaleSystemProxy();
+    // Clear a system proxy left dangling by a previous exit (so the machine
+    // isn't left offline during the boot -> app-start window). Runs concurrently
+    // with window load; the auto-resume below awaits it so the clear can't race
+    // startCore re-enabling the proxy.
+    const healDone = core.healStaleSystemProxy();
     // Silent start: keep the window in the tray when the setting is on, or when
     // launched at login with --hidden (set on the login item by applyAutoLaunch).
     const startHidden = !!settings.silentStart || process.argv.includes('--hidden');
@@ -128,7 +130,8 @@ if (!gotLock) {
     // Auto-resume: if the core was running at last quit, start it again so the
     // user does not have to click Start every time they open the app.
     if (state.store.get('lastRunning') && state.singbox.isCoreInstalled()) {
-      state.mainWindow.webContents.once('did-finish-load', () => {
+      state.mainWindow.webContents.once('did-finish-load', async () => {
+        await healDone.catch(() => {}); // ensure any stale-proxy clear lands first
         core.startCore().catch((e) => sendLog('[gui] auto-resume failed: ' + e.message));
       });
     }
@@ -155,9 +158,13 @@ if (!gotLock) {
   // the app, too short for the async cleanup above. Flip the system proxy off
   // synchronously so the machine isn't left offline on next boot. (Stopping the
   // core itself isn't needed — the OS is tearing everything down regardless.)
+  // Check the registry rather than the in-memory flag (which can be stale by
+  // shutdown), and only clear when the proxy actually points at our local port
+  // so we never wipe a proxy the user set themselves.
   app.on('session-end', () => {
-    if (state.systemProxyOn) {
-      try { proxy.disableSystemProxySync(); } catch (_) { /* best-effort */ }
-    }
+    try {
+      const port = (state.store && state.store.getSettings().mixedPort) || 7890;
+      proxy.disableSystemProxySyncIfOurs(`127.0.0.1:${port}`);
+    } catch (_) { /* best-effort */ }
   });
 }

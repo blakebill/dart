@@ -126,6 +126,7 @@
         }
       });
     });
+    if (App.enhanceSelects) App.enhanceSelects(list); // style these freshly-built selects
   }
   $('#ruleGroupRefresh').addEventListener('click', loadRuleGroups);
 

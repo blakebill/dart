@@ -63,6 +63,29 @@ function disableSystemProxySync() {
 }
 
 /**
+ * Synchronously clear the system proxy, but only when it currently points at
+ * `server` (our local port) — so we never wipe a proxy the user set themselves.
+ * Reads the registry directly (sync) instead of trusting in-memory state, which
+ * can be stale by the time the OS is tearing the session down. Used from the
+ * shutdown / log-off handler, where the persisted ProxyEnable=0 is what keeps
+ * the next boot online before the app has a chance to run.
+ */
+function disableSystemProxySyncIfOurs(server) {
+  if (process.platform !== 'win32') return false;
+  try {
+    const out = execSync(`reg query "${REG_PATH}" /v ProxyServer`, {
+      windowsHide: true,
+      timeout: 3000,
+      encoding: 'utf-8',
+    });
+    if (!out.includes(server)) return false; // not ours (or unset) — leave it alone
+  } catch (_) {
+    return false; // ProxyServer not set / query failed — nothing of ours to clear
+  }
+  return disableSystemProxySync();
+}
+
+/**
  * Whether the system proxy is currently enabled and points at the given server.
  * Used to detect other software overriding our setting.
  */
@@ -108,5 +131,6 @@ module.exports = {
   enableSystemProxy,
   disableSystemProxy,
   disableSystemProxySync,
+  disableSystemProxySyncIfOurs,
   isSystemProxyActive,
 };

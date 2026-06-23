@@ -364,6 +364,22 @@ function mapClashTarget(name, overrides) {
 }
 
 /**
+ * Parse one Clash `rules:` line into { type, value, target }. The line shape is
+ * `TYPE,VALUE,TARGET` (e.g. DOMAIN-SUFFIX,x.com,Proxy); MATCH/FINAL carry the
+ * target in the second field. Returns null for non-strings / blank types. This
+ * is the single place that knows the rule-line layout — every extractor and the
+ * converter route through it.
+ */
+function parseClashRule(raw) {
+  if (typeof raw !== 'string') return null;
+  const parts = raw.split(',').map((s) => s.trim());
+  const type = (parts[0] || '').toUpperCase();
+  if (!type) return null;
+  const isMatch = type === 'MATCH' || type === 'FINAL';
+  return { type, value: parts[1], target: isMatch ? parts[1] : parts[2] };
+}
+
+/**
  * Distinct subscription policy-group names referenced by proxy-bound rules
  * (i.e. excluding DIRECT/REJECT and MATCH/FINAL). These are the groups the user
  * can remap via `overrides`. Returned sorted for a stable UI.
@@ -371,15 +387,23 @@ function mapClashTarget(name, overrides) {
 function extractRuleGroups(clashRules) {
   const groups = new Set();
   for (const raw of clashRules || []) {
-    if (typeof raw !== 'string') continue;
-    const parts = raw.split(',').map((s) => s.trim());
-    const type = (parts[0] || '').toUpperCase();
-    if (type === 'MATCH' || type === 'FINAL') continue;
-    const n = String(parts[2] || '').trim();
+    const r = parseClashRule(raw);
+    if (!r || r.type === 'MATCH' || r.type === 'FINAL') continue;
+    const n = String(r.target || '').trim();
     if (!n || /^DIRECT$/i.test(n) || /^REJECT/i.test(n)) continue;
     groups.add(n);
   }
   return Array.from(groups).sort();
+}
+
+/** Distinct rule-provider names referenced by `RULE-SET,<name>,...` rules. */
+function extractRuleSetRefs(clashRules) {
+  const names = new Set();
+  for (const raw of clashRules || []) {
+    const r = parseClashRule(raw);
+    if (r && r.type === 'RULE-SET' && r.value) names.add(r.value);
+  }
+  return names;
 }
 
 /**
@@ -399,6 +423,11 @@ function defaultGeoAvailable(hasGeo) {
   return new Set(hasGeo ? ['geoip-cn', 'geosite-cn'] : []);
 }
 
+/** Resolve a geoAvailable argument: an explicit Set wins, else the default. */
+function resolveGeoAvailable(geoAvailable, hasGeo) {
+  return geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
+}
+
 /**
  * Distinct GEOSITE/GEOIP rule-sets a subscription references, as
  * { repo, file, tag } — so the caller can ensure each .srs is on disk before
@@ -407,15 +436,14 @@ function defaultGeoAvailable(hasGeo) {
 function extractGeoCategories(clashRules) {
   const seen = new Map();
   for (const raw of clashRules || []) {
-    if (typeof raw !== 'string') continue;
-    const parts = raw.split(',').map((s) => s.trim());
-    const type = (parts[0] || '').toUpperCase();
+    const r = parseClashRule(raw);
+    if (!r) continue;
     let kind = null;
     let repo = null;
-    if (type === 'GEOSITE') { kind = 'geosite'; repo = 'sing-geosite'; }
-    else if (type === 'GEOIP') { kind = 'geoip'; repo = 'sing-geoip'; }
+    if (r.type === 'GEOSITE') { kind = 'geosite'; repo = 'sing-geosite'; }
+    else if (r.type === 'GEOIP') { kind = 'geoip'; repo = 'sing-geoip'; }
     else continue;
-    const tag = geoTag(kind, parts[1]);
+    const tag = geoTag(kind, r.value);
     if (tag) seen.set(tag, { repo, file: tag + '.srs', tag });
   }
   return [...seen.values()];
@@ -438,16 +466,14 @@ function extractGeoCategories(clashRules) {
  * @returns {{ rules: object[], usedGeoTags: Set<string> }}
  */
 function clashRulesToSingbox(clashRules, hasGeo = true, overrides = null, geoAvailable = null, ruleSetData = null) {
-  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
+  const avail = resolveGeoAvailable(geoAvailable, hasGeo);
   const out = [];
   const usedGeoTags = new Set();
   for (const raw of clashRules || []) {
-    if (typeof raw !== 'string') continue;
-    const parts = raw.split(',').map((s) => s.trim());
-    const type = (parts[0] || '').toUpperCase();
-    const value = parts[1];
-    const targetRaw = type === 'MATCH' || type === 'FINAL' ? parts[1] : parts[2];
-    const target = mapClashTarget(targetRaw, overrides);
+    const parsed = parseClashRule(raw);
+    if (!parsed) continue;
+    const { type, value } = parsed;
+    const target = mapClashTarget(parsed.target, overrides);
     const apply = (rule) => {
       if (target === 'reject') rule.action = 'reject';
       else rule.outbound = target;
@@ -628,7 +654,7 @@ function buildRoute(opts = {}) {
   const hasGeo = !!ruleSetDir;
   // Which geo rule-sets are backed by a real local .srs. Defaults to the bundled
   // CN pair; the caller passes a wider set once extra category .srs are on disk.
-  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
+  const avail = resolveGeoAvailable(geoAvailable, hasGeo);
   const { rules: convertedRules, usedGeoTags } = clashRulesToSingbox(clashRules, hasGeo, ruleOverrides, avail, ruleSetData);
 
   // Define a local rule_set for every geo tag that is both available and used,
@@ -752,7 +778,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     listen_port: mixedPort,
   });
 
-  const avail = geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(!!ruleSetDir);
+  const avail = resolveGeoAvailable(geoAvailable, !!ruleSetDir);
   const route = buildRoute({ ruleSetDir, clashRules, extraRules, extraRuleSets, ruleOverrides, geoAvailable: avail, ruleSetData });
 
   const config = {
@@ -826,6 +852,7 @@ module.exports = {
   buildRoute,
   clashRulesToSingbox,
   extractRuleGroups,
+  extractRuleSetRefs,
   extractGeoCategories,
   parseRuleList,
   dnsServerFromAddress,

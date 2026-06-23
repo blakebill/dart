@@ -277,9 +277,76 @@ select {
   font-family: inherit;
 }
 .input:focus,
-.textarea:focus {
+.textarea:focus,
+select:focus {
   border-color: var(--accent);
 }
+
+/* Native <select> ignores border-radius on Windows (it draws the OS control),
+   so strip the native appearance to get our rounded box, and supply our own
+   chevron. The dropdown list itself stays OS-native (not stylable). */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2398a2b3' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+:root[data-theme='light'] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235b6573' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+}
+
+/* Custom dropdown that replaces the un-stylable native <select> popup. The
+   native select stays in the DOM (hidden) to hold the value + fire 'change';
+   .ui-select reuses the .input/.small look for the closed control. */
+select[data-enhanced] { display: none; }
+.ui-select {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  padding-right: 12px; /* the native select's arrow padding isn't needed here */
+}
+.ui-select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.ui-select-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ui-select-chevron {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-dim);
+  transition: transform var(--dur-fast, 0.15s) var(--ease-soft, ease);
+}
+.ui-select.open .ui-select-chevron { transform: rotate(180deg); }
+.ui-select-menu {
+  position: fixed;
+  z-index: 1000;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  max-height: 280px;
+  overflow-y: auto;
+}
+.ui-select-opt {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 14px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ui-select-opt:hover { background: var(--panel-hover); }
+.ui-select-opt.selected { color: var(--accent); }
 .input.grow {
   flex: 1;
 }

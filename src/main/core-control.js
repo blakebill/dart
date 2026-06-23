@@ -8,7 +8,7 @@ const { app } = require('electron');
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
-const { buildSingboxConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, parseRuleList } = require('./converter');
+const { buildSingboxConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
 const { geoDataUrls } = require('./singbox');
 const crypto = require('crypto');
 const subscription = require('./subscription');
@@ -231,9 +231,9 @@ async function startCore() {
   // Pull anything the subscription's rules reference but that isn't on disk yet
   // — GEOSITE/GEOIP categories and RULE-SET providers — now that the proxy can
   // carry the download. Best-effort, non-blocking; applies on the next start.
-  const rules = effectiveClashRules();
+  const { rules, providers } = effectiveSub();
   maybeFetchGeoCategories(rules);
-  maybeFetchRuleProviders(rules, activeSubData().providers);
+  maybeFetchRuleProviders(rules, providers);
 }
 
 // Self-heal for installs that booted without geodata (e.g. dev runs, or a
@@ -261,12 +261,12 @@ function geoBinDir() {
   return path.join(runtimeDir, 'bin');
 }
 
-/**
- * Ensure the bundled CN rule-sets live in the writable runtime bin, so every
- * geo .srs (base + any downloaded GEOSITE/GEOIP category) sits in the one
- * directory resolveRuleSetDir() returns. Idempotent, best-effort.
- */
+// The bundled CN rule-sets only need copying into the writable runtime bin once
+// per process (so every geo .srs sits in the one dir resolveRuleSetDir returns).
+// Gate the fs work behind a flag so it doesn't repeat on every config build.
+let geoBaseEnsured = false;
 function ensureGeoBaseWritable() {
+  if (geoBaseEnsured) return;
   const dir = geoBinDir();
   try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
   for (const file of ['geoip-cn.srs', 'geosite-cn.srs']) {
@@ -277,11 +277,13 @@ function ensureGeoBaseWritable() {
       if (state.singbox._validSrs(src)) fs.copyFileSync(src, dest);
     } catch (_) { /* best-effort */ }
   }
+  geoBaseEnsured = true;
 }
 
-/** Effective subscription rules feeding the route (none in built-in mode). */
-function effectiveClashRules() {
-  return state.store.getSettings().useBuiltinRules ? [] : activeSubData().rules;
+/** The active subscription's rules + providers, honoring built-in-rules mode. */
+function effectiveSub() {
+  const { rules, providers } = activeSubData();
+  return { rules: state.store.getSettings().useBuiltinRules ? [] : rules, providers };
 }
 
 /**
@@ -302,50 +304,58 @@ function availableGeoSet(clashRules) {
 }
 
 /**
+ * Shared scaffold for the post-start, best-effort background downloads (geo
+ * categories + rule-providers): bail when nothing is missing, run each item
+ * (isolating per-item failures), count successes, log a summary, and never
+ * reject into the caller. `perItem` returns true when it fetched something.
+ */
+function runBackgroundFetch(label, items, perItem) {
+  if (!items.length) return;
+  (async () => {
+    let got = 0;
+    for (const item of items) {
+      try { if (await perItem(item)) got += 1; } catch (_) { /* skip a failed item */ }
+    }
+    if (got) sendLog(`[gui] fetched ${got} ${label}; restart to apply`);
+  })().catch((e) => sendLog(`[gui] ${label} fetch failed (non-fatal): ` + e.message));
+}
+
+/**
+ * Download one rule-set .srs (trying each mirror in turn), validating before
+ * swapping it into place so a blocked/HTML response never replaces a good file.
+ * Returns true when a valid .srs landed at dest.
+ */
+async function fetchSrs(repo, file, dest, proxyPort) {
+  const tmp = dest + '.tmp';
+  for (const url of geoDataUrls(repo, file)) {
+    try {
+      await fetch.downloadWithFallback(url, tmp, { proxyPort });
+    } catch (_) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      continue;
+    }
+    if (state.singbox._validSrs(tmp)) {
+      try { fs.renameSync(tmp, dest); return true; } catch (_) { return false; }
+    }
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+  return false;
+}
+
+/**
  * After the core is up (so downloads can use the proxy), fetch any GEOSITE/GEOIP
  * .srs the subscription references but that aren't on disk yet. Best-effort and
  * non-blocking; newly fetched sets apply on the next start (like base geodata).
  */
 function maybeFetchGeoCategories(clashRules) {
-  const cats = extractGeoCategories(clashRules);
-  if (!cats.length) return;
-  ensureGeoBaseWritable();
   const dir = geoBinDir();
-  const missing = cats.filter((c) => !state.singbox._validSrs(path.join(dir, c.file)));
-  if (!missing.length) return;
+  const missing = extractGeoCategories(clashRules).filter(
+    (c) => !state.singbox._validSrs(path.join(dir, c.file))
+  );
   const proxyPort = currentProxyPort();
-  (async () => {
-    let got = 0;
-    for (const c of missing) {
-      const dest = path.join(dir, c.file);
-      const tmp = dest + '.tmp';
-      for (const url of geoDataUrls(c.repo, c.file)) {
-        try {
-          await fetch.downloadWithFallback(url, tmp, { proxyPort });
-        } catch (_) {
-          try { fs.unlinkSync(tmp); } catch (_) {}
-          continue;
-        }
-        if (state.singbox._validSrs(tmp)) {
-          try { fs.renameSync(tmp, dest); got += 1; } catch (_) {}
-          break;
-        }
-        try { fs.unlinkSync(tmp); } catch (_) {}
-      }
-    }
-    if (got) sendLog(`[gui] fetched ${got} subscription rule-set(s); restart to apply`);
-  })().catch((e) => sendLog('[gui] subscription rule-set fetch failed (non-fatal): ' + e.message));
-}
-
-/** Distinct rule-provider names referenced by `RULE-SET,<name>,...` rules. */
-function extractRuleSetRefs(clashRules) {
-  const names = new Set();
-  for (const raw of clashRules || []) {
-    if (typeof raw !== 'string') continue;
-    const parts = raw.split(',').map((s) => s.trim());
-    if ((parts[0] || '').toUpperCase() === 'RULE-SET' && parts[1]) names.add(parts[1]);
-  }
-  return names;
+  runBackgroundFetch('subscription rule-set(s)', missing, (c) =>
+    fetchSrs(c.repo, c.file, path.join(dir, c.file), proxyPort)
+  );
 }
 
 /** Cache path for a rule-provider's parsed matchers (keyed by its URL). */
@@ -383,6 +393,7 @@ function loadRuleSetData(clashRules, providers) {
  * `mrs` rule-sets are skipped (nothing fetchable / not parseable here).
  */
 function maybeFetchRuleProviders(clashRules, providers) {
+  const proxyPort = currentProxyPort();
   const todo = [];
   for (const name of extractRuleSetRefs(clashRules)) {
     const p = providers && providers[name];
@@ -391,26 +402,17 @@ function maybeFetchRuleProviders(clashRules, providers) {
     const f = ruleProviderCacheFile(p.url);
     if (!fs.existsSync(f)) todo.push({ p, f });
   }
-  if (!todo.length) return;
-  const proxyPort = currentProxyPort();
-  (async () => {
-    let got = 0;
-    for (const { p, f } of todo) {
-      try {
-        const { body } = await fetch.getBufferWithFallback(p.url, {
-          proxyPort,
-          headers: { 'User-Agent': 'clash-verge/v2.0.2' },
-        });
-        const m = parseRuleList(body.toString('utf-8'));
-        const total = Object.values(m).reduce((n, a) => n + a.length, 0);
-        if (total > 0) {
-          fs.writeFileSync(f, JSON.stringify(m), 'utf-8');
-          got += 1;
-        }
-      } catch (_) { /* best-effort; a failed provider is just skipped */ }
-    }
-    if (got) sendLog(`[gui] fetched ${got} rule-provider(s); restart to apply`);
-  })().catch((e) => sendLog('[gui] rule-provider fetch failed (non-fatal): ' + e.message));
+  runBackgroundFetch('rule-provider(s)', todo, async ({ p, f }) => {
+    const { body } = await fetch.getBufferWithFallback(p.url, {
+      proxyPort,
+      headers: { 'User-Agent': 'clash-verge/v2.0.2' },
+    });
+    const m = parseRuleList(body.toString('utf-8'));
+    const total = Object.values(m).reduce((n, a) => n + a.length, 0);
+    if (total === 0) return false;
+    fs.writeFileSync(f, JSON.stringify(m), 'utf-8');
+    return true;
+  });
 }
 
 /**
@@ -880,13 +882,13 @@ function applyAutoLaunch(enable, silent, { interactive = false } = {}) {
  * Startup safety net: if a previous run exited uncleanly (crash, force-kill, or
  * a shutdown too fast for cleanup), the Windows system proxy can be left
  * pointing at our local port — which means no network until the app runs again.
- * On boot, when we are NOT about to auto-resume the core, clear the proxy if it
- * is still pointing at us. (If we will auto-resume, startCore re-asserts it.)
+ * Always clear it on boot when it still points at us, even when we will
+ * auto-resume: the invariant is "system proxy on only while the core runs", and
+ * startCore re-asserts the proxy once the core is up. Callers that auto-resume
+ * await this first so the clear can't race the re-enable.
  */
 async function healStaleSystemProxy() {
   if (process.platform !== 'win32') return;
-  const willResume = state.store.get('lastRunning') && state.singbox.isCoreInstalled();
-  if (willResume) return;
   try {
     const settings = state.store.getSettings();
     const ours = await proxy.isSystemProxyActive(`127.0.0.1:${settings.mixedPort}`);

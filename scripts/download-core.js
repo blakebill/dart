@@ -244,6 +244,43 @@ function mihomoGeoDataUrls(file) {
   ];
 }
 
+function mihomoGeoTestConfig() {
+  return [
+    'mixed-port: 7890',
+    'allow-lan: false',
+    'mode: rule',
+    'log-level: silent',
+    'geodata-mode: true',
+    'geodata-loader: standard',
+    'geo-auto-update: false',
+    'rules:',
+    '  - GEOSITE,cn,DIRECT',
+    '  - GEOIP,CN,DIRECT',
+    '  - MATCH,DIRECT',
+    '',
+  ].join('\n');
+}
+
+function validateMihomoGeoData(dir, binName) {
+  const configPath = path.join(dir, 'mihomo-geodata-check.yaml');
+  fs.writeFileSync(configPath, mihomoGeoTestConfig(), 'utf-8');
+  const bin = path.join(dir, binName);
+  try {
+    const r = spawnSync(bin, ['-t', '-f', configPath, '-d', dir], {
+      cwd: dir,
+      encoding: 'utf-8',
+      timeout: 10000,
+      windowsHide: true,
+    });
+    if (r.status !== 0) {
+      const out = String(r.stderr || r.stdout || r.error || '').trim();
+      throw new Error('mihomo rejected bundled GeoData: ' + out.slice(-1000));
+    }
+  } finally {
+    try { fs.unlinkSync(configPath); } catch (_) {}
+  }
+}
+
 async function latestReleaseTag(repo) {
   try {
     const r = await getJson(`https://api.github.com/repos/${repo}/releases/latest`);
@@ -363,6 +400,7 @@ async function bundleMihomo(goos, arch) {
     await downloadFirst(mihomoGeoDataUrls(file), path.join(MIHOMO_DIR, file), validGeo);
     meta[file] = { version: metaTag, updatedAt: Date.now() };
   }
+  validateMihomoGeoData(MIHOMO_DIR, binName);
   fs.writeFileSync(path.join(MIHOMO_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
   console.log('mihomo bundle ready in', MIHOMO_DIR);
 }

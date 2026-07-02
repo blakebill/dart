@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const zlib = require('zlib');
 const yaml = require('js-yaml');
 const fetch = require('./fetch');
@@ -91,6 +91,23 @@ function validMihomoGeoFile(filePath) {
   } catch (_) {
     return false;
   }
+}
+
+function mihomoGeoTestConfig() {
+  return {
+    'mixed-port': 7890,
+    'allow-lan': false,
+    mode: 'rule',
+    'log-level': 'silent',
+    'geodata-mode': true,
+    'geodata-loader': 'standard',
+    'geo-auto-update': false,
+    rules: [
+      'GEOSITE,cn,DIRECT',
+      'GEOIP,CN,DIRECT',
+      'MATCH,DIRECT',
+    ],
+  };
 }
 
 /**
@@ -294,6 +311,59 @@ class SingBoxManager {
     return validMihomoGeoFile(p);
   }
 
+  _mihomoGeoDataKey(dir, bin) {
+    try {
+      const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
+      return [
+        bin,
+        ...files.map((file) => {
+          const st = fs.statSync(path.join(dir, file));
+          return `${file}:${st.size}:${st.mtimeMs}`;
+        }),
+      ].join('|');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  mihomoGeoDataReady() {
+    const dir = this.ensureCoreDir('mihomo');
+    this.ensureMihomoGeoData();
+    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
+    if (!files.every((file) => this._validGeoFile(path.join(dir, file)))) return false;
+
+    const bin = this.getCoreType() === 'mihomo' ? this.resolveBinaryPath() : null;
+    if (!bin) return false;
+    const key = this._mihomoGeoDataKey(dir, bin);
+    if (key && this._mihomoGeoValidation && this._mihomoGeoValidation.key === key) {
+      return this._mihomoGeoValidation.ok;
+    }
+
+    const testConfig = path.join(dir, `.mihomo-geodata-check-${process.pid}.yaml`);
+    try {
+      fs.writeFileSync(testConfig, yaml.dump(mihomoGeoTestConfig(), { lineWidth: -1, noRefs: true }), 'utf-8');
+      const result = spawnSync(bin, ['-t', '-f', testConfig, '-d', dir], {
+        cwd: dir,
+        encoding: 'utf-8',
+        timeout: 10000,
+        windowsHide: true,
+      });
+      const ok = result.status === 0;
+      if (!ok) {
+        const msg = String(result.stderr || result.stdout || result.error || '').trim().split(/\r?\n/).slice(-3).join(' | ');
+        this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules' + (msg ? ': ' + msg : ''));
+      }
+      this._mihomoGeoValidation = { key, ok };
+      return ok;
+    } catch (e) {
+      this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules: ' + e.message);
+      this._mihomoGeoValidation = { key, ok: false };
+      return false;
+    } finally {
+      try { fs.unlinkSync(testConfig); } catch (_) {}
+    }
+  }
+
   ensureSingBoxGeoData() {
     const dir = this.ensureCoreDir('sing-box');
     const sources = [
@@ -341,6 +411,7 @@ class SingBoxManager {
       if (fs.existsSync(dest)) {
         try {
           fs.unlinkSync(dest);
+          this._mihomoGeoValidation = null;
           this.onLog('[gui] removed invalid mihomo geodata: ' + dest);
         } catch (_) {}
       }
@@ -349,6 +420,7 @@ class SingBoxManager {
         if (!this._validGeoFile(src)) continue;
         try {
           fs.copyFileSync(src, dest);
+          this._mihomoGeoValidation = null;
           ready = true;
           this.onLog('[gui] restored mihomo geodata from bundled file: ' + file);
           break;

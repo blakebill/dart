@@ -1094,6 +1094,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     ipv6: !!enableIpv6,
     'geodata-mode': true,
     'geodata-loader': 'standard',
+    'geo-auto-update': false,
     proxies,
     'proxy-groups': [
       { name: '🚀 Proxy', type: 'select', proxies: manualProxies },

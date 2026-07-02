@@ -184,7 +184,7 @@ function buildCurrentConfig() {
   // rules and custom rule-sets are what actually steer routing.
   const clashRules = settings.useBuiltinRules ? [] : allRules;
   const { extraRules, extraRuleSets } = collectCustomRules();
-  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.ensureMihomoGeoData() : false;
+  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.mihomoGeoDataReady() : false;
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
   const commonOpts = {
@@ -300,16 +300,7 @@ function maybeFetchGeodata() {
 
 function geoDataReady() {
   if (state.singbox.getCoreType() !== 'mihomo') return state.singbox.ensureSingBoxGeoData();
-  state.singbox.ensureMihomoGeoData();
-  const dirs = [
-    state.singbox.coreDir('mihomo'),
-    runtimeDir, // legacy fallback
-    ...state.singbox.resourceDirs('mihomo'),
-    resourcesBinDir,
-  ];
-  return ['geoip.dat', 'geosite.dat', 'country.mmdb'].every((file) =>
-    dirs.some((dir) => state.singbox._validGeoFile(path.join(dir, file)))
-  );
+  return state.singbox.mihomoGeoDataReady();
 }
 
 /** Writable dir holding all geo rule-sets (base + downloaded categories). */

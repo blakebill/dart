@@ -261,6 +261,7 @@ test('Mihomo fallback skips GEOIP when GeoData is unavailable', () => {
     clashRules: ['GEOIP,CN,DIRECT', 'GEOSITE,category-ads-all,REJECT', 'DOMAIN-SUFFIX,openai.com,PROXY'],
     hasGeoData: false,
   });
+  assert.strictEqual(cfg['geo-auto-update'], false);
   assert.ok(!cfg.rules.includes('GEOIP,CN,DIRECT'));
   assert.ok(!cfg.rules.includes('GEOSITE,category-ads-all,REJECT'));
   assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));

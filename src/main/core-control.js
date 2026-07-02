@@ -8,7 +8,7 @@ const { app } = require('electron');
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
-const { buildSingboxConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
+const { buildSingboxConfig, buildMihomoConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
 const { geoDataUrls } = require('./singbox');
 const crypto = require('crypto');
 const subscription = require('./subscription');
@@ -44,6 +44,23 @@ function panelUiInfo() {
 /** The local proxy port to tunnel rule-set downloads through (0 = direct). */
 function currentProxyPort() {
   return state.singbox && state.singbox.isRunning() ? state.store.getSettings().mixedPort || 0 : 0;
+}
+
+function detectCustomRuleSetFormat(url) {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    if (pathname.endsWith('.srs')) return 'sing-box';
+  } catch (_) {
+    /* invalid URLs are reported by the IPC validation layer */
+  }
+  return 'clash';
+}
+
+function normalizeCustomRuleSetFormat(format, url) {
+  if (format === 'sing-box') return 'sing-box';
+  if (format === 'clash') return 'clash';
+  // Legacy records used to allow Surge/Loon/QuantumultX; process them as Clash-compatible text.
+  return url ? detectCustomRuleSetFormat(url) : 'clash';
 }
 
 /** The id of the subscription (profile) currently in use; falls back to the first. */
@@ -87,6 +104,21 @@ function buildLocalRuleObject(lr) {
   return applyRuleTarget({ [lr.matchType]: vals }, lr.target);
 }
 
+const MATCH_FIELDS = ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name'];
+
+/**
+ * Older inline custom rule-sets were persisted as one rule containing every
+ * matcher field. sing-box AND-combines fields inside a rule, so split them into
+ * adjacent single-field rules at load time. New records store `rules` already.
+ */
+function splitInlineRule(rule) {
+  if (!rule || typeof rule !== 'object') return [];
+  const fields = MATCH_FIELDS.filter((f) => Array.isArray(rule[f]) && rule[f].length);
+  if (fields.length <= 1) return [rule];
+  const target = rule.action === 'reject' ? { action: 'reject' } : { outbound: rule.outbound || '🚀 Proxy' };
+  return fields.map((f) => ({ [f]: rule[f].slice(), ...target }));
+}
+
 /**
  * Build extraRules/extraRuleSets from the user's local rules + pre-processed
  * custom rule-sets. Local rules come first (most specific user intent).
@@ -101,10 +133,11 @@ function collectCustomRules() {
   }
   for (const c of state.store.get('customRuleSets') || []) {
     if (c.enabled === false) continue;
-    if (c.kind === 'inline' && c.rule) {
-      extraRules.push(c.rule);
+    if (c.kind === 'inline') {
+      if (Array.isArray(c.rules) && c.rules.length) extraRules.push(...c.rules);
+      else if (c.rule) extraRules.push(...splitInlineRule(c.rule));
     } else if (c.kind === 'ruleset') {
-      const p = path.join(runtimeDir, 'bin', 'custom-' + c.id + '.srs');
+      const p = path.join(state.singbox.coreDir('sing-box'), 'custom-' + c.id + '.srs');
       if (state.singbox._validSrs(p)) {
         const tag = 'custom-' + c.id;
         extraRuleSets.push({ type: 'local', tag, format: 'binary', path: p.replace(/\\/g, '/') });
@@ -118,23 +151,24 @@ function collectCustomRules() {
 /** Download + convert one custom rule-set, returning the processed record. */
 async function processCustomRuleSet(c) {
   const proxyPort = currentProxyPort();
-  if (c.format === 'sing-box') {
-    const dest = path.join(runtimeDir, 'bin', 'custom-' + c.id + '.srs');
+  const format = normalizeCustomRuleSetFormat(c.format, c.url);
+  if (format === 'sing-box') {
+    const dest = path.join(state.singbox.ensureCoreDir('sing-box'), 'custom-' + c.id + '.srs');
     if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
     await fetch.downloadWithFallback(c.url, dest, { proxyPort });
     if (!state.singbox._validSrs(dest)) {
       try { fs.unlinkSync(dest); } catch (_) {}
       throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
     }
-    return { ...c, kind: 'ruleset', count: null, error: null, updatedAt: Date.now() };
+    return { ...c, format, kind: 'ruleset', count: null, error: null, updatedAt: Date.now() };
   }
   const { body } = await fetch.getBufferWithFallback(c.url, {
     proxyPort,
     headers: { 'User-Agent': 'clash-verge/v2.0.2' },
   });
-  const { rule, count } = ruleListToSingboxRule(body.toString('utf-8'), c.target);
-  if (!rule) throw new Error('no rules parsed from the list (unsupported format?)');
-  return { ...c, kind: 'inline', rule, count, error: null, updatedAt: Date.now() };
+  const { rule, rules, count } = ruleListToSingboxRule(body.toString('utf-8'), c.target);
+  if (!rules.length) throw new Error('no rules parsed from the list (unsupported format?)');
+  return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
 }
 
 function buildCurrentConfig() {
@@ -142,7 +176,7 @@ function buildCurrentConfig() {
   // Use only the active subscription's nodes (profiles are not merged).
   const { nodes: allNodes, rules: allRules, providers } = activeSubData();
   if (allNodes.length === 0) {
-    throw new Error('No nodes available. Add a subscription first.');
+    throw new Error('No nodes available. Add a config first.');
   }
   // Built-in rules mode: ignore the subscription's own Clash rules (which often
   // route nearly everything through the proxy) and fall back to the app's clean
@@ -152,29 +186,35 @@ function buildCurrentConfig() {
   const { extraRules, extraRuleSets } = collectCustomRules();
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
-  const config = buildSingboxConfig(allNodes, {
+  const commonOpts = {
     ruleOverrides: settings.ruleOverrides,
     mixedPort: settings.mixedPort,
     clashApiPort: settings.clashApiPort,
     clashApiSecret: state.clashApiSecret,
-    externalUiDir: ui.dir.replace(/\\/g, '/'),
-    externalUiDownloadUrl: ui.downloadUrl,
     enableTun: settings.enableTun,
     enableClashApi: settings.enableClashApi,
     logLevel: settings.logLevel,
-    ruleSetDir: state.singbox.resolveRuleSetDir(),
     selected: state.store.get('selected'),
     clashMode: settings.clashMode,
     clashRules,
-    geoAvailable: availableGeoSet(clashRules),
-    ruleSetData: loadRuleSetData(clashRules, providers),
+    ruleProviders: providers,
     enableIpv6: settings.enableIpv6,
     dnsRemote: settings.dnsRemote,
     dnsLocal: settings.dnsLocal,
     dnsStrategy: settings.dnsStrategy,
     extraRules,
     extraRuleSets,
-  });
+  };
+  const config = settings.coreType === 'mihomo'
+    ? buildMihomoConfig(allNodes, commonOpts)
+    : buildSingboxConfig(allNodes, {
+        ...commonOpts,
+        externalUiDir: ui.dir.replace(/\\/g, '/'),
+        externalUiDownloadUrl: ui.downloadUrl,
+        ruleSetDir: state.singbox.resolveRuleSetDir(),
+        geoAvailable: availableGeoSet(clashRules),
+        ruleSetData: loadRuleSetData(clashRules, providers),
+      });
   return { config, settings };
 }
 
@@ -242,23 +282,37 @@ async function startCore() {
 // rule-sets in the background — now that the proxy is available — so the next
 // start gets the full CN-direct routing. Best-effort and non-blocking; it
 // does not restart the running core.
-let geodataFetchTried = false;
+const geodataFetchTried = {};
 function maybeFetchGeodata() {
-  if (geodataFetchTried || state.singbox.resolveRuleSetDir()) return;
-  geodataFetchTried = true;
+  const key = state.singbox.getCoreType();
+  if (geodataFetchTried[key] || geoDataReady()) return;
+  geodataFetchTried[key] = true;
   const proxyPort = currentProxyPort();
   state.singbox
     .updateGeoData(() => {}, proxyPort)
     .then(() => sendLog('[gui] geodata fetched; restart to enable CN direct routing'))
     .catch((e) => {
-      geodataFetchTried = false; // let a later start retry
+      geodataFetchTried[key] = false; // let a later start retry
       sendLog('[gui] background geodata fetch failed (non-fatal): ' + e.message);
     });
 }
 
+function geoDataReady() {
+  if (state.singbox.getCoreType() !== 'mihomo') return !!state.singbox.resolveRuleSetDir();
+  const dirs = [
+    state.singbox.coreDir('mihomo'),
+    runtimeDir, // legacy fallback
+    ...state.singbox.resourceDirs('mihomo'),
+    resourcesBinDir,
+  ];
+  return ['geoip.dat', 'geosite.dat', 'country.mmdb'].every((file) =>
+    dirs.some((dir) => state.singbox._validGeoFile(path.join(dir, file)))
+  );
+}
+
 /** Writable dir holding all geo rule-sets (base + downloaded categories). */
 function geoBinDir() {
-  return path.join(runtimeDir, 'bin');
+  return state.singbox.ensureCoreDir('sing-box');
 }
 
 // The bundled CN rule-sets only need copying into the writable runtime bin once
@@ -273,8 +327,13 @@ function ensureGeoBaseWritable() {
     const dest = path.join(dir, file);
     if (state.singbox._validSrs(dest)) continue;
     try {
-      const src = path.join(resourcesBinDir, file);
-      if (state.singbox._validSrs(src)) fs.copyFileSync(src, dest);
+      for (const resourceDir of state.singbox.resourceDirs('sing-box')) {
+        const src = path.join(resourceDir, file);
+        if (state.singbox._validSrs(src)) {
+          fs.copyFileSync(src, dest);
+          break;
+        }
+      }
     } catch (_) { /* best-effort */ }
   }
   geoBaseEnsured = true;
@@ -614,7 +673,7 @@ async function autoUpdateTick() {
           sub.updatedAt = Date.now();
           changed = true;
           if (nodesChanged && sub.id === getActiveSubId()) activeNodesChanged = true;
-          sendLog('[gui] auto-updated subscription: ' + sub.name);
+          sendLog('[gui] auto-updated config: ' + sub.name);
         }
       } catch (e) {
         sendLog('[gui] auto-update failed for ' + sub.name + ': ' + e.message);
@@ -677,18 +736,19 @@ const GEO_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 let geoTimer = null;
 
 async function checkGeoUpdate() {
-  let last = state.store.get('geoCheckedAt') || 0;
+  const checkedKey = 'geoCheckedAt_' + state.singbox.getCoreType().replace(/[^a-z0-9]/gi, '');
+  let last = state.store.get(checkedKey) || 0;
   if (!last) {
     // First run on this version: seed the clock from the last known update
     // (or now for bundled geodata) so we don't re-download immediately.
     const meta = state.singbox.geoMeta();
     const stamps = Object.values(meta).map((m) => (m && m.updatedAt) || 0);
     last = Math.max(0, ...stamps) || Date.now();
-    state.store.set('geoCheckedAt', last);
+    state.store.set(checkedKey, last);
   }
   if (Date.now() - last < GEO_UPDATE_INTERVAL_MS) return;
   // Advance the clock first, so a failure retries next week — not every tick.
-  state.store.set('geoCheckedAt', Date.now());
+  state.store.set(checkedKey, Date.now());
   try {
     await state.singbox.updateGeoData(() => {}, currentProxyPort());
     sendLog('[gui] geodata weekly auto-update complete');
@@ -907,8 +967,11 @@ module.exports = {
   getActiveSubId,
   activeSubData,
   buildLocalRuleObject,
+  splitInlineRule,
   collectCustomRules,
   processCustomRuleSet,
+  detectCustomRuleSetFormat,
+  normalizeCustomRuleSetFormat,
   buildCurrentConfig,
   currentRouteInfo,
   ruleGroupInfo,

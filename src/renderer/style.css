@@ -41,7 +41,7 @@
 }
 
 body {
-  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
   background: var(--bg);
   color: var(--text);
   font-size: 14px;
@@ -547,6 +547,8 @@ select[data-enhanced] { display: none; }
   color: var(--code-text);
 }
 .log-lv {
+  display: inline-block;
+  min-width: 44px;
   font-weight: 700;
 }
 .log-lv.trace { color: #8b93a7; }
@@ -561,7 +563,12 @@ select[data-enhanced] { display: none; }
   border-radius: 4px;
   padding: 0 4px;
 }
-.log-gui { color: #818cf8; font-weight: 600; }
+.log-gui {
+  display: inline-block;
+  min-width: 44px;
+  color: #818cf8;
+  font-weight: 700;
+}
 :root[data-theme='light'] .log-lv.trace { color: #6b7280; }
 :root[data-theme='light'] .log-lv.debug { color: #0e7490; }
 :root[data-theme='light'] .log-lv.info  { color: #059669; }
@@ -689,6 +696,10 @@ select[data-enhanced] { display: none; }
 .rule-proxy {
   color: var(--text-dim);
   text-align: right;
+}
+.rule-more {
+  margin: 4px 0 0;
+  text-align: center;
 }
 
 /* Connections */
@@ -1323,4 +1334,3 @@ a.ext-link:hover { text-decoration: underline; }
   opacity: 0.4;
   cursor: default;
 }
-

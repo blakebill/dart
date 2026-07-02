@@ -10,7 +10,9 @@ const linkParser = require('../src/main/parsers/share-link');
 const clashParser = require('../src/main/parsers/clash');
 const {
   nodeToOutbound,
+  nodeToClashProxy,
   buildSingboxConfig,
+  buildMihomoConfig,
   buildRoute,
   clashRulesToSingbox,
   extractRuleGroups,
@@ -222,6 +224,38 @@ test('deduplicate nodes with duplicate names', () => {
   assert.strictEqual(new Set(tags).size, 2, 'duplicate tags should be deduplicated');
 });
 
+test('node -> Mihomo proxy', () => {
+  const { nodes } = clashParser.parseClashConfig(clashYaml);
+  const proxy = nodeToClashProxy(nodes[0]);
+  assert.strictEqual(proxy.type, 'vmess');
+  assert.strictEqual(proxy.name, 'HK-vmess');
+  assert.strictEqual(proxy.server, 'hk.example.com');
+  assert.strictEqual(proxy.network, 'ws');
+  assert.strictEqual(proxy.tls, true);
+  assert.strictEqual(proxy['ws-opts'].path, '/path');
+});
+
+test('full config for Mihomo keeps Clash semantics', () => {
+  const { nodes } = clashParser.parseClashConfig(clashYaml);
+  const cfg = buildMihomoConfig(nodes, {
+    mixedPort: 7891,
+    clashApiPort: 9091,
+    clashApiSecret: 'secret',
+    selected: 'US-ss',
+    clashRules: ['DOMAIN-SUFFIX,openai.com,Proxy', 'DOMAIN,example.cn,DIRECT'],
+  });
+  assert.strictEqual(cfg['mixed-port'], 7891);
+  assert.strictEqual(cfg['external-controller'], '127.0.0.1:9091');
+  assert.strictEqual(cfg.secret, 'secret');
+  assert.strictEqual(cfg['geodata-mode'], true);
+  assert.strictEqual(cfg['geodata-loader'], 'standard');
+  assert.strictEqual(cfg.proxies.length, 3);
+  assert.deepStrictEqual(cfg['proxy-groups'][0].proxies.slice(0, 3), ['US-ss', '♻️ Auto', 'HK-vmess']);
+  assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
+  assert.ok(cfg.rules.includes('DOMAIN,example.cn,DIRECT'));
+  assert.strictEqual(cfg.rules[cfg.rules.length - 1], 'MATCH,🚀 Proxy');
+});
+
 console.log('\nAuto format detection:');
 
 test('parseSubscriptionContent detects Clash', () => {
@@ -376,8 +410,8 @@ test('TUN inbound uses mixed stack + mtu', () => {
 
 console.log('\nCustom rule-set conversion:');
 
-test('ruleListToSingboxRule parses Surge/Clash classical lines', () => {
-  const { rule, count } = ruleListToSingboxRule(
+test('ruleListToSingboxRule parses Clash classical lines', () => {
+  const { rule, rules, count } = ruleListToSingboxRule(
     [
       '# comment',
       'DOMAIN-SUFFIX,google.com',
@@ -389,25 +423,30 @@ test('ruleListToSingboxRule parses Surge/Clash classical lines', () => {
     'proxy'
   );
   assert.strictEqual(count, 4);
-  assert.deepStrictEqual(rule.domain_suffix, ['google.com']);
-  assert.deepStrictEqual(rule.domain, ['example.com']);
-  assert.deepStrictEqual(rule.domain_keyword, ['telegram']);
-  assert.deepStrictEqual(rule.ip_cidr, ['1.1.1.0/24']);
-  assert.strictEqual(rule.outbound, '🚀 Proxy');
+  assert.strictEqual(rule, null, 'mixed matcher fields are emitted as multiple OR rules');
+  assert.strictEqual(rules.length, 4);
+  const byField = Object.fromEntries(
+    rules.map((r) => [Object.keys(r).find((k) => k !== 'outbound' && k !== 'action'), r])
+  );
+  assert.deepStrictEqual(byField.domain_suffix, { domain_suffix: ['google.com'], outbound: '🚀 Proxy' });
+  assert.deepStrictEqual(byField.domain, { domain: ['example.com'], outbound: '🚀 Proxy' });
+  assert.deepStrictEqual(byField.domain_keyword, { domain_keyword: ['telegram'], outbound: '🚀 Proxy' });
+  assert.deepStrictEqual(byField.ip_cidr, { ip_cidr: ['1.1.1.0/24'], outbound: '🚀 Proxy' });
 });
 
 test('ruleListToSingboxRule handles a domain list + reject target', () => {
-  const { rule } = ruleListToSingboxRule('payload:\n  - "+.ads.com"\n  - .track.net\n  - plain.com', 'reject');
+  const { rule, rules } = ruleListToSingboxRule('payload:\n  - "+.ads.com"\n  - .track.net\n  - plain.com', 'reject');
+  assert.strictEqual(rules.length, 1);
   assert.deepStrictEqual(rule.domain_suffix, ['ads.com', 'track.net', 'plain.com']);
   assert.strictEqual(rule.action, 'reject');
   assert.ok(!rule.outbound);
 });
 
 test('custom rules inject into the config before geoip fallback', () => {
-  const { rule } = ruleListToSingboxRule('DOMAIN-SUFFIX,openai.com', 'proxy');
+  const { rules } = ruleListToSingboxRule('DOMAIN-SUFFIX,openai.com', 'proxy');
   const cfg = buildSingboxConfig([{ type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' }], {
     ruleSetDir: '/geo', // geodata present, so the geoip-cn fallback is emitted
-    extraRules: [rule],
+    extraRules: rules,
   });
   const i = cfg.route.rules.findIndex((r) => Array.isArray(r.domain_suffix) && r.domain_suffix.includes('openai.com'));
   const g = cfg.route.rules.findIndex((r) => Array.isArray(r.rule_set) && r.rule_set.includes('geoip-cn'));
@@ -590,6 +629,47 @@ test('clashRulesToSingbox emits RULE-SET as one rule per matcher field (OR), hon
 test('clashRulesToSingbox drops RULE-SET whose provider is not yet cached', () => {
   const { rules } = clashRulesToSingbox(['RULE-SET,missing,DIRECT'], true, null, null, {});
   assert.deepStrictEqual(rules, []);
+});
+
+console.log('\nsing-box subscription parsing:');
+
+const singboxParser = require('../src/main/parsers/singbox');
+
+test('parseSingboxConfig converts outbounds to nodes, skipping non-proxies', () => {
+  const cfg = JSON.stringify({
+    outbounds: [
+      { type: 'selector', tag: 'select', outbounds: ['a'] },
+      { type: 'vless', tag: 'VL', server: '1.2.3.4', server_port: 443, uuid: 'u', flow: 'xtls-rprx-vision',
+        tls: { enabled: true, server_name: 'e.com', reality: { enabled: true, public_key: 'PK', short_id: 'ab' } } },
+      { type: 'shadowsocks', tag: 'SS', server: '5.6.7.8', server_port: 8388, method: 'aes-128-gcm', password: 'pw' },
+      { type: 'direct', tag: 'direct' },
+    ],
+  });
+  const { nodes, isSingbox } = singboxParser.parseSingboxConfig(cfg);
+  assert.strictEqual(isSingbox, true);
+  assert.strictEqual(nodes.length, 2); // selector + direct dropped
+  const vl = nodes.find((n) => n.type === 'vless');
+  assert.strictEqual(vl.uuid, 'u');
+  assert.strictEqual(vl.flow, 'xtls-rprx-vision');
+  assert.strictEqual(vl.reality.publicKey, 'PK');
+});
+
+test('a sing-box node round-trips back to the same outbound type', () => {
+  const { nodes } = singboxParser.parseSingboxConfig(JSON.stringify([
+    { type: 'vmess', tag: 'VM', server: 'v.com', server_port: 443, uuid: 'x', security: 'auto', alter_id: 0,
+      transport: { type: 'ws', path: '/ws', headers: { Host: 'v.com' } } },
+  ]));
+  const ob = nodeToOutbound(nodes[0]);
+  assert.strictEqual(ob.type, 'vmess');
+  assert.strictEqual(ob.transport.type, 'ws');
+  assert.strictEqual(ob.transport.path, '/ws');
+});
+
+test('parseSubscriptionContent detects sing-box JSON (raw and base64)', () => {
+  const json = JSON.stringify({ outbounds: [{ type: 'trojan', tag: 'T', server: 't.com', server_port: 443, password: 'p', tls: { enabled: true } }] });
+  assert.strictEqual(parseSubscriptionContent(json).format, 'singbox');
+  const b64 = Buffer.from(json).toString('base64');
+  assert.strictEqual(parseSubscriptionContent(b64).format, 'singbox');
 });
 
 console.log('\nGeoData mirrors:');

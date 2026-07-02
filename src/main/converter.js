@@ -302,6 +302,143 @@ function nodeToOutbound(node) {
   }
 }
 
+function cleanObject(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined && v !== null && v !== ''));
+}
+
+/** Convert an internal node object back into a Clash/Mihomo proxy object. */
+function nodeToClashProxy(node) {
+  if (!node || !node.type) return null;
+  const base = { name: node.name, server: node.server, port: node.port };
+  switch (node.type) {
+    case 'ss':
+      return cleanObject({
+        ...base,
+        type: 'ss',
+        cipher: node.cipher,
+        password: node.password,
+        plugin: node.plugin,
+        'plugin-opts': node.pluginOpts,
+        udp: node.udp,
+      });
+    case 'vmess':
+      return cleanObject({
+        ...base,
+        type: 'vmess',
+        uuid: node.uuid,
+        alterId: node.alterId || 0,
+        cipher: node.cipher || 'auto',
+        network: node.network || 'tcp',
+        tls: !!node.tls,
+        servername: node.servername || undefined,
+        alpn: node.alpn,
+        'skip-cert-verify': node.skipCertVerify,
+        'ws-opts': node.wsOpts,
+        'h2-opts': node.h2Opts,
+        'grpc-opts': node.grpcOpts,
+        udp: node.udp,
+      });
+    case 'vless':
+      return cleanObject({
+        ...base,
+        type: 'vless',
+        uuid: node.uuid,
+        flow: node.flow || undefined,
+        network: node.network || 'tcp',
+        tls: !!node.tls,
+        servername: node.servername || undefined,
+        alpn: node.alpn,
+        'client-fingerprint': node.clientFingerprint,
+        'skip-cert-verify': node.skipCertVerify,
+        'reality-opts': node.reality
+          ? cleanObject({ 'public-key': node.reality.publicKey, 'short-id': node.reality.shortId })
+          : undefined,
+        'ws-opts': node.wsOpts,
+        'h2-opts': node.h2Opts,
+        'grpc-opts': node.grpcOpts,
+        udp: node.udp,
+      });
+    case 'trojan':
+      return cleanObject({
+        ...base,
+        type: 'trojan',
+        password: node.password,
+        sni: node.servername || undefined,
+        alpn: node.alpn,
+        'skip-cert-verify': node.skipCertVerify,
+        network: node.network || 'tcp',
+        'ws-opts': node.wsOpts,
+        'grpc-opts': node.grpcOpts,
+        udp: node.udp,
+      });
+    case 'hysteria2':
+      return cleanObject({
+        ...base,
+        type: 'hysteria2',
+        password: node.password,
+        obfs: node.obfs,
+        'obfs-password': node.obfsPassword,
+        sni: node.servername || undefined,
+        alpn: node.alpn,
+        'skip-cert-verify': node.skipCertVerify,
+        up: node.up,
+        down: node.down,
+      });
+    case 'hysteria':
+      return cleanObject({
+        ...base,
+        type: 'hysteria',
+        auth: node.authStr,
+        obfs: node.obfs,
+        sni: node.servername || undefined,
+        alpn: node.alpn,
+        'skip-cert-verify': node.skipCertVerify,
+        up: node.up,
+        down: node.down,
+      });
+    case 'anytls':
+      return cleanObject({
+        ...base,
+        type: 'anytls',
+        password: node.password,
+        sni: node.servername || undefined,
+        alpn: node.alpn,
+        'client-fingerprint': node.clientFingerprint,
+        'skip-cert-verify': node.skipCertVerify,
+        'idle-session-check-interval': node.idleCheck,
+        'idle-session-timeout': node.idleTimeout,
+        'min-idle-session': node.minIdleSession,
+        udp: node.udp,
+      });
+    case 'tuic':
+      return cleanObject({
+        ...base,
+        type: 'tuic',
+        uuid: node.uuid,
+        password: node.password,
+        'congestion-control': node.congestionControl || 'bbr',
+        'udp-relay-mode': node.udpRelayMode || 'native',
+        sni: node.servername || undefined,
+        alpn: node.alpn,
+        'skip-cert-verify': node.skipCertVerify,
+      });
+    case 'socks':
+      return cleanObject({ ...base, type: 'socks5', username: node.username, password: node.password, udp: node.udp });
+    case 'http':
+      return cleanObject({
+        ...base,
+        type: node.tls ? 'https' : 'http',
+        username: node.username,
+        password: node.password,
+        tls: node.tls,
+        sni: node.servername || undefined,
+        'skip-cert-verify': node.skipCertVerify,
+      });
+    default:
+      return null;
+  }
+}
+
 /**
  * Convert a user-entered DNS address into a sing-box 1.12+ DNS server object.
  * Accepts: https://host/dns-query (DoH), tls://host (DoT), quic://host,
@@ -545,8 +682,8 @@ function clashRulesToSingbox(clashRules, hasGeo = true, overrides = null, geoAva
 }
 
 /**
- * Parse a remote rule list (Clash rule-provider classical/domain/ipcidr, Surge,
- * Loon, QuantumultX, or a plain domain list) into sing-box matcher arrays.
+ * Parse a remote Clash-style rule list (classical/domain/ipcidr, or a plain
+ * domain list) into sing-box matcher arrays.
  */
 function parseRuleList(text) {
   const m = { domain: [], domain_suffix: [], domain_keyword: [], ip_cidr: [], process_name: [] };
@@ -601,23 +738,26 @@ function parseRuleList(text) {
  * Build a single sing-box route rule from a remote rule list + a target.
  * @param {string} text  the downloaded rule list
  * @param {string} target 'proxy' | 'direct' | 'reject'
- * @returns {{ rule: object|null, count: number }}
+ * @returns {{ rule: object|null, rules: object[], count: number }}
  */
 function ruleListToSingboxRule(text, target) {
   const m = parseRuleList(text);
-  const rule = {};
+  const rules = [];
   let count = 0;
   for (const k of Object.keys(m)) {
     if (m[k].length) {
-      rule[k] = m[k];
+      const rule = { [k]: m[k].slice() };
+      if (target === 'direct') rule.outbound = 'direct';
+      else if (target === 'reject') rule.action = 'reject';
+      else rule.outbound = '🚀 Proxy';
+      rules.push(rule);
       count += m[k].length;
     }
   }
-  if (count === 0) return { rule: null, count: 0 };
-  if (target === 'direct') rule.outbound = 'direct';
-  else if (target === 'reject') rule.action = 'reject';
-  else rule.outbound = '🚀 Proxy';
-  return { rule, count };
+  // Different matcher fields in one sing-box rule are AND-combined. Emit one
+  // rule per field so a mixed domain/IP/process list behaves as the source
+  // list intended: any entry may match.
+  return { rule: rules.length === 1 ? rules[0] : null, rules, count };
 }
 
 /** Deduplicate tags and handle nodes with duplicate names. */
@@ -846,9 +986,131 @@ function buildSingboxConfig(nodes, opts = {}) {
   return config;
 }
 
+function dedupeProxyNames(proxies) {
+  const seen = new Map();
+  for (const p of proxies) {
+    let name = p.name || 'node';
+    if (seen.has(name)) {
+      const count = seen.get(name) + 1;
+      seen.set(name, count);
+      p.name = `${name} ${count}`;
+    } else {
+      seen.set(name, 1);
+    }
+  }
+  return proxies;
+}
+
+function clashTargetName(target) {
+  if (target === 'direct') return 'DIRECT';
+  if (target === 'reject') return 'REJECT';
+  return '🚀 Proxy';
+}
+
+function singboxRuleToClashRules(rule) {
+  const target = rule.action === 'reject' ? 'REJECT' : rule.outbound === 'direct' ? 'DIRECT' : '🚀 Proxy';
+  const out = [];
+  const add = (type, vals) => {
+    for (const v of vals || []) out.push(`${type},${v},${target}`);
+  };
+  add('DOMAIN', rule.domain);
+  add('DOMAIN-SUFFIX', rule.domain_suffix);
+  add('DOMAIN-KEYWORD', rule.domain_keyword);
+  add('IP-CIDR', rule.ip_cidr);
+  add('PROCESS-NAME', rule.process_name);
+  if (Array.isArray(rule.rule_set)) {
+    for (const tag of rule.rule_set) out.push(`RULE-SET,${tag},${target}`);
+  }
+  return out;
+}
+
+function clashRuleToMihomo(raw, overrides) {
+  const parts = String(raw || '').split(',').map((s) => s.trim());
+  const type = (parts[0] || '').toUpperCase();
+  if (!type) return null;
+  if (type === 'MATCH' || type === 'FINAL') return null;
+  const parsed = parseClashRule(raw);
+  if (!parsed || !parsed.value) return null;
+  const target = clashTargetName(mapClashTarget(parsed.target, overrides));
+  const extra = parts.slice(3).filter(Boolean);
+  return [type, parsed.value, target, ...extra].join(',');
+}
+
+function buildMihomoConfig(nodes, opts = {}) {
+  const {
+    mixedPort = 7890,
+    enableClashApi = true,
+    clashApiPort = 9090,
+    clashApiSecret = '',
+    logLevel = 'info',
+    selected = null,
+    clashMode = 'rule',
+    clashRules = [],
+    ruleOverrides = null,
+    ruleProviders = {},
+    enableIpv6 = true,
+    extraRules = [],
+  } = opts;
+
+  const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
+  const proxyNames = proxies.map((p) => p.name);
+  const defaultProxy =
+    selected && (selected === '♻️ Auto' || selected === 'DIRECT' || selected === 'direct' || proxyNames.includes(selected))
+      ? selected === 'direct' ? 'DIRECT' : selected
+      : '♻️ Auto';
+  const manualProxies = [defaultProxy, '♻️ Auto', ...proxyNames, 'DIRECT'].filter(
+    (name, idx, arr) => name && arr.indexOf(name) === idx
+  );
+
+  const rules = [];
+  if (clashMode === 'block') {
+    rules.push('MATCH,REJECT');
+  } else {
+    for (const r of extraRules) rules.push(...singboxRuleToClashRules(r));
+    for (const raw of clashRules || []) {
+      const rule = clashRuleToMihomo(raw, ruleOverrides);
+      if (rule) rules.push(rule);
+    }
+    if (!rules.length) {
+      rules.push(
+        'IP-CIDR,127.0.0.0/8,DIRECT',
+        'IP-CIDR,10.0.0.0/8,DIRECT',
+        'IP-CIDR,172.16.0.0/12,DIRECT',
+        'IP-CIDR,192.168.0.0/16,DIRECT',
+        'GEOIP,CN,DIRECT'
+      );
+    }
+    rules.push('MATCH,🚀 Proxy');
+  }
+
+  const config = {
+    'mixed-port': mixedPort,
+    'allow-lan': false,
+    mode: clashMode === 'global' ? 'global' : clashMode === 'direct' ? 'direct' : 'rule',
+    'log-level': logLevel,
+    ipv6: !!enableIpv6,
+    'geodata-mode': true,
+    'geodata-loader': 'standard',
+    proxies,
+    'proxy-groups': [
+      { name: '🚀 Proxy', type: 'select', proxies: manualProxies },
+      { name: '♻️ Auto', type: 'url-test', proxies: proxyNames, url: 'https://www.gstatic.com/generate_204', interval: 60 },
+    ],
+    rules,
+  };
+  if (enableClashApi) {
+    config['external-controller'] = `127.0.0.1:${clashApiPort}`;
+    if (clashApiSecret) config.secret = clashApiSecret;
+  }
+  if (ruleProviders && Object.keys(ruleProviders).length) config['rule-providers'] = ruleProviders;
+  return config;
+}
+
 module.exports = {
   nodeToOutbound,
+  nodeToClashProxy,
   buildSingboxConfig,
+  buildMihomoConfig,
   buildRoute,
   clashRulesToSingbox,
   extractRuleGroups,

@@ -60,6 +60,8 @@ function sendStatus() {
       running: state.singbox.isRunning(),
       systemProxy: state.systemProxyOn,
       coreInstalled: state.singbox.isCoreInstalled(),
+      coreType: state.singbox.getCoreType(),
+      coreName: state.singbox.coreLabel,
     });
   }
   refreshTray();
@@ -70,6 +72,8 @@ async function coreStatusInfo() {
   return {
     running: state.singbox.isRunning(),
     systemProxy: state.systemProxyOn,
+    coreType: state.singbox.getCoreType(),
+    coreName: state.singbox.coreLabel,
     coreInstalled: state.singbox.isCoreInstalled(),
     corePath: state.singbox.resolveBinaryPath(),
     coreVersion: await state.singbox.getCoreVersion(),

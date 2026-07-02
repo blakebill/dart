@@ -3,6 +3,7 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const yaml = require('js-yaml');
 const { app, ipcMain, shell, dialog } = require('electron');
 
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, coreStatusInfo } = require('./state');
@@ -45,8 +46,7 @@ function reqEnum(v, allowed, name) {
 
 // Where converted rules may route to.
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
-// Custom rule-set source formats the converter understands.
-const VALID_CRS_FORMATS = ['clash', 'surge', 'loon', 'quantumultx', 'sing-box'];
+const VALID_CRS_FORMATS = ['clash', 'sing-box'];
 
 // Settings keys the renderer may write; anything else in a patch is dropped so
 // a malformed payload cannot pollute the persisted store.
@@ -54,7 +54,7 @@ const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'enableTun', 'enableClashApi', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
-  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides',
+  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'coreType',
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
@@ -121,7 +121,7 @@ function registerIpc() {
     reqStr(id, 'id');
     const subs = state.store.get('subscriptions') || [];
     const sub = subs.find((s) => s.id === id);
-    if (!sub) throw new Error('subscription not found');
+    if (!sub) throw new Error('config not found');
     const proxyPort = sub.updateViaProxy ? core.currentProxyPort() : 0;
     const result = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
     const nodesChanged = JSON.stringify(sub.nodes) !== JSON.stringify(result.nodes);
@@ -159,7 +159,7 @@ function registerIpc() {
   ipcMain.handle('sub:setActive', async (_e, { id }) => {
     reqStr(id, 'id');
     const subs = state.store.get('subscriptions') || [];
-    if (!subs.some((s) => s.id === id)) throw new Error('subscription not found');
+    if (!subs.some((s) => s.id === id)) throw new Error('config not found');
     state.store.set('activeSub', id);
     state.store.set('selected', null); // reset node selection for the new profile
     await core.restartIfRunning();
@@ -172,7 +172,7 @@ function registerIpc() {
     reqStr(id, 'id');
     const subs = state.store.get('subscriptions') || [];
     const sub = subs.find((s) => s.id === id);
-    if (!sub) throw new Error('subscription not found');
+    if (!sub) throw new Error('config not found');
     if (name !== undefined) sub.name = name;
     if (autoUpdateMinutes !== undefined) sub.autoUpdateMinutes = parseInt(autoUpdateMinutes, 10) || 0;
     if (updateViaProxy !== undefined) sub.updateViaProxy = !!updateViaProxy;
@@ -230,7 +230,7 @@ function registerIpc() {
   ipcMain.handle('sub:getRaw', (_e, { id }) => {
     reqStr(id, 'id');
     const sub = (state.store.get('subscriptions') || []).find((s) => s.id === id);
-    if (!sub) throw new Error('subscription not found');
+    if (!sub) throw new Error('config not found');
     return { raw: sub.raw || null };
   });
   ipcMain.handle('sub:saveRaw', async (_e, { id, content }) => {
@@ -238,7 +238,7 @@ function registerIpc() {
     reqStr(content, 'content');
     const subs = state.store.get('subscriptions') || [];
     const sub = subs.find((s) => s.id === id);
-    if (!sub) throw new Error('subscription not found');
+    if (!sub) throw new Error('config not found');
     const result = subscription.parseSubscriptionContent(content);
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
@@ -260,28 +260,34 @@ function registerIpc() {
     reqStr(content, 'content');
     const result = subscription.parseSubscriptionContent(content);
     if (!result.nodes.length) throw new Error('no nodes parsed');
+    const settings = state.store.getSettings();
+    if (settings.coreType === 'mihomo') {
+      return { text: String(content), nodeCount: result.nodes.length, format: result.format, coreType: 'mihomo' };
+    }
     const config = buildSingboxConfig(result.nodes, {
-      ...state.store.getSettings(),
+      ...settings,
       ruleSetDir: state.singbox.resolveRuleSetDir(),
       clashRules: result.rules || [],
     });
-    return { config, nodeCount: result.nodes.length, format: result.format };
+    return { config, nodeCount: result.nodes.length, format: result.format, coreType: 'sing-box' };
   });
 
   // Export the current sing-box config to a file.
   ipcMain.handle('convert:export', async () => {
-    const { config } = core.buildCurrentConfig();
+    const { config, settings } = core.buildCurrentConfig();
     // The per-run API secret is runtime-only; keep it out of shared exports.
     if (config.experimental && config.experimental.clash_api) {
       delete config.experimental.clash_api.secret;
     }
+    if (settings.coreType === 'mihomo' && config.secret) delete config.secret;
+    const isMihomo = settings.coreType === 'mihomo';
     const { canceled, filePath } = await dialog.showSaveDialog(state.mainWindow, {
-      title: 'Export sing-box config',
-      defaultPath: 'config.json',
-      filters: [{ name: 'JSON', extensions: ['json'] }],
+      title: isMihomo ? 'Export mihomo config' : 'Export sing-box config',
+      defaultPath: isMihomo ? 'config.yaml' : 'config.json',
+      filters: isMihomo ? [{ name: 'YAML', extensions: ['yaml', 'yml'] }] : [{ name: 'JSON', extensions: ['json'] }],
     });
     if (canceled || !filePath) return null;
-    fs.writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf-8');
+    fs.writeFileSync(filePath, isMihomo ? yaml.dump(config, { lineWidth: -1, noRefs: true }) : JSON.stringify(config, null, 2), 'utf-8');
     return filePath;
   });
 
@@ -289,7 +295,15 @@ function registerIpc() {
     patch = Object.fromEntries(
       Object.entries(patch && typeof patch === 'object' ? patch : {}).filter(([k]) => SETTING_KEYS.has(k))
     );
+    if (patch.coreType !== undefined) reqEnum(patch.coreType, ['sing-box', 'mihomo'], 'coreType');
+    const coreTypeChanged = Object.prototype.hasOwnProperty.call(patch, 'coreType') &&
+      patch.coreType !== (state.store.getSettings().coreType || 'sing-box');
     const settings = state.store.updateSettings(patch);
+    if (coreTypeChanged) {
+      state.singbox.setCoreType(settings.coreType);
+      sendStatus();
+      await core.restartIfRunning();
+    }
     // The login item carries the --hidden flag when silent start is on, and on
     // Windows the auto-launch mechanism depends on whether TUN is on (elevated
     // logon task vs plain Run item), so a change to any of these must re-register
@@ -415,15 +429,36 @@ function registerIpc() {
 
   // Rule-set management: report status of each routing rule-set.
   ipcMain.handle('ruleset:list', () => {
-    const items = [
-      { tag: 'geoip-cn', file: 'geoip-cn.srs', repo: 'sing-geoip' },
-      { tag: 'geosite-cn', file: 'geosite-cn.srs', repo: 'sing-geosite' },
-    ];
+    const isMihomo = state.singbox.getCoreType() === 'mihomo';
+    const items = isMihomo
+      ? [
+          { tag: 'geoip', file: 'geoip.dat' },
+          { tag: 'geosite', file: 'geosite.dat' },
+          { tag: 'country-mmdb', file: 'country.mmdb' },
+        ]
+      : [
+          { tag: 'geoip-cn', file: 'geoip-cn.srs', repo: 'sing-geoip' },
+          { tag: 'geosite-cn', file: 'geosite-cn.srs', repo: 'sing-geosite' },
+        ];
     const dirs = [
-      { loc: 'updated', dir: path.join(runtimeDir, 'bin') },
-      { loc: 'bundled', dir: resourcesBinDir },
-    ];
-    const meta = state.singbox.geoMeta();
+      { loc: 'updated', dir: state.singbox.coreDir(isMihomo ? 'mihomo' : 'sing-box') },
+      ...state.singbox.resourceDirs(isMihomo ? 'mihomo' : 'sing-box').map((dir) => ({ loc: 'bundled', dir })),
+      // Legacy fallback for users upgrading from the shared runtime layout.
+      ...(isMihomo
+        ? [{ loc: 'updated', dir: runtimeDir }, { loc: 'bundled', dir: resourcesBinDir }]
+        : [{ loc: 'updated', dir: path.join(runtimeDir, 'bin') }, { loc: 'bundled', dir: resourcesBinDir }]),
+    ].filter((d, i, arr) => d.dir && arr.findIndex((x) => x.dir === d.dir) === i);
+    const readMeta = (dir) => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(dir, 'geodata-meta.json'), 'utf-8'));
+      } catch (_) {
+        return {};
+      }
+    };
+    const cleanVersion = (version) => {
+      const value = String(version || '').trim();
+      return value && value.toLowerCase() !== 'latest' ? value : null;
+    };
     return items.map((it) => {
       let found = null;
       for (const d of dirs) {
@@ -434,8 +469,9 @@ function registerIpc() {
             found = {
               location: d.loc,
               size: st.size,
-              valid: state.singbox._validSrs(p),
+              valid: isMihomo ? state.singbox._validGeoFile(p) : state.singbox._validSrs(p),
               mtime: st.mtimeMs,
+              dir: d.dir,
             };
             break;
           }
@@ -443,17 +479,19 @@ function registerIpc() {
           /* ignore */
         }
       }
-      // The release tag recorded at update time only describes the runtime copy.
-      const m = found && found.location === 'updated' ? meta[it.file] : null;
+      const m = found ? readMeta(found.dir)[it.file] : null;
+      const version = cleanVersion(m && m.version);
       return {
         tag: it.tag,
         file: it.file,
-        url: `https://raw.githubusercontent.com/SagerNet/${it.repo}/rule-set/${it.file}`,
+        url: isMihomo
+          ? version ? `https://github.com/MetaCubeX/meta-rules-dat/releases/download/${version}/${it.file}` : null
+          : it.url || `https://raw.githubusercontent.com/SagerNet/${it.repo}/rule-set/${it.file}`,
         present: !!found,
         size: found ? found.size : 0,
         location: found ? found.location : 'none',
         valid: found ? found.valid : false,
-        version: m ? m.version : null,
+        version,
         updatedAt: m ? m.updatedAt : found ? found.mtime : 0,
       };
     });
@@ -514,7 +552,7 @@ function registerIpc() {
 
   // Custom rule-sets (remote, multi-format -> converted & applied).
   const sanitizeCrs = (c) => ({
-    id: c.id, name: c.name, url: c.url, format: c.format, target: c.target,
+    id: c.id, name: c.name, url: c.url, format: core.normalizeCustomRuleSetFormat(c.format, c.url), target: c.target,
     enabled: c.enabled !== false, kind: c.kind || null, count: c.count ?? null,
     autoUpdateMinutes: c.autoUpdateMinutes || 0,
     updatedAt: c.updatedAt || 0, error: c.error || null,
@@ -522,7 +560,7 @@ function registerIpc() {
   ipcMain.handle('customrs:list', () => (state.store.get('customRuleSets') || []).map(sanitizeCrs));
   ipcMain.handle('customrs:add', async (_e, { name, url, format, target }) => {
     reqUrl(url, 'url');
-    const fmt = format ? reqEnum(format, VALID_CRS_FORMATS, 'format') : 'clash';
+    const fmt = format ? reqEnum(format, VALID_CRS_FORMATS, 'format') : core.detectCustomRuleSetFormat(url);
     const tgt = target ? reqEnum(target, VALID_TARGETS, 'target') : 'proxy';
     let c = { id: crypto.randomUUID(), name: name || url, url, format: fmt, target: tgt, enabled: true };
     c = await core.processCustomRuleSet(c);
@@ -545,9 +583,10 @@ function registerIpc() {
     if (name !== undefined) c.name = name;
     if (enabled !== undefined) c.enabled = enabled;
     if (autoUpdateMinutes !== undefined) c.autoUpdateMinutes = parseInt(autoUpdateMinutes, 10) || 0;
-    const reprocess = (url !== undefined && url !== c.url) || (format !== undefined && format !== c.format) || (target !== undefined && target !== c.target);
+    const nextFormat = format !== undefined ? format : url !== undefined ? core.detectCustomRuleSetFormat(url) : core.normalizeCustomRuleSetFormat(c.format, c.url);
+    const reprocess = (url !== undefined && url !== c.url) || nextFormat !== core.normalizeCustomRuleSetFormat(c.format, c.url) || (target !== undefined && target !== c.target);
     if (url !== undefined) c.url = url;
-    if (format !== undefined) c.format = format;
+    c.format = nextFormat;
     if (target !== undefined) c.target = target;
     if (reprocess) c = await core.processCustomRuleSet(c);
     list[idx] = c;
@@ -572,6 +611,7 @@ function registerIpc() {
     let list = state.store.get('customRuleSets') || [];
     list = list.filter((x) => x.id !== id);
     state.store.set('customRuleSets', list);
+    try { fs.unlinkSync(path.join(state.singbox.coreDir('sing-box'), 'custom-' + id + '.srs')); } catch (_) {}
     try { fs.unlinkSync(path.join(runtimeDir, 'bin', 'custom-' + id + '.srs')); } catch (_) {}
     core.rescheduleAutoUpdate();
     await core.restartIfRunning();
@@ -634,10 +674,19 @@ function registerIpc() {
   ipcMain.handle('uwp:list', () => uwp.listApps(sendLog));
   ipcMain.handle('uwp:set', async (_e, { sids }) => {
     if (!Array.isArray(sids)) throw new Error('invalid sids');
+    const validSids = sids.filter((sid) => /^S-1-15-2-[0-9-]+$/i.test(String(sid)));
+    if (validSids.length !== sids.length) throw new Error('invalid sids');
     if (!(await isWindowsAdmin())) {
-      throw new Error('administrator rights required (use "Restart as administrator")');
+      state.store.set('pendingUwpLoopbackSids', validSids);
+      const r = relaunchElevated();
+      if (!r || r.ok === false) {
+        state.store.set('pendingUwpLoopbackSids', null);
+        throw new Error((r && r.error) || 'administrator rights required');
+      }
+      return { restarting: true };
     }
-    await uwp.setExemptions(sids || []);
+    await uwp.setExemptions(validSids);
+    state.store.set('pendingUwpLoopbackSids', null);
     return true;
   });
 
@@ -748,7 +797,7 @@ function registerIpc() {
       shell.showItemInFolder(bin);
       return true;
     }
-    const dir = path.join(runtimeDir, 'bin');
+    const dir = state.singbox.ensureCoreDir();
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     shell.openPath(dir);
     return true;

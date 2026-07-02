@@ -162,6 +162,87 @@ async function main() {
   assert.strictEqual(core.getActiveSubId(), subB.id, 'explicit activation switches the profile');
 
   console.log('✓ adding a subscription never steals the active profile (legacy-store regression)');
+
+  // ---- Regression: inline custom rule-sets must stay OR-semantics ----
+  // A rule with both domain and ip_cidr fields is an AND in sing-box, so older
+  // persisted inline rule-sets must be split when building the route.
+  state.store.set('customRuleSets', [
+    {
+      id: 'old-inline',
+      kind: 'inline',
+      enabled: true,
+      rule: { domain_suffix: ['example.com'], ip_cidr: ['1.1.1.0/24'], outbound: 'direct' },
+    },
+  ]);
+  assert.deepStrictEqual(core.collectCustomRules().extraRules, [
+    { domain_suffix: ['example.com'], outbound: 'direct' },
+    { ip_cidr: ['1.1.1.0/24'], outbound: 'direct' },
+  ]);
+
+  state.store.set('customRuleSets', [
+    {
+      id: 'new-inline',
+      kind: 'inline',
+      enabled: true,
+      rules: [
+        { domain_suffix: ['example.com'], action: 'reject' },
+        { ip_cidr: ['1.1.1.0/24'], action: 'reject' },
+      ],
+    },
+  ]);
+  assert.deepStrictEqual(core.collectCustomRules().extraRules, [
+    { domain_suffix: ['example.com'], action: 'reject' },
+    { ip_cidr: ['1.1.1.0/24'], action: 'reject' },
+  ]);
+  assert.strictEqual(
+    core.normalizeCustomRuleSetFormat(undefined, 'https://example.com/rules/custom.srs'),
+    'sing-box',
+    'formatless .srs custom rule-set records must auto-detect as sing-box during refresh/auto-update'
+  );
+  assert.strictEqual(
+    core.normalizeCustomRuleSetFormat('surge', 'https://example.com/rules.txt'),
+    'clash',
+    'legacy custom rule-set formats are processed as Clash-compatible text'
+  );
+
+  console.log('✓ inline custom rule-sets keep OR semantics across old and new stores');
+
+  state.singbox.setCoreType('mihomo');
+  const mihomoDir = state.singbox.ensureCoreDir('mihomo');
+  for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
+    fs.writeFileSync(path.join(mihomoDir, file), Buffer.alloc(2048, 1));
+  }
+  fs.writeFileSync(path.join(mihomoDir, 'geodata-meta.json'), JSON.stringify({
+    'geoip.dat': { version: 'latest', updatedAt: Date.now() },
+    'geosite.dat': { version: 'latest', updatedAt: Date.now() },
+    'country.mmdb': { version: 'latest', updatedAt: Date.now() },
+  }));
+  const mihomoGeo = handlers['ruleset:list']();
+  assert.deepStrictEqual(
+    mihomoGeo.map((x) => x.file),
+    ['geoip.dat', 'geosite.dat', 'country.mmdb'],
+    'mihomo mode reports mihomo geodata files'
+  );
+  assert.deepStrictEqual(mihomoGeo.map((x) => x.version), [null, null, null], 'latest is not a displayable mihomo geodata version');
+  assert.ok(
+    mihomoGeo.every((x) => !String(x.url || '').includes('/latest/')),
+    'mihomo geodata status must not expose latest URLs as versions'
+  );
+
+  fs.writeFileSync(path.join(mihomoDir, 'geodata-meta.json'), JSON.stringify({
+    'geoip.dat': { version: '202607010001', updatedAt: Date.now() },
+    'geosite.dat': { version: '202607010001', updatedAt: Date.now() },
+    'country.mmdb': { version: '202607010001', updatedAt: Date.now() },
+  }));
+  const versionedMihomoGeo = handlers['ruleset:list']();
+  assert.deepStrictEqual(
+    versionedMihomoGeo.map((x) => x.version),
+    ['202607010001', '202607010001', '202607010001'],
+    'mihomo mode reports concrete geodata versions'
+  );
+  state.singbox.setCoreType('sing-box');
+
+  console.log('✓ rule-set status switches to mihomo geodata in mihomo mode');
 }
 
 main()

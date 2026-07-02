@@ -4,6 +4,33 @@ const { app, BrowserWindow } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
+const APP_NAME = 'Dart';
+
+function configureUserDataDir() {
+  try {
+    if (typeof app.setName === 'function') app.setName(APP_NAME);
+    const appData = app.getPath('appData');
+    const desired = path.join(appData, APP_NAME);
+    const actual = fs.readdirSync(appData).find((name) => name !== APP_NAME && name.toLowerCase() === APP_NAME.toLowerCase());
+    if (actual) {
+      const actualPath = path.join(appData, actual);
+      if (!fs.existsSync(desired)) {
+        fs.renameSync(actualPath, desired);
+      } else if (fs.realpathSync.native(actualPath) === fs.realpathSync.native(desired)) {
+        const tmp = path.join(appData, APP_NAME + '.__rename_tmp__.' + process.pid);
+        fs.renameSync(actualPath, tmp);
+        fs.renameSync(tmp, desired);
+      }
+    }
+    if (!fs.existsSync(desired)) fs.mkdirSync(desired, { recursive: true });
+    if (typeof app.setPath === 'function') app.setPath('userData', desired);
+  } catch (_) {
+    /* fall back to Electron's default userData path */
+  }
+}
+
+configureUserDataDir();
+
 /**
  * Main-process entry point: Electron lifecycle only.
  *
@@ -50,6 +77,8 @@ const core = require('./core-control');
 const { registerIpc } = require('./ipc');
 const { notify } = require('./notify');
 const proxy = require('./proxy');
+const uwp = require('./uwp');
+const { isWindowsAdmin } = require('./admin');
 
 // Safety net: a stray socket error (e.g. ECONNRESET when the proxy is torn down
 // during a core update) must never crash the app with a fatal error dialog.
@@ -76,6 +105,31 @@ function recordCrash(kind, err) {
 process.on('uncaughtException', (err) => recordCrash('uncaught exception', err));
 process.on('unhandledRejection', (reason) => recordCrash('unhandled rejection', reason));
 
+async function applyPendingUwpLoopback() {
+  const pending = state.store.get('pendingUwpLoopbackSids');
+  if (!Array.isArray(pending)) return;
+  if (process.platform !== 'win32') {
+    state.store.set('pendingUwpLoopbackSids', null);
+    return;
+  }
+  if (!(await isWindowsAdmin())) {
+    sendLog('[gui] pending UWP loopback changes require administrator rights');
+    return;
+  }
+  try {
+    await uwp.setExemptions(pending);
+    state.store.set('pendingUwpLoopbackSids', null);
+    sendLog(`[gui] applied ${pending.length} pending UWP loopback exemption(s)`);
+    const zh = (state.store.getSettings().language || 'zh') === 'zh';
+    notify(
+      zh ? 'UWP 回环豁免已应用' : 'UWP loopback applied',
+      zh ? '已使用管理员权限应用所选 UWP 应用。' : 'The selected UWP apps were applied with administrator rights.'
+    );
+  } catch (e) {
+    sendLog('[gui] pending UWP loopback apply failed: ' + e.message);
+  }
+}
+
 // Single-instance lock
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -91,9 +145,11 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     state.store = new Store(app.getPath('userData'));
+    const settings = state.store.getSettings();
     state.singbox = new SingBoxManager({
       resourcesDir: resourcesBinDir,
       runtimeDir,
+      coreType: settings.coreType,
       onLog: sendLog,
       onExit: () => {
         stopTrafficStream();
@@ -111,7 +167,6 @@ if (!gotLock) {
       },
     });
     registerIpc();
-    const settings = state.store.getSettings();
     // Sync the OS login-item state with the saved setting.
     core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
     // Clear a system proxy left dangling by a previous exit (so the machine
@@ -126,6 +181,7 @@ if (!gotLock) {
     createTray();
     core.rescheduleAutoUpdate();
     core.startGeoAutoUpdate();
+    applyPendingUwpLoopback().catch((e) => sendLog('[gui] pending UWP loopback apply failed: ' + e.message));
 
     // Auto-resume: if the core was running at last quit, start it again so the
     // user does not have to click Start every time they open the app.

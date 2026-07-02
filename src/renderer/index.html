@@ -28,7 +28,6 @@
           <button class="nav-item" data-tab="subs" data-i18n="nav.subs">配置</button>
           <button class="nav-item" data-tab="nodes" data-i18n="nav.nodes">节点</button>
           <button class="nav-item" data-tab="rules" data-i18n="nav.rules">规则</button>
-          <button class="nav-item" data-tab="ruleset" data-i18n="nav.ruleset">规则集</button>
           <button class="nav-item" data-tab="conns" data-i18n="nav.conns">连接</button>
           <button class="nav-item" data-tab="tools" data-i18n="nav.tools">工具</button>
           <button class="nav-item" data-tab="logs" data-i18n="nav.logs">日志</button>
@@ -68,7 +67,7 @@
               <div class="card-value" id="dashProxy">-</div>
             </div>
             <div class="card">
-              <div class="card-label" data-i18n="dash.subCount">订阅数</div>
+              <div class="card-label" data-i18n="dash.subCount">配置数</div>
               <div class="card-value" id="dashSubs">0</div>
             </div>
             <div class="card">
@@ -128,8 +127,25 @@
             <div id="lrList" class="sub-list"></div>
           </div>
           <div class="panel">
+            <h2 data-i18n="customrs.title">远程规则</h2>
+            <p class="hint" data-i18n="customrs.hint"></p>
+            <div class="form-row">
+              <input id="crsName" class="input" data-i18n-ph="customrs.namePh" />
+              <input id="crsUrl" class="input grow" data-i18n-ph="customrs.urlPh" />
+            </div>
+            <div class="form-row">
+              <select id="crsTarget" class="input small">
+                <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
+                <option value="direct" data-i18n="customrs.targetDirect">直连</option>
+                <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
+              </select>
+              <button id="crsAdd" class="btn primary" data-i18n="customrs.add">添加</button>
+            </div>
+            <div id="crsList" class="sub-list"></div>
+          </div>
+          <div class="panel">
             <div class="row">
-              <h2 data-i18n="rulegroups.section">订阅策略组出站</h2>
+              <h2 data-i18n="rulegroups.section">策略组</h2>
               <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
             </div>
             <p class="hint" data-i18n="rulegroups.hint"></p>
@@ -143,43 +159,6 @@
             </div>
             <p class="hint" data-i18n="rules.hint"></p>
             <div id="ruleList" class="rule-list"></div>
-          </div>
-        </section>
-
-        <!-- Rule-sets -->
-        <section class="tab" id="tab-ruleset">
-          <h1 data-i18n="nav.ruleset">规则集</h1>
-          <div class="panel">
-            <div class="row">
-              <span class="hint grow" data-i18n="ruleset.hint"></span>
-              <button id="rulesetUpdate" class="btn primary" data-i18n="ruleset.updateAll">全部更新</button>
-            </div>
-            <div id="rulesetList" class="rule-list"></div>
-          </div>
-
-          <div class="panel">
-            <h2 data-i18n="customrs.title">自定义规则集</h2>
-            <p class="hint" data-i18n="customrs.hint"></p>
-            <div class="form-row">
-              <input id="crsName" class="input" data-i18n-ph="customrs.namePh" />
-              <input id="crsUrl" class="input grow" data-i18n-ph="customrs.urlPh" />
-            </div>
-            <div class="form-row">
-              <select id="crsFormat" class="input small">
-                <option value="clash">Clash</option>
-                <option value="surge">Surge</option>
-                <option value="loon">Loon</option>
-                <option value="quantumultx">QuantumultX</option>
-                <option value="sing-box">sing-box (.srs)</option>
-              </select>
-              <select id="crsTarget" class="input small">
-                <option value="proxy" data-i18n="customrs.targetProxy">走代理</option>
-                <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-                <option value="reject" data-i18n="customrs.targetReject">拦截</option>
-              </select>
-              <button id="crsAdd" class="btn primary" data-i18n="customrs.add">添加</button>
-            </div>
-            <div id="crsList" class="sub-list"></div>
           </div>
         </section>
 
@@ -197,9 +176,9 @@
 
         <!-- Subscriptions -->
         <section class="tab" id="tab-subs">
-          <h1 data-i18n="subs.title">机场订阅</h1>
+          <h1 data-i18n="subs.title">配置</h1>
           <div class="panel">
-            <h2 data-i18n="subs.add">添加订阅</h2>
+            <h2 data-i18n="subs.add">添加配置</h2>
             <div class="form-row">
               <input id="subName" class="input" data-i18n-ph="subs.namePh" />
               <input id="subUrl" class="input grow" data-i18n-ph="subs.urlPh" />
@@ -208,13 +187,13 @@
             <p class="hint" data-i18n="subs.hint"></p>
           </div>
           <div class="panel hidden" id="subEditPanel">
-            <h2 data-i18n="subs.editTitle">编辑订阅</h2>
+            <h2 data-i18n="subs.editTitle">编辑配置</h2>
             <div class="setting-row">
               <label data-i18n="subs.namePh">名称（可选）</label>
               <input id="editName" class="input" />
             </div>
             <div class="setting-row">
-              <label data-i18n="subs.urlPh">订阅链接</label>
+              <label data-i18n="subs.urlPh">配置链接</label>
               <input id="editUrl" class="input grow" />
             </div>
             <div class="setting-row">
@@ -242,7 +221,7 @@
             </div>
           </div>
           <div class="panel">
-            <h2 data-i18n="subs.listTitle">订阅列表</h2>
+            <h2 data-i18n="subs.listTitle">配置列表</h2>
             <div id="subList" class="sub-list"></div>
           </div>
         </section>
@@ -300,17 +279,14 @@
             <h2 data-i18n="settings.coreSection">内核</h2>
             <div class="setting-row">
               <div class="setting-label">
-                <span data-i18n="settings.coreLabel">sing-box 内核</span>
+                <span data-i18n="settings.currentCore">当前运行内核</span>
                 <span id="coreStatus" class="hint" data-i18n="settings.detecting">检测中...</span>
               </div>
-              <div class="btn-group">
-                <button id="coreManageBtn" class="btn" data-i18n="settings.manageCore">管理内核</button>
-                <button id="coreUpdateBtn" class="btn primary" data-i18n="settings.updateCore">更新内核</button>
-              </div>
+              <button id="coreManageBtn" class="btn" data-i18n="settings.manageCore">管理内核</button>
             </div>
             <div class="setting-row">
-              <span data-i18n="settings.updateGeo">更新 GeoData</span>
-              <button id="geoUpdateBtn" class="btn" data-i18n="subs.update">更新</button>
+              <span data-i18n="settings.geoData">GeoData</span>
+              <button id="geoManageBtn" class="btn" data-i18n="settings.manageGeo">管理版本</button>
             </div>
             <div id="downloadProgress" class="progress hidden"><div class="bar"></div></div>
           </div>
@@ -355,19 +331,19 @@
               <input id="setAutoLaunch" type="checkbox" />
             </div>
             <div class="setting-row">
-              <label data-i18n="settings.silentStart">静默启动（启动时最小化到托盘）</label>
+              <label data-i18n="settings.silentStart">静默启动</label>
               <input id="setSilentStart" type="checkbox" />
             </div>
             <div class="setting-row">
-              <label data-i18n="settings.notifications">桌面通知（内核异常、新版本）</label>
+              <label data-i18n="settings.notifications">桌面通知</label>
               <input id="setNotifications" type="checkbox" />
             </div>
             <div class="setting-row">
-              <label data-i18n="settings.hwAccel">硬件加速（重启后生效，关闭可降低内存占用）</label>
+              <label data-i18n="settings.hwAccel">硬件加速</label>
               <input id="setHwAccel" type="checkbox" />
             </div>
             <div class="setting-row">
-              <label data-i18n="settings.ipv6">启用 IPv6（关闭则仅 IPv4）</label>
+              <label data-i18n="settings.ipv6">启用 IPv6</label>
               <input id="setIpv6" type="checkbox" />
             </div>
             <div class="setting-row">
@@ -458,7 +434,7 @@
           <select id="lrTarget" class="input small">
             <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
             <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-            <option value="reject" data-i18n="customrs.targetReject">拦截</option>
+            <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
           </select>
         </div>
         <label class="modal-label" data-i18n="localrules.values">规则内容（每行一个）</label>
@@ -473,17 +449,17 @@
     <!-- Config conversion modal -->
     <div id="convertModal" class="modal hidden">
       <div class="modal-card modal-xl">
-        <h3 data-i18n="convert.title">Clash → sing-box 配置转换</h3>
+        <h3 id="convertTitle" data-i18n="convert.title">Clash → sing-box 配置转换</h3>
         <p class="hint" data-i18n="convert.inputHint"></p>
         <textarea id="convertInput" class="textarea" data-i18n-ph="convert.inputPh"></textarea>
         <div class="row">
           <button id="convertBtn" class="btn primary" data-i18n="convert.preview">转换预览</button>
-          <button id="convertImportBtn" class="btn" data-i18n="convert.import">转换并保存为订阅</button>
+          <button id="convertImportBtn" class="btn" data-i18n="convert.import">转换并保存为配置</button>
           <button id="convertCopyBtn" class="btn" data-i18n="convert.copy">复制结果</button>
           <button id="convertExportBtn" class="btn" data-i18n="convert.export">导出当前配置</button>
         </div>
         <div class="row convert-output-head">
-          <span class="modal-label"><span data-i18n="convert.outputTitle">sing-box 配置输出</span> <span id="convertMeta" class="hint"></span></span>
+          <span class="modal-label"><span id="convertOutputTitle" data-i18n="convert.outputTitle">sing-box 配置输出</span> <span id="convertMeta" class="hint"></span></span>
         </div>
         <pre id="convertOutput" class="code convert-output"></pre>
         <div class="row save-row">
@@ -492,34 +468,63 @@
       </div>
     </div>
 
+    <!-- Core management modal -->
+    <div id="coreModal" class="modal hidden">
+      <div class="modal-card modal-lg">
+        <h3 data-i18n="settings.coreManageTitle">内核管理</h3>
+        <div class="setting-row">
+          <label data-i18n="settings.runningCore">运行内核</label>
+          <select id="setCoreType" class="input small">
+            <option value="sing-box">sing-box</option>
+            <option value="mihomo">mihomo</option>
+          </select>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
+            <span data-i18n="settings.corePath">内核路径</span>
+            <span id="coreModalStatus" class="hint"></span>
+          </div>
+          <button id="coreOpenFolderBtn" class="btn" data-i18n="settings.openCoreFolder">打开目录</button>
+        </div>
+        <div class="row save-row">
+          <button id="coreApplyBtn" class="btn primary" data-i18n="settings.applyCore">应用内核</button>
+          <button id="coreUpdateBtn" class="btn" data-i18n="settings.updateCore">更新内核</button>
+          <button id="coreCloseBtn" class="btn" data-i18n="tools.close">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- GeoData management modal -->
+    <div id="geoModal" class="modal hidden">
+      <div class="modal-card modal-lg">
+        <h3 data-i18n="settings.geoManageTitle">GeoData 版本管理</h3>
+        <p class="hint" data-i18n="settings.geoHint"></p>
+        <div id="geoDataList" class="rule-list"></div>
+        <div class="row save-row">
+          <button id="geoDataUpdateBtn" class="btn primary" data-i18n="settings.updateGeo">更新 GeoData</button>
+          <button id="geoDataCloseBtn" class="btn" data-i18n="tools.close">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Custom rule-set editor modal -->
     <div id="crsModal" class="modal hidden">
       <div class="modal-card modal-lg">
-        <h3 data-i18n="customrs.editTitle">编辑自定义规则集</h3>
+        <h3 data-i18n="customrs.editTitle">编辑远程规则</h3>
         <div class="setting-row">
           <label data-i18n="customrs.namePh">名称</label>
           <input id="crsEditName" class="input" />
         </div>
         <div class="setting-row">
-          <label data-i18n="customrs.urlPh">规则集链接</label>
+          <label data-i18n="customrs.urlPh">远程规则链接</label>
           <input id="crsEditUrl" class="input grow" />
-        </div>
-        <div class="setting-row">
-          <label data-i18n="customrs.format">格式</label>
-          <select id="crsEditFormat" class="input small">
-            <option value="clash">Clash</option>
-            <option value="surge">Surge</option>
-            <option value="loon">Loon</option>
-            <option value="quantumultx">QuantumultX</option>
-            <option value="sing-box">sing-box (.srs)</option>
-          </select>
         </div>
         <div class="setting-row">
           <label data-i18n="localrules.target">目标</label>
           <select id="crsEditTarget" class="input small">
             <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
             <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-            <option value="reject" data-i18n="customrs.targetReject">拦截</option>
+            <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
           </select>
         </div>
         <div class="setting-row">
@@ -549,7 +554,7 @@
     <!-- Profile raw-content editor modal -->
     <div id="rawModal" class="modal hidden">
       <div class="modal-card modal-xl">
-        <h3><span data-i18n="subs.rawTitle">编辑订阅内容</span> <span id="rawName" class="hint"></span></h3>
+        <h3><span data-i18n="subs.rawTitle">编辑配置内容</span> <span id="rawName" class="hint"></span></h3>
         <p class="hint" data-i18n="subs.rawHint"></p>
         <div id="rawEditorWrap" class="editor-wrap">
           <pre id="rawHighlight" class="editor-highlight" aria-hidden="true"></pre>
@@ -584,7 +589,6 @@
         <div id="uwpList" class="uwp-list"></div>
         <div class="row save-row">
           <button id="uwpApply" class="btn primary" data-i18n="uwp.apply">应用</button>
-          <button id="uwpRestartAdmin" class="btn hidden" data-i18n="settings.relaunchAdmin">以管理员身份重启</button>
           <button id="uwpCancel" class="btn" data-i18n="subs.editCancel">取消</button>
         </div>
       </div>

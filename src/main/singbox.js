@@ -3,6 +3,8 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const zlib = require('zlib');
+const yaml = require('js-yaml');
 const fetch = require('./fetch');
 const github = require('./github');
 
@@ -32,11 +34,20 @@ function geoDataUrls(repo, file) {
   ];
 }
 
+function mihomoGeoDataUrls(file) {
+  return [
+    `https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${file}`,
+    `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
+    `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
+    `https://gcore.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
+  ];
+}
+
 /**
- * sing-box core process manager
+ * Proxy core process manager
  *
- * Responsible for: locating the core binary, writing the config, starting/stopping
- * the process, forwarding logs, and (optionally) downloading the core.
+ * Responsible for: locating the selected core binary, writing the config,
+ * starting/stopping the process, forwarding logs, and downloading the core.
  */
 class SingBoxManager {
   /**
@@ -50,15 +61,58 @@ class SingBoxManager {
     this.runtimeDir = opts.runtimeDir;
     this.onLog = opts.onLog || (() => {});
     this.onExit = opts.onExit || (() => {});
+    this.coreType = opts.coreType || 'sing-box';
     this.proc = null;
-    this.configPath = path.join(this.runtimeDir, 'config.json');
     if (!fs.existsSync(this.runtimeDir)) {
       fs.mkdirSync(this.runtimeDir, { recursive: true });
     }
+    this._migrateLegacyLayout();
   }
 
-  /** Core executable file name. */
+  setCoreType(type) {
+    this.coreType = type === 'mihomo' ? 'mihomo' : 'sing-box';
+    this._versionCache = null;
+    this.ensureCoreDir();
+  }
+
+  getCoreType() {
+    return this.coreType || 'sing-box';
+  }
+
+  get coreLabel() {
+    return this.getCoreType() === 'mihomo' ? 'mihomo' : 'sing-box';
+  }
+
+  coreFolderName(type = this.getCoreType()) {
+    return type === 'mihomo' ? 'mihomo' : 'singbox';
+  }
+
+  coreDir(type = this.getCoreType()) {
+    return path.join(this.runtimeDir, this.coreFolderName(type));
+  }
+
+  ensureCoreDir(type = this.getCoreType()) {
+    const dir = this.coreDir(type);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  resourceDirs(type = this.getCoreType()) {
+    if (!this.resourcesDir) return [];
+    return [
+      path.join(this.resourcesDir, this.coreFolderName(type)),
+      path.join(this.resourcesDir, type === 'mihomo' ? 'mihomo' : 'sing-box'),
+      this.resourcesDir,
+    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
+  }
+
+  get configPath() {
+    return path.join(this.ensureCoreDir(), this.getCoreType() === 'mihomo' ? 'config.yaml' : 'config.json');
+  }
+
+  /** Selected core executable file name. */
   get binName() {
+    if (this.getCoreType() === 'mihomo') return process.platform === 'win32' ? 'mihomo.exe' : 'mihomo';
     return process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
   }
 
@@ -68,9 +122,13 @@ class SingBoxManager {
    */
   resolveBinaryPath() {
     const candidates = [
+      path.join(this.coreDir(), this.binName),
+      path.join(this.coreDir(), 'bin', this.binName),
+      // Legacy layout from older builds. Kept as a fallback, but new installs
+      // and updates write to the per-core folders above.
       path.join(this.runtimeDir, 'bin', this.binName),
       path.join(this.runtimeDir, this.binName),
-      this.resourcesDir && path.join(this.resourcesDir, this.binName),
+      ...this.resourceDirs().flatMap((d) => [path.join(d, this.binName), path.join(d, 'bin', this.binName)]),
     ].filter(Boolean);
     for (const c of candidates) {
       if (fs.existsSync(c)) return c;
@@ -89,14 +147,14 @@ class SingBoxManager {
   async getCoreVersion() {
     const bin = this.resolveBinaryPath();
     if (!bin) return null;
-    if (this._versionCache && this._versionCache.bin === bin) {
+    if (this._versionCache && this._versionCache.bin === bin && this._versionCache.coreType === this.getCoreType()) {
       return this._versionCache.version;
     }
     try {
-      const out = await this._runCapture(bin, ['version']);
-      const m = out.match(/version\s+(\S+)/i);
+      const out = await this._runCapture(bin, this.getCoreType() === 'mihomo' ? ['-v'] : ['version']);
+      const m = out.match(/version\s+v?(\S+)/i) || out.match(/\bv?(\d+\.\d+\.\d+(?:[-.\w]*)?)/);
       const version = m ? m[1] : null;
-      this._versionCache = { bin, version };
+      this._versionCache = { bin, coreType: this.getCoreType(), version };
       return version;
     } catch (e) {
       return null;
@@ -110,15 +168,61 @@ class SingBoxManager {
    */
   resolveRuleSetDir() {
     const dirs = [
-      path.join(this.runtimeDir, 'bin'),
-      this.resourcesDir,
-    ].filter(Boolean);
+      this.coreDir('sing-box'),
+      path.join(this.runtimeDir, 'bin'), // legacy fallback
+      ...this.resourceDirs('sing-box'),
+    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
     for (const d of dirs) {
       if (this._validSrs(path.join(d, 'geoip-cn.srs')) && this._validSrs(path.join(d, 'geosite-cn.srs'))) {
         return d;
       }
     }
     return null;
+  }
+
+  _copyIfMissing(src, dest, validate = null) {
+    try {
+      if (!src || !fs.existsSync(src) || fs.existsSync(dest)) return;
+      if (validate && !validate.call(this, src)) return;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+      try {
+        fs.chmodSync(dest, fs.statSync(src).mode);
+      } catch (_) {}
+    } catch (_) {
+      /* best-effort migration */
+    }
+  }
+
+  _migrateLegacyLayout() {
+    const singboxDir = this.ensureCoreDir('sing-box');
+    const mihomoDir = this.ensureCoreDir('mihomo');
+    const legacyBin = path.join(this.runtimeDir, 'bin');
+    const exe = process.platform === 'win32' ? '.exe' : '';
+    this._copyIfMissing(path.join(legacyBin, 'sing-box' + exe), path.join(singboxDir, 'sing-box' + exe));
+    this._copyIfMissing(path.join(this.runtimeDir, 'sing-box' + exe), path.join(singboxDir, 'sing-box' + exe));
+    this._copyIfMissing(path.join(legacyBin, 'mihomo' + exe), path.join(mihomoDir, 'mihomo' + exe));
+    this._copyIfMissing(path.join(this.runtimeDir, 'mihomo' + exe), path.join(mihomoDir, 'mihomo' + exe));
+    this._copyIfMissing(path.join(this.runtimeDir, 'config.json'), path.join(singboxDir, 'config.json'));
+    this._copyIfMissing(path.join(this.runtimeDir, 'config.yaml'), path.join(mihomoDir, 'config.yaml'));
+    this._copyIfMissing(path.join(this.runtimeDir, 'mihomo-geodata-meta.json'), path.join(mihomoDir, 'geodata-meta.json'));
+
+    for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
+      this._copyIfMissing(path.join(this.runtimeDir, file), path.join(mihomoDir, file), this._validGeoFile);
+    }
+    try {
+      for (const name of fs.readdirSync(legacyBin)) {
+        if (
+          name === 'geodata-meta.json' ||
+          /\.srs$/i.test(name) ||
+          /^rp-[a-f0-9]+\.json$/i.test(name)
+        ) {
+          this._copyIfMissing(path.join(legacyBin, name), path.join(singboxDir, name));
+        }
+      }
+    } catch (_) {
+      /* no legacy bin */
+    }
   }
 
   /** A rule-set file is usable only if it exists, is non-empty, and starts with the SRS magic. */
@@ -135,23 +239,38 @@ class SingBoxManager {
     }
   }
 
+  _validGeoFile(p) {
+    try {
+      return fs.existsSync(p) && fs.statSync(p).size > 1024;
+    } catch (_) {
+      return false;
+    }
+  }
+
   isRunning() {
     return !!this.proc;
   }
 
-  /** Write the sing-box config file. */
+  /** Write the selected core's config file. */
   writeConfig(config) {
-    fs.writeFileSync(this.configPath, JSON.stringify(config, null, 2), 'utf-8');
+    const text = this.getCoreType() === 'mihomo'
+      ? yaml.dump(config, { lineWidth: -1, noRefs: true })
+      : JSON.stringify(config, null, 2);
+    fs.writeFileSync(this.configPath, text, 'utf-8');
     return this.configPath;
   }
 
-  /** Validate the config (sing-box check). */
+  /** Validate the selected core config. */
   checkConfig() {
     return new Promise((resolve, reject) => {
       const bin = this.resolveBinaryPath();
-      if (!bin) return reject(new Error('sing-box core not found'));
-      const p = spawn(bin, ['check', '-c', this.configPath], {
-        cwd: this.runtimeDir,
+      if (!bin) return reject(new Error(this.coreLabel + ' core not found'));
+      const workDir = this.ensureCoreDir();
+      const args = this.getCoreType() === 'mihomo'
+        ? ['-t', '-f', this.configPath, '-d', workDir]
+        : ['check', '-c', this.configPath];
+      const p = spawn(bin, args, {
+        cwd: workDir,
       });
       let err = '';
       p.stderr.on('data', (d) => (err += d.toString()));
@@ -170,13 +289,17 @@ class SingBoxManager {
     }
     const bin = this.resolveBinaryPath();
     if (!bin) {
-      throw new Error('sing-box core not found. Download or place the core under Settings first.');
+      throw new Error(this.coreLabel + ' core not found. Download or place the core under Settings first.');
     }
     if (config) this.writeConfig(config);
 
-    this.onLog('[gui] Starting sing-box core...');
-    const proc = spawn(bin, ['run', '-c', this.configPath, '-D', this.runtimeDir], {
-      cwd: this.runtimeDir,
+    this.onLog(`[gui] Starting ${this.coreLabel} core...`);
+    const workDir = this.ensureCoreDir();
+    const args = this.getCoreType() === 'mihomo'
+      ? ['-f', this.configPath, '-d', workDir]
+      : ['run', '-c', this.configPath, '-D', workDir];
+    const proc = spawn(bin, args, {
+      cwd: workDir,
     });
     this.proc = proc;
 
@@ -192,7 +315,7 @@ class SingBoxManager {
     proc.stderr.on('data', handleData);
 
     proc.on('exit', (code, signal) => {
-      this.onLog(`[gui] sing-box exited (code=${code}, signal=${signal})`);
+      this.onLog(`[gui] ${this.coreLabel} exited (code=${code}, signal=${signal})`);
       this.proc = null;
       this.onExit(code, signal);
     });
@@ -238,7 +361,7 @@ class SingBoxManager {
   }
 
   /**
-   * Download the sing-box core (from GitHub Releases).
+   * Download the selected core (from GitHub Releases).
    * @param {string} version like '1.9.3'; empty downloads the latest
    * @param {(p:number)=>void} onProgress progress callback 0~1
    * @param {object} [opts]
@@ -253,24 +376,25 @@ class SingBoxManager {
     const goos = plat === 'win32' ? 'windows' : plat === 'darwin' ? 'darwin' : 'linux';
 
     let tag = version;
+    let release = null;
     if (!tag) {
-      tag = await this._latestVersion(proxyPort);
+      const latest = await this._latestVersion(proxyPort);
+      tag = latest.tag;
+      release = latest.release;
     }
     const ver = tag.replace(/^v/, '');
-    const ext = goos === 'windows' ? 'zip' : 'tar.gz';
-    const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
-    const url = `https://github.com/SagerNet/sing-box/releases/download/v${ver}/${fileName}`;
+    const asset = this._coreAsset(ver, goos, arch, release);
 
-    const binDir = path.join(this.runtimeDir, 'bin');
-    if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
-    const archivePath = path.join(binDir, fileName);
+    const binDir = this.ensureCoreDir();
+    const archivePath = path.join(binDir, asset.fileName);
 
-    this.onLog('[gui] Downloading core: ' + url + (proxyPort ? ' (via proxy)' : ''));
-    await fetch.downloadWithFallback(url, archivePath, { proxyPort, onProgress, log: (m) => this.onLog(m) });
+    this.onLog('[gui] Downloading core: ' + asset.url + (proxyPort ? ' (via proxy)' : ''));
+    await fetch.downloadWithFallback(asset.url, archivePath, { proxyPort, onProgress, log: (m) => this.onLog(m) });
     this.onLog('[gui] Download complete, extracting...');
     if (beforeInstall) await beforeInstall();
     await this._extractCore(archivePath, binDir, goos);
-    // Verify the executable actually landed in runtimeDir/bin before claiming success.
+    // Verify the executable actually landed in the selected core folder before
+    // claiming success.
     const installed = path.join(binDir, this.binName);
     if (!fs.existsSync(installed)) {
       throw new Error('extraction finished but ' + this.binName + ' was not found in ' + binDir);
@@ -282,12 +406,14 @@ class SingBoxManager {
   }
 
   /**
-   * Download/refresh the geoip-cn / geosite-cn rule-sets into runtimeDir/bin so
-   * the bundled (or stale) geodata can be updated from within the app.
+   * Download/refresh the geoip-cn / geosite-cn rule-sets into the singbox core
+   * folder so the bundled (or stale) geodata can be updated from within the app.
    */
   async updateGeoData(onProgress = () => {}, proxyPort = 0) {
-    const binDir = path.join(this.runtimeDir, 'bin');
-    if (!fs.existsSync(binDir)) fs.mkdirSync(binDir, { recursive: true });
+    if (this.getCoreType() === 'mihomo') {
+      return this.updateMihomoGeoData(onProgress, proxyPort);
+    }
+    const binDir = this.ensureCoreDir('sing-box');
     const files = [
       { file: 'geoip-cn.srs', repo: 'sing-geoip' },
       { file: 'geosite-cn.srs', repo: 'sing-geosite' },
@@ -358,10 +484,73 @@ class SingBoxManager {
     return binDir;
   }
 
+  async updateMihomoGeoData(onProgress = () => {}, proxyPort = 0) {
+    const dir = this.ensureCoreDir('mihomo');
+    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
+    let done = 0;
+    for (const file of files) {
+      const dest = path.join(dir, file);
+      const tmp = dest + '.tmp';
+      let ok = false;
+      let lastErr = null;
+      for (const url of mihomoGeoDataUrls(file)) {
+        this.onLog('[gui] Updating mihomo geodata: ' + url + (proxyPort ? ' (via proxy)' : ''));
+        try {
+          await fetch.downloadWithFallback(url, tmp, {
+            proxyPort,
+            log: (m) => this.onLog(m),
+            onProgress: (p) => onProgress((done + p) / files.length),
+          });
+        } catch (e) {
+          lastErr = e;
+          try { fs.unlinkSync(tmp); } catch (_) {}
+          continue;
+        }
+        if (!this._validGeoFile(tmp)) {
+          lastErr = new Error('not a valid geodata file (blocked/redirected)');
+          try { fs.unlinkSync(tmp); } catch (_) {}
+          continue;
+        }
+        fs.renameSync(tmp, dest);
+        this.onLog('[gui] mihomo geodata source OK: ' + url);
+        ok = true;
+        break;
+      }
+      if (!ok) {
+        throw new Error(
+          'download failed for ' + file + ' from all sources' +
+            (lastErr ? ': ' + lastErr.message : '') +
+            (proxyPort ? '' : '. Start the core first so the download can go through the proxy.')
+        );
+      }
+      done += 1;
+      onProgress(done / files.length);
+    }
+    const meta = this.geoMeta();
+    let version = null;
+    try {
+      version = (await github.latestReleaseTag('MetaCubeX/meta-rules-dat', proxyPort, (m) => this.onLog(m))).tag;
+    } catch (_) {
+      /* keep version null */
+    }
+    for (const file of files) meta[file] = { version, updatedAt: Date.now() };
+    try {
+      fs.writeFileSync(this.geoMetaPath(), JSON.stringify(meta), 'utf-8');
+    } catch (_) {
+      /* non-fatal */
+    }
+    this.onLog('[gui] Mihomo GeoData updated in ' + dir);
+    return dir;
+  }
+
   /** Read the stored geodata meta ({ file: { version, updatedAt } }), or {}. */
+  geoMetaPath() {
+    return path.join(this.coreDir(), 'geodata-meta.json');
+  }
+
   geoMeta() {
     try {
-      return JSON.parse(fs.readFileSync(path.join(this.runtimeDir, 'bin', 'geodata-meta.json'), 'utf-8'));
+      return JSON.parse(fs.readFileSync(this.geoMetaPath(), 'utf-8'));
     } catch (e) {
       return {};
     }
@@ -369,13 +558,40 @@ class SingBoxManager {
 
   /** Latest stable core release tag — GitHub API first, jsDelivr fallback. */
   async _latestVersion(proxyPort = 0) {
-    const { tag, source } = await github.latestReleaseTag('SagerNet/sing-box', proxyPort, (m) => this.onLog(m));
+    const repo = this.getCoreType() === 'mihomo' ? 'MetaCubeX/mihomo' : 'SagerNet/sing-box';
+    const { tag, release, source } = await github.latestReleaseTag(repo, proxyPort, (m) => this.onLog(m));
     if (source !== 'github') this.onLog('[gui] core version resolved via jsDelivr: ' + tag);
-    return tag;
+    return { tag, release };
+  }
+
+  _coreAsset(ver, goos, arch, release) {
+    if (this.getCoreType() !== 'mihomo') {
+      const ext = goos === 'windows' ? 'zip' : 'tar.gz';
+      const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
+      return { fileName, url: `https://github.com/SagerNet/sing-box/releases/download/v${ver}/${fileName}` };
+    }
+    const ext = goos === 'windows' ? 'zip' : 'gz';
+    const assets = (release && release.assets) || [];
+    const candidates = assets
+      .map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }))
+      .filter((a) =>
+        /mihomo/i.test(a.name) &&
+        a.name.toLowerCase().includes(goos) &&
+        a.name.toLowerCase().includes(arch) &&
+        new RegExp(`\\.${ext}$`, 'i').test(a.name) &&
+        a.url
+      )
+      .sort((a, b) => Number(/compatible|go\d+/i.test(a.name)) - Number(/compatible|go\d+/i.test(b.name)));
+    if (candidates[0]) return { fileName: candidates[0].name, url: candidates[0].url };
+    const fileName = `mihomo-${goos}-${arch}-v${ver}.${ext}`;
+    return { fileName, url: `https://github.com/MetaCubeX/mihomo/releases/download/v${ver}/${fileName}` };
   }
 
   /** Extract the core archive (zip on Windows / tar.gz elsewhere), only the executable. */
   async _extractCore(archivePath, binDir, goos) {
+    if (this.getCoreType() === 'mihomo') {
+      return this._extractMihomoCore(archivePath, binDir, goos);
+    }
     if (goos === 'windows') {
       // Use PowerShell to extract the zip (built into Windows).
       await this._run('powershell', [
@@ -403,6 +619,54 @@ class SingBoxManager {
     try {
       fs.unlinkSync(archivePath);
     } catch (_) {}
+  }
+
+  _findExtractedBinary(dir, name, depth = 2) {
+    if (depth < 0) return null;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return null;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isFile() && e.name.toLowerCase() === name.toLowerCase()) return p;
+      if (e.isFile() && /^mihomo/i.test(e.name) && (process.platform !== 'win32' || /\.exe$/i.test(e.name))) return p;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        const p = this._findExtractedBinary(path.join(dir, e.name), name, depth - 1);
+        if (p) return p;
+      }
+    }
+    return null;
+  }
+
+  async _extractMihomoCore(archivePath, binDir, goos) {
+    const target = path.join(binDir, this.binName);
+    if (/\.gz$/i.test(archivePath)) {
+      const data = zlib.gunzipSync(fs.readFileSync(archivePath));
+      fs.writeFileSync(target, data);
+      if (goos !== 'windows') fs.chmodSync(target, 0o755);
+      try { fs.unlinkSync(archivePath); } catch (_) {}
+      return;
+    }
+    if (goos === 'windows') {
+      await this._run('powershell', [
+        '-NoProfile',
+        '-Command',
+        `Expand-Archive -Path '${archivePath}' -DestinationPath '${binDir}' -Force`,
+      ]);
+    } else {
+      await this._run('tar', ['-xzf', archivePath, '-C', binDir]);
+    }
+    const found = this._findExtractedBinary(binDir, this.binName);
+    if (found) {
+      if (path.resolve(found) !== path.resolve(target)) fs.copyFileSync(found, target);
+      if (goos !== 'windows') fs.chmodSync(target, 0o755);
+    }
+    try { fs.unlinkSync(archivePath); } catch (_) {}
   }
 
   _run(cmd, args) {

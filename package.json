@@ -1,7 +1,7 @@
 {
   "name": "dart",
-  "version": "0.7.6",
-  "description": "sing-box based Windows proxy client with airport subscription and Clash config conversion",
+  "version": "0.7.7",
+  "description": "sing-box based Windows proxy client with config profiles and Clash config conversion",
   "main": "src/main/index.js",
   "author": "singbox-gui",
   "license": "MIT",
@@ -18,11 +18,11 @@
     "dist:dir": "electron-builder --win --dir"
   },
   "dependencies": {
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^5.2.1"
   },
   "devDependencies": {
-    "electron": "^42.0.0",
-    "electron-builder": "^26.0.0"
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "com.dart.app",

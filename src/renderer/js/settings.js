@@ -26,19 +26,24 @@
     $('#setDnsRemote').value = s.dnsRemote || '';
     $('#setDnsLocal').value = s.dnsLocal || '';
     $('#setDnsStrategy').value = s.dnsStrategy || 'prefer_ipv4';
+    if ($('#setCoreType')) $('#setCoreType').value = s.coreType || 'sing-box';
   }
 
   // Pure render of the core-status label from a status object.
   function renderCoreStatus(st) {
     const el = $('#coreStatus');
     if (!el || !st) return;
+    const coreName = st.coreName || st.coreType || (App.state.settings && App.state.settings.coreType) || 'sing-box';
+    const modal = $('#coreModalStatus');
     if (st.coreInstalled) {
       const ver = st.coreVersion ? 'v' + st.coreVersion : t('settings.versionUnknown');
-      el.textContent = t('settings.installed', ver);
+      el.textContent = t('settings.currentCoreValue', coreName, ver);
       el.title = st.corePath || ''; // full path on hover
+      if (modal) modal.textContent = st.corePath || t('settings.installed', ver);
     } else {
-      el.textContent = t('settings.notInstalled');
+      el.textContent = t('settings.currentCoreValue', coreName, t('settings.notInstalled'));
       el.title = '';
+      if (modal) modal.textContent = t('settings.notInstalled');
     }
     el.style.color = st.coreInstalled ? 'var(--green)' : 'var(--red)';
   }
@@ -91,8 +96,28 @@
     toast(t('settings.saved'));
   });
 
-  // Manage core: open the folder that holds the core binary.
-  $('#coreManageBtn').addEventListener('click', () => call(api.openCoreFolder));
+  // Core management modal: switch selected runtime core and manage/download it.
+  $('#coreManageBtn').addEventListener('click', async () => {
+    $('#coreModal').classList.remove('hidden');
+    $('#setCoreType').value = (App.state.settings && App.state.settings.coreType) || 'sing-box';
+    await refreshCoreStatus();
+  });
+  $('#coreCloseBtn').addEventListener('click', () => $('#coreModal').classList.add('hidden'));
+  $('#coreModal').addEventListener('click', (e) => {
+    if (e.target.id === 'coreModal') $('#coreModal').classList.add('hidden');
+  });
+  $('#coreOpenFolderBtn').addEventListener('click', () => call(api.openCoreFolder));
+  async function applyCoreTypeSelection() {
+    const coreType = $('#setCoreType').value;
+    if (coreType === ((App.state.settings && App.state.settings.coreType) || 'sing-box')) return false;
+    App.state.settings = await call(api.updateSettings, { coreType });
+    return true;
+  }
+  $('#coreApplyBtn').addEventListener('click', async () => {
+    await applyCoreTypeSelection();
+    toast(t('settings.coreChanged'));
+    await refreshCoreStatus();
+  });
 
   // Update core: always fetch the latest release.
   $('#coreUpdateBtn').addEventListener('click', async () => {
@@ -102,6 +127,7 @@
     btn.textContent = t('settings.updatingCore');
     prog.classList.remove('hidden');
     try {
+      await applyCoreTypeSelection();
       // Always fetch the latest core (empty version = latest).
       await call(api.downloadCore, { version: '' });
       toast(t('settings.coreDownloaded'));
@@ -113,25 +139,7 @@
     }
   });
 
-  // Update geodata (geoip/geosite rule-sets)
-  $('#geoUpdateBtn').addEventListener('click', async () => {
-    const btn = $('#geoUpdateBtn');
-    const prog = $('#downloadProgress');
-    btn.disabled = true;
-    btn.textContent = t('settings.updatingGeo');
-    prog.classList.remove('hidden');
-    try {
-      await call(api.updateGeoData);
-      toast(t('settings.geoUpdated'));
-      App.loadRuleSets();
-    } finally {
-      btn.disabled = false;
-      btn.textContent = t('subs.update');
-      setTimeout(() => prog.classList.add('hidden'), 1500);
-    }
-  });
-
-  api.onDownloadProgress((p) => {
+  if (api && api.onDownloadProgress) api.onDownloadProgress((p) => {
     $('#downloadProgress .bar').style.width = Math.round(p * 100) + '%';
   });
 

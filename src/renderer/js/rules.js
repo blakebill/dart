@@ -10,8 +10,15 @@
   // ---------- Rule list ----------
   // Normalized once on load with a prebuilt lowercase search key, so typing in
   // the filter box only filters — it does not re-map the whole rule list.
+  const MAX_RENDERED_RULES = 400;
   let ruleItems = [];
   let ruleSrc = 'config';
+  let rulesReady = false;
+  let rulesLoading = null;
+  let localRulesReady = false;
+  let localRulesLoading = null;
+  let ruleGroupsReady = false;
+  let ruleGroupsLoading = null;
   function normalizeRules(data) {
     const live = data.live && data.live.length ? data.live : null;
     ruleSrc = live ? 'live' : 'config';
@@ -27,18 +34,24 @@
   function renderRules() {
     const filter = ($('#ruleFilter').value || '').toLowerCase();
     const filtered = filter ? ruleItems.filter((it) => it.key.includes(filter)) : ruleItems;
-    $('#ruleCount').textContent = t('rules.count', filtered.length) + ' · ' + t('rules.' + ruleSrc);
+    const shown = filtered.slice(0, MAX_RENDERED_RULES);
+    const limited = shown.length < filtered.length;
+    $('#ruleCount').textContent =
+      t('rules.count', filtered.length) +
+      (limited ? ' · ' + shown.length + '/' + filtered.length : '') +
+      ' · ' + t('rules.' + ruleSrc);
     const list = $('#ruleList');
     if (filtered.length === 0) {
       list.innerHTML = `<p class="hint">${t('rules.empty')}</p>`;
       return;
     }
     let html = '';
-    for (const it of filtered) {
+    for (const it of shown) {
       html += `<div class="rule-item"><span class="rule-type">${escapeHtml(it.type)}</span>` +
         `<span class="rule-payload">${escapeHtml(it.payload)}</span>` +
         `<span class="rule-proxy">${escapeHtml(it.proxy)}</span></div>`;
     }
+    if (limited) html += `<p class="hint rule-more">${shown.length}/${filtered.length}</p>`;
     list.innerHTML = html;
   }
 
@@ -56,79 +69,99 @@
     return { type: 'rule', payload: JSON.stringify(r) };
   }
 
-  async function loadRules() {
-    try {
-      normalizeRules(await api.getRules());
+  async function loadRules(options = {}) {
+    if (options.force === false && rulesReady) {
       renderRules();
-    } catch (e) {
-      /* ignore */
+      return;
     }
+    if (rulesLoading) return rulesLoading;
+    rulesLoading = (async () => {
+      try {
+        normalizeRules(await api.getRules());
+        rulesReady = true;
+        renderRules();
+      } catch (e) {
+        /* ignore */
+      } finally {
+        rulesLoading = null;
+      }
+    })();
+    return rulesLoading;
   }
 
   $('#ruleFilter').addEventListener('input', renderRules);
-  $('#ruleRefresh').addEventListener('click', loadRules);
+  $('#ruleRefresh').addEventListener('click', () => loadRules({ force: true }));
 
   // ---------- Subscription policy-group outbound overrides ----------
   // The subscription's own rules keep their matching, but the user picks where
   // each policy group routes (proxy / direct / reject). Saved as a name->target
   // map in settings; the core restarts to apply.
-  async function loadRuleGroups() {
+  async function loadRuleGroups(options = {}) {
     const list = $('#ruleGroupList');
     if (!list) return;
-    let info;
-    try {
-      info = await api.getRuleGroups();
-    } catch (e) {
-      return;
-    }
-    const groups = info.groups || [];
-    const overrides = info.overrides || {};
-    if (!groups.length) {
-      list.innerHTML = `<p class="hint">${t('rulegroups.empty')}</p>`;
-      return;
-    }
-    const opts = [
-      ['proxy', t('customrs.targetProxy')],
-      ['direct', t('customrs.targetDirect')],
-      ['reject', t('customrs.targetReject')],
-    ];
-    list.innerHTML = '';
-    for (const g of groups) {
-      const cur = overrides[g] || 'proxy';
-      const div = document.createElement('div');
-      div.className = 'sub-item';
-      const sel = opts
-        .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
-        .join('');
-      div.innerHTML = `
-        <div class="sub-info">
-          <div class="sub-name">${escapeHtml(g)}</div>
-        </div>
-        <div class="sub-actions">
-          <select class="input small" data-group="${escapeHtml(g)}">${sel}</select>
-        </div>`;
-      list.appendChild(div);
-    }
-    list.querySelectorAll('select[data-group]').forEach((sel) => {
-      sel.addEventListener('change', async () => {
-        const next = { ...(info.overrides || {}) };
-        const g = sel.dataset.group;
-        if (sel.value === 'proxy') delete next[g]; // proxy is the default; keep the map small
-        else next[g] = sel.value;
-        sel.disabled = true;
-        try {
-          App.state.settings = await call(api.updateSettings, { ruleOverrides: next });
-          info.overrides = next;
-          toast(t('settings.saved'));
-          if (App.state.status && App.state.status.running) loadRules();
-        } finally {
-          sel.disabled = false;
-        }
+    if (options.force === false && ruleGroupsReady) return;
+    if (ruleGroupsLoading) return ruleGroupsLoading;
+    ruleGroupsLoading = (async () => {
+      let info;
+      try {
+        info = await api.getRuleGroups();
+      } catch (e) {
+        return;
+      }
+      const groups = info.groups || [];
+      const overrides = info.overrides || {};
+      if (!groups.length) {
+        list.innerHTML = `<p class="hint">${t('rulegroups.empty')}</p>`;
+        ruleGroupsReady = true;
+        return;
+      }
+      const opts = [
+        ['proxy', t('customrs.targetProxy')],
+        ['direct', t('customrs.targetDirect')],
+        ['reject', t('customrs.targetReject')],
+      ];
+      list.innerHTML = '';
+      for (const g of groups) {
+        const cur = overrides[g] || 'proxy';
+        const div = document.createElement('div');
+        div.className = 'sub-item';
+        const sel = opts
+          .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
+          .join('');
+        div.innerHTML = `
+          <div class="sub-info">
+            <div class="sub-name">${escapeHtml(g)}</div>
+          </div>
+          <div class="sub-actions">
+            <select class="input small" data-group="${escapeHtml(g)}">${sel}</select>
+          </div>`;
+        list.appendChild(div);
+      }
+      list.querySelectorAll('select[data-group]').forEach((sel) => {
+        sel.addEventListener('change', async () => {
+          const next = { ...(info.overrides || {}) };
+          const g = sel.dataset.group;
+          if (sel.value === 'proxy') delete next[g]; // proxy is the default; keep the map small
+          else next[g] = sel.value;
+          sel.disabled = true;
+          try {
+            App.state.settings = await call(api.updateSettings, { ruleOverrides: next });
+            info.overrides = next;
+            toast(t('settings.saved'));
+            if (App.state.status && App.state.status.running) loadRules();
+          } finally {
+            sel.disabled = false;
+          }
+        });
       });
+      if (App.enhanceSelects) App.enhanceSelects(list); // style these freshly-built selects
+      ruleGroupsReady = true;
+    })().finally(() => {
+      ruleGroupsLoading = null;
     });
-    if (App.enhanceSelects) App.enhanceSelects(list); // style these freshly-built selects
+    return ruleGroupsLoading;
   }
-  $('#ruleGroupRefresh').addEventListener('click', loadRuleGroups);
+  $('#ruleGroupRefresh').addEventListener('click', () => loadRuleGroups({ force: true }));
 
   // ---------- Local rules ----------
   const MATCH_LABELS = {
@@ -138,12 +171,20 @@
     ip_cidr: 'IP-CIDR',
     process_name: 'PROCESS-NAME',
   };
-  async function loadLocalRules() {
-    try {
-      renderLocalRules(await api.listLocalRules());
-    } catch (e) {
-      /* ignore */
-    }
+  async function loadLocalRules(options = {}) {
+    if (options.force === false && localRulesReady) return;
+    if (localRulesLoading) return localRulesLoading;
+    localRulesLoading = (async () => {
+      try {
+        renderLocalRules(await api.listLocalRules());
+        localRulesReady = true;
+      } catch (e) {
+        /* ignore */
+      } finally {
+        localRulesLoading = null;
+      }
+    })();
+    return localRulesLoading;
   }
   function renderLocalRules(items) {
     const list = $('#lrList');
@@ -236,7 +277,17 @@
     }
   });
 
+  function invalidateRuleCaches() {
+    rulesReady = false;
+    localRulesReady = false;
+    ruleGroupsReady = false;
+  }
+
   App.loadRules = loadRules;
   App.loadLocalRules = loadLocalRules;
   App.loadRuleGroups = loadRuleGroups;
+  App.ensureRulesLoaded = () => loadRules({ force: false });
+  App.ensureLocalRulesLoaded = () => loadLocalRules({ force: false });
+  App.ensureRuleGroupsLoaded = () => loadRuleGroups({ force: false });
+  App.invalidateRuleCaches = invalidateRuleCaches;
 })();

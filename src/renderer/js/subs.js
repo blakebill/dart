@@ -90,7 +90,7 @@
     $('#subEditPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  // Add a subscription.
+  // Add a config profile.
   $('#subAddBtn').addEventListener('click', async () => {
     const url = $('#subUrl').value.trim();
     if (!url) return toast(t('toast.needUrl'), true);

@@ -9,6 +9,10 @@
 
   // ---------- Conversion ----------
   $('#convertOpen').addEventListener('click', () => {
+    const coreType = (App.state.settings && App.state.settings.coreType) || 'sing-box';
+    const mihomo = coreType === 'mihomo';
+    $('#convertTitle').textContent = mihomo ? t('convert.titleMihomo') : t('convert.title');
+    $('#convertOutputTitle').textContent = mihomo ? t('convert.outputTitleMihomo') : t('convert.outputTitle');
     $('#convertModal').classList.remove('hidden');
     $('#convertInput').focus();
   });
@@ -36,13 +40,15 @@
     const content = $('#convertInput').value.trim();
     if (!content) return toast(t('toast.needContent'), true);
     const res = await call(api.convertPreview, { content });
-    lastConvertOutput = JSON.stringify(res.config, null, 2);
+    lastConvertOutput = res.text !== undefined ? String(res.text) : JSON.stringify(res.config, null, 2);
     const out = $('#convertOutput');
     // Highlighting a giant config (thousands of nodes) would stall the renderer;
     // beyond ~1.5MB fall back to plain text.
-    if (lastConvertOutput.length > 1500000) out.textContent = lastConvertOutput;
+    if (res.text !== undefined || lastConvertOutput.length > 1500000) out.textContent = lastConvertOutput;
     else out.innerHTML = highlightJson(lastConvertOutput);
-    $('#convertMeta').textContent = t('convert.meta', res.nodeCount, res.format);
+    $('#convertMeta').textContent = res.coreType === 'mihomo'
+      ? t('convert.metaMihomo', res.nodeCount, res.format)
+      : t('convert.meta', res.nodeCount, res.format);
     toast(t('convert.done'));
   });
   $('#convertImportBtn').addEventListener('click', async () => {
@@ -68,12 +74,6 @@
     $('#uwpModal').classList.remove('hidden');
     $('#uwpFilter').value = '';
     await loadUwp();
-    try {
-      const admin = await api.isAdmin();
-      $('#uwpRestartAdmin').classList.toggle('hidden', admin);
-      $('#uwpApply').disabled = !admin;
-      if (!admin) $('#uwpStatus').textContent = t('uwp.needAdmin');
-    } catch (_) {}
   }
   async function loadUwp() {
     $('#uwpStatus').textContent = t('uwp.loading');
@@ -134,20 +134,17 @@
     btn.disabled = true;
     btn.textContent = t('uwp.applying');
     try {
-      await call(api.setUwpLoopback, sids);
+      const r = await call(api.setUwpLoopback, sids);
+      if (r && r.restarting) {
+        $('#uwpStatus').textContent = t('uwp.relaunching');
+        toast(t('uwp.relaunching'));
+        return;
+      }
       toast(t('uwp.applied'));
       await loadUwp();
     } finally {
       btn.disabled = false;
       btn.textContent = t('uwp.apply');
-    }
-  });
-  $('#uwpRestartAdmin').addEventListener('click', async () => {
-    try {
-      const r = await api.relaunchElevated();
-      if (r && r.ok === false) toast(r.error || 'relaunch failed', true);
-    } catch (e) {
-      toast(e.message || String(e), true);
     }
   });
 })();

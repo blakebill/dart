@@ -35,6 +35,24 @@
 
   // Per-tab activation: load rules on demand, start/stop connection polling.
   let connTimer = null;
+  function afterPaint(fn, delay = 0) {
+    const run = () => {
+      if (window.requestAnimationFrame) window.requestAnimationFrame(fn);
+      else fn();
+    };
+    if (delay) setTimeout(run, delay);
+    else run();
+  }
+
+  function showRulesTab() {
+    afterPaint(() => {
+      (App.ensureLocalRulesLoaded || App.loadLocalRules)();
+      afterPaint(() => (App.ensureCustomRuleSetsLoaded || App.loadCustomRuleSets)(), 40);
+      afterPaint(() => (App.ensureRuleGroupsLoaded || App.loadRuleGroups)(), 80);
+      afterPaint(() => (App.ensureRulesLoaded || App.loadRules)(), 120);
+    });
+  }
+
   function onTabShown(tab) {
     App.currentTab = tab;
     if (connTimer) {
@@ -42,12 +60,7 @@
       connTimer = null;
     }
     if (tab === 'rules') {
-      App.loadRules();
-      App.loadLocalRules();
-      App.loadRuleGroups();
-    } else if (tab === 'ruleset') {
-      App.loadRuleSets();
-      App.loadCustomRuleSets();
+      showRulesTab();
     } else if (tab === 'conns') {
       App.loadConnections();
       connTimer = setInterval(App.loadConnections, 2000);
@@ -91,6 +104,7 @@
     if (App.state.activeSub !== prevActiveSub) {
       App.delays.clear();
       prevActiveSub = App.state.activeSub;
+      if (App.invalidateRuleCaches) App.invalidateRuleCaches();
     }
     // setLanguage re-renders everything below; only invoke it on an actual change.
     const lang = App.state.settings && App.state.settings.language;
@@ -107,21 +121,25 @@
   }
 
   // ---------- Event streams ----------
-  api.onTraffic((s) => {
+  if (api && api.onTraffic) api.onTraffic((s) => {
     App.trafficChart.push(s.up || 0, s.down || 0);
     App.miniChart.push(s.up || 0, s.down || 0);
   });
-  api.onSubsChanged(() => refresh());
+  if (api && api.onSubsChanged) api.onSubsChanged(() => {
+    if (App.invalidateRuleCaches) App.invalidateRuleCaches();
+    refresh();
+  });
   // Keep the mode buttons in sync when the mode is changed from the tray menu.
-  api.onModeChanged((mode) => {
+  if (api && api.onModeChanged) api.onModeChanged((mode) => {
     if (App.state.settings) App.state.settings.clashMode = mode;
     App.renderMode();
   });
 
-  api.onStatus((status) => {
+  if (api && api.onStatus) api.onStatus((status) => {
     const wasRunning = App.state.status && App.state.status.running;
     App.state.status = status;
     App.renderStatus();
+    if (wasRunning !== status.running && App.invalidateRuleCaches) App.invalidateRuleCaches();
     // Clear the traffic graphs once the core stops.
     if (wasRunning && !status.running) {
       App.trafficChart.reset();
@@ -135,6 +153,12 @@
   // ---------- Startup ----------
   applyI18n();
   App.refreshPalette();
+  if (!api) {
+    if (App.renderThemeLabel) App.renderThemeLabel();
+    App.trafficChart.draw();
+    App.miniChart.draw();
+    return;
+  }
   refresh();
   App.trafficChart.draw();
   App.miniChart.draw();

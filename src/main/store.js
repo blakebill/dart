@@ -27,6 +27,7 @@ const DEFAULT_SETTINGS = {
   language: 'zh',
   theme: 'dark',
   clashMode: 'rule',
+  coreType: 'sing-box',
   hardwareAcceleration: false,
   // When true, ignore the subscription's own Clash rules and use the app's
   // built-in routing (CN/private direct, rest proxied) plus the user's local
@@ -73,6 +74,7 @@ class Store {
       customRuleSets: [], // user-added remote rule-sets
       localRules: [], // user-added local rules (domain/ip_cidr/... -> target)
       lastRunning: false, // whether the core was running at last quit (auto-resume)
+      pendingUwpLoopbackSids: null, // selected UWP loopback exemptions to apply after elevated relaunch
     };
   }
 

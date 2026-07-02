@@ -51,6 +51,42 @@ test('every data-i18n key used in index.html exists in the dictionary', () => {
   assert.deepStrictEqual([...new Set(missing)], [], 'HTML references undefined i18n keys');
 });
 
+test('zh labels keep config terminology', () => {
+  const { zh } = loadDict();
+  assert.strictEqual(zh['subs.title'], '📡 配置');
+  assert.strictEqual(zh['subs.add'], '添加配置');
+  assert.strictEqual(zh['subs.listTitle'], '配置列表');
+  assert.strictEqual(zh['rulegroups.section'], '策略组');
+  assert.strictEqual(zh['customrs.title'], '远程规则');
+  assert.strictEqual(zh['settings.manageGeo'], '管理版本');
+  assert.strictEqual(zh['customrs.targetProxy'], '代理');
+  assert.strictEqual(zh['customrs.targetReject'], '拒绝');
+});
+
+test('static HTML fallbacks keep config terminology', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
+  for (const stale of ['机场订阅', '添加订阅', '订阅列表', '走代理', '拦截', '路由用的', '规则集链接', '自定义规则集']) {
+    assert.ok(!html.includes(stale), `stale fallback text: ${stale}`);
+  }
+  for (const stale of ['静默启动（', '桌面通知（', '硬件加速（', '启用 IPv6（']) {
+    assert.ok(!html.includes(stale), `settings fallback still has parenthetical hint: ${stale}`);
+  }
+});
+
+test('rule-set page is folded into rules and geodata settings', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
+  assert.ok(!html.includes('data-tab="ruleset"'), 'standalone rule-set nav is still present');
+  assert.ok(!html.includes('id="tab-ruleset"'), 'standalone rule-set tab is still present');
+  assert.ok(!html.includes('id="crsFormat"'), 'remote rules should auto-detect format when adding');
+  assert.ok(!html.includes('id="crsEditFormat"'), 'remote rules should auto-detect format when editing');
+  assert.ok(!html.includes('QuantumultX'), 'unsupported remote rule format option is still present');
+  assert.ok(!html.includes('Surge'), 'unsupported remote rule format option is still present');
+  assert.ok(!html.includes('Loon'), 'unsupported remote rule format option is still present');
+  assert.ok(html.indexOf('id="crsList"') > html.indexOf('id="lrList"'), 'remote rules should follow local rules');
+  assert.ok(html.indexOf('id="crsList"') < html.indexOf('id="ruleGroupList"'), 'remote rules should be above policy groups');
+  assert.ok(html.includes('id="geoModal"'), 'GeoData management modal is missing');
+});
+
 console.log('\nRenderer modules:');
 
 // The renderer is split into classic scripts sharing the window.App namespace
@@ -220,6 +256,31 @@ test('settings merge defaults with stored values', () => {
   const s = new Store(dir).getSettings();
   assert.strictEqual(s.mixedPort, 1234);
   assert.strictEqual(s.clashApiPort, 9090); // default still present
+});
+
+console.log('\nCore layout:');
+
+test('selected cores use independent runtime folders', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
+  const { SingBoxManager } = require('../src/main/singbox');
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'bin', 'sing-box' + ext), 'legacy-singbox');
+  fs.writeFileSync(path.join(dir, 'bin', 'mihomo' + ext), 'legacy-mihomo');
+  fs.writeFileSync(path.join(dir, 'geoip.dat'), Buffer.alloc(2048, 1));
+  const mgr = new SingBoxManager({ runtimeDir: dir });
+
+  assert.strictEqual(mgr.coreDir('sing-box'), path.join(dir, 'singbox'));
+  assert.strictEqual(mgr.coreDir('mihomo'), path.join(dir, 'mihomo'));
+  assert.ok(fs.existsSync(path.join(dir, 'singbox', 'sing-box' + ext)), 'sing-box was not migrated');
+  assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'mihomo' + ext)), 'mihomo was not migrated');
+  assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'geoip.dat')), 'mihomo GeoData was not migrated');
+  assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'singbox', 'sing-box' + ext));
+  assert.strictEqual(mgr.configPath, path.join(dir, 'singbox', 'config.json'));
+
+  mgr.setCoreType('mihomo');
+  assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'mihomo', 'mihomo' + ext));
+  assert.strictEqual(mgr.configPath, path.join(dir, 'mihomo', 'config.yaml'));
 });
 
 console.log(`\nDone, ${passed} tests passed.`);

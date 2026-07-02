@@ -1,19 +1,22 @@
-# sing-box core directory
+# Bundled core directory
 
-Place the sing-box core executable in this directory:
+`npm run fetch-core` downloads the Windows build bundle here before packaging:
 
-- Windows: `sing-box.exe`
-- Linux/macOS (development): `sing-box`
+- `singbox/sing-box.exe`
+- `singbox/geoip-cn.srs`
+- `singbox/geosite-cn.srs`
+- `mihomo/mihomo.exe`
+- `mihomo/geoip.dat`
+- `mihomo/geosite.dat`
+- `mihomo/country.mmdb`
 
-How to obtain it:
+The generated files are ignored by Git. GitHub Actions runs the same script
+before `electron-builder`, and `extraResources` copies this directory into the
+installer under `resources/bin/`.
 
-1. **Build script**: run `npm run fetch-core` to download and extract the core here
-   automatically (use `SINGBOX_VERSION=x.y.z` to pin a version).
-2. **In-app download**: launch the app → Settings → "Download core".
-3. **Manual**: download the archive for your platform from
-   https://github.com/SagerNet/sing-box/releases and extract the executable here.
+Version pins:
 
-When packaging (`npm run dist`), this directory is copied into the installer under
-`resources/bin/` via electron-builder's `extraResources`, so the core ships with the app.
+- `SINGBOX_VERSION=1.11.4 npm run fetch-core`
+- `MIHOMO_VERSION=1.19.13 npm run fetch-core`
 
-> Note: the core binary itself is ignored in `.gitignore` and is not committed.
+Leave the variables empty to bundle the latest releases.

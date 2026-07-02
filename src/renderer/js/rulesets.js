@@ -1,76 +1,109 @@
 'use strict';
-// Rule-sets tab: bundled geo rule-set status and user-added custom rule-sets
-// (remote lists converted to sing-box rules) with their editor modal.
+// Remote rules on the Rules tab, plus GeoData version management in Settings.
 (function () {
   const App = window.App;
   const { $, toast, call, fmtBytes, escapeHtml } = App;
   const api = window.api;
-  const { t, getLang } = window.i18n;
+  const { t } = window.i18n;
 
-  // ---------- Bundled rule-sets ----------
-  async function loadRuleSets() {
+  // ---------- GeoData status ----------
+  async function loadGeoDataStatus() {
+    if (!api) return;
     try {
-      renderRuleSets(await api.getRuleSets());
+      renderGeoDataStatus(await api.getRuleSets());
     } catch (e) {
       /* ignore */
     }
   }
-  function renderRuleSets(items) {
-    const list = $('#rulesetList');
+  function renderGeoDataStatus(items) {
+    const list = $('#geoDataList');
     if (!list) return;
     list.innerHTML = '';
+    if (!items || !items.length) {
+      list.innerHTML = `<p class="hint">${t('ruleset.missing')}</p>`;
+      return;
+    }
     for (const it of items || []) {
+      let version;
       let status;
-      if (!it.present) status = t('ruleset.missing');
-      else if (!it.valid) status = t('ruleset.invalid');
+      if (!it.present) {
+        version = t('settings.versionUnknown');
+        status = t('ruleset.missing');
+      } else if (!it.valid) {
+        version = t('settings.versionUnknown');
+        status = t('ruleset.invalid');
+      }
       else {
-        // Show the upstream release tag when known, else the last-update date.
-        const locale = getLang() === 'en' ? 'en-US' : 'zh-CN';
-        const ver = it.version
-          ? ' · ' + it.version
-          : it.updatedAt
-            ? ' · ' + new Date(it.updatedAt).toLocaleDateString(locale)
-            : '';
-        status = (it.location === 'updated' ? t('ruleset.updated') : t('ruleset.bundled')) + ver + ' · ' + fmtBytes(it.size);
+        version = visibleVersion(it.version);
+        status = (it.location === 'updated' ? t('ruleset.updated') : t('ruleset.bundled')) + ' · ' + fmtBytes(it.size);
       }
       const div = document.createElement('div');
       div.className = 'rule-item';
       div.innerHTML = `
-        <span class="rule-type">${escapeHtml(it.tag)}</span>
-        <span class="rule-payload"><a href="#" class="ext-link" data-url="${escapeHtml(it.url)}">${escapeHtml(it.url)}</a></span>
-        <span class="rule-proxy">${status}</span>`;
+        <span class="rule-type">${escapeHtml(it.file || it.tag)}</span>
+        <span class="rule-payload">${escapeHtml(version)}</span>
+        <span class="rule-proxy">${escapeHtml(status)}</span>`;
       list.appendChild(div);
     }
-    list.querySelectorAll('a.ext-link').forEach((a) => {
-      a.addEventListener('click', (e) => {
-        e.preventDefault();
-        api.openExternal(a.dataset.url);
-      });
-    });
   }
 
-  // Rule-set page: update all
-  $('#rulesetUpdate').addEventListener('click', async () => {
-    const btn = $('#rulesetUpdate');
+  function visibleVersion(version) {
+    const value = String(version || '').trim();
+    if (!value || value.toLowerCase() === 'latest') return t('settings.versionUnknown');
+    return value;
+  }
+
+  async function updateGeoData(btn) {
+    const prog = $('#downloadProgress');
     btn.disabled = true;
     btn.textContent = t('settings.updatingGeo');
+    if (prog) prog.classList.remove('hidden');
     try {
       await call(api.updateGeoData);
       toast(t('settings.geoUpdated'));
-      await loadRuleSets();
+      await loadGeoDataStatus();
     } finally {
       btn.disabled = false;
-      btn.textContent = t('ruleset.updateAll');
+      btn.textContent = t('settings.updateGeo');
+      if (prog) setTimeout(() => prog.classList.add('hidden'), 1500);
     }
-  });
+  }
 
-  // ---------- Custom rule-sets ----------
-  async function loadCustomRuleSets() {
-    try {
-      renderCustomRuleSets(await api.listCustomRuleSets());
-    } catch (e) {
-      /* ignore */
-    }
+  const geoManageBtn = $('#geoManageBtn');
+  if (geoManageBtn) {
+    geoManageBtn.addEventListener('click', async () => {
+      $('#geoModal').classList.remove('hidden');
+      await loadGeoDataStatus();
+    });
+  }
+  const geoDataCloseBtn = $('#geoDataCloseBtn');
+  if (geoDataCloseBtn) geoDataCloseBtn.addEventListener('click', () => $('#geoModal').classList.add('hidden'));
+  const geoModal = $('#geoModal');
+  if (geoModal) {
+    geoModal.addEventListener('click', (e) => {
+      if (e.target.id === 'geoModal') geoModal.classList.add('hidden');
+    });
+  }
+  const geoDataUpdateBtn = $('#geoDataUpdateBtn');
+  if (geoDataUpdateBtn) geoDataUpdateBtn.addEventListener('click', () => updateGeoData(geoDataUpdateBtn));
+
+  // ---------- Remote rules ----------
+  let customRuleSetsReady = false;
+  let customRuleSetsLoading = null;
+  async function loadCustomRuleSets(options = {}) {
+    if (options.force === false && customRuleSetsReady) return;
+    if (customRuleSetsLoading) return customRuleSetsLoading;
+    customRuleSetsLoading = (async () => {
+      try {
+        renderCustomRuleSets(await api.listCustomRuleSets());
+        customRuleSetsReady = true;
+      } catch (e) {
+        /* ignore */
+      } finally {
+        customRuleSetsLoading = null;
+      }
+    })();
+    return customRuleSetsLoading;
   }
   function renderCustomRuleSets(items) {
     const list = $('#crsList');
@@ -81,7 +114,7 @@
       return;
     }
     const tgt = { proxy: t('customrs.targetProxy'), direct: t('customrs.targetDirect'), reject: t('customrs.targetReject') };
-    const fmt = { clash: 'Clash', surge: 'Surge', loon: 'Loon', quantumultx: 'QuantumultX', 'sing-box': 'sing-box' };
+    const fmt = { clash: 'Clash', 'sing-box': 'sing-box' };
     for (const it of items) {
       const cnt = it.kind === 'ruleset' ? t('customrs.srs') : t('customrs.rules', it.count || 0);
       const au = parseInt(it.autoUpdateMinutes || 0, 10);
@@ -119,6 +152,7 @@
             await call(api.editCustomRuleSet, { id, enabled: !(it && it.enabled) });
           }
           await loadCustomRuleSets();
+          if (App.state.status && App.state.status.running) App.loadRules();
         } finally {
           b.disabled = false;
         }
@@ -132,7 +166,6 @@
     editingCrsId = it.id;
     $('#crsEditName').value = it.name || '';
     $('#crsEditUrl').value = it.url || '';
-    $('#crsEditFormat').value = it.format;
     $('#crsEditTarget').value = it.target;
     $('#crsEditAutoUpdate').value = String(it.autoUpdateMinutes || 0);
     $('#crsEditEnabled').checked = it.enabled !== false;
@@ -158,12 +191,12 @@
       await call(api.addCustomRuleSet, {
         name: $('#crsName').value.trim(),
         url,
-        format: $('#crsFormat').value,
         target: $('#crsTarget').value,
       });
       toast(t('customrs.added'));
       resetCrsForm();
       await loadCustomRuleSets();
+      if (App.state.status && App.state.status.running) App.loadRules();
     } finally {
       btn.disabled = false;
       btn.textContent = t('customrs.add');
@@ -186,7 +219,6 @@
         id: editingCrsId,
         name: $('#crsEditName').value.trim(),
         url,
-        format: $('#crsEditFormat').value,
         target: $('#crsEditTarget').value,
         autoUpdateMinutes: parseInt($('#crsEditAutoUpdate').value, 10) || 0,
         enabled: $('#crsEditEnabled').checked,
@@ -194,6 +226,7 @@
       toast(t('settings.saved'));
       closeCrsModal();
       await loadCustomRuleSets();
+      if (App.state.status && App.state.status.running) App.loadRules();
     } finally {
       btn.disabled = false;
     }
@@ -207,12 +240,20 @@
       await call(api.refreshCustomRuleSet, { id: editingCrsId });
       toast(t('customrs.added'));
       await loadCustomRuleSets();
+      if (App.state.status && App.state.status.running) App.loadRules();
     } finally {
       btn.disabled = false;
       btn.textContent = t('customrs.refresh');
     }
   });
 
-  App.loadRuleSets = loadRuleSets;
+  App.loadGeoDataStatus = loadGeoDataStatus;
+  App.loadRuleSets = loadGeoDataStatus;
   App.loadCustomRuleSets = loadCustomRuleSets;
+  App.ensureCustomRuleSetsLoaded = () => loadCustomRuleSets({ force: false });
+  const invalidateRuleCaches = App.invalidateRuleCaches;
+  App.invalidateRuleCaches = () => {
+    customRuleSetsReady = false;
+    if (invalidateRuleCaches) invalidateRuleCaches();
+  };
 })();

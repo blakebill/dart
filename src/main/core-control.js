@@ -184,6 +184,7 @@ function buildCurrentConfig() {
   // rules and custom rule-sets are what actually steer routing.
   const clashRules = settings.useBuiltinRules ? [] : allRules;
   const { extraRules, extraRuleSets } = collectCustomRules();
+  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.ensureMihomoGeoData() : false;
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
   const commonOpts = {
@@ -206,7 +207,7 @@ function buildCurrentConfig() {
     extraRuleSets,
   };
   const config = settings.coreType === 'mihomo'
-    ? buildMihomoConfig(allNodes, commonOpts)
+    ? buildMihomoConfig(allNodes, { ...commonOpts, hasGeoData: mihomoGeoReady })
     : buildSingboxConfig(allNodes, {
         ...commonOpts,
         externalUiDir: ui.dir.replace(/\\/g, '/'),
@@ -298,7 +299,8 @@ function maybeFetchGeodata() {
 }
 
 function geoDataReady() {
-  if (state.singbox.getCoreType() !== 'mihomo') return !!state.singbox.resolveRuleSetDir();
+  if (state.singbox.getCoreType() !== 'mihomo') return state.singbox.ensureSingBoxGeoData();
+  state.singbox.ensureMihomoGeoData();
   const dirs = [
     state.singbox.coreDir('mihomo'),
     runtimeDir, // legacy fallback
@@ -321,21 +323,7 @@ function geoBinDir() {
 let geoBaseEnsured = false;
 function ensureGeoBaseWritable() {
   if (geoBaseEnsured) return;
-  const dir = geoBinDir();
-  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
-  for (const file of ['geoip-cn.srs', 'geosite-cn.srs']) {
-    const dest = path.join(dir, file);
-    if (state.singbox._validSrs(dest)) continue;
-    try {
-      for (const resourceDir of state.singbox.resourceDirs('sing-box')) {
-        const src = path.join(resourceDir, file);
-        if (state.singbox._validSrs(src)) {
-          fs.copyFileSync(src, dest);
-          break;
-        }
-      }
-    } catch (_) { /* best-effort */ }
-  }
+  state.singbox.ensureSingBoxGeoData();
   geoBaseEnsured = true;
 }
 

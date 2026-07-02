@@ -43,6 +43,56 @@ function mihomoGeoDataUrls(file) {
   ];
 }
 
+function looksLikeTextError(buf) {
+  const head = buf.slice(0, Math.min(buf.length, 256)).toString('utf-8').trimStart().toLowerCase();
+  return (
+    head.startsWith('<!doctype') ||
+    head.startsWith('<html') ||
+    head.startsWith('{') ||
+    head.startsWith('[') ||
+    head.startsWith('not found') ||
+    head.startsWith('invalid')
+  );
+}
+
+function sampleIsOneByte(buf) {
+  if (!buf.length) return true;
+  const first = buf[0];
+  const step = Math.max(1, Math.floor(buf.length / 64));
+  for (let i = 0; i < buf.length; i += step) {
+    if (buf[i] !== first) return false;
+  }
+  return true;
+}
+
+function validMihomoGeoFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return false;
+    const st = fs.statSync(filePath);
+    if (st.size < 1024) return false;
+    const fd = fs.openSync(filePath, 'r');
+    const head = Buffer.alloc(Math.min(st.size, 4096));
+    fs.readSync(fd, head, 0, head.length, 0);
+    const tailSize = Math.min(st.size, 65536);
+    const tail = Buffer.alloc(tailSize);
+    fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
+    fs.closeSync(fd);
+
+    if (head.slice(0, 3).toString('latin1') === 'SRS') return false;
+    if (head[0] === 0x1f && head[1] === 0x8b) return false; // gzip error/archive
+    if (head[0] === 0x50 && head[1] === 0x4b) return false; // zip/archive
+    if (looksLikeTextError(head)) return false;
+    if (sampleIsOneByte(head)) return false;
+
+    if (path.basename(filePath).toLowerCase() === 'country.mmdb') {
+      return tail.includes(Buffer.from('MaxMind.com'));
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
  * Proxy core process manager
  *
@@ -167,6 +217,7 @@ class SingBoxManager {
    * in which case the converter falls back to remote rule-sets.
    */
   resolveRuleSetDir() {
+    this.ensureSingBoxGeoData();
     const dirs = [
       this.coreDir('sing-box'),
       path.join(this.runtimeDir, 'bin'), // legacy fallback
@@ -240,11 +291,71 @@ class SingBoxManager {
   }
 
   _validGeoFile(p) {
-    try {
-      return fs.existsSync(p) && fs.statSync(p).size > 1024;
-    } catch (_) {
-      return false;
+    return validMihomoGeoFile(p);
+  }
+
+  ensureSingBoxGeoData() {
+    const dir = this.ensureCoreDir('sing-box');
+    const sources = [
+      ...this.resourceDirs('sing-box'),
+      path.join(this.runtimeDir, 'bin'),
+      this.resourcesDir,
+    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
+    let ready = true;
+    for (const file of ['geoip-cn.srs', 'geosite-cn.srs']) {
+      const dest = path.join(dir, file);
+      if (this._validSrs(dest)) continue;
+      ready = false;
+      if (fs.existsSync(dest)) {
+        try {
+          fs.unlinkSync(dest);
+          this.onLog('[gui] removed invalid sing-box geodata: ' + dest);
+        } catch (_) {}
+      }
+      for (const srcDir of sources) {
+        const src = path.join(srcDir, file);
+        if (!this._validSrs(src)) continue;
+        try {
+          fs.copyFileSync(src, dest);
+          ready = true;
+          this.onLog('[gui] restored sing-box geodata from bundled file: ' + file);
+          break;
+        } catch (_) {}
+      }
     }
+    return ready && ['geoip-cn.srs', 'geosite-cn.srs'].every((file) => this._validSrs(path.join(dir, file)));
+  }
+
+  ensureMihomoGeoData() {
+    const dir = this.ensureCoreDir('mihomo');
+    const sources = [
+      ...this.resourceDirs('mihomo'),
+      this.runtimeDir,
+      this.resourcesDir,
+    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
+    let ready = true;
+    for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
+      const dest = path.join(dir, file);
+      if (this._validGeoFile(dest)) continue;
+      ready = false;
+      if (fs.existsSync(dest)) {
+        try {
+          fs.unlinkSync(dest);
+          this.onLog('[gui] removed invalid mihomo geodata: ' + dest);
+        } catch (_) {}
+      }
+      for (const srcDir of sources) {
+        const src = path.join(srcDir, file);
+        if (!this._validGeoFile(src)) continue;
+        try {
+          fs.copyFileSync(src, dest);
+          ready = true;
+          this.onLog('[gui] restored mihomo geodata from bundled file: ' + file);
+          break;
+        } catch (_) {}
+      }
+    }
+    return ready && ['geoip.dat', 'geosite.dat', 'country.mmdb'].every((file) => this._validGeoFile(path.join(dir, file)));
   }
 
   isRunning() {

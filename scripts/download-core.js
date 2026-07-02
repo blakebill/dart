@@ -191,7 +191,36 @@ function validSrs(file) {
 
 function validGeo(file) {
   try {
-    return fs.existsSync(file) && fs.statSync(file).size > 1024;
+    if (!fs.existsSync(file)) return false;
+    const st = fs.statSync(file);
+    if (st.size < 1024) return false;
+    const fd = fs.openSync(file, 'r');
+    const head = Buffer.alloc(Math.min(st.size, 4096));
+    fs.readSync(fd, head, 0, head.length, 0);
+    const tailSize = Math.min(st.size, 65536);
+    const tail = Buffer.alloc(tailSize);
+    fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
+    fs.closeSync(fd);
+    const text = head.slice(0, Math.min(head.length, 256)).toString('utf-8').trimStart().toLowerCase();
+    if (
+      head.slice(0, 3).toString('latin1') === 'SRS' ||
+      (head[0] === 0x1f && head[1] === 0x8b) ||
+      (head[0] === 0x50 && head[1] === 0x4b) ||
+      text.startsWith('<!doctype') ||
+      text.startsWith('<html') ||
+      text.startsWith('{') ||
+      text.startsWith('[') ||
+      text.startsWith('not found') ||
+      text.startsWith('invalid')
+    ) {
+      return false;
+    }
+    const first = head[0];
+    if (head.every((b) => b === first)) return false;
+    if (path.basename(file).toLowerCase() === 'country.mmdb') {
+      return tail.includes(Buffer.from('MaxMind.com'));
+    }
+    return true;
   } catch (_) {
     return false;
   }

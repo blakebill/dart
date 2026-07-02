@@ -256,6 +256,17 @@ test('full config for Mihomo keeps Clash semantics', () => {
   assert.strictEqual(cfg.rules[cfg.rules.length - 1], 'MATCH,🚀 Proxy');
 });
 
+test('Mihomo fallback skips GEOIP when GeoData is unavailable', () => {
+  const cfg = buildMihomoConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {
+    clashRules: ['GEOIP,CN,DIRECT', 'GEOSITE,category-ads-all,REJECT', 'DOMAIN-SUFFIX,openai.com,PROXY'],
+    hasGeoData: false,
+  });
+  assert.ok(!cfg.rules.includes('GEOIP,CN,DIRECT'));
+  assert.ok(!cfg.rules.includes('GEOSITE,category-ads-all,REJECT'));
+  assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
+  assert.ok(cfg.rules.includes('MATCH,🚀 Proxy'));
+});
+
 console.log('\nAuto format detection:');
 
 test('parseSubscriptionContent detects Clash', () => {
@@ -479,6 +490,9 @@ test('without geodata, the route never references an undefined rule-set', () => 
   // core boots instead of fatally failing to fetch a remote rule-set.
   const opts = {
     ruleSetDir: null,
+    // Defensive case: even if a caller accidentally says the geo tags are
+    // available, no local rule_set may be emitted without a real directory.
+    geoAvailable: new Set(['geoip-cn', 'geosite-cn']),
     // A GEOIP,CN rule would normally convert to a geoip-cn reference.
     clashRules: ['GEOIP,CN,DIRECT', 'DOMAIN-SUFFIX,openai.com,PROXY'],
   };

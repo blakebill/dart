@@ -562,6 +562,7 @@ function defaultGeoAvailable(hasGeo) {
 
 /** Resolve a geoAvailable argument: an explicit Set wins, else the default. */
 function resolveGeoAvailable(geoAvailable, hasGeo) {
+  if (!hasGeo) return new Set();
   return geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
 }
 
@@ -1050,6 +1051,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     ruleProviders = {},
     enableIpv6 = true,
     extraRules = [],
+    hasGeoData = true,
   } = opts;
 
   const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
@@ -1069,6 +1071,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     for (const r of extraRules) rules.push(...singboxRuleToClashRules(r));
     for (const raw of clashRules || []) {
       const rule = clashRuleToMihomo(raw, ruleOverrides);
+      if (!hasGeoData && /^(GEOIP|GEOSITE),/i.test(rule || '')) continue;
       if (rule) rules.push(rule);
     }
     if (!rules.length) {
@@ -1077,7 +1080,7 @@ function buildMihomoConfig(nodes, opts = {}) {
         'IP-CIDR,10.0.0.0/8,DIRECT',
         'IP-CIDR,172.16.0.0/12,DIRECT',
         'IP-CIDR,192.168.0.0/16,DIRECT',
-        'GEOIP,CN,DIRECT'
+        ...(hasGeoData ? ['GEOIP,CN,DIRECT'] : [])
       );
     }
     rules.push('MATCH,🚀 Proxy');

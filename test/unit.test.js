@@ -264,10 +264,12 @@ test('selected cores use independent runtime folders', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
   const { SingBoxManager } = require('../src/main/singbox');
   const ext = process.platform === 'win32' ? '.exe' : '';
+  const fakeDat = Buffer.alloc(2048);
+  for (let i = 0; i < fakeDat.length; i++) fakeDat[i] = (i * 31) & 0xff;
   fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'bin', 'sing-box' + ext), 'legacy-singbox');
   fs.writeFileSync(path.join(dir, 'bin', 'mihomo' + ext), 'legacy-mihomo');
-  fs.writeFileSync(path.join(dir, 'geoip.dat'), Buffer.alloc(2048, 1));
+  fs.writeFileSync(path.join(dir, 'geoip.dat'), fakeDat);
   const mgr = new SingBoxManager({ runtimeDir: dir });
 
   assert.strictEqual(mgr.coreDir('sing-box'), path.join(dir, 'singbox'));
@@ -281,6 +283,28 @@ test('selected cores use independent runtime folders', () => {
   mgr.setCoreType('mihomo');
   assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'mihomo', 'mihomo' + ext));
   assert.strictEqual(mgr.configPath, path.join(dir, 'mihomo', 'config.yaml'));
+});
+
+test('sing-box geodata self-heals invalid writable rule-sets from bundled files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
+  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
+  const bundled = path.join(resources, 'singbox');
+  const writable = path.join(dir, 'singbox');
+  const srs = Buffer.concat([Buffer.from('SRS'), Buffer.alloc(16, 1)]);
+  fs.mkdirSync(bundled, { recursive: true });
+  fs.mkdirSync(writable, { recursive: true });
+  fs.writeFileSync(path.join(bundled, 'geoip-cn.srs'), srs);
+  fs.writeFileSync(path.join(bundled, 'geosite-cn.srs'), srs);
+  fs.writeFileSync(path.join(writable, 'geoip-cn.srs'), Buffer.from('<html>blocked</html>'));
+  fs.writeFileSync(path.join(writable, 'geosite-cn.srs'), Buffer.alloc(1));
+
+  const { SingBoxManager } = require('../src/main/singbox');
+  const mgr = new SingBoxManager({ runtimeDir: dir, resourcesDir: resources });
+
+  assert.strictEqual(mgr.ensureSingBoxGeoData(), true);
+  assert.strictEqual(mgr.resolveRuleSetDir(), writable);
+  assert.ok(mgr._validSrs(path.join(writable, 'geoip-cn.srs')), 'geoip-cn.srs was not restored');
+  assert.ok(mgr._validSrs(path.join(writable, 'geosite-cn.srs')), 'geosite-cn.srs was not restored');
 });
 
 console.log(`\nDone, ${passed} tests passed.`);

@@ -16,6 +16,10 @@ on:
         description: 'sing-box core version to bundle (empty = latest)'
         required: false
         default: ''
+      mihomo_version:
+        description: 'mihomo core version to bundle (empty = latest)'
+        required: false
+        default: ''
       tag:
         description: 'Release tag to publish'
         required: false
@@ -104,9 +108,10 @@ jobs:
           echo "Setting package.json version to $VERSION (from tag $TAG)"
           node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n');" "$VERSION"
 
-      - name: Download sing-box core
+      - name: Download bundled cores and GeoData
         env:
           SINGBOX_VERSION: ${{ github.event.inputs.singbox_version }}
+          MIHOMO_VERSION: ${{ github.event.inputs.mihomo_version }}
           SINGBOX_OS: windows
           SINGBOX_ARCH: amd64
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

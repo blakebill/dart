@@ -2,6 +2,7 @@
 
 const clashParser = require('./parsers/clash');
 const linkParser = require('./parsers/share-link');
+const singboxParser = require('./parsers/singbox');
 const fetch = require('./fetch');
 
 /** Parse the airport traffic info header `subscription-userinfo`. */
@@ -16,6 +17,19 @@ function parseUserInfo(headers) {
   return info;
 }
 
+/** Decode a base64 body to text if it plausibly is base64, else return null. */
+function maybeBase64Decode(text) {
+  // A JSON/YAML body contains characters base64 never does; skip those fast.
+  if (/[{}\s:"']/.test(text)) return null;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(text)) return null;
+  try {
+    const decoded = Buffer.from(text, 'base64').toString('utf-8');
+    return decoded && /[ -~]/.test(decoded) ? decoded.trim() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 /**
  * Auto-detect the content format and parse it into a unified array of node objects.
  * Prefer Clash YAML (with conversion), then fall back to share links / base64 subscription.
@@ -23,6 +37,16 @@ function parseUserInfo(headers) {
 function parseSubscriptionContent(content) {
   const text = String(content || '').trim();
   if (!text) return { nodes: [], groups: [], format: 'empty' };
+
+  // sing-box JSON config (a sing-box client must accept its own format). Try the
+  // raw text, then a base64-decoded copy (some airports base64 the whole body).
+  for (const candidate of [text, maybeBase64Decode(text)]) {
+    if (!candidate || (candidate[0] !== '{' && candidate[0] !== '[')) continue;
+    const r = singboxParser.parseSingboxConfig(candidate);
+    if (r.isSingbox && r.nodes.length) {
+      return { nodes: r.nodes, groups: [], rules: [], format: 'singbox' };
+    }
+  }
 
   // Clash YAML first. The cheap "proxies:" check gates the YAML load, and the
   // parse result is reused for detection + conversion (one parse, not two).

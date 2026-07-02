@@ -7,6 +7,8 @@ dist/
 # sing-box core binary (downloaded at runtime or placed manually)
 bin/sing-box.exe
 bin/sing-box
+bin/singbox/
+bin/mihomo/
 
 # user data generated at runtime
 runtime/
@@ -19,3 +21,6 @@ bin/*.dll
 bin/*.so
 bin/*.dylib
 bin/*.srs
+bin/*.dat
+bin/*.mmdb
+bin/geodata-meta.json

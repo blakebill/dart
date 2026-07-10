@@ -26,11 +26,11 @@ const fetch = require('./fetch');
 // tests) instead of opening a fresh TCP connection each time.
 const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
 
-// Locally served control panel: sing-box hosts zashboard at
+// Locally served control panel: the active core hosts zashboard at
 // http://127.0.0.1:<api-port>/ui/ — the same origin as the Clash API. That
 // sidesteps every remote-panel failure mode at once: mixed content, CORS,
 // and Chrome blocking public-site requests to 127.0.0.1 ("failed to fetch").
-// The core downloads the UI zip on first start through its own proxy outbound.
+// Both core configs use Zashboard's latest-release URL for the first download.
 const PANEL_UI_URL = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip';
 
 /** The control panel served at /ui: { dir, downloadUrl }. */
@@ -119,6 +119,15 @@ function splitInlineRule(rule) {
   return fields.map((f) => ({ [f]: rule[f].slice(), ...target }));
 }
 
+/** Stable, traversal-safe file name for a stored custom rule-set id. */
+function customRuleSetFileName(id) {
+  const raw = String(id || '');
+  const safe = /^[A-Za-z0-9_-]{1,128}$/.test(raw)
+    ? raw
+    : crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
+  return `custom-${safe}.srs`;
+}
+
 /**
  * Build extraRules/extraRuleSets from the user's local rules + pre-processed
  * custom rule-sets. Local rules come first (most specific user intent).
@@ -137,7 +146,7 @@ function collectCustomRules() {
       if (Array.isArray(c.rules) && c.rules.length) extraRules.push(...c.rules);
       else if (c.rule) extraRules.push(...splitInlineRule(c.rule));
     } else if (c.kind === 'ruleset') {
-      const p = path.join(state.singbox.coreDir('sing-box'), 'custom-' + c.id + '.srs');
+      const p = path.join(state.singbox.coreDir('sing-box'), customRuleSetFileName(c.id));
       if (state.singbox._validSrs(p)) {
         const tag = 'custom-' + c.id;
         extraRuleSets.push({ type: 'local', tag, format: 'binary', path: p.replace(/\\/g, '/') });
@@ -153,12 +162,17 @@ async function processCustomRuleSet(c) {
   const proxyPort = currentProxyPort();
   const format = normalizeCustomRuleSetFormat(c.format, c.url);
   if (format === 'sing-box') {
-    const dest = path.join(state.singbox.ensureCoreDir('sing-box'), 'custom-' + c.id + '.srs');
+    const dest = path.join(state.singbox.ensureCoreDir('sing-box'), customRuleSetFileName(c.id));
+    const tmp = dest + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
     if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
-    await fetch.downloadWithFallback(c.url, dest, { proxyPort });
-    if (!state.singbox._validSrs(dest)) {
-      try { fs.unlinkSync(dest); } catch (_) {}
-      throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
+    try {
+      await fetch.downloadWithFallback(c.url, tmp, { proxyPort });
+      if (!state.singbox._validSrs(tmp)) {
+        throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
+      }
+      fs.renameSync(tmp, dest);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
     }
     return { ...c, format, kind: 'ruleset', count: null, error: null, updatedAt: Date.now() };
   }
@@ -207,7 +221,12 @@ function buildCurrentConfig() {
     extraRuleSets,
   };
   const config = settings.coreType === 'mihomo'
-    ? buildMihomoConfig(allNodes, { ...commonOpts, hasGeoData: mihomoGeoReady })
+    ? buildMihomoConfig(allNodes, {
+        ...commonOpts,
+        hasGeoData: mihomoGeoReady,
+        externalUiDir: ui.dir.replace(/\\/g, '/'),
+        externalUiDownloadUrl: ui.downloadUrl,
+      })
     : buildSingboxConfig(allNodes, {
         ...commonOpts,
         externalUiDir: ui.dir.replace(/\\/g, '/'),
@@ -417,9 +436,12 @@ function loadRuleSetData(clashRules, providers) {
       const f = ruleProviderCacheFile(p.url);
       if (fs.existsSync(f)) {
         const m = JSON.parse(fs.readFileSync(f, 'utf-8'));
-        if (m && typeof m === 'object') data[name] = m;
+        if (m && typeof m === 'object' && !Array.isArray(m)) data[name] = m;
       }
-    } catch (_) { /* skip a corrupt cache entry */ }
+    } catch (_) {
+      // A corrupt cache must not permanently suppress its re-download.
+      try { fs.unlinkSync(ruleProviderCacheFile(p.url)); } catch (_) {}
+    }
   }
   return data;
 }
@@ -438,7 +460,14 @@ function maybeFetchRuleProviders(clashRules, providers) {
     if (!p || !/^https?:\/\//i.test(p.url || '')) continue;
     if ((p.format || '').toLowerCase() === 'mrs') continue;
     const f = ruleProviderCacheFile(p.url);
-    if (!fs.existsSync(f)) todo.push({ p, f });
+    let cached = false;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
+      cached = !!parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+    } catch (_) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
+    if (!cached) todo.push({ p, f });
   }
   runBackgroundFetch('rule-provider(s)', todo, async ({ p, f }) => {
     const { body } = await fetch.getBufferWithFallback(p.url, {
@@ -448,7 +477,13 @@ function maybeFetchRuleProviders(clashRules, providers) {
     const m = parseRuleList(body.toString('utf-8'));
     const total = Object.values(m).reduce((n, a) => n + a.length, 0);
     if (total === 0) return false;
-    fs.writeFileSync(f, JSON.stringify(m), 'utf-8');
+    const tmp = f + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(m), 'utf-8');
+      fs.renameSync(tmp, f);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
     return true;
   });
 }
@@ -471,10 +506,13 @@ async function stopCore(remember) {
     }
     state.systemProxyOn = false;
   }
-  await state.singbox.stop();
-  state.coreStopping = false;
-  if (remember) state.store.set('lastRunning', false);
-  sendStatus();
+  try {
+    await state.singbox.stop();
+    if (remember) state.store.set('lastRunning', false);
+  } finally {
+    state.coreStopping = false;
+    sendStatus();
+  }
 }
 
 /**
@@ -513,15 +551,22 @@ async function cleanup() {
 }
 
 /** Restart the core if it is running, so config changes (e.g. rules) apply. */
+let restartPromise = null;
 async function restartIfRunning() {
+  if (restartPromise) return restartPromise;
   if (!state.singbox.isRunning()) return;
-  try {
-    await stopCore();
-    await startCore();
-    sendLog('[gui] core restarted to apply changes');
-  } catch (e) {
-    sendLog('[gui] restart to apply changes failed: ' + e.message);
-  }
+  restartPromise = (async () => {
+    try {
+      await stopCore();
+      await startCore();
+      sendLog('[gui] core restarted to apply changes');
+    } catch (e) {
+      sendLog('[gui] restart to apply changes failed: ' + e.message);
+    } finally {
+      restartPromise = null;
+    }
+  })();
+  return restartPromise;
 }
 
 /**
@@ -632,10 +677,21 @@ async function setProxyMode(mode) {
 }
 
 /** Refresh subscriptions + custom rule-sets whose auto-update interval is due (one tick). */
+let autoUpdateRunning = false;
 async function autoUpdateTick() {
+  if (autoUpdateRunning) return;
+  autoUpdateRunning = true;
+  try {
+    await runAutoUpdateTick();
+  } finally {
+    autoUpdateRunning = false;
+  }
+}
+
+async function runAutoUpdateTick() {
   const subs = state.store.get('subscriptions') || [];
   let changed = false;
-  let activeNodesChanged = false;
+  let activeConfigChanged = false;
   for (const sub of subs) {
     const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
     if (mins > 0 && sub.url && Date.now() - (sub.updatedAt || 0) >= mins * 60000) {
@@ -643,15 +699,19 @@ async function autoUpdateTick() {
         const proxyPort = sub.updateViaProxy ? currentProxyPort() : 0;
         const r = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
         if (r.nodes.length) {
-          const nodesChanged = JSON.stringify(sub.nodes) !== JSON.stringify(r.nodes);
+          const configChanged =
+            JSON.stringify(sub.nodes || []) !== JSON.stringify(r.nodes || []) ||
+            JSON.stringify(sub.clashRules || []) !== JSON.stringify(r.rules || []) ||
+            JSON.stringify(sub.clashRuleProviders || {}) !== JSON.stringify(r.ruleProviders || {});
           sub.nodes = r.nodes;
           sub.format = r.format;
           sub.clashRules = r.rules || [];
+          sub.clashRuleProviders = r.ruleProviders || {};
           sub.raw = r.raw || sub.raw || '';
           sub.userInfo = r.userInfo || sub.userInfo;
           sub.updatedAt = Date.now();
           changed = true;
-          if (nodesChanged && sub.id === getActiveSubId()) activeNodesChanged = true;
+          if (configChanged && sub.id === getActiveSubId()) activeConfigChanged = true;
           sendLog('[gui] auto-updated config: ' + sub.name);
         }
       } catch (e) {
@@ -667,7 +727,7 @@ async function autoUpdateTick() {
     // The live profile's node list changed: restart so the core serves the
     // same outbounds the UI shows (custom rule-set auto-update already does
     // this; subscriptions must too, or selection/delay tests start failing).
-    if (activeNodesChanged) await restartIfRunning();
+    if (activeConfigChanged) await restartIfRunning();
   }
 
   // Custom rule-sets on a schedule: re-download + convert, then restart the
@@ -947,6 +1007,7 @@ module.exports = {
   activeSubData,
   buildLocalRuleObject,
   splitInlineRule,
+  customRuleSetFileName,
   collectCustomRules,
   processCustomRuleSet,
   detectCustomRuleSetFormat,

@@ -51,13 +51,70 @@ const VALID_CRS_FORMATS = ['clash', 'sing-box'];
 // Settings keys the renderer may write; anything else in a patch is dropped so
 // a malformed payload cannot pollute the persisted store.
 const SETTING_KEYS = new Set([
-  'mixedPort', 'clashApiPort', 'enableTun', 'enableClashApi', 'logLevel',
+  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
   'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'coreType',
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
+const CORE_CONFIG_SETTINGS = new Set([
+  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
+  'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
+  'ruleOverrides', 'coreType',
+]);
+
+function validateSettingsPatch(patch, current) {
+  for (const key of ['mixedPort', 'clashApiPort']) {
+    if (!(key in patch)) continue;
+    if (!Number.isInteger(patch[key]) || patch[key] < 1 || patch[key] > 65535) {
+      throw new Error(`invalid ${key}`);
+    }
+  }
+  for (const key of [
+    'enableClashApi', 'autoSetSystemProxy', 'autoLaunch', 'silentStart',
+    'notifications', 'enableIpv6', 'hardwareAcceleration', 'useBuiltinRules',
+  ]) {
+    if (key in patch && typeof patch[key] !== 'boolean') throw new Error(`invalid ${key}`);
+  }
+  if ('coreType' in patch) reqEnum(patch.coreType, ['sing-box', 'mihomo'], 'coreType');
+  if ('logLevel' in patch) reqEnum(patch.logLevel, ['trace', 'debug', 'info', 'warn', 'error'], 'logLevel');
+  if ('dnsStrategy' in patch) {
+    reqEnum(patch.dnsStrategy, ['prefer_ipv4', 'prefer_ipv6', 'ipv4_only', 'ipv6_only'], 'dnsStrategy');
+  }
+  if ('language' in patch) reqEnum(patch.language, ['zh', 'en'], 'language');
+  if ('theme' in patch) reqEnum(patch.theme, ['dark', 'light', 'system'], 'theme');
+  if ('clashMode' in patch) reqEnum(patch.clashMode, VALID_MODES, 'clashMode');
+  for (const key of ['dnsRemote', 'dnsLocal']) {
+    if (!(key in patch)) continue;
+    const value = reqStr(patch[key], key).trim();
+    const allowedScheme = /^(?:https|tls|quic|h3|http3|tcp|udp):\/\//i.test(value);
+    if (
+      /\s/.test(value) ||
+      (value.includes('://') && !allowedScheme) ||
+      !/^(?:(?:https|tls|quic|h3|http3|tcp|udp):\/\/)?[^/]+(?:\/\S*)?$/i.test(value)
+    ) {
+      throw new Error('invalid ' + key);
+    }
+    patch[key] = value;
+  }
+  if ('testUrl' in patch && patch.testUrl) reqUrl(patch.testUrl, 'testUrl');
+  if ('testConcurrency' in patch) {
+    if (!Number.isInteger(patch.testConcurrency) || patch.testConcurrency < 1 || patch.testConcurrency > 32) {
+      throw new Error('invalid testConcurrency');
+    }
+  }
+  if ('ruleOverrides' in patch) {
+    if (!patch.ruleOverrides || typeof patch.ruleOverrides !== 'object' || Array.isArray(patch.ruleOverrides)) {
+      throw new Error('invalid ruleOverrides');
+    }
+    for (const value of Object.values(patch.ruleOverrides)) reqEnum(value, VALID_TARGETS, 'ruleOverrides');
+  }
+  const next = { ...current, ...patch };
+  if (next.enableClashApi && next.mixedPort === next.clashApiPort) {
+    throw new Error('mixedPort and clashApiPort must be different');
+  }
+}
 
 /** Register every IPC handler. Called once during boot. */
 function registerIpc() {
@@ -124,7 +181,13 @@ function registerIpc() {
     if (!sub) throw new Error('config not found');
     const proxyPort = sub.updateViaProxy ? core.currentProxyPort() : 0;
     const result = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
-    const nodesChanged = JSON.stringify(sub.nodes) !== JSON.stringify(result.nodes);
+    if (!result.nodes.length) {
+      throw new Error('no nodes parsed (format: ' + result.format + ')');
+    }
+    const configChanged =
+      JSON.stringify(sub.nodes || []) !== JSON.stringify(result.nodes || []) ||
+      JSON.stringify(sub.clashRules || []) !== JSON.stringify(result.rules || []) ||
+      JSON.stringify(sub.clashRuleProviders || {}) !== JSON.stringify(result.ruleProviders || {});
     sub.nodes = result.nodes;
     sub.format = result.format;
     sub.clashRules = result.rules || [];
@@ -136,7 +199,7 @@ function registerIpc() {
     // Apply the active profile's new node list to a running core; otherwise
     // the Clash API keeps serving outbounds the UI no longer shows (delay
     // tests "time out", selecting a node fails with 400).
-    if (nodesChanged && id === core.getActiveSubId()) await core.restartIfRunning();
+    if (configChanged && id === core.getActiveSubId()) await core.restartIfRunning();
     return sub;
   });
 
@@ -295,14 +358,17 @@ function registerIpc() {
     patch = Object.fromEntries(
       Object.entries(patch && typeof patch === 'object' ? patch : {}).filter(([k]) => SETTING_KEYS.has(k))
     );
-    if (patch.coreType !== undefined) reqEnum(patch.coreType, ['sing-box', 'mihomo'], 'coreType');
+    const previous = state.store.getSettings();
+    validateSettingsPatch(patch, previous);
     const coreTypeChanged = Object.prototype.hasOwnProperty.call(patch, 'coreType') &&
-      patch.coreType !== (state.store.getSettings().coreType || 'sing-box');
+      patch.coreType !== (previous.coreType || 'sing-box');
+    const configChanged = [...CORE_CONFIG_SETTINGS].some(
+      (key) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== previous[key]
+    );
     const settings = state.store.updateSettings(patch);
     if (coreTypeChanged) {
       state.singbox.setCoreType(settings.coreType);
       sendStatus();
-      await core.restartIfRunning();
     }
     // The login item carries the --hidden flag when silent start is on, and on
     // Windows the auto-launch mechanism depends on whether TUN is on (elevated
@@ -311,18 +377,13 @@ function registerIpc() {
     // is acceptable here.
     if (
       Object.prototype.hasOwnProperty.call(patch, 'autoLaunch') ||
-      Object.prototype.hasOwnProperty.call(patch, 'silentStart') ||
-      Object.prototype.hasOwnProperty.call(patch, 'enableTun')
+      Object.prototype.hasOwnProperty.call(patch, 'silentStart')
     ) {
       core.applyAutoLaunch(settings.autoLaunch, settings.silentStart, { interactive: true });
     }
     // These change routing, so rebuild and restart the core (when running) for
     // them to take effect immediately.
-    if (
-      (Object.prototype.hasOwnProperty.call(patch, 'useBuiltinRules') ||
-        Object.prototype.hasOwnProperty.call(patch, 'ruleOverrides')) &&
-      state.singbox.isRunning()
-    ) {
+    if (configChanged && state.singbox.isRunning()) {
       await core.restartIfRunning();
     }
     return settings;
@@ -523,7 +584,11 @@ function registerIpc() {
     if (info.error) throw new Error(info.error);
     if (!info.hasUpdate) throw new Error('already up to date');
     if (!info.assetUrl || !info.assetName) throw new Error('no installer asset on the latest release');
-    const dest = path.join(app.getPath('temp'), info.assetName);
+    const assetName = path.basename(info.assetName);
+    if (assetName !== info.assetName || /[\\/]/.test(info.assetName)) {
+      throw new Error('invalid installer asset name');
+    }
+    const dest = path.join(app.getPath('temp'), assetName);
     sendLog('[gui] downloading update: ' + info.assetUrl + (proxyPort ? ' (via proxy)' : ' (direct — start the core to download via proxy)'));
     try {
       await fetch.downloadWithFallback(info.assetUrl, dest, {
@@ -611,8 +676,9 @@ function registerIpc() {
     let list = state.store.get('customRuleSets') || [];
     list = list.filter((x) => x.id !== id);
     state.store.set('customRuleSets', list);
-    try { fs.unlinkSync(path.join(state.singbox.coreDir('sing-box'), 'custom-' + id + '.srs')); } catch (_) {}
-    try { fs.unlinkSync(path.join(runtimeDir, 'bin', 'custom-' + id + '.srs')); } catch (_) {}
+    const file = core.customRuleSetFileName(id);
+    try { fs.unlinkSync(path.join(state.singbox.coreDir('sing-box'), file)); } catch (_) {}
+    try { fs.unlinkSync(path.join(runtimeDir, 'bin', file)); } catch (_) {}
     core.rescheduleAutoUpdate();
     await core.restartIfRunning();
     return true;
@@ -698,8 +764,13 @@ function registerIpc() {
   ipcMain.handle('tun:set', async (_e, { enable }) => {
     state.store.updateSettings({ enableTun: !!enable });
     if (enable && process.platform === 'win32' && !(await isWindowsAdmin())) {
-      if (await promptRestartForTun()) {
-        return { restarting: true, settings: state.store.getSettings() };
+      try {
+        if (await promptRestartForTun()) {
+          return { restarting: true, settings: state.store.getSettings() };
+        }
+      } catch (e) {
+        state.store.updateSettings({ enableTun: false });
+        throw e;
       }
       // Declined: revert the setting so the UI stays consistent.
       state.store.updateSettings({ enableTun: false });
@@ -748,6 +819,10 @@ function registerIpc() {
   // locked on Windows) and restarted afterwards.
   ipcMain.handle('core:download', async (_e, { version }) => {
     if (version !== undefined && typeof version !== 'string') throw new Error('invalid version');
+    version = String(version || '').trim();
+    if (version && !/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+      throw new Error('invalid version');
+    }
     const wasRunning = state.singbox.isRunning();
     let p;
     try {
@@ -807,6 +882,7 @@ function registerIpc() {
   ipcMain.handle('proxy:set', async (_e, { enable }) => {
     const settings = state.store.getSettings();
     if (enable) {
+      if (!state.singbox.isRunning()) throw new Error('start the core before enabling the system proxy');
       await proxy.enableSystemProxy('127.0.0.1', settings.mixedPort);
       state.systemProxyOn = true;
       core.startProxyGuard(settings.mixedPort);

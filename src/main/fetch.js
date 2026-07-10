@@ -6,6 +6,8 @@ const tls = require('tls');
 const fs = require('fs');
 const { URL } = require('url');
 
+const DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
 /**
  * HTTP(S) fetch helpers that can optionally tunnel through the local mixed
  * proxy (sing-box) via HTTP CONNECT. Used to download rule-sets: we try through
@@ -85,7 +87,7 @@ function openRequest(urlStr, opts, cb, errCb) {
 
 /** GET a URL into a Buffer (follows redirects). */
 function getBuffer(urlStr, opts = {}) {
-  const { redirects = 5 } = opts;
+  const { redirects = 5, maxBytes = DEFAULT_MAX_BUFFER_BYTES } = opts;
   return new Promise((resolve, reject) => {
     openRequest(
       urlStr,
@@ -101,10 +103,31 @@ function getBuffer(urlStr, opts = {}) {
           res.resume();
           return reject(new Error('HTTP ' + res.statusCode));
         }
+        const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+        if (maxBytes > 0 && contentLength > maxBytes) {
+          res.resume();
+          return reject(new Error(`response exceeds ${maxBytes} bytes`));
+        }
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve({ body: Buffer.concat(chunks), headers: res.headers, statusCode: res.statusCode }));
-        res.on('error', reject);
+        let received = 0;
+        let failed = false;
+        res.on('data', (c) => {
+          if (failed) return;
+          received += c.length;
+          if (maxBytes > 0 && received > maxBytes) {
+            failed = true;
+            res.destroy();
+            reject(new Error(`response exceeds ${maxBytes} bytes`));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          if (!failed) resolve({ body: Buffer.concat(chunks), headers: res.headers, statusCode: res.statusCode });
+        });
+        res.on('error', (e) => {
+          if (!failed) reject(e);
+        });
       },
       reject
     );
@@ -115,13 +138,15 @@ function getBuffer(urlStr, opts = {}) {
 function download(urlStr, dest, opts = {}) {
   const { onProgress = () => {}, redirects = 5 } = opts;
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
     let settled = false;
+    let file = null;
     const fail = (e) => {
       if (settled) return;
       settled = true;
-      file.close();
-      fs.unlink(dest, () => {});
+      if (file) {
+        file.destroy();
+        fs.unlink(dest, () => {});
+      }
       reject(e);
     };
     openRequest(
@@ -131,8 +156,6 @@ function download(urlStr, dest, opts = {}) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           settled = true;
           res.resume();
-          file.close();
-          fs.unlink(dest, () => {});
           return resolve(
             download(new URL(res.headers.location, urlStr).toString(), dest, { ...opts, redirects: redirects - 1 })
           );
@@ -141,6 +164,8 @@ function download(urlStr, dest, opts = {}) {
           res.resume();
           return fail(new Error('HTTP ' + res.statusCode));
         }
+        file = fs.createWriteStream(dest);
+        file.on('error', fail);
         const total = parseInt(res.headers['content-length'] || '0', 10);
         let received = 0;
         res.on('data', (c) => {

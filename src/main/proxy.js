@@ -23,12 +23,14 @@ const REG_PATH =
 async function enableSystemProxy(host, port) {
   if (process.platform !== 'win32') return false;
   const server = `${host}:${port}`;
-  await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 1 /f`);
+  const private172 = Array.from({ length: 16 }, (_, i) => `172.${16 + i}.*`).join(';');
+  // Write the complete configuration before flipping ProxyEnable. If either
+  // preparatory write fails, Windows keeps using its previous proxy state.
   await run(`reg add "${REG_PATH}" /v ProxyServer /t REG_SZ /d "${server}" /f`);
-  // Local addresses bypass the proxy
   await run(
-    `reg add "${REG_PATH}" /v ProxyOverride /t REG_SZ /d "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;192.168.*;<local>" /f`
+    `reg add "${REG_PATH}" /v ProxyOverride /t REG_SZ /d "localhost;127.*;10.*;${private172};192.168.*;169.254.*;<local>" /f`
   );
+  await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 1 /f`);
   await refreshSettings();
   return true;
 }

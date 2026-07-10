@@ -68,6 +68,40 @@ function safeDecodeURIComponent(str) {
   }
 }
 
+function splitHostPort(hostPart) {
+  const value = String(hostPart || '');
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']');
+    if (end < 0 || value[end + 1] !== ':') return null;
+    return { server: value.slice(1, end), port: parseInt(value.slice(end + 2), 10) };
+  }
+  const colon = value.lastIndexOf(':');
+  if (colon <= 0) return null;
+  return { server: value.slice(0, colon), port: parseInt(value.slice(colon + 1), 10) };
+}
+
+function parseSsPlugin(value) {
+  const parts = String(value || '').split(';').filter(Boolean);
+  if (!parts.length) return {};
+  const plugin = parts.shift();
+  const pluginOpts = {};
+  for (const part of parts) {
+    const idx = part.indexOf('=');
+    if (idx < 0) pluginOpts[part] = true;
+    else pluginOpts[part.slice(0, idx)] = part.slice(idx + 1);
+  }
+  if (plugin === 'obfs' || plugin === 'simple-obfs' || plugin === 'obfs-local') {
+    return {
+      plugin,
+      pluginOpts: {
+        mode: pluginOpts.obfs || pluginOpts.mode,
+        host: pluginOpts['obfs-host'] || pluginOpts.host,
+      },
+    };
+  }
+  return { plugin, pluginOpts };
+}
+
 /** vmess:// (base64 JSON format, the mainstream standard) */
 function parseVmess(uri) {
   const body = uri.slice('vmess://'.length);
@@ -216,23 +250,26 @@ function parseShadowsocks(uri) {
     const hostPart = rest.slice(atIdx + 1);
     const decoded = b64decode(userInfo) || safeDecodeURIComponent(userInfo);
     const colonIdx = decoded.indexOf(':');
+    if (colonIdx <= 0) return null;
     method = decoded.slice(0, colonIdx);
     password = decoded.slice(colonIdx + 1);
-    const lastColon = hostPart.lastIndexOf(':');
-    server = hostPart.slice(0, lastColon);
-    port = parseInt(hostPart.slice(lastColon + 1), 10);
+    const endpoint = splitHostPort(hostPart);
+    if (!endpoint) return null;
+    ({ server, port } = endpoint);
   } else {
     // Format 2: fully base64-encoded
     const decoded = b64decode(rest);
     const atIdx = decoded.lastIndexOf('@');
+    if (atIdx <= 0) return null;
     const cred = decoded.slice(0, atIdx);
     const hostPart = decoded.slice(atIdx + 1);
     const colonIdx = cred.indexOf(':');
+    if (colonIdx <= 0) return null;
     method = cred.slice(0, colonIdx);
     password = cred.slice(colonIdx + 1);
-    const lastColon = hostPart.lastIndexOf(':');
-    server = hostPart.slice(0, lastColon);
-    port = parseInt(hostPart.slice(lastColon + 1), 10);
+    const endpoint = splitHostPort(hostPart);
+    if (!endpoint) return null;
+    ({ server, port } = endpoint);
   }
 
   const node = {
@@ -247,7 +284,7 @@ function parseShadowsocks(uri) {
   // Plugin support (v2ray-plugin / obfs)
   const params = parseQuery(query);
   if (params.plugin) {
-    node.plugin = params.plugin;
+    Object.assign(node, parseSsPlugin(params.plugin));
   }
   return node;
 }

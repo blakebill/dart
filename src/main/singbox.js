@@ -314,8 +314,9 @@ class SingBoxManager {
   _mihomoGeoDataKey(dir, bin) {
     try {
       const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
+      const binStat = fs.statSync(bin);
       return [
-        bin,
+        `${bin}:${binStat.size}:${binStat.mtimeMs}`,
         ...files.map((file) => {
           const st = fs.statSync(path.join(dir, file));
           return `${file}:${st.size}:${st.mtimeMs}`;
@@ -323,6 +324,17 @@ class SingBoxManager {
       ].join('|');
     } catch (_) {
       return null;
+    }
+  }
+
+  _cacheMihomoGeoValidation(dir, key, ok) {
+    const file = path.join(dir, '.mihomo-geodata-validation.json');
+    const tmp = file + '.tmp';
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ key, ok }), 'utf-8');
+      fs.renameSync(tmp, file);
+    } catch (_) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
     }
   }
 
@@ -338,6 +350,16 @@ class SingBoxManager {
     if (key && this._mihomoGeoValidation && this._mihomoGeoValidation.key === key) {
       return this._mihomoGeoValidation.ok;
     }
+    const cacheFile = path.join(dir, '.mihomo-geodata-validation.json');
+    try {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+      if (cached && cached.key === key && typeof cached.ok === 'boolean') {
+        this._mihomoGeoValidation = { key, ok: cached.ok };
+        return cached.ok;
+      }
+    } catch (_) {
+      /* no reusable validation result */
+    }
 
     const testConfig = path.join(dir, `.mihomo-geodata-check-${process.pid}.yaml`);
     try {
@@ -348,12 +370,15 @@ class SingBoxManager {
         timeout: 10000,
         windowsHide: true,
       });
+      if (result.error) throw result.error;
+      if (typeof result.status !== 'number') throw new Error('mihomo validation process did not return an exit code');
       const ok = result.status === 0;
       if (!ok) {
         const msg = String(result.stderr || result.stdout || result.error || '').trim().split(/\r?\n/).slice(-3).join(' | ');
         this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules' + (msg ? ': ' + msg : ''));
       }
       this._mihomoGeoValidation = { key, ok };
+      this._cacheMihomoGeoValidation(dir, key, ok);
       return ok;
     } catch (e) {
       this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules: ' + e.message);
@@ -439,7 +464,13 @@ class SingBoxManager {
     const text = this.getCoreType() === 'mihomo'
       ? yaml.dump(config, { lineWidth: -1, noRefs: true })
       : JSON.stringify(config, null, 2);
-    fs.writeFileSync(this.configPath, text, 'utf-8');
+    const tmp = this.configPath + `.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    try {
+      fs.writeFileSync(tmp, text, 'utf-8');
+      fs.renameSync(tmp, this.configPath);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
     return this.configPath;
   }
 
@@ -454,12 +485,15 @@ class SingBoxManager {
         : ['check', '-c', this.configPath];
       const p = spawn(bin, args, {
         cwd: workDir,
+        env: this._coreEnv(),
       });
+      let out = '';
       let err = '';
+      p.stdout.on('data', (d) => (out += d.toString()));
       p.stderr.on('data', (d) => (err += d.toString()));
       p.on('close', (code) => {
         if (code === 0) resolve(true);
-        else reject(new Error('config validation failed: ' + err));
+        else reject(new Error('config validation failed: ' + (err || out).trim()));
       });
       p.on('error', reject);
     });
@@ -483,6 +517,7 @@ class SingBoxManager {
       : ['run', '-c', this.configPath, '-D', workDir];
     const proc = spawn(bin, args, {
       cwd: workDir,
+      env: this._coreEnv(),
     });
     this.proc = proc;
 
@@ -516,12 +551,23 @@ class SingBoxManager {
     return true;
   }
 
+  _coreEnv() {
+    if (this.getCoreType() !== 'mihomo') return process.env;
+    const uiRoot = path.join(this.runtimeDir, 'ui');
+    const safePaths = [process.env.SAFE_PATHS, uiRoot].filter(Boolean).join(path.delimiter);
+    return { ...process.env, SAFE_PATHS: safePaths };
+  }
+
   /** Stop the core. */
   async stop() {
     if (!this.proc) return;
     const proc = this.proc;
     return new Promise((resolve) => {
-      const done = () => resolve();
+      let timer = null;
+      const done = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
       proc.once('exit', done);
       try {
         if (process.platform === 'win32') {
@@ -534,7 +580,7 @@ class SingBoxManager {
         resolve();
       }
       // Timeout fallback
-      setTimeout(() => {
+      timer = setTimeout(() => {
         try {
           proc.kill('SIGKILL');
         } catch (_) {}
@@ -558,7 +604,10 @@ class SingBoxManager {
     const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
     const goos = plat === 'win32' ? 'windows' : plat === 'darwin' ? 'darwin' : 'linux';
 
-    let tag = version;
+    let tag = String(version || '').trim();
+    if (tag && !/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(tag)) {
+      throw new Error('invalid core version');
+    }
     let release = null;
     if (!tag) {
       const latest = await this._latestVersion(proxyPort);

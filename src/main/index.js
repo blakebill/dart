@@ -153,7 +153,15 @@ if (!gotLock) {
       onLog: sendLog,
       onExit: () => {
         stopTrafficStream();
-        sendStatus();
+        core.stopProxyGuard();
+        if (state.systemProxyOn) {
+          state.systemProxyOn = false;
+          proxy.disableSystemProxy()
+            .catch((e) => sendLog('[gui] failed to clear system proxy after core exit: ' + e.message))
+            .finally(sendStatus);
+        } else {
+          sendStatus();
+        }
         // Unexpected exit (not a stop/restart we triggered, not during quit):
         // alert the user — the proxy is now down, which is easy to miss when
         // the app is sitting in the tray.

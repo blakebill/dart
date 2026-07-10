@@ -2,6 +2,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+const PROFILE_FIELDS = ['nodes', 'clashRules', 'clashRuleProviders', 'raw'];
 
 /**
  * Minimal JSON persistence store (a zero-dependency replacement for electron-store).
@@ -48,13 +51,34 @@ class Store {
   constructor(dir, name = 'config.json') {
     this.dir = dir;
     this.file = path.join(dir, name);
+    this.profileDir = path.join(dir, 'profiles');
+    this._profileSerialized = new Map();
+    this._persistedSubscriptions = null;
+    this._needsProfileMigration = false;
+    this._profileStorageEnabled = true;
     this.data = this._load();
+    const subscriptions = Array.isArray(this.data.subscriptions) ? this.data.subscriptions : [];
+    this.data.subscriptions = subscriptions;
+    this._persistedSubscriptions = subscriptions.map((sub) => this._subscriptionMetadata(sub));
+    if (this._needsProfileMigration) {
+      try {
+        this.save('subscriptions');
+      } catch (_) {
+        // Keep the legacy single-file format for this run if migration cannot
+        // be completed. The original config remains untouched.
+        this._profileStorageEnabled = false;
+      }
+    }
   }
 
   _load() {
     try {
       if (fs.existsSync(this.file)) {
-        return JSON.parse(fs.readFileSync(this.file, 'utf-8'));
+        const data = JSON.parse(fs.readFileSync(this.file, 'utf-8'));
+        if (Array.isArray(data.subscriptions)) {
+          data.subscriptions = data.subscriptions.map((sub) => this._hydrateSubscription(sub));
+        }
+        return data;
       }
     } catch (e) {
       // Back up and reset if the file is corrupted
@@ -78,15 +102,123 @@ class Store {
     };
   }
 
-  save() {
+  _profileFileName(id) {
+    const raw = String(id || 'profile');
+    const safe = /^[A-Za-z0-9_-]{1,128}$/.test(raw)
+      ? raw
+      : crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
+    return safe + '.json';
+  }
+
+  _profilePayload(sub) {
+    const payload = {};
+    for (const key of PROFILE_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(sub, key)) payload[key] = sub[key];
+    }
+    return payload;
+  }
+
+  _subscriptionMetadata(sub) {
+    const metadata = {};
+    for (const [key, value] of Object.entries(sub || {})) {
+      if (!PROFILE_FIELDS.includes(key) && key !== 'dataFile') metadata[key] = value;
+    }
+    metadata.dataFile = this._profileFileName(metadata.id);
+    return metadata;
+  }
+
+  _readProfile(fileName) {
+    const expected = path.join(this.profileDir, fileName);
+    for (const file of [expected, expected + '.bak']) {
+      try {
+        const text = fs.readFileSync(file, 'utf-8');
+        const payload = JSON.parse(text);
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
+        this._profileSerialized.set(fileName, JSON.stringify(payload));
+        return payload;
+      } catch (_) {
+        /* try the backup */
+      }
+    }
+    return {};
+  }
+
+  _hydrateSubscription(sub) {
+    if (!sub || typeof sub !== 'object') return sub;
+    if (!sub.dataFile) {
+      this._needsProfileMigration = true;
+      return sub;
+    }
+    const expected = this._profileFileName(sub.id);
+    if (sub.dataFile !== expected) {
+      this._needsProfileMigration = true;
+      return { ...sub, dataFile: undefined };
+    }
+    const { dataFile, ...metadata } = sub;
+    return { ...metadata, ...this._readProfile(dataFile) };
+  }
+
+  _writeAtomic(file, text, keepBackup = false) {
+    const tmp = file + `.tmp-${process.pid}`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    try {
+      fs.writeFileSync(tmp, text, 'utf-8');
+      if (keepBackup && fs.existsSync(file)) fs.copyFileSync(file, file + '.bak');
+      fs.renameSync(tmp, file);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
+  }
+
+  _syncProfiles() {
+    const subscriptions = Array.isArray(this.data.subscriptions) ? this.data.subscriptions : [];
+    const activeFiles = new Set();
+    const metadata = [];
+    for (const sub of subscriptions) {
+      const meta = this._subscriptionMetadata(sub);
+      const fileName = meta.dataFile;
+      const payloadText = JSON.stringify(this._profilePayload(sub));
+      activeFiles.add(fileName);
+      metadata.push(meta);
+      if (this._profileSerialized.get(fileName) !== payloadText) {
+        this._writeAtomic(path.join(this.profileDir, fileName), payloadText, true);
+        this._profileSerialized.set(fileName, payloadText);
+      }
+    }
+    this._persistedSubscriptions = metadata;
+    this._pendingProfileCleanup = activeFiles;
+  }
+
+  _cleanupProfiles(activeFiles) {
+    if (!activeFiles) return;
+    try {
+      for (const name of fs.readdirSync(this.profileDir)) {
+        const base = name.endsWith('.bak') ? name.slice(0, -4) : name;
+        if (/^[A-Za-z0-9_-]+\.json$/.test(base) && !activeFiles.has(base)) {
+          fs.unlinkSync(path.join(this.profileDir, name));
+          this._profileSerialized.delete(base);
+        }
+      }
+    } catch (_) {
+      /* profile dir may not exist yet */
+    }
+  }
+
+  save(changedKey = null) {
     if (!fs.existsSync(this.dir)) {
       fs.mkdirSync(this.dir, { recursive: true });
     }
+    if (!this._profileStorageEnabled) {
+      this._writeAtomic(this.file, JSON.stringify(this.data, null, 2));
+      return;
+    }
+    if (changedKey === 'subscriptions' || !this._persistedSubscriptions) this._syncProfiles();
+    const persisted = { ...this.data, subscriptions: this._persistedSubscriptions || [] };
     // Atomic write: a crash/power-cut mid-write must never truncate the only
     // copy of the user's subscriptions. Write a temp file, then rename over.
-    const tmp = this.file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf-8');
-    fs.renameSync(tmp, this.file);
+    this._writeAtomic(this.file, JSON.stringify(persisted, null, 2));
+    this._cleanupProfiles(this._pendingProfileCleanup);
+    this._pendingProfileCleanup = null;
   }
 
   get(key) {
@@ -95,7 +227,7 @@ class Store {
 
   set(key, value) {
     this.data[key] = value;
-    this.save();
+    this.save(key);
   }
 
   getSettings() {
@@ -104,7 +236,7 @@ class Store {
 
   updateSettings(patch) {
     this.data.settings = { ...this.getSettings(), ...patch };
-    this.save();
+    this.save('settings');
     return this.data.settings;
   }
 }

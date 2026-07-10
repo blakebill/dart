@@ -13,13 +13,14 @@ const yaml = require('js-yaml');
 /** Normalize a Clash proxy object into an internal node object. */
 function normalizeClashProxy(p) {
   if (!p || !p.type) return null;
+  const type = String(p.type).toLowerCase();
   const base = {
     name: p.name,
     server: p.server,
     port: parseInt(p.port, 10),
   };
 
-  switch (p.type) {
+  switch (type) {
     case 'ss':
     case 'shadowsocks':
       return {
@@ -162,7 +163,7 @@ function normalizeClashProxy(p) {
         type: 'http',
         username: p.username,
         password: p.password,
-        tls: p.tls || p.type === 'https',
+        tls: p.tls || type === 'https',
         servername: p.sni || '',
         skipCertVerify: p['skip-cert-verify'],
       };

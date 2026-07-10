@@ -6,6 +6,7 @@
   const delays = App.delays;
   const api = window.api;
   const { t } = window.i18n;
+  const MAX_RENDERED_NODES = 500;
 
   // The node the ♻️ Auto (urltest) group currently routes through, or null.
   let autoNow = null;
@@ -83,14 +84,27 @@
     if (!list) return;
     const filter = ($('#nodeFilter').value || '').toLowerCase();
     const nodes = activeNodes().filter((n) => n.name.toLowerCase().includes(filter));
-    $('#nodeCount').textContent = t('nodes.count', nodes.length);
+    const shown = nodes.slice(0, MAX_RENDERED_NODES);
+    const shownNames = new Set(shown.map((n) => n.name));
+    for (const special of [App.state.selected, autoNow]) {
+      if (!special || special === '♻️ Auto' || shownNames.has(special)) continue;
+      const node = nodes.find((n) => n.name === special);
+      if (node) {
+        shown.push(node);
+        shownNames.add(special);
+      }
+    }
+    const limited = shown.length < nodes.length;
+    $('#nodeCount').textContent =
+      t('nodes.count', nodes.length) + (limited ? ` · ${shown.length}/${nodes.length}` : '');
     // Always offer the automatic (urltest) selection at the top.
     let html = nodeRowHtml('♻️ Auto');
     if (nodes.length === 0) {
       list.innerHTML = html + `<p class="hint">${t('nodes.empty')}</p>`;
       return;
     }
-    for (const n of nodes) html += nodeRowHtml(n.name, n.type, n.server, n.port);
+    for (const n of shown) html += nodeRowHtml(n.name, n.type, n.server, n.port);
+    if (limited) html += `<p class="hint rule-more">${shown.length}/${nodes.length}</p>`;
     list.innerHTML = html;
   }
   $('#nodeList').addEventListener('click', (e) => {
@@ -163,11 +177,16 @@
     refreshAutoNow(); // a fresh delay result may make urltest re-pick
   }
 
+  let testAllRunning = false;
   async function testAll() {
+    if (testAllRunning) return;
     if (!App.state.status || !App.state.status.running) {
       toast(t('nodes.needRunning'), true);
       return;
     }
+    testAllRunning = true;
+    const button = $('#testAllBtn');
+    button.disabled = true;
     const names = activeNodes().map((n) => n.name);
     // Limited-concurrency pool to avoid hammering the core (and any shared
     // upstream server). User-configurable; clamp to a sane range.
@@ -188,11 +207,20 @@
         scheduleDelayUpdate(name);
       }
     }
-    await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
-    refreshAutoNow(); // the full sweep usually changes urltest's pick
+    try {
+      await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
+      refreshAutoNow(); // the full sweep usually changes urltest's pick
+    } finally {
+      testAllRunning = false;
+      button.disabled = false;
+    }
   }
 
-  $('#nodeFilter').addEventListener('input', renderNodes);
+  let nodeFilterTimer = null;
+  $('#nodeFilter').addEventListener('input', () => {
+    clearTimeout(nodeFilterTimer);
+    nodeFilterTimer = setTimeout(renderNodes, 80);
+  });
   $('#testAllBtn').addEventListener('click', testAll);
 
   App.activeNodes = activeNodes;

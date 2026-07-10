@@ -62,7 +62,10 @@ async function promptRestartForTun() {
     detail: 'Restart Dart as administrator to enable TUN mode?',
   });
   if (response === 0) {
-    relaunchElevated();
+    const result = relaunchElevated();
+    if (!result || result.ok === false) {
+      throw new Error((result && result.error) || 'failed to restart as administrator');
+    }
     return true;
   }
   return false;

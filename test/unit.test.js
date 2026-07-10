@@ -167,6 +167,17 @@ test('renderer modules parse and every App.* member used is defined somewhere', 
   assert.deepStrictEqual(undefined_, [], 'App members used but never assigned');
 });
 
+test('large live lists have bounded rendering and offscreen containment', () => {
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(nodes.includes('MAX_RENDERED_NODES = 500'));
+  assert.ok(conns.includes('MAX_RENDERED_CONNECTIONS = 500'));
+  assert.ok(rules.includes('MAX_RENDERED_RULES = 400'));
+  assert.ok(css.includes('content-visibility: auto'));
+});
+
 console.log('\nGitHub release helper:');
 
 const github = require('../src/main/github');
@@ -258,6 +269,36 @@ test('settings merge defaults with stored values', () => {
   assert.strictEqual(s.clashApiPort, 9090); // default still present
 });
 
+test('large subscription payloads migrate to independent profile files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const legacy = {
+    subscriptions: [{
+      id: 'profile-a',
+      name: 'Large profile',
+      url: 'https://example.com/sub',
+      nodes: [{ name: 'n', type: 'trojan', server: 'example.com', port: 443, password: 'p' }],
+      clashRules: ['MATCH,PROXY'],
+      clashRuleProviders: {},
+      raw: 'raw-subscription-content',
+    }],
+    settings: { mixedPort: 7890 },
+  };
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf-8');
+
+  const store = new Store(dir);
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
+  assert.strictEqual(persisted.subscriptions[0].nodes, undefined);
+  assert.strictEqual(persisted.subscriptions[0].raw, undefined);
+  assert.strictEqual(persisted.subscriptions[0].dataFile, 'profile-a.json');
+  const profilePath = path.join(dir, 'profiles', 'profile-a.json');
+  const profileBefore = fs.readFileSync(profilePath, 'utf-8');
+
+  store.updateSettings({ logLevel: 'debug' });
+  assert.strictEqual(fs.readFileSync(profilePath, 'utf-8'), profileBefore, 'settings writes do not rewrite profile payloads');
+  assert.deepStrictEqual(new Store(dir).get('subscriptions'), legacy.subscriptions);
+});
+
 console.log('\nCore layout:');
 
 test('selected cores use independent runtime folders', () => {
@@ -283,6 +324,7 @@ test('selected cores use independent runtime folders', () => {
   mgr.setCoreType('mihomo');
   assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'mihomo', 'mihomo' + ext));
   assert.strictEqual(mgr.configPath, path.join(dir, 'mihomo', 'config.yaml'));
+  assert.ok(mgr._coreEnv().SAFE_PATHS.split(path.delimiter).includes(path.join(dir, 'ui')));
 });
 
 test('sing-box geodata self-heals invalid writable rule-sets from bundled files', () => {
@@ -305,6 +347,32 @@ test('sing-box geodata self-heals invalid writable rule-sets from bundled files'
   assert.strictEqual(mgr.resolveRuleSetDir(), writable);
   assert.ok(mgr._validSrs(path.join(writable, 'geoip-cn.srs')), 'geoip-cn.srs was not restored');
   assert.ok(mgr._validSrs(path.join(writable, 'geosite-cn.srs')), 'geosite-cn.srs was not restored');
+});
+
+test('mihomo geodata validation cache survives restarts and follows core changes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
+  const { SingBoxManager } = require('../src/main/singbox');
+  const mgr = new SingBoxManager({ runtimeDir: dir, coreType: 'mihomo' });
+  const coreDir = mgr.ensureCoreDir('mihomo');
+  const bin = path.join(coreDir, process.platform === 'win32' ? 'mihomo.exe' : 'mihomo');
+  fs.writeFileSync(bin, 'fake-core');
+  const geo = Buffer.alloc(4096);
+  for (let i = 0; i < geo.length; i++) geo[i] = (i * 31 + 7) & 0xff;
+  fs.writeFileSync(path.join(coreDir, 'geoip.dat'), geo);
+  fs.writeFileSync(path.join(coreDir, 'geosite.dat'), geo);
+  const mmdb = Buffer.from(geo);
+  Buffer.from('MaxMind.com').copy(mmdb, mmdb.length - 32);
+  fs.writeFileSync(path.join(coreDir, 'country.mmdb'), mmdb);
+
+  const key = mgr._mihomoGeoDataKey(coreDir, bin);
+  fs.writeFileSync(
+    path.join(coreDir, '.mihomo-geodata-validation.json'),
+    JSON.stringify({ key, ok: true }),
+    'utf-8'
+  );
+  assert.strictEqual(mgr.mihomoGeoDataReady(), true, 'cached validation avoids spawning the fake core');
+  fs.appendFileSync(bin, '-updated');
+  assert.notStrictEqual(mgr._mihomoGeoDataKey(coreDir, bin), key, 'a core update invalidates the cache key');
 });
 
 console.log(`\nDone, ${passed} tests passed.`);

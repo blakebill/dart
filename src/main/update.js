@@ -24,7 +24,9 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}) {
   try {
     const { tag, release, source } = await github.latestReleaseTag(UPDATE_REPO, proxyPort, log);
     const latest = tag.replace(/^v/, '');
-    const asset = release ? (release.assets || []).find((a) => /\.exe$/i.test(a.name || '')) : null;
+    const expectedName = installerName(latest);
+    const assets = release ? (release.assets || []).filter((a) => /\.exe$/i.test(a.name || '')) : [];
+    const asset = assets.find((a) => String(a.name).toLowerCase() === expectedName.toLowerCase()) || null;
     const assetName = asset ? asset.name : installerName(latest);
     return {
       current,

@@ -110,7 +110,7 @@ function nodeToOutbound(node) {
         password: node.password,
       };
       // Simple pass-through for shadowsocks plugins (obfs / v2ray-plugin)
-      if (node.plugin === 'obfs' || node.plugin === 'simple-obfs') {
+      if (node.plugin === 'obfs' || node.plugin === 'simple-obfs' || node.plugin === 'obfs-local') {
         ob.plugin = 'obfs-local';
         const o = node.pluginOpts || {};
         const parts = [];
@@ -1050,6 +1050,11 @@ function buildMihomoConfig(nodes, opts = {}) {
     ruleOverrides = null,
     ruleProviders = {},
     enableIpv6 = true,
+    enableTun = false,
+    dnsRemote = 'https://1.1.1.1/dns-query',
+    dnsLocal = 'https://223.5.5.5/dns-query',
+    externalUiDir = '',
+    externalUiDownloadUrl = '',
     extraRules = [],
     hasGeoData = true,
   } = opts;
@@ -1102,9 +1107,39 @@ function buildMihomoConfig(nodes, opts = {}) {
     ],
     rules,
   };
+  if (enableTun) {
+    // TUN captures the system's port 53 traffic, so Mihomo's DNS module must
+    // answer it. Resolve proxy server hostnames through the local resolver to
+    // avoid a bootstrap loop, while regular queries follow the proxy rules.
+    config.dns = {
+      enable: true,
+      ipv6: !!enableIpv6,
+      'enhanced-mode': 'fake-ip',
+      'fake-ip-range': '198.18.0.1/16',
+      'fake-ip-filter': ['*.lan', '*.local', 'localhost', 'localhost.*'],
+      'default-nameserver': ['223.5.5.5', '1.1.1.1'],
+      nameserver: [dnsRemote],
+      'proxy-server-nameserver': [dnsLocal],
+      'direct-nameserver': [dnsLocal],
+      'respect-rules': true,
+    };
+    config.tun = {
+      enable: true,
+      stack: 'mixed',
+      mtu: 9000,
+      'auto-route': true,
+      'strict-route': true,
+      'auto-detect-interface': true,
+      'dns-hijack': ['any:53', 'tcp://any:53'],
+    };
+  }
   if (enableClashApi) {
     config['external-controller'] = `127.0.0.1:${clashApiPort}`;
     if (clashApiSecret) config.secret = clashApiSecret;
+    if (externalUiDir) {
+      config['external-ui'] = externalUiDir;
+      if (externalUiDownloadUrl) config['external-ui-url'] = externalUiDownloadUrl;
+    }
   }
   if (ruleProviders && Object.keys(ruleProviders).length) config['rule-providers'] = ruleProviders;
   return config;

@@ -19,6 +19,7 @@
     const proxyOn = !!st.systemProxy;
     $('#quickProxy').textContent = proxyOn ? t('dash.proxyOff') : t('dash.proxyOn');
     $('#quickProxy').classList.toggle('stop', proxyOn);
+    $('#quickProxy').disabled = !st.running && !proxyOn;
     const tunOn = !!(App.state.settings && App.state.settings.enableTun);
     $('#quickTun').textContent = tunOn ? t('dash.tunOff') : t('dash.tunOn');
     $('#quickTun').classList.toggle('stop', tunOn);

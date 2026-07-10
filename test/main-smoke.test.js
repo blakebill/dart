@@ -27,6 +27,7 @@ class FakeWebContents {
   on() {}
   once() {}
   openDevTools() {}
+  setWindowOpenHandler() {}
 }
 class FakeBrowserWindow {
   constructor() {
@@ -157,11 +158,67 @@ async function main() {
   assert.strictEqual(core.getActiveSubId(), subA.id, 'the effective profile remains subs[0]');
   assert.strictEqual(state.store.get('activeSub'), subA.id, 'getActiveSubId pins the legacy fallback');
 
+  // Updating only rules/providers still changes the generated core config.
+  const subscriptionStub = require(subscriptionPath);
+  const originalFetchSubscription = subscriptionStub.fetchSubscription;
+  const originalRestartIfRunning = core.restartIfRunning;
+  let restartCount = 0;
+  subscriptionStub.fetchSubscription = async () => ({
+    nodes: subA.nodes,
+    format: 'clash',
+    rules: ['DOMAIN-SUFFIX,example.com,PROXY'],
+    ruleProviders: { remote: { type: 'http', behavior: 'domain', url: 'https://example.com/rules.yaml', format: 'yaml' } },
+    raw: 'updated',
+    userInfo: null,
+  });
+  core.restartIfRunning = async () => { restartCount += 1; };
+  await handlers['sub:update'](null, { id: subA.id });
+  core.restartIfRunning = originalRestartIfRunning;
+  subscriptionStub.fetchSubscription = originalFetchSubscription;
+  assert.strictEqual(restartCount, 1, 'active rule-only updates restart the core');
+  assert.deepStrictEqual(
+    state.store.get('subscriptions').find((s) => s.id === subA.id).clashRuleProviders,
+    { remote: { type: 'http', behavior: 'domain', url: 'https://example.com/rules.yaml', format: 'yaml' } },
+    'rule providers are persisted during updates'
+  );
+
+  const savedSubA = JSON.stringify(state.store.get('subscriptions').find((s) => s.id === subA.id));
+  subscriptionStub.fetchSubscription = async () => ({ nodes: [], format: 'unknown', rules: [], raw: '' });
+  await assert.rejects(handlers['sub:update'](null, { id: subA.id }), /no nodes parsed/);
+  subscriptionStub.fetchSubscription = originalFetchSubscription;
+  assert.strictEqual(
+    JSON.stringify(state.store.get('subscriptions').find((s) => s.id === subA.id)),
+    savedSubA,
+    'an empty update must preserve the last working profile'
+  );
+
   // Explicit activation still works and is the only way to switch.
   await handlers['sub:setActive'](null, { id: subB.id });
   assert.strictEqual(core.getActiveSubId(), subB.id, 'explicit activation switches the profile');
 
   console.log('✓ adding a subscription never steals the active profile (legacy-store regression)');
+
+  await assert.rejects(
+    handlers['settings:update'](null, { mixedPort: 0 }),
+    /invalid mixedPort/
+  );
+  await assert.rejects(
+    handlers['settings:update'](null, { mixedPort: 9090, clashApiPort: 9090 }),
+    /must be different/
+  );
+  await assert.rejects(
+    handlers['settings:update'](null, { dnsRemote: 'file:///etc/hosts' }),
+    /invalid dnsRemote/
+  );
+  await assert.rejects(
+    handlers['proxy:set'](null, { enable: true }),
+    /start the core/
+  );
+  await assert.rejects(
+    handlers['core:download'](null, { version: '../../bad' }),
+    /invalid version/
+  );
+  console.log('✓ settings reject invalid ports and cannot enable a dead system proxy');
 
   // ---- Regression: inline custom rule-sets must stay OR-semantics ----
   // A rule with both domain and ip_cidr fields is an AND in sing-box, so older
@@ -204,8 +261,29 @@ async function main() {
     'clash',
     'legacy custom rule-set formats are processed as Clash-compatible text'
   );
+  assert.ok(!/[\\/]/.test(core.customRuleSetFileName('../../outside')), 'custom rule-set file names cannot traverse');
 
   console.log('✓ inline custom rule-sets keep OR semantics across old and new stores');
+
+  const github = require(path.join(__dirname, '..', 'src', 'main', 'github'));
+  const appUpdate = require(path.join(__dirname, '..', 'src', 'main', 'update'));
+  const originalLatestReleaseTag = github.latestReleaseTag;
+  github.latestReleaseTag = async () => ({
+    tag: 'v0.7.8',
+    source: 'github',
+    release: {
+      html_url: 'https://example.com/release',
+      assets: [
+        { name: 'Unrelated.Tool.exe', browser_download_url: 'https://example.com/wrong.exe', size: 1 },
+        { name: 'Dart.Setup.0.7.8.exe', browser_download_url: 'https://example.com/right.exe', size: 2 },
+      ],
+    },
+  });
+  const updateInfo = await appUpdate.checkUpdate('0.7.7');
+  github.latestReleaseTag = originalLatestReleaseTag;
+  assert.strictEqual(updateInfo.assetName, 'Dart.Setup.0.7.8.exe');
+  assert.strictEqual(updateInfo.assetUrl, 'https://example.com/right.exe');
+  console.log('✓ app updates select the matching Dart installer asset');
 
   state.singbox.setCoreType('mihomo');
   const mihomoDir = state.singbox.ensureCoreDir('mihomo');

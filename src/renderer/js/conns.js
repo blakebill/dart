@@ -5,13 +5,19 @@
   const { $, toast, call, fmtBytes, escapeHtml } = App;
   const api = window.api;
   const { t } = window.i18n;
+  const MAX_RENDERED_CONNECTIONS = 500;
 
+  let connectionsLoading = false;
   async function loadConnections() {
+    if (connectionsLoading) return;
+    connectionsLoading = true;
     try {
       const data = await api.getConnections();
       renderConnections(data);
     } catch (e) {
       /* ignore */
+    } finally {
+      connectionsLoading = false;
     }
   }
   // Incremental rendering keyed by connection id: rows are created once,
@@ -40,10 +46,10 @@
     );
   }
   function renderConnections(data) {
-    const conns = data.connections || [];
-    $('#connStats').textContent = t('conns.stats', conns.length, fmtBytes(data.up), fmtBytes(data.down));
+    const allConnections = data.connections || [];
+    $('#connStats').textContent = t('conns.stats', allConnections.length, fmtBytes(data.up), fmtBytes(data.down));
     const list = $('#connList');
-    if (!data.running || conns.length === 0) {
+    if (!data.running || allConnections.length === 0) {
       connRows.clear();
       list.innerHTML = `<p class="hint">${t('conns.empty')}</p>`;
       return;
@@ -51,7 +57,10 @@
     if (!connRows.size) list.innerHTML = ''; // leaving the empty-hint state
     // Oldest first, prepending each NEW row: newest connections end up on top
     // while existing rows never move.
-    conns.sort((a, b) => String(a.start || '').localeCompare(String(b.start || '')));
+    const conns = allConnections
+      .slice()
+      .sort((a, b) => String(a.start || '').localeCompare(String(b.start || '')))
+      .slice(-MAX_RENDERED_CONNECTIONS);
     const seen = new Set();
     for (const c of conns) {
       const m = c.metadata || {};

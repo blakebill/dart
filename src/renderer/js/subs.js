@@ -55,23 +55,33 @@
     list.querySelectorAll('button[data-act]').forEach((b) => {
       b.addEventListener('click', async () => {
         const id = b.dataset.id;
-        if (b.dataset.act === 'activate') {
-          b.disabled = true;
-          await call(api.setActiveSub, { id });
-          await App.refresh();
-        } else if (b.dataset.act === 'update') {
-          b.disabled = true;
-          b.textContent = t('subs.updating');
-          await call(api.updateSubscription, { id });
-          toast(t('toast.subUpdated'));
-          await App.refresh();
-        } else if (b.dataset.act === 'edit') {
-          openSubEdit(id);
-        } else if (b.dataset.act === 'editraw') {
-          openRawEdit(id);
-        } else if (b.dataset.act === 'remove') {
-          await call(api.removeSubscription, { id });
-          await App.refresh();
+        const originalText = b.textContent;
+        const busy = b.dataset.act === 'activate' || b.dataset.act === 'update' || b.dataset.act === 'remove';
+        if (busy) b.disabled = true;
+        try {
+          if (b.dataset.act === 'activate') {
+            await call(api.setActiveSub, { id });
+            await App.refresh();
+          } else if (b.dataset.act === 'update') {
+            b.textContent = t('subs.updating');
+            await call(api.updateSubscription, { id });
+            toast(t('toast.subUpdated'));
+            await App.refresh();
+          } else if (b.dataset.act === 'edit') {
+            openSubEdit(id);
+          } else if (b.dataset.act === 'editraw') {
+            openRawEdit(id);
+          } else if (b.dataset.act === 'remove') {
+            await call(api.removeSubscription, { id });
+            await App.refresh();
+          }
+        } catch (_) {
+          // call() already showed the localized error toast.
+        } finally {
+          if (b.isConnected) {
+            b.disabled = false;
+            b.textContent = originalText;
+          }
         }
       });
     });

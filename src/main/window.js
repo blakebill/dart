@@ -29,6 +29,7 @@ function createWindow(startHidden = false) {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
       // Explicit: throttle animations/timers when the page is in the background
       // (default true, but pinning it documents the contract — paired with the
       // setFrameRate cycle below to crush paint cost while hidden in the tray).
@@ -39,6 +40,8 @@ function createWindow(startHidden = false) {
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
 
   // Reveal once the renderer is painted, unless we're starting silently — then
   // the app lives in the tray until the user opens it (tray menu / relaunch).

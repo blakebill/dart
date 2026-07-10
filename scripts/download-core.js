@@ -36,13 +36,13 @@ function requestHeaders(extra = {}) {
   return headers;
 }
 
-function getJson(urlStr) {
+function getJson(urlStr, redirects = 5) {
   return new Promise((resolve, reject) => {
-    https
-      .get(urlStr, { headers: requestHeaders() }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+    const req = https
+      .get(urlStr, { headers: requestHeaders(), timeout: 20000 }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           res.resume();
-          return resolve(getJson(new URL(res.headers.location, urlStr).toString()));
+          return resolve(getJson(new URL(res.headers.location, urlStr).toString(), redirects - 1));
         }
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -59,35 +59,39 @@ function getJson(urlStr) {
         });
       })
       .on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('request timeout')));
   });
 }
 
 function download(urlStr, dest, redirects = 5) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const file = fs.createWriteStream(dest);
-    https
-      .get(urlStr, { headers: { 'User-Agent': 'dart-build' } }, (res) => {
+    let file = null;
+    const fail = (err) => {
+      if (file) {
+        file.destroy();
+        try { fs.unlinkSync(dest); } catch (_) {}
+      }
+      reject(err);
+    };
+    const req = https
+      .get(urlStr, { headers: { 'User-Agent': 'dart-build' }, timeout: 30000 }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           res.resume();
-          file.close();
-          fs.unlink(dest, () => {});
           return resolve(download(new URL(res.headers.location, urlStr).toString(), dest, redirects - 1));
         }
         if (res.statusCode !== 200) {
           res.resume();
-          file.close();
-          fs.unlink(dest, () => {});
           return reject(new Error('download failed HTTP ' + res.statusCode));
         }
+        file = fs.createWriteStream(dest);
+        file.on('error', fail);
+        res.on('error', fail);
         res.pipe(file);
         file.on('finish', () => file.close(() => resolve(dest)));
       })
-      .on('error', (err) => {
-        file.close();
-        fs.unlink(dest, () => {});
-        reject(err);
-      });
+      .on('error', fail);
+    req.on('timeout', () => req.destroy(new Error('download timeout')));
   });
 }
 

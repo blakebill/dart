@@ -98,8 +98,12 @@
 
   // ---------- Data refresh ----------
   let prevActiveSub;
+  let refreshSequence = 0;
   async function refresh() {
-    App.state = await api.getState();
+    const sequence = ++refreshSequence;
+    const nextState = await api.getState();
+    if (sequence !== refreshSequence) return;
+    App.state = nextState;
     // Drop stale latency results when the active profile changes.
     if (App.state.activeSub !== prevActiveSub) {
       App.delays.clear();

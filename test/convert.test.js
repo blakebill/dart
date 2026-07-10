@@ -88,6 +88,32 @@ test('parse ss:// (SIP002)', () => {
   assert.strictEqual(node.name, 'SG-Node');
 });
 
+test('parse ss:// plugin options and IPv6 endpoint', () => {
+  const userinfo = Buffer.from('aes-128-gcm:secret').toString('base64');
+  const plugin = encodeURIComponent('v2ray-plugin;mode=websocket;tls;host=cdn.example.com;path=/ws');
+  const node = linkParser.parseSingleLink(`ss://${userinfo}@[2001:db8::1]:443?plugin=${plugin}#IPv6-SS`);
+  assert.strictEqual(node.server, '2001:db8::1');
+  assert.strictEqual(node.port, 443);
+  assert.strictEqual(node.plugin, 'v2ray-plugin');
+  assert.deepStrictEqual(node.pluginOpts, {
+    mode: 'websocket', tls: true, host: 'cdn.example.com', path: '/ws',
+  });
+  const outbound = nodeToOutbound(node);
+  assert.strictEqual(outbound.plugin, 'v2ray-plugin');
+  assert.ok(outbound.plugin_opts.includes('tls'));
+  assert.ok(outbound.plugin_opts.includes('host=cdn.example.com'));
+});
+
+test('parse ss:// simple-obfs option names', () => {
+  const userinfo = Buffer.from('aes-128-gcm:secret').toString('base64');
+  const plugin = encodeURIComponent('simple-obfs;obfs=http;obfs-host=edge.example.com');
+  const node = linkParser.parseSingleLink(`ss://${userinfo}@ss.example.com:443?plugin=${plugin}#obfs`);
+  assert.deepStrictEqual(node.pluginOpts, { mode: 'http', host: 'edge.example.com' });
+  const outbound = nodeToOutbound(node);
+  assert.strictEqual(outbound.plugin, 'obfs-local');
+  assert.strictEqual(outbound.plugin_opts, 'obfs=http;obfs-host=edge.example.com');
+});
+
 test('parse hysteria2://', () => {
   const uri = 'hysteria2://pass@hy2.example.com:443?sni=hy2.example.com&insecure=1&obfs=salamander&obfs-password=xyz#HY2';
   const node = linkParser.parseSingleLink(uri);
@@ -148,6 +174,12 @@ proxy-groups:
 
 test('detect Clash config', () => {
   assert.strictEqual(clashParser.isClashConfig(clashYaml), true);
+});
+
+test('Clash proxy types are case-insensitive', () => {
+  const parsed = clashParser.parseClashConfig(`proxies:\n  - name: upper\n    type: TROJAN\n    server: example.com\n    port: 443\n    password: secret`);
+  assert.strictEqual(parsed.nodes.length, 1);
+  assert.strictEqual(parsed.nodes[0].type, 'trojan');
 });
 
 test('parse Clash proxies', () => {
@@ -243,10 +275,17 @@ test('full config for Mihomo keeps Clash semantics', () => {
     clashApiSecret: 'secret',
     selected: 'US-ss',
     clashRules: ['DOMAIN-SUFFIX,openai.com,Proxy', 'DOMAIN,example.cn,DIRECT'],
+    externalUiDir: 'C:/Users/test/AppData/Roaming/Dart/runtime/ui/zashboard',
+    externalUiDownloadUrl: 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip',
   });
   assert.strictEqual(cfg['mixed-port'], 7891);
   assert.strictEqual(cfg['external-controller'], '127.0.0.1:9091');
   assert.strictEqual(cfg.secret, 'secret');
+  assert.strictEqual(cfg['external-ui'], 'C:/Users/test/AppData/Roaming/Dart/runtime/ui/zashboard');
+  assert.strictEqual(
+    cfg['external-ui-url'],
+    'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip'
+  );
   assert.strictEqual(cfg['geodata-mode'], true);
   assert.strictEqual(cfg['geodata-loader'], 'standard');
   assert.strictEqual(cfg.proxies.length, 3);
@@ -266,6 +305,27 @@ test('Mihomo fallback skips GEOIP when GeoData is unavailable', () => {
   assert.ok(!cfg.rules.includes('GEOSITE,category-ads-all,REJECT'));
   assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
   assert.ok(cfg.rules.includes('MATCH,🚀 Proxy'));
+});
+
+test('Mihomo TUN mode emits tun configuration', () => {
+  const cfg = buildMihomoConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {
+    enableTun: true,
+    enableIpv6: false,
+    dnsRemote: 'https://1.1.1.1/dns-query',
+    dnsLocal: 'https://223.5.5.5/dns-query',
+  });
+  assert.strictEqual(cfg.tun.enable, true);
+  assert.strictEqual(cfg.tun.stack, 'mixed');
+  assert.strictEqual(cfg.tun.device, undefined);
+  assert.strictEqual(cfg.tun['auto-route'], true);
+  assert.strictEqual(cfg.tun['auto-detect-interface'], true);
+  assert.deepStrictEqual(cfg.tun['dns-hijack'], ['any:53', 'tcp://any:53']);
+  assert.strictEqual(cfg.dns.enable, true);
+  assert.strictEqual(cfg.dns.ipv6, false);
+  assert.strictEqual(cfg.dns['enhanced-mode'], 'fake-ip');
+  assert.deepStrictEqual(cfg.dns.nameserver, ['https://1.1.1.1/dns-query']);
+  assert.deepStrictEqual(cfg.dns['proxy-server-nameserver'], ['https://223.5.5.5/dns-query']);
+  assert.strictEqual(cfg.dns['respect-rules'], true);
 });
 
 console.log('\nAuto format detection:');

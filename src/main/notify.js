@@ -15,7 +15,7 @@ function notify(title, body) {
     if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
     const s = state.store ? state.store.getSettings() : {};
     if (s.notifications === false) return;
-    const n = new Notification({ title: String(title || 'Dart'), body: String(body || '') });
+    const n = new Notification({ title: String(title || 'Dart Network Control'), body: String(body || '') });
     n.on('click', () => {
       if (state.mainWindow && !state.mainWindow.isDestroyed()) {
         state.mainWindow.show();

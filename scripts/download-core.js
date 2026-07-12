@@ -255,7 +255,7 @@ function mihomoGeoTestConfig() {
     'mode: rule',
     'log-level: silent',
     'geodata-mode: true',
-    'geodata-loader: standard',
+    'geodata-loader: memconservative',
     'geo-auto-update: false',
     'rules:',
     '  - GEOSITE,cn,DIRECT',
@@ -282,15 +282,6 @@ function validateMihomoGeoData(dir, binName) {
     }
   } finally {
     try { fs.unlinkSync(configPath); } catch (_) {}
-  }
-}
-
-async function latestReleaseTag(repo) {
-  try {
-    const r = await getJson(`https://api.github.com/repos/${repo}/releases/latest`);
-    return r.tag_name || null;
-  } catch (_) {
-    return null;
   }
 }
 
@@ -335,7 +326,7 @@ async function bundleSingBox(goos, arch) {
   for (const rs of ruleSets) {
     const dest = path.join(SINGBOX_DIR, rs.file);
     await downloadFirst(geoDataUrls(rs.repo, rs.file), dest, validSrs);
-    meta[rs.file] = { version: await latestReleaseTag(`SagerNet/${rs.repo}`), updatedAt: Date.now() };
+    meta[rs.file] = { updatedAt: Date.now() };
   }
   fs.writeFileSync(path.join(SINGBOX_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
   console.log('sing-box bundle ready in', SINGBOX_DIR);
@@ -398,11 +389,10 @@ async function bundleMihomo(goos, arch) {
   }
   fs.unlinkSync(archivePath);
 
-  const metaTag = await latestReleaseTag('MetaCubeX/meta-rules-dat');
   const meta = {};
   for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
     await downloadFirst(mihomoGeoDataUrls(file), path.join(MIHOMO_DIR, file), validGeo);
-    meta[file] = { version: metaTag, updatedAt: Date.now() };
+    meta[file] = { updatedAt: Date.now() };
   }
   validateMihomoGeoData(MIHOMO_DIR, binName);
   fs.writeFileSync(path.join(MIHOMO_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');

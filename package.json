@@ -1,7 +1,7 @@
 {
   "name": "dart",
-  "version": "0.7.7",
-  "description": "sing-box based Windows proxy client with config profiles and Clash config conversion",
+  "version": "0.8.0",
+  "description": "Desktop network control for sing-box and mihomo on Windows",
   "main": "src/main/index.js",
   "author": "singbox-gui",
   "license": "MIT",
@@ -13,6 +13,7 @@
     "dev": "electron . --dev",
     "test": "node test/convert.test.js && node test/unit.test.js && node test/fetch.test.js && node test/main-smoke.test.js",
     "make-icon": "node scripts/make-icon.js",
+    "make-tray-icon": "node scripts/make-icon.js --tray-only",
     "fetch-core": "node scripts/download-core.js",
     "dist": "electron-builder --win",
     "dist:dir": "electron-builder --win --dir"

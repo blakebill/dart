@@ -14,6 +14,8 @@ const crypto = require('crypto');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const fetch = require('./fetch');
+const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
+const { buildDelayApiPath } = require('./delay');
 
 /**
  * Core control: everything that drives the sing-box core — building the
@@ -25,6 +27,9 @@ const fetch = require('./fetch');
 // Reuse sockets for the frequent Clash API calls (connection polling, latency
 // tests) instead of opening a fresh TCP connection each time.
 const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+const MAX_CLASH_RESPONSE_BYTES = 32 * 1024 * 1024;
+let tunWasActive = false;
+let tunAdaptersClean = false;
 
 // Locally served control panel: the active core hosts zashboard at
 // http://127.0.0.1:<api-port>/ui/ — the same origin as the Clash API. That
@@ -65,7 +70,7 @@ function normalizeCustomRuleSetFormat(format, url) {
 
 /** The id of the subscription (profile) currently in use; falls back to the first. */
 function getActiveSubId() {
-  const subs = state.store.get('subscriptions') || [];
+  const subs = state.store.listSubscriptions();
   if (!subs.length) return null;
   const active = state.store.get('activeSub');
   if (active && subs.some((s) => s.id === active)) return active;
@@ -78,10 +83,23 @@ function getActiveSubId() {
   return subs[0].id;
 }
 
+/** Load the active profile and migrate legacy duplicate/reserved node names. */
+function getActiveSubscription() {
+  const id = getActiveSubId();
+  const sub = id ? state.store.getSubscription(id) : null;
+  if (!sub || !Array.isArray(sub.nodes)) return sub;
+  const nodes = subscription.uniqueNodeNames(sub.nodes);
+  if (nodes.some((node, index) => node.name !== sub.nodes[index].name)) {
+    sub.nodes = nodes;
+    sub.configHash = subscription.configFingerprint(sub);
+    state.store.upsertSubscription(sub);
+  }
+  return sub;
+}
+
 /** Nodes + Clash rules (+ rule-providers) of the active subscription only. */
 function activeSubData() {
-  const subs = state.store.get('subscriptions') || [];
-  const sub = subs.find((s) => s.id === getActiveSubId());
+  const sub = getActiveSubscription();
   return {
     nodes: (sub && sub.nodes) || [],
     rules: (sub && sub.clashRules) || [],
@@ -185,8 +203,11 @@ async function processCustomRuleSet(c) {
   return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
 }
 
-function buildCurrentConfig() {
-  const settings = state.store.getSettings();
+function buildCurrentConfig(coreType = null) {
+  const storedSettings = state.store.getSettings();
+  const settings = coreType
+    ? { ...storedSettings, coreType: coreType === 'mihomo' ? 'mihomo' : 'sing-box' }
+    : storedSettings;
   // Use only the active subscription's nodes (profiles are not merged).
   const { nodes: allNodes, rules: allRules, providers } = activeSubData();
   if (allNodes.length === 0) {
@@ -217,6 +238,7 @@ function buildCurrentConfig() {
     dnsRemote: settings.dnsRemote,
     dnsLocal: settings.dnsLocal,
     dnsStrategy: settings.dnsStrategy,
+    testUrl: settings.testUrl,
     extraRules,
     extraRuleSets,
   };
@@ -269,12 +291,22 @@ function ruleGroupInfo() {
   return { groups, overrides: settings.ruleOverrides || {} };
 }
 
-async function startCore() {
+async function startCoreNow() {
   const { config, settings } = buildCurrentConfig();
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
   }
+  if ((settings.enableTun || tunWasActive) && !tunAdaptersClean) {
+    tunAdaptersClean = await cleanupTunAdapters(sendLog);
+  }
   await state.singbox.start(config);
+  tunWasActive = !!settings.enableTun;
+  if (tunWasActive) {
+    tunAdaptersClean = false;
+    // Renaming is cosmetic and the adapter may appear slightly after the core
+    // is ready. Keep it off the user-visible TUN startup path.
+    void syncTunDisplayName(sendLog);
+  }
   if (settings.autoSetSystemProxy && !settings.enableTun) {
     try {
       await proxy.enableSystemProxy('127.0.0.1', settings.mixedPort);
@@ -492,7 +524,7 @@ function maybeFetchRuleProviders(clashRules, providers) {
  * Stop the core. When `remember` is true (an explicit user stop) we also clear
  * the auto-resume flag, so the app does not start itself on the next launch.
  */
-async function stopCore(remember) {
+async function stopCoreNow(remember) {
   // Mark the stop as intentional so the exit handler doesn't fire a "core
   // crashed" notification for a stop/restart we initiated.
   state.coreStopping = true;
@@ -508,6 +540,8 @@ async function stopCore(remember) {
   }
   try {
     await state.singbox.stop();
+    if (tunWasActive) tunAdaptersClean = await cleanupTunAdapters(sendLog);
+    tunWasActive = false;
     if (remember) state.store.set('lastRunning', false);
   } finally {
     state.coreStopping = false;
@@ -520,26 +554,59 @@ async function stopCore(remember) {
  * Windows proxy registry. While we own it, re-assert it if it gets changed.
  */
 let proxyGuard = null;
+let proxyGuardGeneration = 0;
+let proxyGuardBusy = false;
 function startProxyGuard(port) {
   stopProxyGuard();
   const server = '127.0.0.1:' + port;
+  const generation = ++proxyGuardGeneration;
   proxyGuard = setInterval(async () => {
-    if (!state.systemProxyOn) return;
+    if (!state.systemProxyOn || proxyGuardBusy || generation !== proxyGuardGeneration) return;
+    proxyGuardBusy = true;
     try {
-      if (!(await proxy.isSystemProxyActive(server))) {
+      const active = await proxy.isSystemProxyActive(server);
+      if (generation !== proxyGuardGeneration || !state.systemProxyOn) return;
+      if (!active) {
         await proxy.enableSystemProxy('127.0.0.1', port);
+        // Stop may have landed while reg.exe was still writing. Clear the
+        // just-written value again instead of leaving a dead local proxy.
+        if (!state.systemProxyOn) {
+          await proxy.disableSystemProxy();
+          return;
+        }
         sendLog('[gui] system proxy was changed by another app; restored');
       }
     } catch (_) {
       /* ignore */
+    } finally {
+      proxyGuardBusy = false;
     }
   }, 30000); // re-assert at most twice a minute (each check spawns reg.exe)
 }
 function stopProxyGuard() {
+  proxyGuardGeneration++;
   if (proxyGuard) {
     clearInterval(proxyGuard);
     proxyGuard = null;
   }
+}
+
+// Serialize lifecycle operations from the sidebar, dashboard, settings and
+// auto-update paths. Rapid clicks must never spawn two cores or interleave a
+// stop halfway through a restart.
+let lifecycleTail = Promise.resolve();
+function queueLifecycle(operation) {
+  const run = lifecycleTail.then(operation, operation);
+  lifecycleTail = run.catch(() => {});
+  return run;
+}
+
+function startCore() {
+  return queueLifecycle(() => (state.singbox.isRunning() ? true : startCoreNow()));
+}
+
+function stopCore(remember) {
+  return queueLifecycle(() => stopCoreNow(remember));
 }
 
 async function cleanup() {
@@ -554,18 +621,18 @@ async function cleanup() {
 let restartPromise = null;
 async function restartIfRunning() {
   if (restartPromise) return restartPromise;
-  if (!state.singbox.isRunning()) return;
-  restartPromise = (async () => {
+  restartPromise = queueLifecycle(async () => {
     try {
-      await stopCore();
-      await startCore();
+      if (!state.singbox.isRunning()) return;
+      await stopCoreNow();
+      await startCoreNow();
       sendLog('[gui] core restarted to apply changes');
     } catch (e) {
       sendLog('[gui] restart to apply changes failed: ' + e.message);
     } finally {
       restartPromise = null;
     }
-  })();
+  });
   return restartPromise;
 }
 
@@ -577,15 +644,9 @@ async function restartIfRunning() {
 function testNodeDelay(name) {
   return new Promise((resolve, reject) => {
     const settings = state.store.getSettings();
-    // Configurable test target (default: the HTTP — not HTTPS — generate_204,
-    // the Clash-ecosystem default). The core dials a fresh outbound per test, so
-    // an HTTPS target would add a full TLS handshake to the destination on every
-    // probe; that cost is amortized away by connection reuse during real
-    // browsing, so an HTTP target better tracks the latency users actually feel
-    // and has lower variance. Empty/blank falls back to the default.
-    const url = (settings.testUrl || '').trim() || 'http://www.gstatic.com/generate_204';
-    const testUrl = encodeURIComponent(url);
-    const reqPath = `/proxies/${encodeURIComponent(name)}/delay?timeout=5000&url=${testUrl}`;
+    // Keep `url` first: this is the documented Clash API shape and avoids older
+    // compatibility layers silently falling back to their built-in test URL.
+    const reqPath = buildDelayApiPath(name, settings.testUrl);
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -598,8 +659,20 @@ function testNodeDelay(name) {
       },
       (res) => {
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
+        let bytes = 0;
+        let tooLarge = false;
+        res.on('data', (c) => {
+          bytes += c.length;
+          if (bytes > 1024 * 1024) {
+            tooLarge = true;
+            res.destroy();
+            reject(new Error('delay response too large'));
+            return;
+          }
+          chunks.push(c);
+        });
         res.on('end', () => {
+          if (tooLarge) return;
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
             if (typeof data.delay === 'number') resolve(data.delay);
@@ -630,8 +703,20 @@ function clashApi(method, apiPath, body) {
       { host: '127.0.0.1', port: settings.clashApiPort, path: apiPath, method, headers, timeout: 6000, agent: clashAgent },
       (res) => {
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
+        let bytes = 0;
+        let tooLarge = false;
+        res.on('data', (c) => {
+          bytes += c.length;
+          if (bytes > MAX_CLASH_RESPONSE_BYTES) {
+            tooLarge = true;
+            res.destroy();
+            reject(new Error('clash api response too large'));
+            return;
+          }
+          chunks.push(c);
+        });
         res.on('end', () => {
+          if (tooLarge) return;
           if (res.statusCode < 200 || res.statusCode >= 300) {
             return reject(new Error('clash api ' + res.statusCode));
           }
@@ -689,30 +774,32 @@ async function autoUpdateTick() {
 }
 
 async function runAutoUpdateTick() {
-  const subs = state.store.get('subscriptions') || [];
+  const subs = state.store.listSubscriptions();
   let changed = false;
   let activeConfigChanged = false;
   for (const sub of subs) {
     const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
     if (mins > 0 && sub.url && Date.now() - (sub.updatedAt || 0) >= mins * 60000) {
       try {
-        const proxyPort = sub.updateViaProxy ? currentProxyPort() : 0;
-        const r = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
+        const current = state.store.getSubscription(sub.id);
+        if (!current) continue;
+        const proxyPort = current.updateViaProxy ? currentProxyPort() : 0;
+        const r = await subscription.fetchSubscription(current.url, sendLog, { proxyPort });
         if (r.nodes.length) {
-          const configChanged =
-            JSON.stringify(sub.nodes || []) !== JSON.stringify(r.nodes || []) ||
-            JSON.stringify(sub.clashRules || []) !== JSON.stringify(r.rules || []) ||
-            JSON.stringify(sub.clashRuleProviders || {}) !== JSON.stringify(r.ruleProviders || {});
-          sub.nodes = r.nodes;
-          sub.format = r.format;
-          sub.clashRules = r.rules || [];
-          sub.clashRuleProviders = r.ruleProviders || {};
-          sub.raw = r.raw || sub.raw || '';
-          sub.userInfo = r.userInfo || sub.userInfo;
-          sub.updatedAt = Date.now();
+          const nextHash = subscription.configFingerprint(r);
+          const configChanged = (current.configHash || subscription.configFingerprint(current)) !== nextHash;
+          current.nodes = r.nodes;
+          current.format = r.format;
+          current.clashRules = r.rules || [];
+          current.clashRuleProviders = r.ruleProviders || {};
+          current.raw = r.raw || current.raw || '';
+          current.userInfo = r.userInfo || current.userInfo;
+          current.updatedAt = Date.now();
+          current.configHash = nextHash;
+          state.store.upsertSubscription(current);
           changed = true;
-          if (configChanged && sub.id === getActiveSubId()) activeConfigChanged = true;
-          sendLog('[gui] auto-updated config: ' + sub.name);
+          if (configChanged && current.id === getActiveSubId()) activeConfigChanged = true;
+          sendLog('[gui] auto-updated config: ' + current.name);
         }
       } catch (e) {
         sendLog('[gui] auto-update failed for ' + sub.name + ': ' + e.message);
@@ -720,7 +807,6 @@ async function runAutoUpdateTick() {
     }
   }
   if (changed) {
-    state.store.set('subscriptions', subs);
     if (state.mainWindow && !state.mainWindow.isDestroyed()) {
       state.mainWindow.webContents.send('subs:changed');
     }
@@ -760,7 +846,7 @@ let autoUpdateTimer = null;
 function rescheduleAutoUpdate() {
   const hasDue = (list) => (list || []).some((x) => parseInt(x.autoUpdateMinutes || 0, 10) > 0 && x.url);
   const need =
-    hasDue(state.store.get('subscriptions')) || hasDue(state.store.get('customRuleSets'));
+    hasDue(state.store.listSubscriptions()) || hasDue(state.store.get('customRuleSets'));
   if (need && !autoUpdateTimer) {
     autoUpdateTimer = setInterval(autoUpdateTick, 60000);
   } else if (!need && autoUpdateTimer) {
@@ -875,7 +961,7 @@ function buildAutostartTaskXml() {
   const user = `${process.env.USERDOMAIN || process.env.COMPUTERNAME || ''}\\${process.env.USERNAME || ''}`;
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Dart auto-start (elevated for TUN mode)</Description></RegistrationInfo>
+  <RegistrationInfo><Description>Dart Network Control auto-start (elevated for TUN mode)</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${esc(user)}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>${esc(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
@@ -1004,6 +1090,7 @@ async function healStaleSystemProxy() {
 module.exports = {
   currentProxyPort,
   getActiveSubId,
+  getActiveSubscription,
   activeSubData,
   buildLocalRuleObject,
   splitInlineRule,

@@ -227,10 +227,12 @@ test('full Clash -> sing-box config', () => {
   assert.ok(config.route);
   // Inbounds include mixed
   assert.ok(config.inbounds.some((i) => i.type === 'mixed' && i.listen_port === 7890));
-  // Outbounds include selector / urltest / 3 nodes / direct (1.12+: no block/dns outbounds)
+  // Outbounds include selector / automatic groups / 3 nodes / direct.
   const types = config.outbounds.map((o) => o.type);
   assert.ok(types.includes('selector'));
   assert.ok(types.includes('urltest'));
+  assert.ok(config.outbounds.some((o) => o.tag === '🛟 Fallback' && o.type === 'urltest'));
+  assert.ok(config.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('🛟 Fallback'));
   assert.ok(types.includes('direct'));
   assert.ok(!types.includes('block'), 'block outbound removed in 1.12+');
   assert.strictEqual(config.outbounds.filter((o) => ['vmess', 'shadowsocks', 'trojan'].includes(o.type)).length, 3);
@@ -287,9 +289,10 @@ test('full config for Mihomo keeps Clash semantics', () => {
     'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip'
   );
   assert.strictEqual(cfg['geodata-mode'], true);
-  assert.strictEqual(cfg['geodata-loader'], 'standard');
+  assert.strictEqual(cfg['geodata-loader'], 'memconservative');
   assert.strictEqual(cfg.proxies.length, 3);
-  assert.deepStrictEqual(cfg['proxy-groups'][0].proxies.slice(0, 3), ['US-ss', '♻️ Auto', 'HK-vmess']);
+  assert.deepStrictEqual(cfg['proxy-groups'][0].proxies.slice(0, 3), ['US-ss', '♻️ Auto', '🛟 Fallback']);
+  assert.ok(cfg['proxy-groups'].some((group) => group.name === '🛟 Fallback' && group.type === 'fallback'));
   assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
   assert.ok(cfg.rules.includes('DOMAIN,example.cn,DIRECT'));
   assert.strictEqual(cfg.rules[cfg.rules.length - 1], 'MATCH,🚀 Proxy');
@@ -316,7 +319,7 @@ test('Mihomo TUN mode emits tun configuration', () => {
   });
   assert.strictEqual(cfg.tun.enable, true);
   assert.strictEqual(cfg.tun.stack, 'mixed');
-  assert.strictEqual(cfg.tun.device, undefined);
+  assert.strictEqual(cfg.tun.device, 'Dart');
   assert.strictEqual(cfg.tun['auto-route'], true);
   assert.strictEqual(cfg.tun['auto-detect-interface'], true);
   assert.deepStrictEqual(cfg.tun['dns-hijack'], ['any:53', 'tcp://any:53']);
@@ -342,9 +345,20 @@ test('parseSubscriptionContent detects share links', () => {
   assert.strictEqual(res.nodes.length, 2);
 });
 
+test('subscription node names are unique and cannot shadow strategy groups', () => {
+  const res = parseSubscriptionContent([
+    'trojan://p@a.com:443#dup',
+    'trojan://p@b.com:443#dup',
+    'trojan://p@c.com:443#%E2%99%BB%EF%B8%8F%20Auto',
+  ].join('\n'));
+  assert.deepStrictEqual(res.nodes.map((node) => node.name), ['dup', 'dup 2', '♻️ Auto 2']);
+});
+
 test('TUN inbound', () => {
   const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], { enableTun: true });
-  assert.ok(config.inbounds.some((i) => i.type === 'tun'));
+  const tun = config.inbounds.find((inbound) => inbound.type === 'tun');
+  assert.ok(tun);
+  assert.strictEqual(tun.interface_name, 'Dart');
 });
 
 test('clash_api secret is included when given, absent otherwise', () => {
@@ -373,12 +387,30 @@ test('clash_api hosts a local panel when externalUi opts are set', () => {
 test('Block mode rejects everything via a top clash_mode rule', () => {
   const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {});
   const rules = config.route.rules;
-  const blockIdx = rules.findIndex((r) => r.clash_mode === 'Block');
+  const blockIdx = rules.findIndex((r) => r.clash_mode === 'block');
   assert.ok(blockIdx >= 0, 'Block rule present');
   assert.strictEqual(rules[blockIdx].action, 'reject');
   // It must sit above every routing decision (only sniff/dns hijack before it).
-  const directIdx = rules.findIndex((r) => r.clash_mode === 'Direct');
+  const directIdx = rules.findIndex((r) => r.clash_mode === 'direct');
   assert.ok(blockIdx < directIdx, 'Block precedes other mode rules');
+});
+
+test('sing-box mode rules use the lowercase values emitted by the Clash API', () => {
+  const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {});
+  assert.deepStrictEqual(
+    config.route.rules.filter((rule) => rule.clash_mode).map((rule) => rule.clash_mode),
+    ['block', 'direct', 'global']
+  );
+  assert.deepStrictEqual(config.dns.rules.slice(0, 2).map((rule) => rule.clash_mode), ['direct', 'global']);
+});
+
+test('custom latency URL is used by both cores health-check groups', () => {
+  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
+  const testUrl = 'https://example.com/ping';
+  const singbox = buildSingboxConfig([node], { testUrl });
+  assert.ok(singbox.outbounds.filter((outbound) => outbound.type === 'urltest').every((outbound) => outbound.url === testUrl));
+  const mihomo = buildMihomoConfig([node], { testUrl });
+  assert.ok(mihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type)).every((group) => group.url === testUrl));
 });
 
 test('interface binding only in TUN mode (VPN/WireGuard coexistence)', () => {
@@ -741,8 +773,23 @@ test('a sing-box node round-trips back to the same outbound type', () => {
 });
 
 test('parseSubscriptionContent detects sing-box JSON (raw and base64)', () => {
-  const json = JSON.stringify({ outbounds: [{ type: 'trojan', tag: 'T', server: 't.com', server_port: 443, password: 'p', tls: { enabled: true } }] });
-  assert.strictEqual(parseSubscriptionContent(json).format, 'singbox');
+  const json = JSON.stringify({
+    outbounds: [{ type: 'trojan', tag: 'T', server: 't.com', server_port: 443, password: 'p', tls: { enabled: true } }],
+    route: {
+      rules: [
+        { domain_suffix: 'example.com', outbound: 'direct' },
+        { ip_is_private: true, outbound: 'direct' },
+        { rule_set: 'geoip-cn', outbound: 'direct' },
+        { action: 'hijack-dns', protocol: 'dns' },
+      ],
+    },
+  });
+  const parsed = parseSubscriptionContent(json);
+  assert.strictEqual(parsed.format, 'singbox');
+  assert.ok(parsed.rules.includes('DOMAIN-SUFFIX,example.com,DIRECT'));
+  assert.ok(parsed.rules.includes('IP-CIDR,10.0.0.0/8,DIRECT'));
+  assert.ok(!parsed.rules.some((rule) => rule.startsWith('RULE-SET,')));
+  assert.ok(!parsed.rules.some((rule) => rule.includes('hijack-dns')));
   const b64 = Buffer.from(json).toString('base64');
   assert.strictEqual(parseSubscriptionContent(b64).format, 'singbox');
 });

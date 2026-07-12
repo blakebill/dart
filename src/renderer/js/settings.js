@@ -17,7 +17,6 @@
     $('#setAutoLaunch').checked = !!s.autoLaunch;
     $('#setSilentStart').checked = !!s.silentStart;
     $('#setNotifications').checked = s.notifications !== false;
-    $('#setHwAccel').checked = !!s.hardwareAcceleration;
     $('#setIpv6').checked = !!s.enableIpv6;
     $('#setBuiltinRules').checked = !!s.useBuiltinRules;
     $('#setTestUrl').value = s.testUrl || '';
@@ -36,7 +35,11 @@
     const coreName = st.coreName || st.coreType || (App.state.settings && App.state.settings.coreType) || 'sing-box';
     const modal = $('#coreModalStatus');
     if (st.coreInstalled) {
-      const ver = st.coreVersion ? 'v' + st.coreVersion : t('settings.versionUnknown');
+      const ver = st.coreVersion
+        ? 'v' + st.coreVersion
+        : st.coreVersion === undefined
+          ? t('settings.detecting')
+          : t('settings.versionUnknown');
       el.textContent = t('settings.currentCoreValue', coreName, ver);
       el.title = st.corePath || ''; // full path on hover
       if (modal) modal.textContent = st.corePath || t('settings.installed', ver);
@@ -48,15 +51,25 @@
     el.style.color = st.coreInstalled ? 'var(--green)' : 'var(--red)';
   }
   // Re-fetch core status over IPC (used after a core download).
+  let coreStatusRequest = null;
   async function refreshCoreStatus() {
-    const st = await api.coreStatus();
-    App.state.status = { ...App.state.status, ...st };
-    renderCoreStatus(st);
+    if (!api || !api.coreStatus) return App.state.status;
+    if (coreStatusRequest) return coreStatusRequest;
+    coreStatusRequest = (async () => {
+      const st = await api.coreStatus();
+      App.state.status = { ...App.state.status, ...st };
+      renderCoreStatus(App.state.status);
+      return App.state.status;
+    })().finally(() => {
+      coreStatusRequest = null;
+    });
+    return coreStatusRequest;
   }
 
   $('#setLanguage').addEventListener('change', async (e) => {
     const lang = e.target.value;
     App.setLanguage(lang);
+    if (!api || !api.updateSettings) return;
     App.state.settings = await call(api.updateSettings, { language: lang });
   });
   $('#saveSettings').addEventListener('click', async () => {
@@ -69,16 +82,14 @@
       autoLaunch: $('#setAutoLaunch').checked,
       silentStart: $('#setSilentStart').checked,
       notifications: $('#setNotifications').checked,
-      hardwareAcceleration: $('#setHwAccel').checked,
       enableIpv6: $('#setIpv6').checked,
       useBuiltinRules: $('#setBuiltinRules').checked,
       testUrl: $('#setTestUrl').value.trim(),
       testConcurrency: Math.max(1, Math.min(32, parseInt($('#setTestConcurrency').value, 10) || 8)),
       language: $('#setLanguage').value,
     };
-    const hwChanged = !!App.state.settings.hardwareAcceleration !== patch.hardwareAcceleration;
     App.state.settings = await call(api.updateSettings, patch);
-    toast(hwChanged ? t('settings.savedRestart') : t('settings.saved'));
+    toast(t('settings.saved'));
   });
   $('#checkConfigBtn').addEventListener('click', async () => {
     await call(api.checkConfig);
@@ -107,6 +118,16 @@
     if (e.target.id === 'coreModal') $('#coreModal').classList.add('hidden');
   });
   $('#coreOpenFolderBtn').addEventListener('click', () => call(api.openCoreFolder));
+  $('#coreRestartBtn').addEventListener('click', async () => {
+    const btn = $('#coreRestartBtn');
+    btn.disabled = true;
+    try {
+      await call(api.restartCore);
+      toast(t('toast.restarted'));
+    } finally {
+      btn.disabled = false;
+    }
+  });
   async function applyCoreTypeSelection() {
     const coreType = $('#setCoreType').value;
     if (coreType === ((App.state.settings && App.state.settings.coreType) || 'sing-box')) return false;
@@ -211,6 +232,7 @@
 
   App.renderSettings = renderSettings;
   App.renderCoreStatus = renderCoreStatus;
+  App.refreshCoreStatus = refreshCoreStatus;
   App.initVersion = initVersion;
   App.runUpdateCheck = runUpdateCheck;
 })();

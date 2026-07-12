@@ -1,23 +1,37 @@
 'use strict';
 
+const path = require('path');
 const { app, Tray, Menu, nativeImage, dialog } = require('electron');
 
 const { state, sendLog, setTrayRefresher } = require('./state');
 const core = require('./core-control');
 
-// Tray icon: a solid blue swift silhouette lifted from the app art, so it
-// stays legible on light and dark system trays. 32x32 PNG, embedded as a
-// base64 data URL so the tray needs no external asset at runtime. Regenerate
-// with `node scripts/make-icon.js`, which prints it.
-const TRAY_ICON_DATAURL =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAPoAAAD6AG1e1JrAAADnElEQVRYw71XTWsTURR9atGiIhZBBSsoCCJa0G6Kij/AlRUpCIqCIriqC0F0YxddqCutTTIz+Wib2CJ240JEXKk7F6I7RVeiaAUpflSsNM07nnfnzWSSJo1tpj64TDLz3txzz/0cpeouLFN9aKEsV/9nUaFZA7pdZbFzzuNxrFhaMEaBWTkcVmkUlYNnysNllcK+8JlZBoT8t4DjI8C+0MNqgnijxgB1ByUB4+pXytNXCWZPuM8AMEBQB0gANCoNQQeWZnBF5QnAxTQBaTUsYBBh5gzBtFUAiSpetKsCa1LYqHL6PZkwIIpUWLJXrUYoBbn/UbmzfeoWNtmzlYrT2K7S+gTPXKL0UnrUTayviLd5WUjhuCjKUqFL8fjbAHD1rIi577MyoVKzvTy3Us4l0MX9d7n3p5wvEPw92TfOAF9XYeg8TPiWODhF30/ysK/cBxFIiVIkSyUB4uE59+0WJQns4P8XdCXUkDxL/5viKD3D2Cw0ujhJiz/QYkSYKItr3ZMXtr6rJPeb7DH3snLvC13RLu/sicRKQxd4OO1TrH+LpdWK5wChWzI2PgpyryjXNK7Z4GxZeFA6SKhRY4X1e0MQNkY8zAj9OXzlO7YtgP4aK4WLfNmUtUo3BOFJ7ZiROuLhQgWrCy7NQTAmsZWW9NtgrK/Y97sflA4GmrM8APHE+s7BdSlIfvRXU48wLU3WuDgfFqWmVvACk15D+CMMzM0Ebe9PUG4Q6JYy7c32iwCAyesc4yATVkYdpuCQXB+oQWwIKTes9SzK7/OASDKgTF6PRIqQa6338Iu/XwoDaewNgSCujhm8yMFBylPxdz7if8NM0LCyzAAPDykdMQRhDSbMNYVDVHA/DMhy/hfJQElSNoMfKjHTFU8wVk9FwQs9Npi8rYLRoPQYsKNSiMaaqAN1a0MwuLDr6U91esSMdYcbI4BwVmij9JHiaTsv6Kqa4DehnP4mE1TzLgiH1VXMhLPsC5PS3zOmP1Qo9yvhiFA/xb3d8ft/mBNNUu+SSucy9QK6TQzkbCd0OAcMojNe6qPDp4v9VPpYLM5IOmqx2sFbtu5zwlR0qGk69coR30GfPpIuN24HVYft1mSCgyP839r8UFprMClgDRXfFnr9LveaShOUbhleq8/EUnjK5fcAKX9HpZ+psJ/SyWetNef/2D9QHByVJuPh2Byrgg8NLNXXkYl0Q3Ewakc/VGNXWmslsDaserHSu5g4WOL1Fxb+td/nVYogAAAAAElFTkSuQmCC';
+const TRAY_ASSET_DIR = path.join(__dirname, 'assets');
+let trayImages = null;
+let trayRunning = null;
+
+function loadTrayImages() {
+  if (!trayImages) {
+    trayImages = {
+      stopped: nativeImage.createFromPath(path.join(TRAY_ASSET_DIR, 'tray-stopped.png')),
+      running: nativeImage.createFromPath(path.join(TRAY_ASSET_DIR, 'tray-running.png')),
+    };
+  }
+  return trayImages;
+}
+
+function updateTrayIcon(running) {
+  if (!state.tray || trayRunning === running) return;
+  const images = loadTrayImages();
+  state.tray.setImage(running ? images.running : images.stopped);
+  trayRunning = running;
+}
 
 function createTray() {
-  // Use a simple built-in icon (placeholder) to avoid depending on external asset files.
-  const icon = nativeImage.createFromDataURL(TRAY_ICON_DATAURL);
-  const tray = new Tray(icon);
+  const tray = new Tray(loadTrayImages().stopped);
   state.tray = tray;
-  tray.setToolTip('Dart');
+  trayRunning = false;
+  tray.setToolTip('Dart Network Control');
   // Let other modules (sendStatus, setProxyMode) refresh the menu without
   // requiring this module, which would create a require cycle.
   setTrayRefresher(updateTrayMenu);
@@ -31,14 +45,15 @@ function createTray() {
 function updateTrayMenu() {
   if (!state.tray) return;
   const running = state.singbox && state.singbox.isRunning();
+  updateTrayIcon(!!running);
   // While running, the traffic stream keeps the tooltip showing live speed;
   // reset it to the plain name once stopped so it doesn't show stale numbers.
   if (!running) {
-    try { state.tray.setToolTip('Dart'); } catch (_) { /* tray gone */ }
+    try { state.tray.setToolTip('Dart Network Control'); } catch (_) { /* tray gone */ }
   }
   const currentMode = (state.store && state.store.getSettings().clashMode) || 'rule';
   const menu = Menu.buildFromTemplate([
-    { label: 'Dart', enabled: false },
+    { label: 'Dart Network Control', enabled: false },
     { type: 'separator' },
     {
       label: running ? '● Running' : '○ Stopped',

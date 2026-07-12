@@ -40,7 +40,7 @@
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(sub.name)}${isActive ? ' ✓' : ''}</div>
-          <div class="sub-meta">${t('subs.nodes', (sub.nodes || []).length)} · ${fmt} · ${auInfo}${viaProxy} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
+          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${fmt} · ${auInfo}${viaProxy} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
           ${trafficLine}
         </div>
         <div class="sub-actions">
@@ -221,6 +221,12 @@
   let rawEditId = null;
   function closeRawModal() {
     rawEditId = null;
+    clearTimeout(rawHlTimer);
+    rawHlTimer = null;
+    $('#rawName').textContent = '';
+    $('#rawContent').value = '';
+    $('#rawHighlight').textContent = '';
+    $('#rawEditorWrap').classList.remove('plain');
     $('#rawModal').classList.add('hidden');
   }
   async function openRawEdit(id) {

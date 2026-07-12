@@ -3,10 +3,75 @@
 const http = require('http');
 const https = require('https');
 const tls = require('tls');
+const net = require('net');
 const fs = require('fs');
 const { URL } = require('url');
 
 const DEFAULT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+/** Open a TCP tunnel through the local mixed HTTP proxy. */
+function connectTunnel(targetHost, targetPort, proxyPort, timeout = 20000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (error, socket = null) => {
+      if (settled) {
+        if (socket) socket.destroy();
+        return;
+      }
+      settled = true;
+      if (error) reject(error);
+      else resolve(socket);
+    };
+    const bareHost = String(targetHost).replace(/^\[|\]$/g, '');
+    const authority = net.isIP(bareHost) === 6 ? `[${bareHost}]:${targetPort}` : `${bareHost}:${targetPort}`;
+    const req = http.request({
+      host: '127.0.0.1',
+      port: proxyPort,
+      method: 'CONNECT',
+      path: authority,
+      timeout,
+    });
+    req.once('connect', (res, socket, head) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        done(new Error('proxy CONNECT failed HTTP ' + res.statusCode));
+        return;
+      }
+      socket.setTimeout(0);
+      if (head && head.length) socket.unshift(head);
+      done(null, socket);
+    });
+    req.once('response', (res) => {
+      res.resume();
+      done(new Error('proxy CONNECT failed HTTP ' + res.statusCode));
+    });
+    req.once('error', (error) => done(error));
+    req.once('timeout', () => req.destroy(new Error('proxy connect timeout')));
+    req.end();
+  });
+}
+
+/** Build a one-shot HTTPS agent whose TLS transport is the CONNECT socket. */
+function tunneledHttpsAgent(socket, hostname) {
+  const agent = new https.Agent({ keepAlive: false, maxSockets: 1 });
+  let used = false;
+  agent.createConnection = (options) => {
+    if (used) throw new Error('tunnel socket already used');
+    used = true;
+    const tlsHost = String(hostname).replace(/^\[|\]$/g, '');
+    const tlsOptions = { ...options, socket };
+    if (net.isIP(tlsHost)) {
+      delete tlsOptions.servername;
+      tlsOptions.checkServerIdentity = (_host, cert) => tls.checkServerIdentity(tlsHost, cert);
+    } else {
+      tlsOptions.servername = tlsHost;
+    }
+    const tlsSocket = tls.connect(tlsOptions);
+    tlsSocket.on('error', () => {});
+    return tlsSocket;
+  };
+  return agent;
+}
 
 /**
  * HTTP(S) fetch helpers that can optionally tunnel through the local mixed
@@ -31,23 +96,13 @@ function openRequest(urlStr, opts, cb, errCb) {
   const reqPath = u.pathname + u.search;
 
   if (proxyPort && isHttps) {
-    // Tunnel: CONNECT to the proxy, then run TLS + GET over the tunneled socket.
-    const connectReq = http.request({
-      host: '127.0.0.1',
-      port: proxyPort,
-      method: 'CONNECT',
-      path: `${u.hostname}:${port}`,
-      timeout,
-    });
-    connectReq.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        return errCb(new Error('proxy CONNECT failed HTTP ' + res.statusCode));
-      }
+    // Tunnel: CONNECT to the proxy, then run TLS + GET over that exact socket.
+    connectTunnel(u.hostname, port, proxyPort, timeout).then((socket) => {
       // Swallow late resets on the tunneled socket: when the proxy (sing-box) is
       // torn down — e.g. the core is stopped right after an update download — the
       // tunnel emits ECONNRESET. Without a listener that would crash the process.
       socket.on('error', () => {});
+      const agent = tunneledHttpsAgent(socket, u.hostname);
       const req = https.request(
         {
           host: u.hostname,
@@ -55,23 +110,15 @@ function openRequest(urlStr, opts, cb, errCb) {
           path: reqPath,
           method: 'GET',
           headers: reqHeaders,
-          agent: false,
+          agent,
           timeout,
-          createConnection: () => {
-            const tlsSock = tls.connect({ socket, servername: u.hostname });
-            tlsSock.on('error', () => {});
-            return tlsSock;
-          },
         },
         cb
       );
       req.on('error', errCb);
       req.on('timeout', () => req.destroy(new Error('timeout')));
       req.end();
-    });
-    connectReq.on('error', errCb);
-    connectReq.on('timeout', () => connectReq.destroy(new Error('proxy connect timeout')));
-    connectReq.end();
+    }).catch(errCb);
     return;
   }
 
@@ -95,8 +142,10 @@ function getBuffer(urlStr, opts = {}) {
       (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           res.resume();
+          const nextUrl = new URL(res.headers.location, urlStr).toString();
+          if (typeof opts.onRedirect === 'function') opts.onRedirect(nextUrl, urlStr);
           return resolve(
-            getBuffer(new URL(res.headers.location, urlStr).toString(), { ...opts, redirects: redirects - 1 })
+            getBuffer(nextUrl, { ...opts, redirects: redirects - 1 })
           );
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -156,8 +205,10 @@ function download(urlStr, dest, opts = {}) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
           settled = true;
           res.resume();
+          const nextUrl = new URL(res.headers.location, urlStr).toString();
+          if (typeof opts.onRedirect === 'function') opts.onRedirect(nextUrl, urlStr);
           return resolve(
-            download(new URL(res.headers.location, urlStr).toString(), dest, { ...opts, redirects: redirects - 1 })
+            download(nextUrl, dest, { ...opts, redirects: redirects - 1 })
           );
         }
         if (res.statusCode !== 200) {
@@ -213,4 +264,4 @@ async function getBufferWithFallback(urlStr, opts = {}) {
   return getBuffer(urlStr, { ...rest, proxyPort: 0 });
 }
 
-module.exports = { download, downloadWithFallback, getBufferWithFallback };
+module.exports = { connectTunnel, download, downloadWithFallback, getBuffer, getBufferWithFallback };

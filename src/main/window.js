@@ -1,26 +1,48 @@
 'use strict';
 
 const path = require('path');
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, nativeTheme } = require('electron');
 
 const { state, isDev } = require('./state');
 
-// The window background must match the resolved theme to avoid a flash before
-// the renderer paints. For 'system', ask the OS.
+const isWin = process.platform === 'win32';
+
 function resolveBackground() {
-  const { nativeTheme } = require('electron');
+  // Windows Mica needs a fully transparent window background.
+  if (isWin) return '#00000000';
   const theme = (state.store && state.store.getSettings().theme) || 'dark';
   const dark = theme === 'system' ? nativeTheme.shouldUseDarkColors : theme !== 'light';
-  return dark ? '#0d1017' : '#f4f6fa';
+  return dark ? '#202020' : '#ffffff';
+}
+
+/** Sync DWM/Chromium dark mode so Mica tint matches the app theme. */
+function applyNativeThemeSource() {
+  const theme = (state.store && state.store.getSettings().theme) || 'dark';
+  nativeTheme.themeSource = theme === 'light' || theme === 'system' ? theme : 'dark';
+}
+
+function applyMica(win) {
+  if (!isWin || !win || win.isDestroyed()) return;
+  try {
+    win.setBackgroundMaterial('mica');
+    win.setBackgroundColor('#00000000');
+  } catch (_) {
+    /* older Electron / non-W11 */
+  }
 }
 
 function createWindow(startHidden = false) {
+  applyNativeThemeSource();
+
   const mainWindow = new BrowserWindow({
     width: 1040,
     height: 720,
     minWidth: 880,
     minHeight: 600,
-    title: 'Dart',
+    title: 'Dart Network Control',
+    frame: false,
+    titleBarStyle: 'hidden',
+    ...(isWin ? { backgroundMaterial: 'mica' } : {}),
     // Start hidden and reveal on ready-to-show; this avoids a white flash and
     // lets silent start keep the window in the tray without it ever appearing.
     show: false,
@@ -46,6 +68,7 @@ function createWindow(startHidden = false) {
   // Reveal once the renderer is painted, unless we're starting silently — then
   // the app lives in the tray until the user opens it (tray menu / relaunch).
   mainWindow.once('ready-to-show', () => {
+    applyMica(mainWindow);
     if (!startHidden) mainWindow.show();
   });
 
@@ -65,16 +88,25 @@ function createWindow(startHidden = false) {
   // the renderer to 1 fps while hidden and restore the default on show. This is
   // belt-and-suspenders on top of backgroundThrottling — Chromium already idles
   // background pages, but capping the frame rate makes the contract obvious and
-  // catches edge cases where a stray repaint could still wake the GPU. The
-  // renderer separately runs a GC on visibilitychange:hidden (see main.js).
+  // catches edge cases where a stray repaint could still wake the GPU.
   mainWindow.on('hide', () => {
     try { mainWindow.webContents.setFrameRate(1); } catch (_) { /* ignore */ }
   });
   mainWindow.on('show', () => {
     try { mainWindow.webContents.setFrameRate(60); } catch (_) { /* ignore */ }
+    applyMica(mainWindow);
   });
+
+  const sendMaximized = () => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('window:maximized', mainWindow.isMaximized());
+    }
+  };
+  mainWindow.on('maximize', sendMaximized);
+  mainWindow.on('unmaximize', sendMaximized);
+  mainWindow.on('restore', sendMaximized);
 
   return mainWindow;
 }
 
-module.exports = { createWindow };
+module.exports = { createWindow, applyNativeThemeSource };

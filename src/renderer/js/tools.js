@@ -1,6 +1,5 @@
 'use strict';
-// Tools tab modals: Clash → sing-box conversion preview and the UWP loopback
-// exemption manager.
+// Tools tab modals: bidirectional config conversion and UWP loopback manager.
 (function () {
   const App = window.App;
   const { $, toast, call, escapeHtml } = App;
@@ -8,17 +7,70 @@
   const { t } = window.i18n;
 
   // ---------- Conversion ----------
+  let convertTarget = 'auto';
+  let lastConvertOutput = '';
+  let lastConvertInfo = null;
+  let convertGeneration = 0;
+
+  function conversionTargetLabel(target) {
+    return t(target === 'clash' ? 'convert.targetClash' : 'convert.targetSingbox');
+  }
+
+  function conversionSourceLabel(format) {
+    if (format === 'clash') return t('convert.targetClash');
+    return format === 'singbox' || format === 'sing-box' ? t('convert.targetSingbox') : format;
+  }
+
+  function renderConvertLabels() {
+    $('#convertTitle').textContent = t('convert.title');
+    $('#convertInputHint').textContent = t('convert.inputHint');
+    $('#convertOutputTitle').textContent = lastConvertInfo
+      ? t(lastConvertInfo.target === 'clash' ? 'convert.outputTitleClash' : 'convert.outputTitleSingbox')
+      : t('convert.outputTitle');
+    for (const button of document.querySelectorAll('[data-convert-target]')) {
+      const active = button.dataset.convertTarget === convertTarget;
+      button.classList.toggle('primary', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
+    if (lastConvertInfo) {
+      $('#convertMeta').textContent = t(
+        'convert.meta',
+        conversionSourceLabel(lastConvertInfo.format),
+        conversionTargetLabel(lastConvertInfo.target),
+        lastConvertInfo.nodeCount
+      );
+    }
+  }
+
+  function invalidateConversion() {
+    convertGeneration++;
+    lastConvertOutput = '';
+    lastConvertInfo = null;
+    $('#convertOutput').textContent = '';
+    $('#convertMeta').textContent = '';
+    renderConvertLabels();
+  }
+
+  $('#openPanelBtn').addEventListener('click', async () => {
+    try {
+      await call(api.openClashApi);
+    } catch (e) {
+      toast(e.message || String(e), true);
+    }
+  });
+
   $('#convertOpen').addEventListener('click', () => {
-    const coreType = (App.state.settings && App.state.settings.coreType) || 'sing-box';
-    const mihomo = coreType === 'mihomo';
-    $('#convertTitle').textContent = mihomo ? t('convert.titleMihomo') : t('convert.title');
-    $('#convertOutputTitle').textContent = mihomo ? t('convert.outputTitleMihomo') : t('convert.outputTitle');
+    renderConvertLabels();
     $('#convertModal').classList.remove('hidden');
     $('#convertInput').focus();
   });
-  $('#convertClose').addEventListener('click', () => $('#convertModal').classList.add('hidden'));
+  function closeConvertModal() {
+    invalidateConversion();
+    $('#convertModal').classList.add('hidden');
+  }
+  $('#convertClose').addEventListener('click', closeConvertModal);
   $('#convertModal').addEventListener('click', (e) => {
-    if (e.target.id === 'convertModal') $('#convertModal').classList.add('hidden');
+    if (e.target.id === 'convertModal') closeConvertModal();
   });
   // Minimal JSON syntax highlighter for the conversion preview. The input is
   // JSON.stringify output (well-formed), so one token regex is sufficient:
@@ -35,26 +87,47 @@
     );
   }
 
-  let lastConvertOutput = '';
-  $('#convertBtn').addEventListener('click', async () => {
+  async function convertContent(showToast = true) {
     const content = $('#convertInput').value.trim();
     if (!content) return toast(t('toast.needContent'), true);
-    const res = await call(api.convertPreview, { content });
+    const generation = ++convertGeneration;
+    const res = await call(api.convertPreview, { content, target: convertTarget });
+    if (generation !== convertGeneration) return false;
+    lastConvertInfo = {
+      target: res.target,
+      nodeCount: res.nodeCount,
+      format: res.format,
+    };
     lastConvertOutput = res.text !== undefined ? String(res.text) : JSON.stringify(res.config, null, 2);
     const out = $('#convertOutput');
     // Highlighting a giant config (thousands of nodes) would stall the renderer;
     // beyond ~1.5MB fall back to plain text.
-    if (res.text !== undefined || lastConvertOutput.length > 1500000) out.textContent = lastConvertOutput;
+    if (res.target === 'clash' || lastConvertOutput.length > 1500000) out.textContent = lastConvertOutput;
     else out.innerHTML = highlightJson(lastConvertOutput);
-    $('#convertMeta').textContent = res.coreType === 'mihomo'
-      ? t('convert.metaMihomo', res.nodeCount, res.format)
-      : t('convert.meta', res.nodeCount, res.format);
-    toast(t('convert.done'));
+    renderConvertLabels();
+    if (showToast) toast(t('convert.done'));
+    return true;
+  }
+
+  $('#convertBtn').addEventListener('click', () => convertContent());
+  $('#convertTarget').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-convert-target]');
+    if (!button || button.dataset.convertTarget === convertTarget) return;
+    convertTarget = button.dataset.convertTarget;
+    invalidateConversion();
+  });
+  $('#convertInput').addEventListener('input', () => {
+    if (lastConvertInfo || lastConvertOutput) invalidateConversion();
+    else convertGeneration++;
   });
   $('#convertImportBtn').addEventListener('click', async () => {
     const content = $('#convertInput').value.trim();
     if (!content) return toast(t('toast.needContent'), true);
-    const sub = await call(api.importSubscription, { name: t('convert.importName'), content });
+    if (!lastConvertInfo) {
+      await convertContent(false);
+    }
+    if (!lastConvertOutput) return;
+    const sub = await call(api.importSubscription, { name: t('convert.importName'), content: lastConvertOutput });
     toast(t('toast.subSaved', sub.nodes.length));
     await App.refresh();
   });
@@ -70,20 +143,24 @@
 
   // ---------- UWP loopback exemption ----------
   let uwpApps = [];
+  let uwpLoadGeneration = 0;
   async function openUwpModal() {
     $('#uwpModal').classList.remove('hidden');
     $('#uwpFilter').value = '';
     await loadUwp();
   }
   async function loadUwp() {
+    const generation = ++uwpLoadGeneration;
     $('#uwpStatus').textContent = t('uwp.loading');
+    let apps;
     try {
-      uwpApps = await api.listUwpApps();
+      apps = await api.listUwpApps();
     } catch (e) {
-      uwpApps = [];
+      apps = [];
     }
+    if (generation !== uwpLoadGeneration || $('#uwpModal').classList.contains('hidden')) return;
+    uwpApps = apps;
     renderUwp();
-    $('#uwpStatus').textContent = uwpApps.length ? '' : t('uwp.empty');
   }
   // Apps matching the current scope + search filter.
   function visibleUwp() {
@@ -96,17 +173,37 @@
     );
   }
   function renderUwp() {
+    const visible = visibleUwp();
+    const list = $('#uwpList');
+    if (!visible.length) {
+      list.innerHTML = `<div class="uwp-empty">${t(uwpApps.length ? 'uwp.noMatches' : 'uwp.empty')}</div>`;
+      updateUwpStatus();
+      return;
+    }
     let html = '';
-    for (const a of visibleUwp()) {
+    for (const a of visible) {
       html += `<label class="uwp-item"><input type="checkbox" data-sid="${escapeHtml(a.sid)}" ${a.enabled ? 'checked' : ''}/><span class="uwp-name">${escapeHtml(a.name)}</span></label>`;
     }
-    $('#uwpList').innerHTML = html;
+    list.innerHTML = html;
+    updateUwpStatus();
+  }
+  function updateUwpStatus() {
+    const selected = uwpApps.reduce((count, app) => count + (app.enabled ? 1 : 0), 0);
+    $('#uwpStatus').textContent = uwpApps.length ? t('uwp.selection', selected, uwpApps.length) : '';
+  }
+
+  function closeUwpModal() {
+    uwpLoadGeneration++;
+    uwpApps = [];
+    $('#uwpList').textContent = '';
+    $('#uwpStatus').textContent = '';
+    $('#uwpModal').classList.add('hidden');
   }
 
   $('#uwpOpen').addEventListener('click', openUwpModal);
-  $('#uwpCancel').addEventListener('click', () => $('#uwpModal').classList.add('hidden'));
+  $('#uwpCancel').addEventListener('click', closeUwpModal);
   $('#uwpModal').addEventListener('click', (e) => {
-    if (e.target.id === 'uwpModal') $('#uwpModal').classList.add('hidden');
+    if (e.target.id === 'uwpModal') closeUwpModal();
   });
   $('#uwpReload').addEventListener('click', loadUwp);
   $('#uwpFilter').addEventListener('input', renderUwp);
@@ -126,7 +223,10 @@
     const cb = e.target.closest('input[type=checkbox]');
     if (!cb) return;
     const a = uwpApps.find((x) => x.sid === cb.dataset.sid);
-    if (a) a.enabled = cb.checked;
+    if (a) {
+      a.enabled = cb.checked;
+      updateUwpStatus();
+    }
   });
   $('#uwpApply').addEventListener('click', async () => {
     const sids = uwpApps.filter((a) => a.enabled).map((a) => a.sid);
@@ -147,4 +247,9 @@
       btn.textContent = t('uwp.apply');
     }
   });
+
+  App.refreshToolsLanguage = () => {
+    renderConvertLabels();
+    if (!$('#uwpModal').classList.contains('hidden')) renderUwp();
+  };
 })();

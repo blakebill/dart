@@ -1,9 +1,42 @@
 'use strict';
 
+const crypto = require('crypto');
 const clashParser = require('./parsers/clash');
 const linkParser = require('./parsers/share-link');
 const singboxParser = require('./parsers/singbox');
+const { singboxRuleToClashRules } = require('./converter');
 const fetch = require('./fetch');
+
+const RESERVED_NODE_NAMES = new Set([
+  '🚀 Proxy', '♻️ Auto', '🛟 Fallback',
+  'direct', 'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL',
+]);
+
+function uniqueNodeNames(nodes) {
+  const used = new Set(RESERVED_NODE_NAMES);
+  return (nodes || []).map((node, index) => {
+    const fallback = `${node.type || 'node'} ${index + 1}`;
+    const base = String(node.name || fallback).trim() || fallback;
+    let name = base;
+    let suffix = 2;
+    while (used.has(name)) name = `${base} ${suffix++}`;
+    used.add(name);
+    return name === node.name ? node : { ...node, name };
+  });
+}
+
+/** Stable digest of the parts that change a running core configuration. */
+function configFingerprint(value) {
+  const source = value || {};
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([
+      source.nodes || [],
+      source.clashRules || source.rules || [],
+      source.clashRuleProviders || source.ruleProviders || {},
+    ]))
+    .digest('hex');
+}
 
 /** Parse the airport traffic info header `subscription-userinfo`. */
 function parseUserInfo(headers) {
@@ -44,7 +77,14 @@ function parseSubscriptionContent(content) {
     if (!candidate || (candidate[0] !== '{' && candidate[0] !== '[')) continue;
     const r = singboxParser.parseSingboxConfig(candidate);
     if (r.isSingbox && r.nodes.length) {
-      return { nodes: r.nodes, groups: [], rules: [], format: 'singbox' };
+      return {
+        nodes: uniqueNodeNames(r.nodes),
+        groups: [],
+        // sing-box binary rule sets are not Clash-compatible; preserve common
+        // inline matchers and omit unresolved RULE-SET references.
+        rules: (r.routeRules || []).flatMap((rule) => singboxRuleToClashRules(rule, { includeRuleSets: false })),
+        format: 'singbox',
+      };
     }
   }
 
@@ -53,14 +93,14 @@ function parseSubscriptionContent(content) {
   if (/proxies\s*:/.test(text)) {
     try {
       const r = clashParser.parseClashConfig(text);
-      if (r.isClash) return { nodes: r.nodes, groups: r.groups, rules: r.rules, ruleProviders: r.ruleProviders, format: 'clash' };
+      if (r.isClash) return { nodes: uniqueNodeNames(r.nodes), groups: r.groups, rules: r.rules, ruleProviders: r.ruleProviders, format: 'clash' };
     } catch (e) {
       /* not valid YAML; fall through to the link parser */
     }
   }
 
   // Share links / base64 subscription
-  const nodes = linkParser.parseSubscriptionLinks(text);
+  const nodes = uniqueNodeNames(linkParser.parseSubscriptionLinks(text));
   if (nodes.length > 0) {
     return { nodes, groups: [], rules: [], format: 'links' };
   }
@@ -68,7 +108,7 @@ function parseSubscriptionContent(content) {
   // Fallback: try parsing as Clash again (some configs without a proxies: comment)
   try {
     const { nodes: cn, groups, rules, ruleProviders } = clashParser.parseClashConfig(text);
-    if (cn.length > 0) return { nodes: cn, groups, rules, ruleProviders, format: 'clash' };
+    if (cn.length > 0) return { nodes: uniqueNodeNames(cn), groups, rules, ruleProviders, format: 'clash' };
   } catch (e) {
     /* ignore */
   }
@@ -134,4 +174,6 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
 module.exports = {
   fetchSubscription,
   parseSubscriptionContent,
+  configFingerprint,
+  uniqueNodeNames,
 };

@@ -12,6 +12,12 @@ contextBridge.exposeInMainWorld('api', {
   getState: () => ipcRenderer.invoke('app:getState'),
   coreStatus: () => ipcRenderer.invoke('core:status'),
 
+  // Frameless window controls
+  minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
+  toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggleMaximize'),
+  isWindowMaximized: () => ipcRenderer.invoke('window:isMaximized'),
+  closeWindow: () => ipcRenderer.invoke('window:close'),
+
   // Subscriptions
   addSubscription: (payload) => ipcRenderer.invoke('sub:add', payload),
   updateSubscription: (payload) => ipcRenderer.invoke('sub:update', payload),
@@ -35,9 +41,9 @@ contextBridge.exposeInMainWorld('api', {
   // Node latency test
   testNodeDelay: (name) => ipcRenderer.invoke('node:delay', { name }),
 
-  // Node selection (+ the urltest group's current pick)
+  // Node selection (+ current picks for the automatic groups)
   selectNode: (name) => ipcRenderer.invoke('node:select', { name }),
-  getAutoSelected: () => ipcRenderer.invoke('node:autoNow'),
+  getGroupSelections: (all = false) => ipcRenderer.invoke('node:groupSelections', { all: !!all }),
 
   // Rules / connections / proxy mode
   getRules: () => ipcRenderer.invoke('rules:get'),
@@ -55,6 +61,17 @@ contextBridge.exposeInMainWorld('api', {
   // UWP loopback exemption tool
   listUwpApps: () => ipcRenderer.invoke('uwp:list'),
   setUwpLoopback: (sids) => ipcRenderer.invoke('uwp:set', { sids }),
+
+  // Diagnostics and maintenance toolbox
+  inspectRoute: (payload) => ipcRenderer.invoke('tools:routeInspect', payload),
+  runNetworkDiagnostics: () => ipcRenderer.invoke('tools:networkDiagnostics'),
+  checkAllConfigs: () => ipcRenderer.invoke('tools:configCheck'),
+  inspectPorts: (payload) => ipcRenderer.invoke('tools:portCheck', payload),
+  compareDns: (payload) => ipcRenderer.invoke('tools:dnsCompare', payload),
+  saveToolReport: (payload) => ipcRenderer.invoke('tools:saveReport', payload),
+  exportBackup: () => ipcRenderer.invoke('tools:backupExport'),
+  selectBackup: () => ipcRenderer.invoke('tools:backupSelect'),
+  restoreBackup: (payload) => ipcRenderer.invoke('tools:backupRestore', payload),
 
   // Local rules
   listLocalRules: () => ipcRenderer.invoke('localrules:list'),
@@ -117,5 +134,10 @@ contextBridge.exposeInMainWorld('api', {
     const handler = (_e, mode) => cb(mode);
     ipcRenderer.on('mode:changed', handler);
     return () => ipcRenderer.removeListener('mode:changed', handler);
+  },
+  onWindowMaximized: (cb) => {
+    const handler = (_e, maximized) => cb(!!maximized);
+    ipcRenderer.on('window:maximized', handler);
+    return () => ipcRenderer.removeListener('window:maximized', handler);
   },
 });

@@ -11,6 +11,8 @@ const { state } = require('./state');
  */
 
 let trafficReq = null;
+const MAX_TRAFFIC_BUFFER = 64 * 1024;
+let lastTrayTooltip = '';
 
 // Human-readable rate for the tray tooltip (e.g. "1.2 MB/s", "840 KB/s").
 function fmtRate(n) {
@@ -28,8 +30,11 @@ function fmtRate(n) {
 // when the window is hidden in the tray (pairs with silent start).
 function updateTrayTooltip(up, down) {
   if (!state.tray || (state.tray.isDestroyed && state.tray.isDestroyed())) return;
+  const tooltip = `Dart Network Control\n↑ ${fmtRate(up)}   ↓ ${fmtRate(down)}`;
+  if (tooltip === lastTrayTooltip) return;
   try {
-    state.tray.setToolTip(`Dart\n↑ ${fmtRate(up)}   ↓ ${fmtRate(down)}`);
+    state.tray.setToolTip(tooltip);
+    lastTrayTooltip = tooltip;
   } catch (_) {
     /* tray may be gone during shutdown */
   }
@@ -55,6 +60,10 @@ function startTrafficStream() {
       res.setEncoding('utf-8');
       res.on('data', (chunk) => {
         buf += chunk;
+        if (buf.length > MAX_TRAFFIC_BUFFER && !buf.includes('\n')) {
+          req.destroy(new Error('traffic stream frame too large'));
+          return;
+        }
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, idx).trim();
@@ -65,7 +74,10 @@ function startTrafficStream() {
             const up = t.up || 0;
             const down = t.down || 0;
             updateTrayTooltip(up, down);
-            if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+            const windowVisible = state.mainWindow && !state.mainWindow.isDestroyed() &&
+              (typeof state.mainWindow.isVisible !== 'function' || state.mainWindow.isVisible()) &&
+              (typeof state.mainWindow.isMinimized !== 'function' || !state.mainWindow.isMinimized());
+            if (windowVisible) {
               state.mainWindow.webContents.send('singbox:traffic', { up, down });
             }
           } catch (_) {

@@ -30,8 +30,13 @@ class FakeWebContents {
   setWindowOpenHandler() {}
 }
 class FakeBrowserWindow {
-  constructor() {
+  constructor(options = {}) {
+    this.options = options;
     this.webContents = new FakeWebContents();
+    this.maximized = false;
+    this.minimized = false;
+    this.closed = false;
+    FakeBrowserWindow.last = this;
   }
   loadFile() {}
   setMenuBarVisibility() {}
@@ -49,13 +54,24 @@ class FakeBrowserWindow {
   hide() {}
   focus() {}
   restore() {}
+  minimize() { this.minimized = true; }
+  maximize() { this.maximized = true; }
+  unmaximize() { this.maximized = false; }
+  isMaximized() { return this.maximized; }
+  close() { this.closed = true; }
+  setBackgroundMaterial() {}
+  setBackgroundColor() {}
   static getAllWindows() {
     return [];
+  }
+  static fromWebContents(contents) {
+    return FakeBrowserWindow.last && FakeBrowserWindow.last.webContents === contents ? FakeBrowserWindow.last : null;
   }
 }
 class FakeTray {
   setToolTip() {}
   setContextMenu() {}
+  setImage() {}
   on() {}
 }
 
@@ -75,14 +91,15 @@ const electronStub = {
   BrowserWindow: FakeBrowserWindow,
   Tray: FakeTray,
   Menu: { buildFromTemplate: (tpl) => tpl },
-  nativeImage: { createFromDataURL: () => ({}) },
-  nativeTheme: { shouldUseDarkColors: false },
+  nativeImage: { createFromDataURL: () => ({}), createFromPath: (file) => ({ file }) },
+  nativeTheme: { shouldUseDarkColors: false, themeSource: 'system' },
   Notification: class { static isSupported() { return false; } show() {} on() {} },
   shell: { openExternal: () => {}, openPath: () => {}, showItemInFolder: () => {} },
   dialog: {
     showErrorBox: () => {},
     showMessageBox: async () => ({ response: 1 }),
     showSaveDialog: async () => ({ canceled: true }),
+    showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
   },
   ipcMain: {
     handle: (channel, fn) => {
@@ -110,6 +127,12 @@ require.cache[require.resolve(subscriptionPath)] = {
       userInfo: null,
     }),
     parseSubscriptionContent: () => ({ nodes: [], format: 'unknown', rules: [], raw: '' }),
+    configFingerprint: (value) => JSON.stringify([
+      value.nodes || [],
+      value.clashRules || value.rules || [],
+      value.clashRuleProviders || value.ruleProviders || {},
+    ]),
+    uniqueNodeNames: (nodes) => nodes || [],
   },
 };
 
@@ -140,6 +163,18 @@ async function main() {
 
   console.log(`✓ main process boots with ${fromMain.length} IPC handlers, all matching preload`);
 
+  const windowEvent = { sender: FakeBrowserWindow.last.webContents };
+  assert.strictEqual(await handlers['window:isMaximized'](windowEvent), false);
+  assert.strictEqual(await handlers['window:toggleMaximize'](windowEvent), true);
+  assert.strictEqual(await handlers['window:toggleMaximize'](windowEvent), false);
+  await handlers['window:minimize'](windowEvent);
+  await handlers['window:close'](windowEvent);
+  assert.strictEqual(FakeBrowserWindow.last.minimized, true);
+  assert.strictEqual(FakeBrowserWindow.last.closed, true);
+  assert.strictEqual(FakeBrowserWindow.last.options.frame, false);
+  assert.strictEqual(FakeBrowserWindow.last.options.titleBarStyle, 'hidden');
+  console.log('✓ frameless window controls invoke the active BrowserWindow');
+
   // ---- Regression: adding a subscription must never steal the active profile ----
   // Legacy stores (pre-profiles) have subscriptions but no activeSub; the core
   // runs subs[0] via the getActiveSubId fallback. sub:add used to flip the NEW
@@ -157,6 +192,12 @@ async function main() {
   assert.notStrictEqual(state.store.get('activeSub'), subB.id, 'a later add must not steal activeness');
   assert.strictEqual(core.getActiveSubId(), subA.id, 'the effective profile remains subs[0]');
   assert.strictEqual(state.store.get('activeSub'), subA.id, 'getActiveSubId pins the legacy fallback');
+  const rendererState = await handlers['app:getState']();
+  const rendererSubA = rendererState.subscriptions.find((s) => s.id === subA.id);
+  const rendererSubB = rendererState.subscriptions.find((s) => s.id === subB.id);
+  assert.strictEqual(rendererSubA.nodes.length, 1, 'active profile exposes node summaries');
+  assert.strictEqual(rendererSubB.nodes.length, 0, 'inactive profile payload stays out of renderer IPC');
+  assert.strictEqual(rendererSubB.nodeCount, 1, 'inactive profile still exposes its node count');
 
   // Updating only rules/providers still changes the generated core config.
   const subscriptionStub = require(subscriptionPath);
@@ -198,6 +239,26 @@ async function main() {
 
   console.log('✓ adding a subscription never steals the active profile (legacy-store regression)');
 
+  const originalParseSubscription = subscriptionStub.parseSubscriptionContent;
+  const conversionNode = { name: 'Converted', type: 'trojan', server: 'proxy.example.com', port: 443, password: 'p', tls: true };
+  subscriptionStub.parseSubscriptionContent = (content) => content === 'singbox-source'
+    ? { nodes: [conversionNode], rules: ['DOMAIN-SUFFIX,example.com,DIRECT'], format: 'singbox' }
+    : { nodes: [conversionNode], rules: ['DOMAIN-SUFFIX,example.com,Proxy'], format: 'clash' };
+  const toClash = handlers['convert:preview'](null, { content: 'singbox-source', target: 'auto' });
+  assert.strictEqual(toClash.target, 'clash');
+  assert.ok(toClash.text.includes('name: Dart Proxy'));
+  assert.ok(!/[🚀♻️]/u.test(toClash.text), 'converted Clash output still contains decorative emoji');
+  const toSingbox = handlers['convert:preview'](null, { content: 'clash-source', target: 'auto' });
+  assert.strictEqual(toSingbox.target, 'sing-box');
+  assert.ok(toSingbox.config.outbounds.some((outbound) => outbound.tag === 'Dart Proxy'));
+  assert.ok(!/[🚀♻️]/u.test(JSON.stringify(toSingbox.config)), 'converted sing-box output still contains decorative emoji');
+  await assert.rejects(
+    Promise.resolve().then(() => handlers['convert:preview'](null, { content: 'clash-source', target: 'invalid' })),
+    /invalid conversion target/
+  );
+  subscriptionStub.parseSubscriptionContent = originalParseSubscription;
+  console.log('✓ config conversion auto-detects both directions and emits plain group names');
+
   await assert.rejects(
     handlers['settings:update'](null, { mixedPort: 0 }),
     /invalid mixedPort/
@@ -218,7 +279,26 @@ async function main() {
     handlers['core:download'](null, { version: '../../bad' }),
     /invalid version/
   );
-  console.log('✓ settings reject invalid ports and cannot enable a dead system proxy');
+  const previousTestUrl = state.store.getSettings().testUrl;
+  const originalSettingsRunning = state.singbox.isRunning;
+  const originalSettingsRestart = core.restartIfRunning;
+  let settingsRestartCount = 0;
+  state.singbox.isRunning = () => true;
+  core.restartIfRunning = async () => { settingsRestartCount += 1; };
+  try {
+    const testUrl = 'https://example.com/dart-204';
+    await handlers['settings:update'](null, { testUrl });
+    assert.strictEqual(settingsRestartCount, 1, 'changing the health-check URL must rebuild a running core config');
+    const singboxHealth = core.buildCurrentConfig('sing-box').config.outbounds.filter((outbound) => outbound.type === 'urltest');
+    const mihomoHealth = core.buildCurrentConfig('mihomo').config['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type));
+    assert.ok(singboxHealth.length && singboxHealth.every((outbound) => outbound.url === testUrl));
+    assert.ok(mihomoHealth.length && mihomoHealth.every((group) => group.url === testUrl));
+  } finally {
+    state.store.updateSettings({ testUrl: previousTestUrl });
+    state.singbox.isRunning = originalSettingsRunning;
+    core.restartIfRunning = originalSettingsRestart;
+  }
+  console.log('✓ settings reject invalid values and apply custom health-check URLs to both cores');
 
   // ---- Regression: inline custom rule-sets must stay OR-semantics ----
   // A rule with both domain and ip_cidr fields is an AND in sing-box, so older
@@ -285,42 +365,217 @@ async function main() {
   assert.strictEqual(updateInfo.assetUrl, 'https://example.com/right.exe');
   console.log('✓ app updates select the matching Dart installer asset');
 
+  const originalIsRunning = state.singbox.isRunning;
+  const originalClashApi = core.clashApi;
+  state.singbox.isRunning = () => true;
+  core.clashApi = async () => ({
+    connections: Array.from({ length: 1000 }, (_, i) => ({
+      id: 'c' + i,
+      start: 's' + String(i).padStart(4, '0'),
+      upload: i,
+      download: i * 2,
+      chains: ['proxy'],
+      rule: 'MATCH',
+      metadata: { host: 'example.com', destinationPort: 443, network: 'tcp', ignored: 'large-extra-field' },
+      ignored: 'large-extra-field',
+    })),
+    uploadTotal: 10,
+    downloadTotal: 20,
+  });
+  const connectionSnapshot = await handlers['connections:get']();
+  core.clashApi = originalClashApi;
+  state.singbox.isRunning = originalIsRunning;
+  assert.strictEqual(connectionSnapshot.totalConnections, 1000);
+  assert.strictEqual(connectionSnapshot.connections.length, 600);
+  assert.strictEqual(connectionSnapshot.connections[0].id, 'c400');
+  assert.strictEqual(connectionSnapshot.connections[599].id, 'c999');
+  assert.ok(!('ignored' in connectionSnapshot.connections[0]));
+  assert.ok(!('ignored' in connectionSnapshot.connections[0].metadata));
+  console.log('✓ connection IPC keeps only the newest sanitized window');
+
   state.singbox.setCoreType('mihomo');
   const mihomoDir = state.singbox.ensureCoreDir('mihomo');
   for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
     fs.writeFileSync(path.join(mihomoDir, file), Buffer.alloc(2048, 1));
   }
+  const geoUpdatedAt = Date.now() - 1234;
   fs.writeFileSync(path.join(mihomoDir, 'geodata-meta.json'), JSON.stringify({
-    'geoip.dat': { version: 'latest', updatedAt: Date.now() },
-    'geosite.dat': { version: 'latest', updatedAt: Date.now() },
-    'country.mmdb': { version: 'latest', updatedAt: Date.now() },
+    'geoip.dat': { updatedAt: geoUpdatedAt },
+    'geosite.dat': { updatedAt: geoUpdatedAt },
+    'country.mmdb': { updatedAt: geoUpdatedAt },
   }));
-  const mihomoGeo = handlers['ruleset:list']();
+  const mihomoGeo = await handlers['ruleset:list']();
   assert.deepStrictEqual(
     mihomoGeo.map((x) => x.file),
     ['geoip.dat', 'geosite.dat', 'country.mmdb'],
     'mihomo mode reports mihomo geodata files'
   );
-  assert.deepStrictEqual(mihomoGeo.map((x) => x.version), [null, null, null], 'latest is not a displayable mihomo geodata version');
   assert.ok(
-    mihomoGeo.every((x) => !String(x.url || '').includes('/latest/')),
-    'mihomo geodata status must not expose latest URLs as versions'
-  );
-
-  fs.writeFileSync(path.join(mihomoDir, 'geodata-meta.json'), JSON.stringify({
-    'geoip.dat': { version: '202607010001', updatedAt: Date.now() },
-    'geosite.dat': { version: '202607010001', updatedAt: Date.now() },
-    'country.mmdb': { version: '202607010001', updatedAt: Date.now() },
-  }));
-  const versionedMihomoGeo = handlers['ruleset:list']();
-  assert.deepStrictEqual(
-    versionedMihomoGeo.map((x) => x.version),
-    ['202607010001', '202607010001', '202607010001'],
-    'mihomo mode reports concrete geodata versions'
+    mihomoGeo.every((x) => x.updatedAt === geoUpdatedAt && !Object.prototype.hasOwnProperty.call(x, 'version')),
+    'GeoData status only exposes the stored update time, not release versions'
   );
   state.singbox.setCoreType('sing-box');
 
   console.log('✓ rule-set status switches to mihomo geodata in mihomo mode');
+
+  const originalRouteRunning = state.singbox.isRunning;
+  const originalRouteApi = core.clashApi;
+  const routeApiPaths = [];
+  state.singbox.isRunning = () => true;
+  core.clashApi = async (_method, apiPath) => {
+    routeApiPaths.push(apiPath);
+    if (apiPath === '/rules') return { rules: [{ type: 'Default', payload: 'ip_cidr=1.1.1.1/32', proxy: '' }] };
+    return {};
+  };
+  const inspectedRoute = await handlers['tools:routeInspect'](null, { value: '1.1.1.1' });
+  state.singbox.isRunning = originalRouteRunning;
+  core.clashApi = originalRouteApi;
+  assert.strictEqual(inspectedRoute.target.host, '1.1.1.1');
+  assert.strictEqual(inspectedRoute.dnsPath.skipped, true, 'literal IP route checks should not claim a DNS path');
+  assert.ok(inspectedRoute.finalOutbound, 'route inspector did not resolve a final outbound');
+  assert.ok(!routeApiPaths.includes('/rules'), 'sing-box route inspection used lossy DEFAULT rules from Clash API');
+  assert.ok(
+    !inspectedRoute.unresolvedBeforeMatch.some((rule) => rule.type === 'DEFAULT'),
+    'route inspector still reports structured sing-box rules as DEFAULT'
+  );
+
+  const toolbox = require(path.join(__dirname, '..', 'src', 'main', 'toolbox'));
+  const forcedModeCalls = [];
+  const forcedContext = {
+    state: {
+      store: { getSettings: () => ({ enableClashApi: true, clashMode: 'rule' }) },
+      singbox: { isRunning: () => true },
+    },
+    core: {
+      currentProxyPort: () => 7890,
+      clashApi: async (method, apiPath, body) => forcedModeCalls.push({ method, apiPath, body }),
+    },
+  };
+  const forcedResult = await toolbox.withForcedProxy(forcedContext, async (port, forced) => ({ port, forced }));
+  assert.deepStrictEqual(forcedResult, { port: 7890, forced: true });
+  assert.deepStrictEqual(forcedModeCalls.filter((call) => call.method === 'PATCH').map((call) => call.body.mode), ['global', 'rule']);
+  forcedModeCalls.length = 0;
+  await assert.rejects(
+    toolbox.withForcedProxy(forcedContext, async () => { throw new Error('probe failed'); }),
+    /probe failed/
+  );
+  assert.deepStrictEqual(forcedModeCalls.filter((call) => call.method === 'PATCH').map((call) => call.body.mode), ['global', 'rule']);
+
+  let runtimeMode = 'rule';
+  let pendingMode = null;
+  const delayedModeContext = {
+    state: forcedContext.state,
+    core: {
+      currentProxyPort: () => 7890,
+      clashApi: async (method, apiPath, body) => {
+        if (apiPath.startsWith('/proxies/')) return null;
+        if (method === 'PATCH') {
+          pendingMode = body.mode;
+          return {};
+        }
+        assert.strictEqual(apiPath, '/configs');
+        if (pendingMode) {
+          const staleMode = runtimeMode;
+          runtimeMode = pendingMode;
+          pendingMode = null;
+          return { mode: staleMode };
+        }
+        return { mode: runtimeMode };
+      },
+    },
+  };
+  const observedMode = await toolbox.withForcedProxy(delayedModeContext, async () => runtimeMode);
+  assert.strictEqual(observedMode, 'global', 'probe started before the requested core mode became active');
+  assert.strictEqual(runtimeMode, 'rule', 'diagnostics did not wait for the saved mode to be restored');
+
+  let mihomoMode = 'rule';
+  let mihomoGlobal = 'DIRECT';
+  const mihomoDiagnosticContext = {
+    state: {
+      store: forcedContext.state.store,
+      singbox: { isRunning: () => true, getCoreType: () => 'mihomo' },
+    },
+    core: {
+      currentProxyPort: () => 7890,
+      clashApi: async (method, apiPath, body) => {
+        if (apiPath === '/configs') {
+          if (method === 'PATCH') mihomoMode = body.mode;
+          return { mode: mihomoMode };
+        }
+        if (apiPath === '/proxies/%F0%9F%9A%80%20Proxy') {
+          return { now: '♻️ Auto', all: ['♻️ Auto', 'DIRECT'] };
+        }
+        assert.strictEqual(apiPath, '/proxies/GLOBAL');
+        if (method === 'PUT') mihomoGlobal = body.name;
+        return { now: mihomoGlobal, all: ['DIRECT', '🚀 Proxy'] };
+      },
+    },
+  };
+  const mihomoObserved = await toolbox.withForcedProxy(
+    mihomoDiagnosticContext,
+    async () => ({ mode: mihomoMode, global: mihomoGlobal })
+  );
+  assert.deepStrictEqual(mihomoObserved, { mode: 'global', global: '🚀 Proxy' });
+  assert.strictEqual(mihomoGlobal, 'DIRECT', 'mihomo GLOBAL selection was not restored');
+  assert.strictEqual(mihomoMode, 'rule', 'mihomo mode was not restored');
+
+  let singboxMode = 'rule';
+  let singboxProxy = 'direct';
+  const singboxDiagnosticContext = {
+    state: {
+      store: {
+        get: () => 'direct',
+        getSettings: () => ({ enableClashApi: true, clashMode: 'rule' }),
+      },
+      singbox: { isRunning: () => true, getCoreType: () => 'sing-box' },
+    },
+    core: {
+      currentProxyPort: () => 7890,
+      clashApi: async (method, apiPath, body) => {
+        if (apiPath === '/configs') {
+          if (method === 'PATCH') singboxMode = body.mode;
+          return { mode: singboxMode };
+        }
+        assert.strictEqual(apiPath, '/proxies/%F0%9F%9A%80%20Proxy');
+        if (method === 'PUT') singboxProxy = body.name;
+        return { now: singboxProxy, all: ['direct', '♻️ Auto', 'node-a'] };
+      },
+    },
+  };
+  const singboxObserved = await toolbox.withForcedProxy(
+    singboxDiagnosticContext,
+    async () => ({ mode: singboxMode, proxy: singboxProxy })
+  );
+  assert.deepStrictEqual(singboxObserved, { mode: 'global', proxy: '♻️ Auto' });
+  assert.strictEqual(singboxProxy, 'direct', 'sing-box app proxy selection was not restored');
+  assert.strictEqual(singboxMode, 'rule', 'sing-box mode was not restored');
+
+  const coreBeforeValidation = state.singbox.getCoreType();
+  const checkedConfigs = await handlers['tools:configCheck']();
+  assert.deepStrictEqual(checkedConfigs.results.map((result) => result.coreType), ['sing-box', 'mihomo']);
+  assert.ok(checkedConfigs.results.every((result) => result.summary), 'both generated configs need a comparison summary');
+  assert.strictEqual(state.singbox.getCoreType(), coreBeforeValidation, 'dual-core validation switched the active runtime core');
+  console.log('✓ route inspection, forced proxy probes and dual-core validation preserve runtime state');
+
+  const backupPath = path.join(tmpDir, 'toolbox-backup.json');
+  const originalMixedPort = state.store.getSettings().mixedPort;
+  state.store.set('localRules', [{ id: 'backup-rule', name: 'Backup marker', matchType: 'domain', values: ['example.com'], target: 'direct' }]);
+  electronStub.dialog.showSaveDialog = async () => ({ canceled: false, filePath: backupPath });
+  assert.strictEqual(await handlers['tools:backupExport'](), backupPath);
+  assert.ok(fs.existsSync(backupPath), 'backup export did not create a file');
+
+  state.store.updateSettings({ mixedPort: originalMixedPort + 1 });
+  state.store.set('localRules', []);
+  electronStub.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [backupPath] });
+  const selectedBackup = await handlers['tools:backupSelect']();
+  assert.strictEqual(selectedBackup.summary.localRules, 1);
+  await assert.rejects(handlers['tools:backupRestore'](null, { token: 'wrong-token' }), /expired/);
+  const selectedAgain = await handlers['tools:backupSelect']();
+  const restoredBackup = await handlers['tools:backupRestore'](null, { token: selectedAgain.token });
+  assert.strictEqual(restoredBackup.restored, true);
+  assert.strictEqual(state.store.getSettings().mixedPort, originalMixedPort);
+  assert.strictEqual(state.store.get('localRules')[0].id, 'backup-rule');
+  console.log('✓ toolbox backup exports, validates and restores settings and rules');
 }
 
 main()

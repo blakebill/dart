@@ -44,28 +44,14 @@ configureUserDataDir();
  *   ipc.js           every ipcMain handler
  */
 
-// Memory optimizations. Hardware acceleration is opt-in (off by default): a proxy
-// GUI does not need a separate GPU process, and dropping it lowers idle RAM use by
-// ~100MB (CSS transitions still run). The preference must be read before the app is
-// ready, so we peek at the on-disk config directly. The V8 heap is also capped.
-function prefersHardwareAccel() {
-  try {
-    const f = path.join(app.getPath('userData'), 'config.json');
-    const d = JSON.parse(fs.readFileSync(f, 'utf-8'));
-    return !!(d.settings && d.settings.hardwareAcceleration);
-  } catch (_) {
-    return false;
-  }
+// Windows keeps GPU on for Mica/DWM. Elsewhere disable hardware acceleration to
+// cut idle RAM — there is no user toggle (it was a no-op on Windows).
+if (process.platform !== 'win32') {
+  app.disableHardwareAcceleration();
 }
-if (!prefersHardwareAccel()) app.disableHardwareAcceleration();
-// V8 tuning for the renderer (the heaviest process):
-//   --max-old-space-size=192  caps the heap; the UI doesn't need 256MB, and a
-//                             tighter cap nudges V8 to GC sooner. 192 keeps
-//                             margin for very large subscription / node lists.
-//   --expose-gc               exposes window.gc() so the renderer can run a
-//                             collection on visibilitychange:hidden, freeing
-//                             heap promptly when minimized to the tray.
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=192 --expose-gc');
+// Keep a bounded renderer heap. Profile payloads are loaded on demand, so the
+// renderer no longer needs manual GC hooks or an unbounded old-space budget.
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=192');
 
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
@@ -79,6 +65,7 @@ const { notify } = require('./notify');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
 const { isWindowsAdmin } = require('./admin');
+const { cleanupTunAdapters } = require('./tun-adapter');
 
 // Safety net: a stray socket error (e.g. ECONNRESET when the proxy is torn down
 // during a core update) must never crash the app with a fatal error dialog.
@@ -166,6 +153,7 @@ if (!gotLock) {
         // alert the user — the proxy is now down, which is easy to miss when
         // the app is sitting in the tray.
         if (!state.coreStopping && !app.isQuitting) {
+          cleanupTunAdapters(sendLog).catch(() => {});
           const zh = (state.store.getSettings().language || 'zh') === 'zh';
           notify(
             zh ? '内核已停止' : 'Core stopped',
@@ -227,6 +215,9 @@ if (!gotLock) {
   // so we never wipe a proxy the user set themselves.
   app.on('session-end', () => {
     try {
+      state.systemProxyOn = false;
+      core.stopProxyGuard();
+      proxy.beginShutdown();
       const port = (state.store && state.store.getSettings().mixedPort) || 7890;
       proxy.disableSystemProxySyncIfOurs(`127.0.0.1:${port}`);
     } catch (_) { /* best-effort */ }

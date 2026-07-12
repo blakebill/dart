@@ -62,38 +62,78 @@
     }
     return escapeHtml(line) + '\n';
   }
-  const logBuf = [];
+  const LOG_LIMIT = 200000;
+  const LOG_FLUSH_LINES = 400;
+  let logBuf = [];
+  let logBufStart = 0;
+  let logBufLen = 0;
   let logFlushTimer = null;
   let logLen = 0; // total kept text length across chunks
-  if (api && api.onLog) api.onLog((line) => {
+
+  function scheduleLogFlush(delay = 200) {
+    if (logFlushTimer || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    logFlushTimer = setTimeout(flushLogs, delay);
+  }
+
+  function flushLogs() {
+    logFlushTimer = null;
+    if (document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    const end = Math.min(logBuf.length, logBufStart + LOG_FLUSH_LINES);
+    let html = '';
+    let len = 0;
+    for (let index = logBufStart; index < end; index++) {
+      const line = logBuf[index];
+      html += logLineHtml(line);
+      len += line.length + 1;
+    }
+    logBufStart = end;
+    logBufLen -= len;
+    if (logBufStart >= logBuf.length) {
+      logBuf = [];
+      logBufStart = 0;
+      logBufLen = 0;
+    } else if (logBufStart > 1000) {
+      logBuf = logBuf.slice(logBufStart);
+      logBufStart = 0;
+    }
+
+    const box = $('#logBox');
+    const chunk = document.createElement('span');
+    chunk.innerHTML = html;
+    chunk._len = len;
+    box.appendChild(chunk);
+    logLen += len;
+    while (logLen > LOG_LIMIT && box.firstChild && box.firstChild !== chunk) {
+      logLen -= box.firstChild._len || box.firstChild.textContent.length;
+      box.removeChild(box.firstChild);
+    }
+    if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
+    scheduleLogFlush(16);
+  }
+
+  if (api && api.onLog) api.onLog((value) => {
+    const line = String(value || '');
     logBuf.push(line);
-    if (logFlushTimer) return;
-    logFlushTimer = setTimeout(() => {
-      logFlushTimer = null;
-      const box = $('#logBox');
-      let html = '';
-      let len = 0;
-      for (const l of logBuf) {
-        html += logLineHtml(l);
-        len += l.length + 1;
-      }
-      logBuf.length = 0;
-      const chunk = document.createElement('span');
-      chunk.innerHTML = html;
-      chunk._len = len;
-      box.appendChild(chunk);
-      logLen += len;
-      // Cap the kept log length by dropping the oldest chunks.
-      while (logLen > 200000 && box.firstChild && box.firstChild !== chunk) {
-        logLen -= box.firstChild._len || box.firstChild.textContent.length;
-        box.removeChild(box.firstChild);
-      }
-      if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
-    }, 200);
+    logBufLen += line.length + 1;
+    while (logBufLen > LOG_LIMIT && logBufStart < logBuf.length) {
+      logBufLen -= logBuf[logBufStart++].length + 1;
+    }
+    if (logBufStart > 1000 && logBufStart * 2 > logBuf.length) {
+      logBuf = logBuf.slice(logBufStart);
+      logBufStart = 0;
+    }
+    scheduleLogFlush();
   });
 
   $('#logClear').addEventListener('click', () => {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+    logBuf = [];
+    logBufStart = 0;
+    logBufLen = 0;
     $('#logBox').textContent = '';
     logLen = 0;
   });
+
+  App.flushLogs = () => scheduleLogFlush(0);
 })();

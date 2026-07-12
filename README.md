@@ -1,21 +1,23 @@
-# Dart
+# Dart Network Control
 
 ## English
 
-Dart is an Electron-based proxy client for Windows with support for both the
+Dart Network Control is a focused Windows desktop workspace for operating both the
 [sing-box](https://github.com/SagerNet/sing-box) and
-[mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) cores. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
+[mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) network cores. It brings profiles, routing, traffic, connections, logs, TUN, system proxy controls, and core maintenance into one operational interface. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
 
 This is an independent project and is not affiliated with or endorsed by sing-box, mihomo, or Zashboard.
 
 ### Features
 
-- Keep sing-box and mihomo installed side by side, with in-app switching, download, and update management.
+- Operate sing-box and mihomo side by side from one network-control workspace, with in-app switching, download, and update management.
 - Import Clash YAML, sing-box JSON, Base64 subscriptions, and common share links.
 - Generate a runtime configuration for the selected core while preserving Clash rules and policy-group semantics in mihomo mode.
 - Use system proxy, TUN, launch at login, silent startup, and UWP loopback exemption features.
 - Manage local rules, remote rules, policy-group target overrides, and GeoData.
+- Select manual, Auto, or Fallback routing and view the live outbound beside the traffic meter.
 - View nodes, connections, traffic, logs, and latency through the Clash API.
+- Inspect routes, validate both generated configs, diagnose ports/network egress, compare DNS paths, and export or restore user data.
 - Let either core download and host the latest
   [Zashboard](https://github.com/Zephyruso/zashboard) release.
 - Store large profile payloads separately so routine setting changes do not rewrite subscription contents.
@@ -24,7 +26,7 @@ This is an independent project and is not affiliated with or endorsed by sing-bo
 
 ```mermaid
 flowchart LR
-    UI["Renderer UI"] -->|"contextBridge"| PRELOAD["Preload API"]
+    UI["Network Control UI"] -->|"contextBridge"| PRELOAD["Preload API"]
     PRELOAD -->|"validated IPC"| MAIN["Electron main process"]
 
     MAIN --> STORE["Store\nsettings and profiles"]
@@ -45,7 +47,7 @@ flowchart LR
     PANEL -->|"same-origin Clash API"| MH
 ```
 
-The renderer has no direct access to Node.js or operating-system APIs. The preload script exposes the only allowed interface, while the main process handles validation, configuration generation, persistence, core processes, system proxy integration, and elevated operations.
+The Network Control renderer has no direct access to Node.js or operating-system APIs. The preload script exposes the only allowed interface, while the main process handles validation, configuration generation, persistence, core processes, system proxy integration, and elevated operations.
 
 Configuration flow:
 
@@ -136,7 +138,7 @@ Build output is written to `release/`. GitHub Actions runs the same test, core-d
 
 ### Third-Party Components and Licenses
 
-The Dart Electron UI, configuration management, and process orchestration code is declared as MIT in `package.json`. The installer and runtime also use the independent third-party components below. Each component remains subject to its upstream license and is not relicensed under Dart's license.
+The Dart Network Control Electron UI, configuration management, and process orchestration code is declared as MIT in `package.json`. The installer and runtime also use the independent third-party components below. Each component remains subject to its upstream license and is not relicensed under Dart's license.
 
 | Component | Purpose and distribution | Upstream license |
 | --- | --- | --- |
@@ -147,7 +149,7 @@ The Dart Electron UI, configuration management, and process orchestration code i
 | [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) | Bundled and updateable mihomo GeoData | [GPL v3](https://github.com/MetaCubeX/meta-rules-dat/blob/master/LICENSE) |
 | [Zashboard](https://github.com/Zephyruso/zashboard) | Clash API dashboard downloaded from the latest release when needed | [MIT](https://github.com/Zephyruso/zashboard/blob/main/LICENSE) |
 
-Dart communicates with both cores through configuration files, standard streams, and the local Clash API; neither core is linked into the Electron application. Installer distributions should still preserve the copyright and license notices above and provide an upstream source-code location corresponding to each bundled binary version. The upstream `LICENSE` files are authoritative.
+Dart Network Control communicates with both cores through configuration files, standard streams, and the local Clash API; neither core is linked into the Electron application. Installer distributions should still preserve the copyright and license notices above and provide an upstream source-code location corresponding to each bundled binary version. The upstream `LICENSE` files are authoritative.
 
 Node.js dependencies retain their individual licenses. Their resolved versions can be traced through `package-lock.json`.
 
@@ -155,20 +157,22 @@ Node.js dependencies retain their individual licenses. Their resolved versions c
 
 ## 中文
 
-Dart 是一个以 Electron 构建的 Windows 代理客户端，同时支持
+Dart Network Control 是一个面向 Windows 的桌面网络控制工具，同时支持
 [sing-box](https://github.com/SagerNet/sing-box) 与
-[mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) 内核。两个内核、配置和规则数据分别存放，切换内核时无需重复安装。
+[mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) 内核。它把配置、路由、流量、连接、日志、TUN、系统代理和内核维护集中在一个操作界面中。两个内核、配置和规则数据分别存放，切换内核时无需重复安装。
 
 本项目不是 sing-box、mihomo 或 Zashboard 的官方项目，也不代表这些上游项目。
 
 ### 主要功能
 
-- 同时保留 sing-box 与 mihomo，可在内核管理中切换、下载和更新。
+- 在统一的 Network Control 工作区中同时管理 sing-box 与 mihomo，可在内核管理中切换、下载和更新。
 - 支持 Clash YAML、sing-box JSON、Base64 配置和常见分享链接。
 - 根据当前内核生成对应运行配置；mihomo 模式保留 Clash 规则与策略组语义。
 - 支持系统代理、TUN、开机启动、静默启动和 UWP 回环豁免。
 - 支持本地规则、远程规则、策略组目标覆盖和 GeoData 管理。
+- 支持手动、Auto 和 Fallback 节点策略，并在侧栏流量图下显示当前实际出站。
 - 通过 Clash API 显示节点、连接、流量、日志和延迟。
+- 提供路由检查、双内核配置校验、端口与网络诊断、DNS 对比以及用户数据备份恢复工具。
 - sing-box 与 mihomo 都可自动下载并托管最新版
   [Zashboard](https://github.com/Zephyruso/zashboard) 面板。
 - 订阅正文与节点数据独立存储，设置修改不会重复写入大型配置文件。
@@ -177,7 +181,7 @@ Dart 是一个以 Electron 构建的 Windows 代理客户端，同时支持
 
 ```mermaid
 flowchart LR
-    UI["Renderer UI"] -->|"contextBridge"| PRELOAD["Preload API"]
+    UI["Network Control UI"] -->|"contextBridge"| PRELOAD["Preload API"]
     PRELOAD -->|"validated IPC"| MAIN["Electron main process"]
 
     MAIN --> STORE["Store\nsettings and profiles"]
@@ -198,7 +202,7 @@ flowchart LR
     PANEL -->|"same-origin Clash API"| MH
 ```
 
-Renderer 不直接访问 Node.js 或操作系统能力。可调用接口只通过 `preload` 暴露，主进程负责输入校验、配置生成、持久化、内核进程、系统代理和管理员权限操作。
+Network Control 的 Renderer 不直接访问 Node.js 或操作系统能力。可调用接口只通过 `preload` 暴露，主进程负责输入校验、配置生成、持久化、内核进程、系统代理和管理员权限操作。
 
 配置处理流程：
 
@@ -289,7 +293,7 @@ npm run dist
 
 ### 第三方组件与许可证
 
-Dart 的 Electron 界面、配置管理和进程编排代码在 `package.json` 中声明为 MIT。安装包或运行时还会使用下列独立第三方组件；它们不改用 Dart 的许可证，而是继续受各自上游许可证约束。
+Dart Network Control 的 Electron 界面、配置管理和进程编排代码在 `package.json` 中声明为 MIT。安装包或运行时还会使用下列独立第三方组件；它们不改用 Dart 的许可证，而是继续受各自上游许可证约束。
 
 | 组件 | 用途与分发方式 | 上游许可证 |
 | --- | --- | --- |
@@ -300,6 +304,6 @@ Dart 的 Electron 界面、配置管理和进程编排代码在 `package.json` �
 | [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) | mihomo GeoData，随安装包提供并可更新 | [GPL v3](https://github.com/MetaCubeX/meta-rules-dat/blob/master/LICENSE) |
 | [Zashboard](https://github.com/Zephyruso/zashboard) | Clash API 面板，首次需要时从 latest Release 下载 | [MIT](https://github.com/Zephyruso/zashboard/blob/main/LICENSE) |
 
-Dart 通过配置文件、标准输入输出和本地 Clash API 与两个内核通信，不把内核源码链接进 Electron 应用。发布安装包时仍应保留上表中的版权与许可证信息，并为随包二进制提供对应版本的上游源码入口。各项目的完整条款以上游 `LICENSE` 文件为准。
+Dart Network Control 通过配置文件、标准输入输出和本地 Clash API 与两个内核通信，不把内核源码链接进 Electron 应用。发布安装包时仍应保留上表中的版权与许可证信息，并为随包二进制提供对应版本的上游源码入口。各项目的完整条款以上游 `LICENSE` 文件为准。
 
 Node.js 依赖的许可证由各软件包分别声明，可通过 `package-lock.json` 追踪实际安装版本。

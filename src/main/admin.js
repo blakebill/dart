@@ -59,7 +59,7 @@ async function promptRestartForTun() {
     cancelId: 1,
     noLink: true,
     message: 'TUN mode requires administrator rights',
-    detail: 'Restart Dart as administrator to enable TUN mode?',
+    detail: 'Restart Dart Network Control as administrator to enable TUN mode?',
   });
   if (response === 0) {
     const result = relaunchElevated();

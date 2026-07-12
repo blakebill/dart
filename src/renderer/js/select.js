@@ -8,6 +8,7 @@
   const App = window.App || (window.App = {});
 
   let openMenuCtl = null; // controller {root, menu, close} of the open dropdown
+  const selectSync = new WeakMap();
 
   function closeOpen() {
     if (openMenuCtl) openMenuCtl.close();
@@ -72,6 +73,7 @@
       const o = sel.options[sel.selectedIndex];
       label.textContent = o ? o.textContent : '';
     };
+    selectSync.set(sel, syncLabel);
 
     const closeMenu = () => {
       if (menu) { menu.remove(); menu = null; }
@@ -144,7 +146,20 @@
     (root || document).querySelectorAll('select').forEach(enhance);
   }
 
+  // Translation updates mutate the native <option> text in place. Refresh the
+  // mirrored label as well, otherwise the enhanced control keeps displaying
+  // the previous language until its value changes.
+  function refreshSelects(root) {
+    closeOpen();
+    enhanceSelects(root);
+    (root || document).querySelectorAll('select').forEach((sel) => {
+      const sync = selectSync.get(sel);
+      if (sync) sync();
+    });
+  }
+
   App.enhanceSelects = enhanceSelects;
+  App.refreshSelects = refreshSelects;
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => enhanceSelects());
   } else {

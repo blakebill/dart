@@ -114,26 +114,29 @@ function outboundToNode(ob) {
 /**
  * Parse sing-box JSON content into nodes.
  * Accepts a full config ({ outbounds: [...] }) or a bare outbounds array.
- * @returns {{ nodes: object[], isSingbox: boolean }}
+ * @returns {{ nodes: object[], routeRules: object[], isSingbox: boolean }}
  */
 function parseSingboxConfig(content) {
   let doc;
   try {
     doc = JSON.parse(content);
   } catch (e) {
-    return { nodes: [], isSingbox: false };
+    return { nodes: [], routeRules: [], isSingbox: false };
   }
   let outbounds = null;
   if (Array.isArray(doc)) outbounds = doc;
   else if (doc && Array.isArray(doc.outbounds)) outbounds = doc.outbounds;
-  if (!outbounds) return { nodes: [], isSingbox: false };
+  if (!outbounds) return { nodes: [], routeRules: [], isSingbox: false };
 
   const nodes = [];
   for (const ob of outbounds) {
     const node = outboundToNode(ob);
     if (node) nodes.push(node);
   }
-  return { nodes, isSingbox: true };
+  const routeRules = !Array.isArray(doc) && doc.route && Array.isArray(doc.route.rules)
+    ? doc.route.rules
+    : [];
+  return { nodes, routeRules, isSingbox: true };
 }
 
 module.exports = { parseSingboxConfig, outboundToNode };

@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const zlib = require('zlib');
 const yaml = require('js-yaml');
@@ -70,13 +71,16 @@ function validMihomoGeoFile(filePath) {
     if (!fs.existsSync(filePath)) return false;
     const st = fs.statSync(filePath);
     if (st.size < 1024) return false;
-    const fd = fs.openSync(filePath, 'r');
     const head = Buffer.alloc(Math.min(st.size, 4096));
-    fs.readSync(fd, head, 0, head.length, 0);
     const tailSize = Math.min(st.size, 65536);
     const tail = Buffer.alloc(tailSize);
-    fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
-    fs.closeSync(fd);
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      fs.readSync(fd, head, 0, head.length, 0);
+      fs.readSync(fd, tail, 0, tailSize, st.size - tailSize);
+    } finally {
+      fs.closeSync(fd);
+    }
 
     if (head.slice(0, 3).toString('latin1') === 'SRS') return false;
     if (head[0] === 0x1f && head[1] === 0x8b) return false; // gzip error/archive
@@ -100,7 +104,7 @@ function mihomoGeoTestConfig() {
     mode: 'rule',
     'log-level': 'silent',
     'geodata-mode': true,
-    'geodata-loader': 'standard',
+    'geodata-loader': 'memconservative',
     'geo-auto-update': false,
     rules: [
       'GEOSITE,cn,DIRECT',
@@ -147,7 +151,11 @@ class SingBoxManager {
   }
 
   get coreLabel() {
-    return this.getCoreType() === 'mihomo' ? 'mihomo' : 'sing-box';
+    return this.coreLabelFor();
+  }
+
+  coreLabelFor(type = this.getCoreType()) {
+    return type === 'mihomo' ? 'mihomo' : 'sing-box';
   }
 
   coreFolderName(type = this.getCoreType()) {
@@ -174,12 +182,20 @@ class SingBoxManager {
   }
 
   get configPath() {
-    return path.join(this.ensureCoreDir(), this.getCoreType() === 'mihomo' ? 'config.yaml' : 'config.json');
+    return this.configPathFor();
+  }
+
+  configPathFor(type = this.getCoreType()) {
+    return path.join(this.ensureCoreDir(type), type === 'mihomo' ? 'config.yaml' : 'config.json');
   }
 
   /** Selected core executable file name. */
   get binName() {
-    if (this.getCoreType() === 'mihomo') return process.platform === 'win32' ? 'mihomo.exe' : 'mihomo';
+    return this.binNameFor();
+  }
+
+  binNameFor(type = this.getCoreType()) {
+    if (type === 'mihomo') return process.platform === 'win32' ? 'mihomo.exe' : 'mihomo';
     return process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
   }
 
@@ -187,15 +203,16 @@ class SingBoxManager {
    * Resolve the core path. A user-downloaded core (runtimeDir) takes precedence
    * over the bundled one (resourcesDir) so "Download core" can update it.
    */
-  resolveBinaryPath() {
+  resolveBinaryPath(type = this.getCoreType()) {
+    const binName = this.binNameFor(type);
     const candidates = [
-      path.join(this.coreDir(), this.binName),
-      path.join(this.coreDir(), 'bin', this.binName),
+      path.join(this.coreDir(type), binName),
+      path.join(this.coreDir(type), 'bin', binName),
       // Legacy layout from older builds. Kept as a fallback, but new installs
       // and updates write to the per-core folders above.
-      path.join(this.runtimeDir, 'bin', this.binName),
-      path.join(this.runtimeDir, this.binName),
-      ...this.resourceDirs().flatMap((d) => [path.join(d, this.binName), path.join(d, 'bin', this.binName)]),
+      path.join(this.runtimeDir, 'bin', binName),
+      path.join(this.runtimeDir, binName),
+      ...this.resourceDirs(type).flatMap((d) => [path.join(d, binName), path.join(d, 'bin', binName)]),
     ].filter(Boolean);
     for (const c of candidates) {
       if (fs.existsSync(c)) return c;
@@ -203,25 +220,25 @@ class SingBoxManager {
     return null;
   }
 
-  isCoreInstalled() {
-    return !!this.resolveBinaryPath();
+  isCoreInstalled(type = this.getCoreType()) {
+    return !!this.resolveBinaryPath(type);
   }
 
   /**
    * Return the installed core version (e.g. "1.9.3"), or null if not available.
    * The result is cached per binary path and refreshed after a download.
    */
-  async getCoreVersion() {
-    const bin = this.resolveBinaryPath();
+  async getCoreVersion(type = this.getCoreType()) {
+    const bin = this.resolveBinaryPath(type);
     if (!bin) return null;
-    if (this._versionCache && this._versionCache.bin === bin && this._versionCache.coreType === this.getCoreType()) {
+    if (this._versionCache && this._versionCache.bin === bin && this._versionCache.coreType === type) {
       return this._versionCache.version;
     }
     try {
-      const out = await this._runCapture(bin, this.getCoreType() === 'mihomo' ? ['-v'] : ['version']);
+      const out = await this._runCapture(bin, type === 'mihomo' ? ['-v'] : ['version']);
       const m = out.match(/version\s+v?(\S+)/i) || out.match(/\bv?(\d+\.\d+\.\d+(?:[-.\w]*)?)/);
       const version = m ? m[1] : null;
-      this._versionCache = { bin, coreType: this.getCoreType(), version };
+      this._versionCache = { bin, coreType: type, version };
       return version;
     } catch (e) {
       return null;
@@ -299,8 +316,11 @@ class SingBoxManager {
       if (!fs.existsSync(p) || fs.statSync(p).size < 8) return false;
       const fd = fs.openSync(p, 'r');
       const buf = Buffer.alloc(3);
-      fs.readSync(fd, buf, 0, 3, 0);
-      fs.closeSync(fd);
+      try {
+        fs.readSync(fd, buf, 0, 3, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
       return buf.toString('latin1') === 'SRS';
     } catch (e) {
       return false;
@@ -344,7 +364,7 @@ class SingBoxManager {
     const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
     if (!files.every((file) => this._validGeoFile(path.join(dir, file)))) return false;
 
-    const bin = this.getCoreType() === 'mihomo' ? this.resolveBinaryPath() : null;
+    const bin = this.resolveBinaryPath('mihomo');
     if (!bin) return false;
     const key = this._mihomoGeoDataKey(dir, bin);
     if (key && this._mihomoGeoValidation && this._mihomoGeoValidation.key === key) {
@@ -476,26 +496,65 @@ class SingBoxManager {
 
   /** Validate the selected core config. */
   checkConfig() {
+    return this._checkConfigPath(this.getCoreType(), this.configPath).then(() => true);
+  }
+
+  /** Validate an in-memory config with either installed core, without switching. */
+  async checkConfigFor(type, config) {
+    type = type === 'mihomo' ? 'mihomo' : 'sing-box';
+    const workDir = this.ensureCoreDir(type);
+    const ext = type === 'mihomo' ? '.yaml' : '.json';
+    const file = path.join(workDir, `.dart-check-${process.pid}-${crypto.randomBytes(4).toString('hex')}${ext}`);
+    const text = type === 'mihomo'
+      ? yaml.dump(config, { lineWidth: -1, noRefs: true })
+      : JSON.stringify(config, null, 2);
+    try {
+      await fs.promises.writeFile(file, text, 'utf-8');
+      return await this._checkConfigPath(type, file);
+    } finally {
+      try { await fs.promises.unlink(file); } catch (_) {}
+    }
+  }
+
+  _checkConfigPath(type, configPath) {
     return new Promise((resolve, reject) => {
-      const bin = this.resolveBinaryPath();
-      if (!bin) return reject(new Error(this.coreLabel + ' core not found'));
-      const workDir = this.ensureCoreDir();
-      const args = this.getCoreType() === 'mihomo'
-        ? ['-t', '-f', this.configPath, '-d', workDir]
-        : ['check', '-c', this.configPath];
+      const bin = this.resolveBinaryPath(type);
+      if (!bin) return reject(new Error(this.coreLabelFor(type) + ' core not found'));
+      const workDir = this.ensureCoreDir(type);
+      const args = type === 'mihomo'
+        ? ['-t', '-f', configPath, '-d', workDir]
+        : ['check', '-c', configPath];
       const p = spawn(bin, args, {
         cwd: workDir,
-        env: this._coreEnv(),
+        env: this._coreEnv(type),
+        windowsHide: true,
       });
       let out = '';
       let err = '';
-      p.stdout.on('data', (d) => (out += d.toString()));
-      p.stderr.on('data', (d) => (err += d.toString()));
+      let settled = false;
+      const append = (current, data) => (current + stripAnsi(data.toString())).slice(-2 * 1024 * 1024);
+      p.stdout.on('data', (d) => (out = append(out, d)));
+      p.stderr.on('data', (d) => (err = append(err, d)));
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { p.kill('SIGKILL'); } catch (_) {}
+        reject(new Error('config validation timed out'));
+      }, 15000);
       p.on('close', (code) => {
-        if (code === 0) resolve(true);
-        else reject(new Error('config validation failed: ' + (err || out).trim()));
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const output = (err || out).trim();
+        if (code === 0) resolve({ output });
+        else reject(new Error('config validation failed: ' + output));
       });
-      p.on('error', reject);
+      p.on('error', (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
     });
   }
 
@@ -551,8 +610,8 @@ class SingBoxManager {
     return true;
   }
 
-  _coreEnv() {
-    if (this.getCoreType() !== 'mihomo') return process.env;
+  _coreEnv(type = this.getCoreType()) {
+    if (type !== 'mihomo') return process.env;
     const uiRoot = path.join(this.runtimeDir, 'ui');
     const safePaths = [process.env.SAFE_PATHS, uiRoot].filter(Boolean).join(path.delimiter);
     return { ...process.env, SAFE_PATHS: safePaths };
@@ -693,20 +752,9 @@ class SingBoxManager {
       done += 1;
       onProgress(done / files.length);
     }
-    // Record the matching release tags (the repos tag releases by date, e.g.
-    // 20250606...) and the update time, so the UI can show a version per file.
-    // Best-effort: a failed API lookup still records the update date.
     const meta = this.geoMeta();
-    for (const f of files) {
-      let version = null;
-      try {
-        // GitHub API first, jsDelivr tag list as fallback (reachable in CN).
-        version = (await github.latestReleaseTag(`SagerNet/${f.repo}`, proxyPort, (m) => this.onLog(m))).tag;
-      } catch (e) {
-        /* keep version null */
-      }
-      meta[f.file] = { version, updatedAt: Date.now() };
-    }
+    const updatedAt = Date.now();
+    for (const f of files) meta[f.file] = { updatedAt };
     try {
       fs.writeFileSync(path.join(binDir, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
     } catch (e) {
@@ -759,13 +807,8 @@ class SingBoxManager {
       onProgress(done / files.length);
     }
     const meta = this.geoMeta();
-    let version = null;
-    try {
-      version = (await github.latestReleaseTag('MetaCubeX/meta-rules-dat', proxyPort, (m) => this.onLog(m))).tag;
-    } catch (_) {
-      /* keep version null */
-    }
-    for (const file of files) meta[file] = { version, updatedAt: Date.now() };
+    const updatedAt = Date.now();
+    for (const file of files) meta[file] = { updatedAt };
     try {
       fs.writeFileSync(this.geoMetaPath(), JSON.stringify(meta), 'utf-8');
     } catch (_) {
@@ -775,7 +818,7 @@ class SingBoxManager {
     return dir;
   }
 
-  /** Read the stored geodata meta ({ file: { version, updatedAt } }), or {}. */
+  /** Read the stored geodata update times ({ file: { updatedAt } }), or {}. */
   geoMetaPath() {
     return path.join(this.coreDir(), 'geodata-meta.json');
   }

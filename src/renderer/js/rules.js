@@ -10,8 +10,10 @@
   // ---------- Rule list ----------
   // Normalized once on load with a prebuilt lowercase search key, so typing in
   // the filter box only filters — it does not re-map the whole rule list.
-  const MAX_RENDERED_RULES = 400;
+  const VIRTUAL_RULE_ROW_HEIGHT = 44;
+  const VIRTUAL_OVERSCAN = 8;
   let ruleItems = [];
+  let visibleRuleItems = [];
   let ruleSrc = 'config';
   let rulesReady = false;
   let rulesLoading = null;
@@ -31,28 +33,32 @@
         });
     for (const it of ruleItems) it.key = (it.type + it.payload + it.proxy).toLowerCase();
   }
-  function renderRules() {
-    const filter = ($('#ruleFilter').value || '').toLowerCase();
-    const filtered = filter ? ruleItems.filter((it) => it.key.includes(filter)) : ruleItems;
-    const shown = filtered.slice(0, MAX_RENDERED_RULES);
-    const limited = shown.length < filtered.length;
-    $('#ruleCount').textContent =
-      t('rules.count', filtered.length) +
-      (limited ? ' · ' + shown.length + '/' + filtered.length : '') +
-      ' · ' + t('rules.' + ruleSrc);
+  function renderRuleWindow() {
     const list = $('#ruleList');
-    if (filtered.length === 0) {
+    if (!visibleRuleItems.length) {
       list.innerHTML = `<p class="hint">${t('rules.empty')}</p>`;
       return;
     }
-    let html = '';
-    for (const it of shown) {
+    const visible = Math.ceil((list.clientHeight || 480) / VIRTUAL_RULE_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(list.scrollTop / VIRTUAL_RULE_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+    const end = Math.min(visibleRuleItems.length, start + visible + VIRTUAL_OVERSCAN * 2);
+    let html = start ? `<div class="virtual-spacer" style="height:${start * VIRTUAL_RULE_ROW_HEIGHT}px"></div>` : '';
+    for (let i = start; i < end; i++) {
+      const it = visibleRuleItems[i];
       html += `<div class="rule-item"><span class="rule-type">${escapeHtml(it.type)}</span>` +
         `<span class="rule-payload">${escapeHtml(it.payload)}</span>` +
         `<span class="rule-proxy">${escapeHtml(it.proxy)}</span></div>`;
     }
-    if (limited) html += `<p class="hint rule-more">${shown.length}/${filtered.length}</p>`;
+    const after = visibleRuleItems.length - end;
+    if (after) html += `<div class="virtual-spacer" style="height:${after * VIRTUAL_RULE_ROW_HEIGHT}px"></div>`;
     list.innerHTML = html;
+  }
+
+  function renderRules() {
+    const filter = ($('#ruleFilter').value || '').toLowerCase();
+    visibleRuleItems = filter ? ruleItems.filter((it) => it.key.includes(filter)) : ruleItems;
+    $('#ruleCount').textContent = t('rules.count', visibleRuleItems.length) + ' · ' + t('rules.' + ruleSrc);
+    renderRuleWindow();
   }
 
   // Describe a sing-box route rule object compactly as { type, payload }.
@@ -89,7 +95,19 @@
     return rulesLoading;
   }
 
-  $('#ruleFilter').addEventListener('input', renderRules);
+  $('#ruleFilter').addEventListener('input', () => {
+    $('#ruleList').scrollTop = 0;
+    renderRules();
+  });
+  let ruleScrollQueued = false;
+  $('#ruleList').addEventListener('scroll', () => {
+    if (ruleScrollQueued) return;
+    ruleScrollQueued = true;
+    requestAnimationFrame(() => {
+      ruleScrollQueued = false;
+      renderRuleWindow();
+    });
+  });
   $('#ruleRefresh').addEventListener('click', () => loadRules({ force: true }));
 
   // ---------- Subscription policy-group outbound overrides ----------

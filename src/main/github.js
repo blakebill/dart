@@ -5,8 +5,7 @@ const fetch = require('./fetch');
 /**
  * GitHub release/tag lookups with a jsDelivr fallback.
  *
- * Every version check in the app (its own releases, the sing-box core, the
- * geodata rule-sets) needs api.github.com, which is often unreachable from
+ * App and core version checks need api.github.com, which is often unreachable from
  * mainland China unless the proxy is up AND the node can reach GitHub.
  * jsDelivr's data API serves the same tag list over a CDN that is reachable
  * directly, so it backs the canonical API: GitHub first (proxy-first, then

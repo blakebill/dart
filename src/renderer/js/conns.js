@@ -5,7 +5,9 @@
   const { $, toast, call, fmtBytes, escapeHtml } = App;
   const api = window.api;
   const { t } = window.i18n;
-  const MAX_RENDERED_CONNECTIONS = 500;
+  const VIRTUAL_CONNECTION_ROW_HEIGHT = 62;
+  const VIRTUAL_OVERSCAN = 7;
+  let connectionItems = [];
 
   let connectionsLoading = false;
   async function loadConnections() {
@@ -13,19 +15,13 @@
     connectionsLoading = true;
     try {
       const data = await api.getConnections();
-      renderConnections(data);
+      if (App.currentTab === 'conns' && !document.hidden) renderConnections(data);
     } catch (e) {
       /* ignore */
     } finally {
       connectionsLoading = false;
     }
   }
-  // Incremental rendering keyed by connection id: rows are created once,
-  // only the traffic counters mutate, and rows keep a stable position (new
-  // connections enter at the top). Rebuilding the whole list every poll made
-  // rows jump around (the Clash API does not return a stable order) and broke
-  // text selection.
-  const connRows = new Map(); // key -> { el, trafEl, up, down }
   function connRowInner(c) {
     const m = c.metadata || {};
     const host = m.host || m.destinationIP || '';
@@ -42,53 +38,54 @@
       `<span class="conn-host">${escapeHtml(target)}</span>` +
       `<span class="conn-sub">${netHtml}<span class="sub-meta">${escapeHtml(c.rule || '')}</span></span></div>` +
       `<div class="conn-right"><span class="conn-chains">${escapeHtml(chains)}</span>` +
-      `<span class="sub-meta conn-traffic"></span></div>${closeHtml}`
+      `<span class="sub-meta conn-traffic">↑ ${fmtBytes(c.upload || 0)} ↓ ${fmtBytes(c.download || 0)}</span></div>${closeHtml}`
     );
   }
+
+  function renderConnectionWindow() {
+    const list = $('#connList');
+    if (!connectionItems.length) return;
+    const visible = Math.ceil((list.clientHeight || 480) / VIRTUAL_CONNECTION_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(list.scrollTop / VIRTUAL_CONNECTION_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+    const end = Math.min(connectionItems.length, start + visible + VIRTUAL_OVERSCAN * 2);
+    let html = start ? `<div class="virtual-spacer" style="height:${start * VIRTUAL_CONNECTION_ROW_HEIGHT}px"></div>` : '';
+    for (let i = start; i < end; i++) {
+      const c = connectionItems[i];
+      html += `<div class="conn-item" data-connection-id="${escapeHtml(c.id || '')}">${connRowInner(c)}</div>`;
+    }
+    const after = connectionItems.length - end;
+    if (after) html += `<div class="virtual-spacer" style="height:${after * VIRTUAL_CONNECTION_ROW_HEIGHT}px"></div>`;
+    list.innerHTML = html;
+  }
+
   function renderConnections(data) {
     const allConnections = data.connections || [];
-    $('#connStats').textContent = t('conns.stats', allConnections.length, fmtBytes(data.up), fmtBytes(data.down));
+    $('#connStats').textContent = t(
+      'conns.stats',
+      Number.isFinite(data.totalConnections) ? data.totalConnections : allConnections.length,
+      fmtBytes(data.up),
+      fmtBytes(data.down)
+    );
     const list = $('#connList');
     if (!data.running || allConnections.length === 0) {
-      connRows.clear();
-      list.innerHTML = `<p class="hint">${t('conns.empty')}</p>`;
+      connectionItems = [];
+      list.classList.add('is-empty');
+      list.innerHTML = `<p class="hint conn-empty-state">${t('conns.empty')}</p>`;
       return;
     }
-    if (!connRows.size) list.innerHTML = ''; // leaving the empty-hint state
-    // Oldest first, prepending each NEW row: newest connections end up on top
-    // while existing rows never move.
-    const conns = allConnections
+    list.classList.remove('is-empty');
+    connectionItems = allConnections
       .slice()
-      .sort((a, b) => String(a.start || '').localeCompare(String(b.start || '')))
-      .slice(-MAX_RENDERED_CONNECTIONS);
-    const seen = new Set();
-    for (const c of conns) {
-      const m = c.metadata || {};
-      const key = c.id || (m.host || m.destinationIP || '') + ':' + (m.destinationPort || '') + '@' + (c.start || '');
-      seen.add(key);
-      let row = connRows.get(key);
-      if (!row) {
-        const el = document.createElement('div');
-        el.className = 'conn-item';
-        el.innerHTML = connRowInner(c);
-        list.prepend(el);
-        row = { el, trafEl: el.querySelector('.conn-traffic'), up: -1, down: -1 };
-        connRows.set(key, row);
-      }
-      const up = c.upload || 0;
-      const down = c.download || 0;
-      if (up !== row.up || down !== row.down) {
-        row.trafEl.textContent = `↑ ${fmtBytes(up)} ↓ ${fmtBytes(down)}`;
-        row.up = up;
-        row.down = down;
-      }
-    }
-    for (const [key, row] of connRows) {
-      if (!seen.has(key)) {
-        row.el.remove();
-        connRows.delete(key);
-      }
-    }
+      .sort((a, b) => String(b.start || '').localeCompare(String(a.start || '')));
+    renderConnectionWindow();
+  }
+
+  function clearConnections() {
+    connectionItems = [];
+    const list = $('#connList');
+    list.classList.remove('is-empty');
+    list.textContent = '';
+    $('#connStats').textContent = '';
   }
   // Per-connection close: rows come and go with every poll, so use one
   // delegated listener instead of binding each ✕ button.
@@ -105,6 +102,16 @@
     }
   });
 
+  let connScrollQueued = false;
+  $('#connList').addEventListener('scroll', () => {
+    if (connScrollQueued) return;
+    connScrollQueued = true;
+    requestAnimationFrame(() => {
+      connScrollQueued = false;
+      renderConnectionWindow();
+    });
+  });
+
   $('#connClose').addEventListener('click', async () => {
     await call(api.closeAllConnections);
     toast(t('conns.closed'));
@@ -112,4 +119,5 @@
   });
 
   App.loadConnections = loadConnections;
+  App.clearConnections = clearConnections;
 })();

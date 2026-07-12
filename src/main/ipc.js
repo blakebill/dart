@@ -4,18 +4,19 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const yaml = require('js-yaml');
-const { app, ipcMain, shell, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, coreStatusInfo } = require('./state');
 const core = require('./core-control');
 const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
 const update = require('./update');
-const { buildSingboxConfig } = require('./converter');
+const { buildMihomoConfig, buildSingboxConfig } = require('./converter');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
 const fetch = require('./fetch');
 const { notify } = require('./notify');
+const toolbox = require('./toolbox');
 
 /** Validate an IPC payload field: must be a non-empty string. */
 function reqStr(v, name) {
@@ -44,6 +45,12 @@ function reqEnum(v, allowed, name) {
   return v;
 }
 
+function senderWindow(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win !== state.mainWindow || win.isDestroyed()) throw new Error('invalid window');
+  return win;
+}
+
 // Where converted rules may route to.
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
 const VALID_CRS_FORMATS = ['clash', 'sing-box'];
@@ -53,15 +60,53 @@ const VALID_CRS_FORMATS = ['clash', 'sing-box'];
 const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
-  'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode', 'hardwareAcceleration',
+  'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
   'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'coreType',
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
+const MAX_IPC_CONNECTIONS = 600;
+
+function recentConnections(items, limit) {
+  const key = (item) => String(item.start || '') + '\0' + String(item.id || '');
+  if (items.length <= limit) return items.slice().sort((a, b) => key(a).localeCompare(key(b)));
+  const heap = [];
+  const swap = (a, b) => { [heap[a], heap[b]] = [heap[b], heap[a]]; };
+  const siftUp = (index) => {
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (key(heap[parent]).localeCompare(key(heap[index])) <= 0) break;
+      swap(parent, index);
+      index = parent;
+    }
+  };
+  const siftDown = (index) => {
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (left < heap.length && key(heap[left]).localeCompare(key(heap[smallest])) < 0) smallest = left;
+      if (right < heap.length && key(heap[right]).localeCompare(key(heap[smallest])) < 0) smallest = right;
+      if (smallest === index) return;
+      swap(index, smallest);
+      index = smallest;
+    }
+  };
+  for (const item of items) {
+    if (heap.length < limit) {
+      heap.push(item);
+      siftUp(heap.length - 1);
+    } else if (key(item).localeCompare(key(heap[0])) > 0) {
+      heap[0] = item;
+      siftDown(0);
+    }
+  }
+  return heap.sort((a, b) => key(a).localeCompare(key(b)));
+}
 const CORE_CONFIG_SETTINGS = new Set([
   'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
   'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
-  'ruleOverrides', 'coreType',
+  'ruleOverrides', 'coreType', 'testUrl',
 ]);
 
 function validateSettingsPatch(patch, current) {
@@ -72,8 +117,8 @@ function validateSettingsPatch(patch, current) {
     }
   }
   for (const key of [
-    'enableClashApi', 'autoSetSystemProxy', 'autoLaunch', 'silentStart',
-    'notifications', 'enableIpv6', 'hardwareAcceleration', 'useBuiltinRules',
+    'enableClashApi', 'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
+    'notifications', 'enableIpv6', 'useBuiltinRules',
   ]) {
     if (key in patch && typeof patch[key] !== 'boolean') throw new Error(`invalid ${key}`);
   }
@@ -116,30 +161,62 @@ function validateSettingsPatch(patch, current) {
   }
 }
 
+let pendingBackup = null;
+
+async function writeAtomicText(file, text) {
+  const tmp = file + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    await fs.promises.writeFile(tmp, text, 'utf-8');
+    await fs.promises.rename(tmp, file);
+  } finally {
+    try { await fs.promises.unlink(tmp); } catch (_) {}
+  }
+}
+
+/** Remove decorative built-in group emoji from standalone converted files. */
+function plainConversionLabels(value) {
+  if (typeof value === 'string') {
+    return value.replace(/🚀 Proxy/g, 'Dart Proxy').replace(/♻️ Auto/g, 'Dart Auto');
+  }
+  if (Array.isArray(value)) return value.map(plainConversionLabels);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plainConversionLabels(item)]));
+  }
+  return value;
+}
+
 /** Register every IPC handler. Called once during boot. */
 function registerIpc() {
-  ipcMain.handle('app:getState', async () => ({
-    // Slim the subscriptions: the renderer only needs these fields and the
-    // node's name/type/server/port, not full node configs or clash rules — this
-    // keeps the IPC payload small for large airports.
-    subscriptions: (state.store.get('subscriptions') || []).map((s) => ({
-      id: s.id,
-      name: s.name,
-      url: s.url,
-      format: s.format,
-      autoUpdateMinutes: s.autoUpdateMinutes || 0,
-      updateViaProxy: !!s.updateViaProxy,
-      updatedAt: s.updatedAt || 0,
-      userInfo: s.userInfo || null,
-      nodes: Array.isArray(s.nodes)
-        ? s.nodes.map((n) => ({ name: n.name, type: n.type, server: n.server, port: n.port }))
-        : [],
-    })),
-    settings: state.store.getSettings(),
-    selected: state.store.get('selected'),
-    activeSub: core.getActiveSubId(),
-    status: await coreStatusInfo(),
-  }));
+  const toolContext = { state, core, proxy, isAdmin: isWindowsAdmin };
+  ipcMain.handle('app:getState', async () => {
+    const activeSub = core.getActiveSubId();
+    const active = activeSub ? core.getActiveSubscription() : null;
+    const activeNodes = new Map(
+      active && Array.isArray(active.nodes)
+        ? [[active.id, active.nodes.map((n) => ({ name: n.name, type: n.type, server: n.server, port: n.port }))]]
+        : []
+    );
+    return {
+      // The renderer receives summaries for every profile and node details only
+      // for the active one, keeping inactive profiles out of its heap.
+      subscriptions: state.store.listSubscriptions().map((s) => ({
+        id: s.id,
+        name: s.name,
+        url: s.url,
+        format: s.format,
+        autoUpdateMinutes: s.autoUpdateMinutes || 0,
+        updateViaProxy: !!s.updateViaProxy,
+        updatedAt: s.updatedAt || 0,
+        userInfo: s.userInfo || null,
+        nodeCount: s.nodeCount || 0,
+        nodes: activeNodes.get(s.id) || [],
+      })),
+      settings: state.store.getSettings(),
+      selected: state.store.get('selected'),
+      activeSub,
+      status: await coreStatusInfo(),
+    };
+  });
 
   // Add/update a subscription (fetch and parse).
   ipcMain.handle('sub:add', async (_e, { name, url }) => {
@@ -148,8 +225,7 @@ function registerIpc() {
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
-    const subs = state.store.get('subscriptions') || [];
-    const isFirst = subs.length === 0;
+    const isFirst = state.store.listSubscriptions().length === 0;
     const sub = {
       id: crypto.randomUUID(),
       name: name || new URL(url).hostname,
@@ -162,9 +238,9 @@ function registerIpc() {
       autoUpdateMinutes: 0,
       userInfo: result.userInfo || null,
       updatedAt: Date.now(),
+      configHash: subscription.configFingerprint(result),
     };
-    subs.push(sub);
-    state.store.set('subscriptions', subs);
+    state.store.upsertSubscription(sub);
     // Only the FIRST subscription becomes the active profile automatically.
     // (Checking `!activeSub` here used to steal activeness on legacy stores
     // where activeSub was never set — see getActiveSubId.)
@@ -176,18 +252,15 @@ function registerIpc() {
   // Update a specific subscription.
   ipcMain.handle('sub:update', async (_e, { id }) => {
     reqStr(id, 'id');
-    const subs = state.store.get('subscriptions') || [];
-    const sub = subs.find((s) => s.id === id);
+    const sub = state.store.getSubscription(id);
     if (!sub) throw new Error('config not found');
     const proxyPort = sub.updateViaProxy ? core.currentProxyPort() : 0;
     const result = await subscription.fetchSubscription(sub.url, sendLog, { proxyPort });
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
-    const configChanged =
-      JSON.stringify(sub.nodes || []) !== JSON.stringify(result.nodes || []) ||
-      JSON.stringify(sub.clashRules || []) !== JSON.stringify(result.rules || []) ||
-      JSON.stringify(sub.clashRuleProviders || {}) !== JSON.stringify(result.ruleProviders || {});
+    const nextHash = subscription.configFingerprint(result);
+    const configChanged = (sub.configHash || subscription.configFingerprint(sub)) !== nextHash;
     sub.nodes = result.nodes;
     sub.format = result.format;
     sub.clashRules = result.rules || [];
@@ -195,7 +268,8 @@ function registerIpc() {
     sub.raw = result.raw || sub.raw || '';
     sub.userInfo = result.userInfo || sub.userInfo;
     sub.updatedAt = Date.now();
-    state.store.set('subscriptions', subs);
+    sub.configHash = nextHash;
+    state.store.upsertSubscription(sub);
     // Apply the active profile's new node list to a running core; otherwise
     // the Clash API keeps serving outbounds the UI no longer shows (delay
     // tests "time out", selecting a node fails with 400).
@@ -205,9 +279,8 @@ function registerIpc() {
 
   ipcMain.handle('sub:remove', async (_e, { id }) => {
     reqStr(id, 'id');
-    let subs = state.store.get('subscriptions') || [];
-    subs = subs.filter((s) => s.id !== id);
-    state.store.set('subscriptions', subs);
+    state.store.removeSubscription(id);
+    const subs = state.store.listSubscriptions();
     // If the active profile was removed, fall back to the first remaining one.
     if (state.store.get('activeSub') === id) {
       state.store.set('activeSub', subs[0] ? subs[0].id : null);
@@ -221,7 +294,7 @@ function registerIpc() {
   // Switch the active profile (subscription). Restarts the core to apply.
   ipcMain.handle('sub:setActive', async (_e, { id }) => {
     reqStr(id, 'id');
-    const subs = state.store.get('subscriptions') || [];
+    const subs = state.store.listSubscriptions();
     if (!subs.some((s) => s.id === id)) throw new Error('config not found');
     state.store.set('activeSub', id);
     state.store.set('selected', null); // reset node selection for the new profile
@@ -233,8 +306,7 @@ function registerIpc() {
   // URL changed.
   ipcMain.handle('sub:edit', async (_e, { id, name, url, autoUpdateMinutes, updateViaProxy }) => {
     reqStr(id, 'id');
-    const subs = state.store.get('subscriptions') || [];
-    const sub = subs.find((s) => s.id === id);
+    const sub = state.store.getSubscription(id);
     if (!sub) throw new Error('config not found');
     if (name !== undefined) sub.name = name;
     if (autoUpdateMinutes !== undefined) sub.autoUpdateMinutes = parseInt(autoUpdateMinutes, 10) || 0;
@@ -254,8 +326,9 @@ function registerIpc() {
       sub.raw = result.raw || '';
       sub.userInfo = result.userInfo || sub.userInfo;
       sub.updatedAt = Date.now();
+      sub.configHash = subscription.configFingerprint(result);
     }
-    state.store.set('subscriptions', subs);
+    state.store.upsertSubscription(sub);
     core.rescheduleAutoUpdate();
     // A URL change replaced the node list — apply it if this is the live profile.
     if (urlChanged && url && sub.id === core.getActiveSubId()) await core.restartIfRunning();
@@ -269,7 +342,6 @@ function registerIpc() {
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
-    const subs = state.store.get('subscriptions') || [];
     const sub = {
       id: crypto.randomUUID(),
       name: name || 'Local import',
@@ -282,9 +354,9 @@ function registerIpc() {
       autoUpdateMinutes: 0,
       userInfo: null,
       updatedAt: Date.now(),
+      configHash: subscription.configFingerprint(result),
     };
-    subs.push(sub);
-    state.store.set('subscriptions', subs);
+    state.store.upsertSubscription(sub);
     return sub;
   });
 
@@ -292,15 +364,14 @@ function registerIpc() {
   // Kept out of app:getState so large profiles don't bloat every state refresh.
   ipcMain.handle('sub:getRaw', (_e, { id }) => {
     reqStr(id, 'id');
-    const sub = (state.store.get('subscriptions') || []).find((s) => s.id === id);
+    const sub = state.store.getSubscription(id);
     if (!sub) throw new Error('config not found');
     return { raw: sub.raw || null };
   });
   ipcMain.handle('sub:saveRaw', async (_e, { id, content }) => {
     reqStr(id, 'id');
     reqStr(content, 'content');
-    const subs = state.store.get('subscriptions') || [];
-    const sub = subs.find((s) => s.id === id);
+    const sub = state.store.getSubscription(id);
     if (!sub) throw new Error('config not found');
     const result = subscription.parseSubscriptionContent(content);
     if (!result.nodes.length) {
@@ -312,27 +383,42 @@ function registerIpc() {
     sub.clashRuleProviders = result.ruleProviders || {};
     sub.raw = String(content);
     sub.updatedAt = Date.now();
-    state.store.set('subscriptions', subs);
+    sub.configHash = subscription.configFingerprint(result);
+    state.store.upsertSubscription(sub);
     if (sub.id === core.getActiveSubId()) await core.restartIfRunning();
     return { nodeCount: result.nodes.length, format: result.format };
   });
 
-  // Conversion preview: convert subscription content to sing-box config JSON
-  // (no save, no run).
-  ipcMain.handle('convert:preview', (_e, { content }) => {
+  // Bidirectional standalone conversion (no save, no run). Auto mode converts
+  // sing-box input to Clash and every other supported source to sing-box.
+  ipcMain.handle('convert:preview', (_e, { content, target = 'auto' }) => {
     reqStr(content, 'content');
+    reqEnum(target, ['auto', 'sing-box', 'clash'], 'conversion target');
     const result = subscription.parseSubscriptionContent(content);
     if (!result.nodes.length) throw new Error('no nodes parsed');
     const settings = state.store.getSettings();
-    if (settings.coreType === 'mihomo') {
-      return { text: String(content), nodeCount: result.nodes.length, format: result.format, coreType: 'mihomo' };
+    const outputTarget = target === 'auto'
+      ? (result.format === 'singbox' ? 'clash' : 'sing-box')
+      : target;
+    if (outputTarget === 'clash') {
+      const config = plainConversionLabels(buildMihomoConfig(result.nodes, {
+        ...settings,
+        clashRules: result.rules || [],
+        ruleProviders: result.ruleProviders || {},
+      }));
+      return {
+        text: yaml.dump(config, { lineWidth: -1, noRefs: true }),
+        nodeCount: result.nodes.length,
+        format: result.format,
+        target: 'clash',
+      };
     }
-    const config = buildSingboxConfig(result.nodes, {
+    const config = plainConversionLabels(buildSingboxConfig(result.nodes, {
       ...settings,
       ruleSetDir: state.singbox.resolveRuleSetDir(),
       clashRules: result.rules || [],
-    });
-    return { config, nodeCount: result.nodes.length, format: result.format, coreType: 'sing-box' };
+    }));
+    return { config, nodeCount: result.nodes.length, format: result.format, target: 'sing-box' };
   });
 
   // Export the current sing-box config to a file.
@@ -366,6 +452,9 @@ function registerIpc() {
       (key) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== previous[key]
     );
     const settings = state.store.updateSettings(patch);
+    if (Object.prototype.hasOwnProperty.call(patch, 'theme')) {
+      try { require('./window').applyNativeThemeSource(); } catch (_) { /* ignore */ }
+    }
     if (coreTypeChanged) {
       state.singbox.setCoreType(settings.coreType);
       sendStatus();
@@ -404,18 +493,28 @@ function registerIpc() {
     return core.testNodeDelay(name);
   });
 
-  // Select an outbound (node tag, '♻️ Auto', or 'direct'). Persisted as the
-  // default for the next start; switched live via the Clash API if running.
-  // The node the ♻️ Auto (urltest) group is currently routing through.
-  ipcMain.handle('node:autoNow', async () => {
-    if (!state.singbox.isRunning()) return null;
-    try {
-      const d = await core.clashApi('GET', '/proxies/' + encodeURIComponent('♻️ Auto'));
-      return d.now || null;
-    } catch (e) {
-      return null;
-    }
+  // Resolve the live outer selector plus the health-check groups. Outside the
+  // Nodes tab only the active automatic group is queried, keeping polling tiny.
+  ipcMain.handle('node:groupSelections', async (_e, { all = false } = {}) => {
+    if (!state.singbox.isRunning()) return { proxy: null, auto: null, fallback: null };
+    const current = async (name) => {
+      try {
+        const group = await core.clashApi('GET', '/proxies/' + encodeURIComponent(name));
+        return group && group.now || null;
+      } catch (_) {
+        return null;
+      }
+    };
+    const proxy = await current('🚀 Proxy');
+    const selected = proxy || state.store.get('selected') || '♻️ Auto';
+    const [auto, fallback] = await Promise.all([
+      all || selected === '♻️ Auto' ? current('♻️ Auto') : null,
+      all || selected === '🛟 Fallback' ? current('🛟 Fallback') : null,
+    ]);
+    return { proxy, auto, fallback };
   });
+
+  // Select an outbound and persist it as the default for the next start.
 
   ipcMain.handle('node:select', async (_e, { name }) => {
     reqStr(name, 'name');
@@ -458,9 +557,29 @@ function registerIpc() {
     if (!state.singbox.isRunning()) return { running: false, connections: [], up: 0, down: 0 };
     try {
       const d = await core.clashApi('GET', '/connections');
+      const all = Array.isArray(d.connections) ? d.connections : [];
+      const recent = recentConnections(all, MAX_IPC_CONNECTIONS)
+        .map((c) => {
+          const m = c.metadata || {};
+          return {
+            id: c.id,
+            start: c.start,
+            upload: c.upload || 0,
+            download: c.download || 0,
+            rule: c.rule || '',
+            chains: Array.isArray(c.chains) ? c.chains : [],
+            metadata: {
+              host: m.host || '',
+              destinationIP: m.destinationIP || '',
+              destinationPort: m.destinationPort || '',
+              network: m.network || '',
+            },
+          };
+        });
       return {
         running: true,
-        connections: Array.isArray(d.connections) ? d.connections : [],
+        connections: recent,
+        totalConnections: all.length,
         up: d.uploadTotal || 0,
         down: d.downloadTotal || 0,
       };
@@ -489,7 +608,7 @@ function registerIpc() {
   });
 
   // Rule-set management: report status of each routing rule-set.
-  ipcMain.handle('ruleset:list', () => {
+  ipcMain.handle('ruleset:list', async () => {
     const isMihomo = state.singbox.getCoreType() === 'mihomo';
     const items = isMihomo
       ? [
@@ -498,8 +617,8 @@ function registerIpc() {
           { tag: 'country-mmdb', file: 'country.mmdb' },
         ]
       : [
-          { tag: 'geoip-cn', file: 'geoip-cn.srs', repo: 'sing-geoip' },
-          { tag: 'geosite-cn', file: 'geosite-cn.srs', repo: 'sing-geosite' },
+          { tag: 'geoip-cn', file: 'geoip-cn.srs' },
+          { tag: 'geosite-cn', file: 'geosite-cn.srs' },
         ];
     const dirs = [
       { loc: 'updated', dir: state.singbox.coreDir(isMihomo ? 'mihomo' : 'sing-box') },
@@ -509,16 +628,14 @@ function registerIpc() {
         ? [{ loc: 'updated', dir: runtimeDir }, { loc: 'bundled', dir: resourcesBinDir }]
         : [{ loc: 'updated', dir: path.join(runtimeDir, 'bin') }, { loc: 'bundled', dir: resourcesBinDir }]),
     ].filter((d, i, arr) => d.dir && arr.findIndex((x) => x.dir === d.dir) === i);
-    const readMeta = (dir) => {
+    const readUpdatedAt = (dir, file) => {
       try {
-        return JSON.parse(fs.readFileSync(path.join(dir, 'geodata-meta.json'), 'utf-8'));
+        const meta = JSON.parse(fs.readFileSync(path.join(dir, 'geodata-meta.json'), 'utf-8'));
+        const updatedAt = Number(meta && meta[file] && meta[file].updatedAt);
+        return Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : 0;
       } catch (_) {
-        return {};
+        return 0;
       }
-    };
-    const cleanVersion = (version) => {
-      const value = String(version || '').trim();
-      return value && value.toLowerCase() !== 'latest' ? value : null;
     };
     return items.map((it) => {
       let found = null;
@@ -540,26 +657,35 @@ function registerIpc() {
           /* ignore */
         }
       }
-      const m = found ? readMeta(found.dir)[it.file] : null;
-      const version = cleanVersion(m && m.version);
       return {
         tag: it.tag,
         file: it.file,
-        url: isMihomo
-          ? version ? `https://github.com/MetaCubeX/meta-rules-dat/releases/download/${version}/${it.file}` : null
-          : it.url || `https://raw.githubusercontent.com/SagerNet/${it.repo}/rule-set/${it.file}`,
         present: !!found,
         size: found ? found.size : 0,
         location: found ? found.location : 'none',
         valid: found ? found.valid : false,
-        version,
-        updatedAt: m ? m.updatedAt : found ? found.mtime : 0,
+        updatedAt: found ? readUpdatedAt(found.dir, it.file) || found.mtime : 0,
       };
     });
   });
 
   // App version + update check.
   ipcMain.handle('app:version', () => app.getVersion());
+  ipcMain.handle('window:minimize', (event) => {
+    senderWindow(event).minimize();
+    return true;
+  });
+  ipcMain.handle('window:toggleMaximize', (event) => {
+    const win = senderWindow(event);
+    if (win.isMaximized()) win.unmaximize();
+    else win.maximize();
+    return win.isMaximized();
+  });
+  ipcMain.handle('window:isMaximized', (event) => senderWindow(event).isMaximized());
+  ipcMain.handle('window:close', (event) => {
+    senderWindow(event).close();
+    return true;
+  });
   // Only web URLs may leave the app: openExternal with e.g. file:// or
   // ms-settings: from a (hypothetically compromised) renderer is an easy
   // sandbox escape, so allowlist the protocol here in the main process.
@@ -733,6 +859,111 @@ function registerIpc() {
     state.store.set('localRules', list);
     await core.restartIfRunning();
     return true;
+  });
+
+  // Diagnostics and maintenance tools. Renderer input is deliberately small;
+  // all network, process, filesystem and core operations remain in main.
+  ipcMain.handle('tools:routeInspect', (_e, { value }) => {
+    reqStr(value, 'domain or IP');
+    return toolbox.inspectRoute(value, toolContext);
+  });
+  ipcMain.handle('tools:networkDiagnostics', () => toolbox.networkDiagnostics(toolContext));
+  ipcMain.handle('tools:configCheck', () => toolbox.checkAllConfigs(toolContext));
+  ipcMain.handle('tools:portCheck', (_e, { ports }) => toolbox.inspectPorts(ports, toolContext));
+  ipcMain.handle('tools:dnsCompare', (_e, { host }) => {
+    reqStr(host, 'host');
+    return toolbox.dnsComparison(host, toolContext);
+  });
+
+  ipcMain.handle('tools:saveReport', async (_e, { name, content, format }) => {
+    reqStr(content, 'report');
+    if (Buffer.byteLength(content) > 2 * 1024 * 1024) throw new Error('report exceeds 2 MB');
+    format = format === 'txt' ? 'txt' : 'json';
+    const safeBase = String(name || 'dart-report').replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 96) || 'dart-report';
+    const fileName = safeBase.toLowerCase().endsWith('.' + format) ? safeBase : safeBase + '.' + format;
+    const result = await dialog.showSaveDialog(state.mainWindow, {
+      title: 'Export diagnostic report',
+      defaultPath: fileName,
+      filters: [{ name: format === 'json' ? 'JSON' : 'Text', extensions: [format] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    await writeAtomicText(result.filePath, content);
+    return result.filePath;
+  });
+
+  ipcMain.handle('tools:backupExport', async () => {
+    const backup = toolbox.buildBackup(state.store, app.getVersion());
+    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const result = await dialog.showSaveDialog(state.mainWindow, {
+      title: 'Export Dart backup',
+      defaultPath: `Dart-backup-${stamp}.json`,
+      filters: [{ name: 'Dart backup', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    await writeAtomicText(result.filePath, JSON.stringify(backup, null, 2));
+    return result.filePath;
+  });
+
+  ipcMain.handle('tools:backupSelect', async () => {
+    const result = await dialog.showOpenDialog(state.mainWindow, {
+      title: 'Select Dart backup',
+      properties: ['openFile'],
+      filters: [{ name: 'Dart backup', extensions: ['json'] }],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths[0]) return null;
+    const file = result.filePaths[0];
+    const stat = await fs.promises.stat(file);
+    if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error('backup is not a file or exceeds 64 MB');
+    const document = JSON.parse(await fs.promises.readFile(file, 'utf-8'));
+    const normalized = toolbox.validateBackupDocument(document);
+    const token = crypto.randomUUID();
+    const summary = toolbox.backupSummary(document, normalized);
+    pendingBackup = { token, normalized, summary, expiresAt: Date.now() + 10 * 60 * 1000 };
+    return { token, fileName: path.basename(file), summary };
+  });
+
+  ipcMain.handle('tools:backupRestore', async (_e, { token }) => {
+    reqStr(token, 'backup token');
+    if (!pendingBackup || pendingBackup.token !== token || pendingBackup.expiresAt < Date.now()) {
+      pendingBackup = null;
+      throw new Error('backup selection expired; select the file again');
+    }
+    const restored = pendingBackup.normalized;
+    const currentSettings = state.store.getSettings();
+    const knownSettings = new Set(Object.keys(currentSettings));
+    restored.settings = Object.fromEntries(
+      Object.entries(restored.settings).filter(([key]) => knownSettings.has(key))
+    );
+    validateSettingsPatch(restored.settings, currentSettings);
+
+    const before = toolbox.validateBackupDocument(toolbox.buildBackup(state.store, app.getVersion()));
+    const wasRunning = state.singbox.isRunning();
+    if (wasRunning) await core.stopCore(true);
+    const apply = (data) => {
+      state.store.set('subscriptions', data.subscriptions);
+      state.store.updateSettings(data.settings);
+      state.store.set('activeSub', data.activeSub);
+      state.store.set('selected', data.selected);
+      state.store.set('customRuleSets', data.customRuleSets);
+      state.store.set('localRules', data.localRules);
+    };
+    try {
+      apply(restored);
+    } catch (error) {
+      try { apply(before); } catch (_) {}
+      throw error;
+    }
+
+    const settings = state.store.getSettings();
+    state.singbox.setCoreType(settings.coreType);
+    core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
+    core.rescheduleAutoUpdate();
+    pendingBackup = null;
+    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+      state.mainWindow.webContents.send('subs:changed');
+    }
+    sendStatus();
+    return { restored: true, stoppedCore: wasRunning, summary: toolbox.backupSummary({ appVersion: app.getVersion(), createdAt: new Date().toISOString() }, restored) };
   });
 
   // UWP loopback exemption tool (Windows). Listing is unprivileged; applying

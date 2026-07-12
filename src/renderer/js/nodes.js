@@ -6,28 +6,71 @@
   const delays = App.delays;
   const api = window.api;
   const { t } = window.i18n;
-  const MAX_RENDERED_NODES = 500;
+  const NODE_COLUMNS = 2;
+  const VIRTUAL_NODE_ROW_HEIGHT = 78;
+  const VIRTUAL_OVERSCAN = 5;
+  const AUTO_GROUP = '♻️ Auto';
+  const FALLBACK_GROUP = '🛟 Fallback';
+  let nodeRows = [];
+  let filteredNodeCount = 0;
 
-  // The node the ♻️ Auto (urltest) group currently routes through, or null.
-  let autoNow = null;
-  async function refreshAutoNow() {
-    let now = null;
-    if (App.state.status && App.state.status.running) {
-      try {
-        now = await api.getAutoSelected();
-      } catch (_) {
-        /* keep null */
+  let groupNow = { proxy: null, auto: null, fallback: null };
+  let groupRefresh = null;
+  let currentNodeFrame = 0;
+
+  function currentNodeName() {
+    if (!(App.state.status && App.state.status.running)) return '-';
+    const selected = groupNow.proxy || App.state.selected || AUTO_GROUP;
+    if (selected === AUTO_GROUP) return groupNow.auto || AUTO_GROUP;
+    if (selected === FALLBACK_GROUP) return groupNow.fallback || FALLBACK_GROUP;
+    return selected === 'direct' ? 'DIRECT' : selected;
+  }
+
+  function renderCurrentNode() {
+    const el = $('#miniCurrentNode');
+    if (el) {
+      const name = currentNodeName();
+      if (el.textContent !== name) el.textContent = name;
+      el.title = name === '-' ? '' : name;
+      if (!currentNodeFrame) {
+        currentNodeFrame = requestAnimationFrame(() => {
+          currentNodeFrame = 0;
+          const viewport = el.parentElement;
+          const overflow = Math.max(0, el.scrollWidth - viewport.clientWidth);
+          el.style.setProperty('--node-offset', -overflow + 'px');
+          el.style.setProperty('--node-scroll-duration', Math.max(6, 4 + overflow / 18) + 's');
+          el.classList.toggle('scrolling', overflow > 3);
+        });
       }
     }
-    if (now !== autoNow) {
-      autoNow = now;
-      if (App.currentTab === 'nodes' && !document.hidden) renderNodes();
-    }
+    if (typeof App.renderDashNodeCards === 'function') App.renderDashNodeCards();
   }
-  // urltest re-picks on its own schedule; keep the label fresh while visible.
+
+  async function refreshGroupSelections() {
+    if (groupRefresh) return groupRefresh;
+    groupRefresh = (async () => {
+      let next = { proxy: null, auto: null, fallback: null };
+      if (App.state.status && App.state.status.running) {
+        try { next = await api.getGroupSelections(App.currentTab === 'nodes'); } catch (_) {}
+      }
+      if (!(App.state.status && App.state.status.running)) next = {};
+      next = {
+        proxy: next && next.proxy || null,
+        auto: next && next.auto || null,
+        fallback: next && next.fallback || null,
+      };
+      const changed = next.proxy !== groupNow.proxy || next.auto !== groupNow.auto || next.fallback !== groupNow.fallback;
+      groupNow = next;
+      renderCurrentNode();
+      if (changed && App.currentTab === 'nodes' && !document.hidden) renderNodes();
+    })().finally(() => { groupRefresh = null; });
+    return groupRefresh;
+  }
+  // Keep the sidebar current-node label fresh without waking a hidden window.
   setInterval(() => {
-    if (App.currentTab === 'nodes' && !document.hidden) refreshAutoNow();
+    if (!document.hidden && App.state.status && App.state.status.running) refreshGroupSelections();
   }, 5000);
+  window.addEventListener('resize', renderCurrentNode);
 
   // Only the active profile's nodes are used (profiles are not merged), matching
   // the config the core actually runs. Returns the raw array (no copying).
@@ -52,8 +95,8 @@
   }
 
   function isActiveNode(name) {
-    const sel = App.state.selected;
-    if (!sel) return name === '♻️ Auto';
+    const sel = groupNow.proxy || App.state.selected;
+    if (!sel) return name === AUTO_GROUP;
     return sel === name;
   }
 
@@ -65,47 +108,74 @@
     // The urltest group's current pick: shown on the Auto row ("当前: X") and
     // as a ⚡ marker on that node's own row.
     let tagHtml = type ? `<span class="node-tag">${escapeHtml(String(type))}</span>` : '';
-    if (server && autoNow && name === autoNow) tagHtml += '<span class="node-tag">⚡</span>';
+    if (server && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
+    if (server && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
     let metaHtml = server ? `<span class="sub-meta">${escapeHtml(String(server))}:${escapeHtml(String(port))}</span>` : '';
-    if (!server && autoNow && name === '♻️ Auto') {
-      metaHtml = `<span class="sub-meta">${t('nodes.autoNow', escapeHtml(autoNow))}</span>`;
+    const selectedNow = name === AUTO_GROUP ? groupNow.auto : name === FALLBACK_GROUP ? groupNow.fallback : null;
+    if (!server && selectedNow) {
+      metaHtml = `<span class="sub-meta">${t('nodes.autoNow', escapeHtml(selectedNow))}</span>`;
     }
     const testHtml = server ? `<button class="node-test-btn" data-name="${escapeHtml(name)}">${t('nodes.test')}</button>` : '';
     const activeHtml = active ? `<span class="node-active">✓ ${t('nodes.active')}</span>` : '';
     return `<div class="node-item${active ? ' active' : ''}" data-name="${escapeHtml(name)}">
-      <div><span class="node-name">${escapeHtml(name)}</span>${tagHtml}</div>
-      <div class="node-right">${metaHtml}${delayHtml}${activeHtml}${testHtml}</div></div>`;
+      <div class="node-top">
+        <div class="node-identity"><span class="node-name">${escapeHtml(name)}</span>${tagHtml}</div>
+        ${activeHtml}
+      </div>
+      <div class="node-bottom">${metaHtml}${delayHtml}${testHtml}</div>
+    </div>`;
   }
 
-  // Build the whole list as one HTML string (cheaper than per-row createElement);
-  // clicks are handled by a single delegated listener attached once at startup.
+  function virtualRange(list, total) {
+    const totalRows = Math.ceil(total / NODE_COLUMNS);
+    const visibleRows = Math.ceil((list.clientHeight || 480) / VIRTUAL_NODE_ROW_HEIGHT);
+    const firstRow = Math.floor(Math.max(0, list.scrollTop - 10) / VIRTUAL_NODE_ROW_HEIGHT);
+    const startRow = Math.max(0, firstRow - VIRTUAL_OVERSCAN);
+    const endRow = Math.min(totalRows, startRow + visibleRows + VIRTUAL_OVERSCAN * 2);
+    return {
+      start: startRow * NODE_COLUMNS,
+      end: Math.min(total, endRow * NODE_COLUMNS),
+      startRow,
+      endRow,
+      totalRows,
+    };
+  }
+
+  function renderNodeWindow() {
+    const list = $('#nodeList');
+    if (!list) return;
+    if (!nodeRows.length) {
+      list.innerHTML = `<p class="hint">${t('nodes.empty')}</p>`;
+      return;
+    }
+    const { start, end, startRow, endRow, totalRows } = virtualRange(list, nodeRows.length);
+    let html = startRow
+      ? `<div class="virtual-spacer" style="height:${startRow * VIRTUAL_NODE_ROW_HEIGHT}px"></div>`
+      : '';
+    html += '<div class="node-grid-window">';
+    for (let i = start; i < end; i++) {
+      const n = nodeRows[i];
+      html += nodeRowHtml(n.name, n.type, n.server, n.port);
+    }
+    html += '</div>';
+    const afterRows = totalRows - endRow;
+    if (afterRows) {
+      html += `<div class="virtual-spacer" style="height:${afterRows * VIRTUAL_NODE_ROW_HEIGHT}px"></div>`;
+    }
+    if (!filteredNodeCount) html += `<p class="hint rule-more">${t('nodes.empty')}</p>`;
+    list.innerHTML = html;
+  }
+
+  // Strategy groups stay first; manual nodes always retain profile order.
   function renderNodes() {
     const list = $('#nodeList');
     if (!list) return;
     const filter = ($('#nodeFilter').value || '').toLowerCase();
     const nodes = activeNodes().filter((n) => n.name.toLowerCase().includes(filter));
-    const shown = nodes.slice(0, MAX_RENDERED_NODES);
-    const shownNames = new Set(shown.map((n) => n.name));
-    for (const special of [App.state.selected, autoNow]) {
-      if (!special || special === '♻️ Auto' || shownNames.has(special)) continue;
-      const node = nodes.find((n) => n.name === special);
-      if (node) {
-        shown.push(node);
-        shownNames.add(special);
-      }
-    }
-    const limited = shown.length < nodes.length;
-    $('#nodeCount').textContent =
-      t('nodes.count', nodes.length) + (limited ? ` · ${shown.length}/${nodes.length}` : '');
-    // Always offer the automatic (urltest) selection at the top.
-    let html = nodeRowHtml('♻️ Auto');
-    if (nodes.length === 0) {
-      list.innerHTML = html + `<p class="hint">${t('nodes.empty')}</p>`;
-      return;
-    }
-    for (const n of shown) html += nodeRowHtml(n.name, n.type, n.server, n.port);
-    if (limited) html += `<p class="hint rule-more">${shown.length}/${nodes.length}</p>`;
-    list.innerHTML = html;
+    filteredNodeCount = nodes.length;
+    nodeRows = [{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes];
+    $('#nodeCount').textContent = t('nodes.count', nodes.length);
+    renderNodeWindow();
   }
   $('#nodeList').addEventListener('click', (e) => {
     const tb = e.target.closest('.node-test-btn');
@@ -122,7 +192,9 @@
     try {
       await api.selectNode(name);
       App.state.selected = name;
+      groupNow.proxy = name;
       renderNodes();
+      renderCurrentNode();
       toast(t('toast.nodeSelected', name));
     } catch (e) {
       toast(e.message || String(e), true);
@@ -143,6 +215,9 @@
     delayPatchQueued = true;
     requestAnimationFrame(() => {
       delayPatchQueued = false;
+      if (typeof App.renderDashNodeCards === 'function' && !document.hidden) {
+        App.renderDashNodeCards();
+      }
       if (App.currentTab !== 'nodes' || document.hidden) {
         dirtyDelays.clear(); // renderNodes() on tab show covers these
         return;
@@ -165,6 +240,10 @@
       toast(t('nodes.needRunning'), true);
       return;
     }
+    if (!name || name === '-' || name === 'DIRECT' || name === 'direct') {
+      toast(t('dash.noNode'), true);
+      return;
+    }
     delays.set(name, 'testing');
     scheduleDelayUpdate(name);
     try {
@@ -174,7 +253,13 @@
       delays.set(name, 'timeout');
     }
     scheduleDelayUpdate(name);
-    refreshAutoNow(); // a fresh delay result may make urltest re-pick
+    refreshGroupSelections(); // a fresh delay result may make a group re-pick
+  }
+
+  async function testCurrentNodeDelay() {
+    await refreshGroupSelections();
+    const name = currentNodeName();
+    await testOne(name);
   }
 
   let testAllRunning = false;
@@ -209,7 +294,7 @@
     }
     try {
       await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
-      refreshAutoNow(); // the full sweep usually changes urltest's pick
+      refreshGroupSelections(); // the full sweep usually changes group picks
     } finally {
       testAllRunning = false;
       button.disabled = false;
@@ -219,11 +304,26 @@
   let nodeFilterTimer = null;
   $('#nodeFilter').addEventListener('input', () => {
     clearTimeout(nodeFilterTimer);
-    nodeFilterTimer = setTimeout(renderNodes, 80);
+    nodeFilterTimer = setTimeout(() => {
+      $('#nodeList').scrollTop = 0;
+      renderNodes();
+    }, 80);
+  });
+  let nodeScrollQueued = false;
+  $('#nodeList').addEventListener('scroll', () => {
+    if (nodeScrollQueued) return;
+    nodeScrollQueued = true;
+    requestAnimationFrame(() => {
+      nodeScrollQueued = false;
+      renderNodeWindow();
+    });
   });
   $('#testAllBtn').addEventListener('click', testAll);
 
   App.activeNodes = activeNodes;
   App.renderNodes = renderNodes;
-  App.refreshAutoNow = refreshAutoNow;
+  App.currentNodeName = currentNodeName;
+  App.renderCurrentNode = renderCurrentNode;
+  App.refreshGroupSelections = refreshGroupSelections;
+  App.testCurrentNodeDelay = testCurrentNodeDelay;
 })();

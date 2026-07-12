@@ -18,29 +18,52 @@ function run(cmd) {
 
 const REG_PATH =
   'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
+let proxyOperationQueue = Promise.resolve();
+let shuttingDown = false;
+
+function queueProxyOperation(operation) {
+  const task = proxyOperationQueue.then(operation, operation);
+  proxyOperationQueue = task.catch(() => {});
+  return task;
+}
 
 /** Enable the system proxy, pointing at local host:port. */
 async function enableSystemProxy(host, port) {
-  if (process.platform !== 'win32') return false;
-  const server = `${host}:${port}`;
-  const private172 = Array.from({ length: 16 }, (_, i) => `172.${16 + i}.*`).join(';');
-  // Write the complete configuration before flipping ProxyEnable. If either
-  // preparatory write fails, Windows keeps using its previous proxy state.
-  await run(`reg add "${REG_PATH}" /v ProxyServer /t REG_SZ /d "${server}" /f`);
-  await run(
-    `reg add "${REG_PATH}" /v ProxyOverride /t REG_SZ /d "localhost;127.*;10.*;${private172};192.168.*;169.254.*;<local>" /f`
-  );
-  await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 1 /f`);
-  await refreshSettings();
-  return true;
+  if (process.platform !== 'win32' || shuttingDown) return false;
+  return queueProxyOperation(async () => {
+    if (shuttingDown) return false;
+    const server = `${host}:${port}`;
+    const private172 = Array.from({ length: 16 }, (_, i) => `172.${16 + i}.*`).join(';');
+    // Write the complete configuration before flipping ProxyEnable. If either
+    // preparatory write fails, Windows keeps using its previous proxy state.
+    await run(`reg add "${REG_PATH}" /v ProxyServer /t REG_SZ /d "${server}" /f`);
+    if (shuttingDown) return false;
+    await run(
+      `reg add "${REG_PATH}" /v ProxyOverride /t REG_SZ /d "localhost;127.*;10.*;${private172};192.168.*;169.254.*;<local>" /f`
+    );
+    if (shuttingDown) return false;
+    await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 1 /f`);
+    if (shuttingDown) {
+      disableSystemProxySync();
+      return false;
+    }
+    await refreshSettings();
+    return true;
+  });
+}
+
+function beginShutdown() {
+  shuttingDown = true;
 }
 
 /** Disable the system proxy. */
 async function disableSystemProxy() {
   if (process.platform !== 'win32') return false;
-  await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 0 /f`);
-  await refreshSettings();
-  return true;
+  return queueProxyOperation(async () => {
+    await run(`reg add "${REG_PATH}" /v ProxyEnable /t REG_DWORD /d 0 /f`);
+    await refreshSettings();
+    return true;
+  });
 }
 
 /**
@@ -132,6 +155,7 @@ async function refreshSettings() {
 module.exports = {
   enableSystemProxy,
   disableSystemProxy,
+  beginShutdown,
   disableSystemProxySync,
   disableSystemProxySyncIfOurs,
   isSystemProxyActive,

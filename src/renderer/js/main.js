@@ -11,26 +11,52 @@
   function setLanguage(lang) {
     setLang(lang);
     applyI18n();
+    if (App.refreshSelects) App.refreshSelects();
     const sel = $('#setLanguage');
     if (sel) sel.value = lang;
     // Re-render dynamic content that isn't covered by data-i18n.
     App.renderStatus();
     App.renderSubs();
     App.renderNodes();
+    App.renderSettings();
+    App.renderMode();
+    App.renderUsage();
     App.renderCoreStatus(App.state.status);
+    if (App.refreshToolsLanguage) App.refreshToolsLanguage();
+    if (App.currentTab === 'rules') {
+      App.loadRules({ force: false });
+      App.loadLocalRules({ force: true });
+      App.loadRuleGroups({ force: true });
+      App.loadCustomRuleSets({ force: true });
+    }
+    syncTopbarTitle();
     if (App.renderThemeLabel) App.renderThemeLabel();
   }
 
   // ---------- Tab switching ----------
-  $$('.nav-item').forEach((btn) => {
-    btn.addEventListener('click', () => {
+  function syncTopbarTitle(button) {
+    const active = button || document.querySelector('.nav-item.active');
+    const title = $('#topbarTitle');
+    if (active && title) title.textContent = active.textContent.trim();
+  }
+
+  function showTab(tab) {
+    const btn = document.querySelector(`.nav-item[data-tab="${tab}"]`);
+    if (!btn) return;
+    if (!btn.classList.contains('active')) {
       $$('.nav-item').forEach((b) => b.classList.remove('active'));
-      $$('.tab').forEach((tab) => tab.classList.remove('active'));
+      $$('.tab').forEach((el) => el.classList.remove('active'));
       btn.classList.add('active');
-      const tab = btn.dataset.tab;
-      $('#tab-' + tab).classList.add('active');
-      onTabShown(tab);
-    });
+      syncTopbarTitle(btn);
+      const panel = $('#tab-' + tab);
+      if (panel) panel.classList.add('active');
+    }
+    onTabShown(tab);
+  }
+  App.showTab = showTab;
+
+  $$('.nav-item').forEach((btn) => {
+    btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });
 
   // Per-tab activation: load rules on demand, start/stop connection polling.
@@ -54,7 +80,9 @@
   }
 
   function onTabShown(tab) {
+    const previousTab = App.currentTab;
     App.currentTab = tab;
+    if (previousTab === 'conns' && tab !== 'conns') App.clearConnections();
     if (connTimer) {
       clearInterval(connTimer);
       connTimer = null;
@@ -66,8 +94,9 @@
       connTimer = setInterval(App.loadConnections, 2000);
     } else if (tab === 'nodes') {
       App.renderNodes(); // refresh delay results that arrived while hidden
-      App.refreshAutoNow();
+      App.refreshGroupSelections();
     } else if (tab === 'logs') {
+      App.flushLogs();
       // Land at the latest line when opening the Logs tab (lines accumulate while hidden).
       const box = $('#logBox');
       if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
@@ -76,19 +105,15 @@
     }
   }
 
-  // While hidden (minimized to tray), stop polling and drawing; the traffic
-  // history still accumulates, so the charts catch up when shown again. We also
-  // ask V8 for a collection (window.gc is exposed by the main process's
-  // --expose-gc flag) so the heap promptly returns memory to the OS rather than
-  // waiting for the next allocation to trip a GC, which can be many minutes
-  // while the window is in the tray.
+  // While hidden (minimized to tray), stop polling and drawing. The main
+  // process keeps the tray tooltip live without waking the renderer each second.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (connTimer) {
         clearInterval(connTimer);
         connTimer = null;
       }
-      try { if (window.gc) window.gc(); } catch (_) { /* gc unavailable */ }
+      if (App.currentTab === 'conns') App.clearConnections();
     } else {
       onTabShown(App.currentTab);
       App.trafficChart.draw();
@@ -122,6 +147,7 @@
     App.renderUsage();
     // getState already carries the core path/version, so no extra IPC is needed.
     App.renderCoreStatus(App.state.status);
+    App.refreshGroupSelections();
   }
 
   // ---------- Event streams ----------
@@ -140,9 +166,22 @@
   });
 
   if (api && api.onStatus) api.onStatus((status) => {
-    const wasRunning = App.state.status && App.state.status.running;
-    App.state.status = status;
+    const previous = App.state.status || {};
+    const wasRunning = previous.running;
+    const coreChanged = !!(
+      previous.coreType && status.coreType && previous.coreType !== status.coreType
+    );
+    // Status broadcasts are intentionally compact. Preserve the full path and
+    // version loaded by app:getState instead of replacing them with undefined.
+    App.state.status = coreChanged
+      ? { ...previous, ...status, corePath: undefined, coreVersion: undefined }
+      : { ...previous, ...status };
     App.renderStatus();
+    App.renderCoreStatus(App.state.status);
+    App.refreshGroupSelections();
+    if (App.state.status.coreInstalled && App.state.status.coreVersion === undefined && App.refreshCoreStatus) {
+      App.refreshCoreStatus().catch(() => {});
+    }
     if (wasRunning !== status.running && App.invalidateRuleCaches) App.invalidateRuleCaches();
     // Clear the traffic graphs once the core stops.
     if (wasRunning && !status.running) {

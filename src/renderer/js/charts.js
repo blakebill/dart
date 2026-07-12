@@ -72,9 +72,14 @@
     const canvas = $(sel);
     if (!canvas) return { push() {}, reset() {}, draw() {} };
     const ctx = canvas.getContext('2d');
-    const { size, upEl, downEl, fill = false, lineWidth = 2, fallbackW = 0, fallbackH = 0, axes = null } = opts;
+    const {
+      size, upEl, downEl, upTotalEl, downTotalEl,
+      fill = false, lineWidth = 2, fallbackW = 0, fallbackH = 0, axes = null,
+    } = opts;
     const up = new Array(size).fill(0);
     const down = new Array(size).fill(0);
+    let sessionUp = 0;
+    let sessionDown = 0;
     const pad = fill ? 8 : 2;
     const base = fill ? 4 : 1;
 
@@ -188,8 +193,13 @@
     function setLabels(u, d) {
       if (upEl) { const e = $(upEl); if (e) e.textContent = fmtBytes(u) + '/s'; }
       if (downEl) { const e = $(downEl); if (e) e.textContent = fmtBytes(d) + '/s'; }
+      if (upTotalEl) { const e = $(upTotalEl); if (e) e.textContent = fmtBytes(sessionUp); }
+      if (downTotalEl) { const e = $(downTotalEl); if (e) e.textContent = fmtBytes(sessionDown); }
     }
     function push(u, d) {
+      // Clash /traffic is ~1 Hz; treat each sample as one second of throughput.
+      sessionUp += Math.max(0, Number(u) || 0);
+      sessionDown += Math.max(0, Number(d) || 0);
       up.push(u); up.shift();
       down.push(d); down.shift();
       setLabels(u, d);
@@ -197,6 +207,8 @@
     }
     function reset() {
       up.fill(0); down.fill(0);
+      sessionUp = 0;
+      sessionDown = 0;
       setLabels(0, 0);
       draw();
     }
@@ -207,7 +219,15 @@
   App.refreshPalette = refreshPalette;
   App.applyTheme = applyTheme;
   App.trafficChart = makeChart('#trafficChart', {
-    size: 60, upEl: '#trafficUp', downEl: '#trafficDown', fill: true, axes: 'outer', lineWidth: 2, fallbackH: 160,
+    size: 60,
+    upEl: '#trafficUp',
+    downEl: '#trafficDown',
+    upTotalEl: '#trafficUpTotal',
+    downTotalEl: '#trafficDownTotal',
+    fill: true,
+    axes: 'outer',
+    lineWidth: 2,
+    fallbackH: 120,
   });
   App.miniChart = makeChart('#miniTraffic', {
     size: 48, upEl: '#miniUp', downEl: '#miniDown', axes: 'inner', lineWidth: 1.5, fallbackW: 176, fallbackH: 40,

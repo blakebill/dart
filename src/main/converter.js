@@ -1,5 +1,9 @@
 'use strict';
 
+const AUTO_GROUP = '♻️ Auto';
+const FALLBACK_GROUP = '🛟 Fallback';
+const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
+
 /**
  * Core converter
  *
@@ -761,20 +765,22 @@ function ruleListToSingboxRule(text, target) {
   return { rule: rules.length === 1 ? rules[0] : null, rules, count };
 }
 
-/** Deduplicate tags and handle nodes with duplicate names. */
-function dedupeTags(outbounds) {
-  const seen = new Map();
-  for (const ob of outbounds) {
-    let tag = ob.tag || 'node';
-    if (seen.has(tag)) {
-      const count = seen.get(tag) + 1;
-      seen.set(tag, count);
-      ob.tag = `${tag} ${count}`;
-    } else {
-      seen.set(tag, 1);
-    }
+function dedupeNames(items, key, reserved = []) {
+  const used = new Set(reserved);
+  for (const item of items) {
+    const base = String(item[key] || 'node');
+    let name = base;
+    let suffix = 2;
+    while (used.has(name)) name = `${base} ${suffix++}`;
+    used.add(name);
+    item[key] = name;
   }
-  return outbounds;
+  return items;
+}
+
+/** Deduplicate tags and keep generated strategy outbounds unambiguous. */
+function dedupeTags(outbounds) {
+  return dedupeNames(outbounds, 'tag', ['🚀 Proxy', AUTO_GROUP, FALLBACK_GROUP, 'direct']);
 }
 
 /**
@@ -814,10 +820,10 @@ function buildRoute(opts = {}) {
       { action: 'sniff' },
       { protocol: 'dns', action: 'hijack-dns' },
       // Block mode: reject every connection (placed above all other routing).
-      { clash_mode: 'Block', action: 'reject' },
+      { clash_mode: 'block', action: 'reject' },
       { ip_is_private: true, outbound: 'direct' },
-      { clash_mode: 'Direct', outbound: 'direct' },
-      { clash_mode: 'Global', outbound: '🚀 Proxy' },
+      { clash_mode: 'direct', outbound: 'direct' },
+      { clash_mode: 'global', outbound: '🚀 Proxy' },
       // Custom rule-sets (user-added) take top priority.
       ...extraRules,
       // Converted from the subscription's Clash rules (above the geoip/geosite fallback).
@@ -858,9 +864,11 @@ function buildSingboxConfig(nodes, opts = {}) {
     geoAvailable = null, // Set of geo rule-set tags backed by a local .srs
     ruleSetData = null, // RULE-SET provider name -> parsed matcher arrays
     enableIpv6 = true,
+    tunInterfaceName = 'Dart',
     dnsRemote = 'https://1.1.1.1/dns-query',
     dnsLocal = 'https://223.5.5.5/dns-query',
     dnsStrategy = 'prefer_ipv4',
+    testUrl = DEFAULT_TEST_URL,
     extraRules = [], // route rules from custom rule-sets
     extraRuleSets = [], // local rule_set defs from custom .srs
   } = opts;
@@ -869,33 +877,45 @@ function buildSingboxConfig(nodes, opts = {}) {
     nodes.map(nodeToOutbound).filter(Boolean)
   );
   const nodeTags = nodeOutbounds.map((o) => o.tag);
+  const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
 
   // Default selection: a specific node tag if it still exists, else auto.
   const defaultOutbound =
-    selected && (selected === '♻️ Auto' || selected === 'direct' || nodeTags.includes(selected))
+    selected && ([AUTO_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) || nodeTags.includes(selected))
       ? selected
-      : '♻️ Auto';
+      : AUTO_GROUP;
 
-  // Node groups: manual selector + automatic urltest
+  // sing-box has no distinct ordered-fallback outbound. A sticky URLTest group
+  // is its native health-checked equivalent: it keeps a healthy route and
+  // moves when that route fails.
   const proxyGroup = {
     type: 'selector',
     tag: '🚀 Proxy',
-    outbounds: ['♻️ Auto', ...nodeTags, 'direct'],
+    outbounds: [AUTO_GROUP, FALLBACK_GROUP, ...nodeTags, 'direct'],
     default: defaultOutbound,
   };
   const autoGroup = {
     type: 'urltest',
-    tag: '♻️ Auto',
+    tag: AUTO_GROUP,
     outbounds: nodeTags,
-    url: 'https://www.gstatic.com/generate_204',
+    url: latencyUrl,
     interval: '1m',
     tolerance: 50,
     idle_timeout: '30m',
   };
+  const fallbackGroup = {
+    type: 'urltest',
+    tag: FALLBACK_GROUP,
+    outbounds: nodeTags,
+    url: latencyUrl,
+    interval: '1m',
+    tolerance: 10000,
+    idle_timeout: '1m',
+  };
 
   // Only "direct" remains a special outbound; block / dns are handled via route
   // rule actions (reject / hijack-dns) in sing-box 1.12+.
-  const outbounds = [proxyGroup, autoGroup, ...nodeOutbounds, { type: 'direct', tag: 'direct' }];
+  const outbounds = [proxyGroup, autoGroup, fallbackGroup, ...nodeOutbounds, { type: 'direct', tag: 'direct' }];
 
   // Inbounds (sing-box 1.12+: sniffing is a route rule action, not an inbound field)
   const inbounds = [];
@@ -903,6 +923,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     inbounds.push({
       type: 'tun',
       tag: 'tun-in',
+      ...(tunInterfaceName ? { interface_name: tunInterfaceName } : {}),
       // IPv4-only when IPv6 is disabled, so the TUN never advertises a v6 route.
       address: enableIpv6 ? ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'] : ['172.19.0.1/30'],
       mtu: 9000,
@@ -933,8 +954,8 @@ function buildSingboxConfig(nodes, opts = {}) {
         dnsServerFromAddress(dnsLocal, 'local-dns'),
       ],
       rules: [
-        { clash_mode: 'Direct', server: 'local-dns' },
-        { clash_mode: 'Global', server: 'proxy-dns' },
+        { clash_mode: 'direct', server: 'local-dns' },
+        { clash_mode: 'global', server: 'proxy-dns' },
         // Resolve CN domains with the local resolver — only when the rule-set
         // exists (see buildRoute: a missing geosite-cn must not be referenced).
         ...(avail.has('geosite-cn') ? [{ rule_set: 'geosite-cn', server: 'local-dns' }] : []),
@@ -988,18 +1009,7 @@ function buildSingboxConfig(nodes, opts = {}) {
 }
 
 function dedupeProxyNames(proxies) {
-  const seen = new Map();
-  for (const p of proxies) {
-    let name = p.name || 'node';
-    if (seen.has(name)) {
-      const count = seen.get(name) + 1;
-      seen.set(name, count);
-      p.name = `${name} ${count}`;
-    } else {
-      seen.set(name, 1);
-    }
-  }
-  return proxies;
+  return dedupeNames(proxies, 'name', ['🚀 Proxy', AUTO_GROUP, FALLBACK_GROUP, 'direct', 'DIRECT', 'REJECT', 'GLOBAL']);
 }
 
 function clashTargetName(target) {
@@ -1008,19 +1018,35 @@ function clashTargetName(target) {
   return '🚀 Proxy';
 }
 
-function singboxRuleToClashRules(rule) {
-  const target = rule.action === 'reject' ? 'REJECT' : rule.outbound === 'direct' ? 'DIRECT' : '🚀 Proxy';
+function singboxRuleToClashRules(rule, options = {}) {
+  if (!rule || typeof rule !== 'object' || ['sniff', 'hijack-dns'].includes(rule.action)) return [];
+  const outbound = String(rule.outbound || '').toLowerCase();
+  const target = rule.action === 'reject' || ['block', 'reject'].includes(outbound)
+    ? 'REJECT'
+    : outbound === 'direct' ? 'DIRECT' : '🚀 Proxy';
   const out = [];
   const add = (type, vals) => {
-    for (const v of vals || []) out.push(`${type},${v},${target}`);
+    const values = Array.isArray(vals) ? vals : vals === undefined ? [] : [vals];
+    for (const v of values) out.push(`${type},${v},${target}`);
   };
   add('DOMAIN', rule.domain);
   add('DOMAIN-SUFFIX', rule.domain_suffix);
   add('DOMAIN-KEYWORD', rule.domain_keyword);
   add('IP-CIDR', rule.ip_cidr);
   add('PROCESS-NAME', rule.process_name);
-  if (Array.isArray(rule.rule_set)) {
-    for (const tag of rule.rule_set) out.push(`RULE-SET,${tag},${target}`);
+  add('DST-PORT', rule.port);
+  if (rule.ip_is_private === true) {
+    add('IP-CIDR', ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8']);
+    add('IP-CIDR6', ['fc00::/7', 'fe80::/10', '::1/128']);
+  }
+  if (options.includeRuleSets !== false) {
+    const ruleSets = Array.isArray(rule.rule_set) ? rule.rule_set : rule.rule_set ? [rule.rule_set] : [];
+    for (const tag of ruleSets) out.push(`RULE-SET,${tag},${target}`);
+  }
+  if (rule.type === 'logical' && rule.mode === 'or' && Array.isArray(rule.rules)) {
+    for (const child of rule.rules) {
+      out.push(...singboxRuleToClashRules({ ...child, outbound: rule.outbound, action: rule.action }, options));
+    }
   }
   return out;
 }
@@ -1051,8 +1077,10 @@ function buildMihomoConfig(nodes, opts = {}) {
     ruleProviders = {},
     enableIpv6 = true,
     enableTun = false,
+    tunInterfaceName = 'Dart',
     dnsRemote = 'https://1.1.1.1/dns-query',
     dnsLocal = 'https://223.5.5.5/dns-query',
+    testUrl = DEFAULT_TEST_URL,
     externalUiDir = '',
     externalUiDownloadUrl = '',
     extraRules = [],
@@ -1061,11 +1089,12 @@ function buildMihomoConfig(nodes, opts = {}) {
 
   const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
   const proxyNames = proxies.map((p) => p.name);
+  const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const defaultProxy =
-    selected && (selected === '♻️ Auto' || selected === 'DIRECT' || selected === 'direct' || proxyNames.includes(selected))
+    selected && ([AUTO_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) || proxyNames.includes(selected))
       ? selected === 'direct' ? 'DIRECT' : selected
-      : '♻️ Auto';
-  const manualProxies = [defaultProxy, '♻️ Auto', ...proxyNames, 'DIRECT'].filter(
+      : AUTO_GROUP;
+  const manualProxies = [defaultProxy, AUTO_GROUP, FALLBACK_GROUP, ...proxyNames, 'DIRECT'].filter(
     (name, idx, arr) => name && arr.indexOf(name) === idx
   );
 
@@ -1098,12 +1127,13 @@ function buildMihomoConfig(nodes, opts = {}) {
     'log-level': logLevel,
     ipv6: !!enableIpv6,
     'geodata-mode': true,
-    'geodata-loader': 'standard',
+    'geodata-loader': 'memconservative',
     'geo-auto-update': false,
     proxies,
     'proxy-groups': [
       { name: '🚀 Proxy', type: 'select', proxies: manualProxies },
-      { name: '♻️ Auto', type: 'url-test', proxies: proxyNames, url: 'https://www.gstatic.com/generate_204', interval: 60 },
+      { name: AUTO_GROUP, type: 'url-test', proxies: proxyNames, url: latencyUrl, interval: 60 },
+      { name: FALLBACK_GROUP, type: 'fallback', proxies: proxyNames, url: latencyUrl, interval: 60, lazy: true },
     ],
     rules,
   };
@@ -1125,6 +1155,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     };
     config.tun = {
       enable: true,
+      ...(tunInterfaceName ? { device: tunInterfaceName } : {}),
       stack: 'mixed',
       mtu: 9000,
       'auto-route': true,
@@ -1146,6 +1177,7 @@ function buildMihomoConfig(nodes, opts = {}) {
 }
 
 module.exports = {
+  DEFAULT_TEST_URL,
   nodeToOutbound,
   nodeToClashProxy,
   buildSingboxConfig,
@@ -1157,5 +1189,6 @@ module.exports = {
   extractGeoCategories,
   parseRuleList,
   dnsServerFromAddress,
+  singboxRuleToClashRules,
   ruleListToSingboxRule,
 };

@@ -1,8 +1,8 @@
 'use strict';
-// Remote rules on the Rules tab, plus GeoData version management in Settings.
+// Remote rules on the Rules tab, plus GeoData status management in Settings.
 (function () {
   const App = window.App;
-  const { $, toast, call, fmtBytes, escapeHtml } = App;
+  const { $, toast, call, fmtBytes, fmtDate, escapeHtml } = App;
   const api = window.api;
   const { t } = window.i18n;
 
@@ -24,33 +24,29 @@
       return;
     }
     for (const it of items || []) {
-      let version;
+      let details;
       let status;
+      let statusClass = 'ready';
       if (!it.present) {
-        version = t('settings.versionUnknown');
+        details = '-';
         status = t('ruleset.missing');
+        statusClass = 'problem';
       } else if (!it.valid) {
-        version = t('settings.versionUnknown');
+        details = `${fmtDate(it.updatedAt)} · ${fmtBytes(it.size)}`;
         status = t('ruleset.invalid');
-      }
-      else {
-        version = visibleVersion(it.version);
-        status = (it.location === 'updated' ? t('ruleset.updated') : t('ruleset.bundled')) + ' · ' + fmtBytes(it.size);
+        statusClass = 'problem';
+      } else {
+        details = `${fmtDate(it.updatedAt)} · ${fmtBytes(it.size)}`;
+        status = it.location === 'updated' ? t('ruleset.updated') : t('ruleset.bundled');
       }
       const div = document.createElement('div');
-      div.className = 'rule-item';
+      div.className = 'rule-item geodata-item';
       div.innerHTML = `
         <span class="rule-type">${escapeHtml(it.file || it.tag)}</span>
-        <span class="rule-payload">${escapeHtml(version)}</span>
-        <span class="rule-proxy">${escapeHtml(status)}</span>`;
+        <span class="rule-payload geodata-details" title="${escapeHtml(details)}">${escapeHtml(details)}</span>
+        <span class="rule-proxy geodata-status ${statusClass}">${escapeHtml(status)}</span>`;
       list.appendChild(div);
     }
-  }
-
-  function visibleVersion(version) {
-    const value = String(version || '').trim();
-    if (!value || value.toLowerCase() === 'latest') return t('settings.versionUnknown');
-    return value;
   }
 
   async function updateGeoData(btn) {

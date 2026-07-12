@@ -10,6 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vm = require('vm');
+const { buildDelayApiPath } = require('../src/main/delay');
 
 let passed = 0;
 function test(name, fn) {
@@ -24,6 +25,15 @@ function test(name, fn) {
 }
 
 console.log('i18n:');
+
+test('manual latency request carries the configured URL in Clash API order', () => {
+  const requestPath = buildDelayApiPath('Hong Kong / 01', 'https://example.com/ping?q=a&x=1');
+  const parsed = new URL(requestPath, 'http://127.0.0.1');
+  assert.strictEqual(parsed.pathname, '/proxies/Hong%20Kong%20%2F%2001/delay');
+  assert.strictEqual(parsed.searchParams.get('url'), 'https://example.com/ping?q=a&x=1');
+  assert.strictEqual(parsed.searchParams.get('timeout'), '5000');
+  assert.ok(parsed.search.startsWith('?url='));
+});
 
 // i18n.js is a browser IIFE; evaluate it with a stub window to get the DICT.
 function loadDict() {
@@ -51,6 +61,29 @@ test('every data-i18n key used in index.html exists in the dictionary', () => {
   assert.deepStrictEqual([...new Set(missing)], [], 'HTML references undefined i18n keys');
 });
 
+test('toolbox renderer references only declared i18n keys', () => {
+  const DICT = loadDict();
+  const code = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'toolbox.js'), 'utf-8');
+  const literalKeys = [...code.matchAll(/\bt\('([^']+)'/g)].map((match) => match[1]).filter((key) => !key.endsWith('.'));
+  const dynamicKeys = [
+    'toolbox.confidence.exact', 'toolbox.confidence.estimated',
+    'toolbox.diag.coreInstalled', 'toolbox.diag.coreRunning', 'toolbox.diag.mixedPort',
+    'toolbox.diag.apiPort', 'toolbox.diag.clashApi', 'toolbox.diag.systemProxy',
+    'toolbox.diag.tun', 'toolbox.diag.dns', 'toolbox.diag.directIp',
+    'toolbox.diag.proxyIp', 'toolbox.diag.egressCompare',
+    'toolbox.dns.system', 'toolbox.dns.local', 'toolbox.dns.remote',
+    'toolbox.dnsAssessment.no-anomaly', 'toolbox.dnsAssessment.suspicious-private',
+    'toolbox.dnsAssessment.divergent', 'toolbox.dnsAssessment.inconclusive',
+    'toolbox.portRole.mixed', 'toolbox.portRole.clash-api', 'toolbox.portRole.custom',
+    'toolbox.routeSource.live', 'toolbox.routeSource.generated',
+    'toolbox.status.pass', 'toolbox.status.warn', 'toolbox.status.fail',
+    'toolbox.status.skip', 'toolbox.status.missing',
+    'toolbox.via.system', 'toolbox.via.direct', 'toolbox.via.proxy',
+  ];
+  const missing = [...new Set([...literalKeys, ...dynamicKeys])].filter((key) => !(key in DICT.zh));
+  assert.deepStrictEqual(missing, [], 'toolbox references undefined i18n keys');
+});
+
 test('zh labels keep config terminology', () => {
   const { zh } = loadDict();
   assert.strictEqual(zh['subs.title'], '📡 配置');
@@ -58,7 +91,7 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['subs.listTitle'], '配置列表');
   assert.strictEqual(zh['rulegroups.section'], '策略组');
   assert.strictEqual(zh['customrs.title'], '远程规则');
-  assert.strictEqual(zh['settings.manageGeo'], '管理版本');
+  assert.strictEqual(zh['settings.manageGeo'], '管理');
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
 });
@@ -110,6 +143,93 @@ test('module load order: util.js first of the js/ modules, main.js last', () => 
   assert.strictEqual(mods[mods.length - 1], 'js/main.js');
 });
 
+test('frameless window exposes Mica-safe custom desktop controls', () => {
+  const windowMain = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'window.js'), 'utf-8');
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload', 'index.js'), 'utf-8');
+  const controls = fs.readFileSync(path.join(rendererDir, 'js', 'window.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(windowMain.includes('frame: false'));
+  assert.ok(windowMain.includes("titleBarStyle: 'hidden'"));
+  assert.ok(windowMain.includes("backgroundMaterial: 'mica'"));
+  assert.ok(windowMain.includes("return '#00000000'"));
+  assert.ok(windowMain.includes("setBackgroundMaterial('mica')"));
+  for (const id of ['windowMinimize', 'windowMaximize', 'windowClose']) {
+    assert.ok(indexHtml.includes(`id="${id}"`), `missing custom control: ${id}`);
+  }
+  for (const method of ['minimizeWindow', 'toggleMaximizeWindow', 'isWindowMaximized', 'closeWindow']) {
+    assert.ok(preload.includes(`${method}:`), `missing window API: ${method}`);
+    assert.ok(controls.includes(`api.${method}`), `custom controls do not call ${method}`);
+  }
+  assert.ok(css.includes('-webkit-app-region: drag'));
+  assert.ok(css.includes('-webkit-app-region: no-drag'));
+  assert.ok(css.includes('background-color: transparent !important'));
+  assert.ok(css.includes('"Segoe UI Variable", "Segoe UI", "Microsoft YaHei", sans-serif'));
+  assert.ok(css.includes('-webkit-user-drag: none'));
+  assert.ok(css.includes('*::-webkit-scrollbar'));
+  assert.ok(css.includes('--motion-standard: 200ms cubic-bezier(0.4, 0, 0.2, 1)'));
+});
+
+test('all six diagnostic tools have a launcher, modal and preload method', () => {
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload', 'index.js'), 'utf-8');
+  const tools = [
+    ['route', 'inspectRoute'],
+    ['diag', 'runNetworkDiagnostics'],
+    ['configCheck', 'checkAllConfigs'],
+    ['port', 'inspectPorts'],
+    ['backup', 'exportBackup'],
+    ['dns', 'compareDns'],
+  ];
+  for (const [id, method] of tools) {
+    assert.ok(indexHtml.includes(`id="${id}Open"`), `missing ${id} launcher`);
+    assert.ok(indexHtml.includes(`id="${id}Modal"`), `missing ${id} modal`);
+    assert.ok(preload.includes(`${method}:`), `missing ${method} preload method`);
+  }
+});
+
+test('conversion UI exposes both output directions without decorative emoji', () => {
+  const { zh, en } = loadDict();
+  for (const target of ['auto', 'sing-box', 'clash']) {
+    assert.ok(indexHtml.includes(`data-convert-target="${target}"`), `missing conversion target: ${target}`);
+  }
+  assert.ok(!/[🚀♻️🔄]/u.test(zh['convert.title']));
+  assert.ok(!/[🚀♻️🔄]/u.test(en['convert.title']));
+  assert.strictEqual(zh['convert.targetSingbox'], 'Sing-Box');
+  assert.strictEqual(en['convert.targetSingbox'], 'Sing-Box');
+  const tools = fs.readFileSync(path.join(rendererDir, 'js', 'tools.js'), 'utf-8');
+  assert.ok(tools.includes('content: lastConvertOutput'), 'save must import the converted output');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(css.includes('grid-template-columns: repeat(3, minmax(72px, auto))'));
+  assert.ok(css.includes('width: auto'));
+  assert.ok(css.includes('#convertModal .save-row'));
+  assert.ok(css.includes('#convertModal .convert-output'));
+});
+
+test('UWP list scrolls independently while its actions stay fixed', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(css.includes('#uwpModal .modal-card'));
+  assert.ok(css.includes('height: min(620px, calc(100vh - 56px))'));
+  assert.ok(css.includes('.uwp-list'));
+  assert.ok(css.includes('flex: 1'));
+  assert.ok(css.includes('.uwp-footer'));
+});
+
+test('tray uses app-derived stopped and running icon assets', () => {
+  const trayCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'tray.js'), 'utf-8');
+  assert.ok(trayCode.includes("nativeImage.createFromPath"));
+  assert.ok(trayCode.includes('state.tray.setImage'));
+  assert.ok(!trayCode.includes('TRAY_ICON_DATAURL'));
+  for (const name of ['tray-stopped.png', 'tray-running.png']) {
+    const png = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'assets', name));
+    assert.strictEqual(png.slice(1, 4).toString('ascii'), 'PNG');
+    assert.strictEqual(png.readUInt32BE(16), 32);
+    assert.strictEqual(png.readUInt32BE(20), 32);
+  }
+  assert.notDeepStrictEqual(
+    fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'assets', 'tray-stopped.png')),
+    fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'assets', 'tray-running.png'))
+  );
+});
+
 // util.js is a browser IIFE; evaluate it with a stub window to reach App.*.
 function loadRendererUtil() {
   const src = fs.readFileSync(path.join(rendererDir, 'js', 'util.js'), 'utf-8');
@@ -143,6 +263,9 @@ test('external-input fields stay HTML-escaped in the renderer templates', () => 
     ['js/rulesets.js', 'escapeHtml(it.name)'],
     ['js/logs.js', 'escapeHtml(rest)'],
     ['js/tools.js', 'escapeHtml(a.name)'],
+    ['js/toolbox.js', 'escapeHtml(check.detail'],
+    ['js/toolbox.js', 'escapeHtml(lastConfigCheck.source.preview)'],
+    ['js/toolbox.js', 'escapeHtml(result.preview)'],
   ];
   for (const [file, needle] of mustEscape) {
     const code = fs.readFileSync(path.join(rendererDir, file), 'utf-8');
@@ -167,15 +290,98 @@ test('renderer modules parse and every App.* member used is defined somewhere', 
   assert.deepStrictEqual(undefined_, [], 'App members used but never assigned');
 });
 
-test('large live lists have bounded rendering and offscreen containment', () => {
+test('large live lists use bounded virtual windows', () => {
   const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
   const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
   const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
   const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
-  assert.ok(nodes.includes('MAX_RENDERED_NODES = 500'));
-  assert.ok(conns.includes('MAX_RENDERED_CONNECTIONS = 500'));
-  assert.ok(rules.includes('MAX_RENDERED_RULES = 400'));
-  assert.ok(css.includes('content-visibility: auto'));
+  assert.ok(nodes.includes('VIRTUAL_NODE_ROW_HEIGHT'));
+  assert.ok(nodes.includes('NODE_COLUMNS = 2'), 'node virtualization must remain two-column aware');
+  assert.ok(nodes.includes('node-grid-window'));
+  assert.ok(conns.includes('VIRTUAL_CONNECTION_ROW_HEIGHT'));
+  assert.ok(conns.includes("list.classList.add('is-empty')"));
+  assert.ok(conns.includes("list.classList.remove('is-empty')"));
+  assert.ok(rules.includes('VIRTUAL_RULE_ROW_HEIGHT'));
+  for (const code of [nodes, conns, rules]) assert.ok(code.includes('virtual-spacer'));
+  assert.ok(css.includes('.virtual-spacer'));
+  assert.ok(css.includes('.conn-list.is-empty'));
+  assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+});
+
+test('node strategies keep profile order and expose a stable sidebar readout', () => {
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(indexHtml.includes('id="miniCurrentNode"'));
+  assert.ok(nodes.includes("{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes"));
+  assert.ok(!nodes.includes('const pinned = []'));
+  assert.ok(css.includes('.mini-current-node'));
+  assert.ok(css.includes('--node-offset'));
+});
+
+test('dashboard status cards expose current node latency and click actions', () => {
+  const dash = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  assert.ok(indexHtml.includes('id="dashNode"'));
+  assert.ok(indexHtml.includes('id="dashDelay"'));
+  assert.ok(indexHtml.includes('data-dash-action="power"'));
+  assert.ok(indexHtml.includes('data-dash-action="proxy"'));
+  assert.ok(indexHtml.includes('data-dash-action="nodes"'));
+  assert.ok(indexHtml.includes('data-dash-action="testDelay"'));
+  assert.ok(dash.includes('renderDashNodeCards'));
+  assert.ok(dash.includes("action === 'testDelay'"));
+  assert.ok(main.includes('App.showTab = showTab'));
+});
+
+test('dashboard traffic chart is compact and tracks session totals with switch toggles', () => {
+  const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(indexHtml.includes('id="trafficUpTotal"'));
+  assert.ok(indexHtml.includes('id="trafficDownTotal"'));
+  assert.ok(indexHtml.includes('role="switch"'));
+  assert.ok(indexHtml.includes('id="quickProxy"'));
+  assert.ok(indexHtml.includes('id="quickTun"'));
+  assert.ok(!indexHtml.includes('id="quickRestart"'));
+  assert.ok(!indexHtml.includes('id="quickPanel"'));
+  assert.ok(indexHtml.includes('id="coreRestartBtn"'));
+  assert.ok(indexHtml.includes('id="openPanelBtn"'));
+  assert.ok(indexHtml.includes('data-i18n="tools.panelHint"'));
+  assert.ok(!indexHtml.includes('settings.clashApiHint'));
+  assert.ok(charts.includes('upTotalEl'));
+  assert.ok(charts.includes('sessionUp'));
+  assert.ok(css.includes('height: 120px'));
+  assert.ok(css.includes('.switch-track'));
+  assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+});
+
+test('dynamic first-paint regions reserve dimensions to limit layout shift', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(css.includes('min-width: 260px'));
+  assert.ok(css.includes('#coreHint'));
+  assert.ok(css.includes('#usageList'));
+  assert.ok(css.includes('.card-value'));
+  assert.ok(css.includes('min-height: 28px'));
+});
+
+test('light theme uses quiet system surfaces and independently framed dashboard cards', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(css.includes('--bg: transparent'));
+  assert.ok(css.includes('--sidebar: transparent'));
+  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.86)'));
+  assert.ok(css.includes('--text-faint: #6e6e6e'));
+  assert.ok(css.includes('--panel-shadow:'));
+  assert.ok(css.includes('.rule-proxy.geodata-status'));
+});
+
+test('language changes refresh enhanced select labels immediately', () => {
+  const select = fs.readFileSync(path.join(rendererDir, 'js', 'select.js'), 'utf-8');
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.ok(select.includes('function refreshSelects('));
+  assert.ok(select.includes('selectSync.get(sel)'));
+  assert.ok(main.includes('App.refreshSelects()'));
+  assert.ok(main.includes('{ ...previous, ...status }'), 'compact status events must preserve core version fields');
+  assert.ok(css.includes('.btn.primary:hover:not(:disabled)'));
+  assert.ok(css.includes('background: var(--accent-hover)'), 'primary hover must retain a contrast-safe blue background');
 });
 
 console.log('\nGitHub release helper:');
@@ -236,6 +442,112 @@ test('prettyName resolves unreadable display names from the package', () => {
     uwp.prettyName({ displayName: 'E2A4F912-2574-4A75-9BB0-0D023378592B' }),
     '{E2A4F912-2574-4A75-9BB0-0D023378592B}'
   );
+});
+
+console.log('\nToolbox:');
+
+const toolbox = require('../src/main/toolbox');
+
+test('route targets normalize URLs, domains and IP literals', () => {
+  assert.deepStrictEqual(
+    toolbox.normalizeTarget('https://Example.COM:8443/path?q=1'),
+    { input: 'https://Example.COM:8443/path?q=1', host: 'example.com', port: 8443, ipVersion: 0 }
+  );
+  assert.strictEqual(toolbox.normalizeTarget('1.1.1.1').ipVersion, 4);
+  assert.strictEqual(toolbox.normalizeTarget('[2001:db8::1]').ipVersion, 6);
+  assert.throws(() => toolbox.normalizeTarget('bad host'), /invalid/);
+});
+
+test('CIDR and common Clash/sing-box route rules match correctly', () => {
+  assert.strictEqual(toolbox.cidrContains('10.20.30.40', '10.0.0.0/8'), true);
+  assert.strictEqual(toolbox.cidrContains('11.20.30.40', '10.0.0.0/8'), false);
+  assert.strictEqual(toolbox.cidrContains('2001:db8::7', '2001:db8::/32'), true);
+  const target = toolbox.normalizeTarget('https://api.example.com:443');
+  assert.strictEqual(toolbox.matchClashRule('DOMAIN-SUFFIX,example.com,Proxy', target, []), true);
+  assert.strictEqual(toolbox.matchClashRule('DST-PORT,80,Proxy', target, []), false);
+  assert.strictEqual(toolbox.matchClashRule('RULE-SET,private,Proxy', target, []), null);
+  assert.strictEqual(toolbox.matchSingboxRule({ domain_suffix: ['example.com'], port: [443] }, target, [], 'rule'), true);
+});
+
+test('port input is deduplicated and bounded', () => {
+  assert.deepStrictEqual(toolbox.parsePorts('7890, 9090 7890'), [7890, 9090]);
+  assert.throws(() => toolbox.parsePorts('0, 70000'), /valid ports/);
+  assert.throws(() => toolbox.parsePorts(Array.from({ length: 21 }, (_, index) => index + 1)), /valid ports/);
+});
+
+test('DNS wire parser reads an A response built from its query', () => {
+  const query = toolbox.buildDnsQuery('example.com', 1);
+  const header = Buffer.alloc(12);
+  query.copy(header, 0, 0, 2);
+  header.writeUInt16BE(0x8180, 2);
+  header.writeUInt16BE(1, 4);
+  header.writeUInt16BE(1, 6);
+  const answer = Buffer.alloc(16);
+  answer.writeUInt16BE(0xc00c, 0);
+  answer.writeUInt16BE(1, 2);
+  answer.writeUInt16BE(1, 4);
+  answer.writeUInt32BE(60, 6);
+  answer.writeUInt16BE(4, 10);
+  Buffer.from([93, 184, 216, 34]).copy(answer, 12);
+  const records = toolbox.parseDnsMessage(Buffer.concat([header, query.slice(12), answer]));
+  assert.deepStrictEqual(records, [{ type: 'A', value: '93.184.216.34', ttl: 60 }]);
+});
+
+test('DNS endpoints accept bare IPv4 and IPv6 resolver addresses', () => {
+  assert.deepStrictEqual(
+    { ...toolbox.dnsEndpoint('8.8.8.8'), url: null },
+    { raw: '8.8.8.8', scheme: 'udp', host: '8.8.8.8', port: 53, url: null }
+  );
+  const ipv6 = toolbox.dnsEndpoint('2001:4860:4860::8888');
+  assert.strictEqual(ipv6.scheme, 'udp');
+  assert.strictEqual(ipv6.host, '2001:4860:4860::8888');
+  assert.strictEqual(ipv6.port, 53);
+});
+
+test('DNS comparison assessment flags suspicious and divergent answers', () => {
+  const suspicious = toolbox.assessDnsResults([
+    { id: 'system', status: 'pass', answers: ['127.0.0.1'] },
+    { id: 'remote', status: 'pass', answers: ['93.184.216.34'] },
+  ]);
+  assert.strictEqual(suspicious.result, 'suspicious-private');
+  const divergent = toolbox.assessDnsResults([
+    { id: 'system', status: 'pass', answers: ['1.1.1.1'] },
+    { id: 'remote', status: 'pass', answers: ['8.8.8.8'] },
+  ]);
+  assert.strictEqual(divergent.result, 'divergent');
+  assert.strictEqual(toolbox.assessDnsResults([
+    { id: 'system', status: 'pass', answers: ['1.1.1.1'] },
+    { id: 'remote', status: 'pass', answers: ['1.1.1.1', '8.8.8.8'] },
+  ]).result, 'no-anomaly');
+});
+
+test('config validation errors expose common line, column and object paths', () => {
+  assert.deepStrictEqual(
+    toolbox.extractErrorLocation('yaml: line 42 column 7: invalid value'),
+    { line: 42, column: 7, path: null }
+  );
+  assert.strictEqual(
+    toolbox.extractErrorLocation('parse config error: rules[4050] [GEOIP,CN,DIRECT]').path,
+    'rules[4050]'
+  );
+  assert.strictEqual(
+    toolbox.extractErrorLocation('decode config: route.rules[3].outbound: unknown outbound').path,
+    'route.rules[3].outbound'
+  );
+});
+
+test('backup validation preserves supported data and rejects duplicate config ids', () => {
+  const store = {
+    getSettings: () => ({ coreType: 'mihomo', mixedPort: 7890 }),
+    getSubscriptions: () => [{ id: 'profile-a', name: 'A', nodes: [{ name: 'node-a' }] }],
+    get: (key) => ({ activeSub: 'profile-a', selected: 'node-a', customRuleSets: [{ id: 'rule-a' }], localRules: [] }[key]),
+  };
+  const document = toolbox.buildBackup(store, '0.8.0');
+  const normalized = toolbox.validateBackupDocument(document);
+  assert.strictEqual(normalized.activeSub, 'profile-a');
+  assert.strictEqual(toolbox.backupSummary(document, normalized).nodes, 1);
+  document.data.subscriptions.push({ id: 'profile-a' });
+  assert.throws(() => toolbox.validateBackupDocument(document), /duplicate config id/);
 });
 
 console.log('\nVersioning:');
@@ -299,7 +611,48 @@ test('large subscription payloads migrate to independent profile files', () => {
   assert.deepStrictEqual(new Store(dir).get('subscriptions'), legacy.subscriptions);
 });
 
+test('profile payloads load on demand with a bounded cache', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const store = new Store(dir);
+  for (let i = 0; i < 5; i++) {
+    store.upsertSubscription({
+      id: 'profile-' + i,
+      name: 'Profile ' + i,
+      nodes: [{ name: 'node-' + i }],
+      raw: 'x'.repeat(1024),
+    });
+  }
+  const reloaded = new Store(dir);
+  const summaries = reloaded.listSubscriptions();
+  assert.strictEqual(reloaded._profileCache.size, 0, 'startup should not hydrate profile payloads');
+  assert.ok(summaries.every((sub) => !('nodes' in sub) && sub.nodeCount === 1));
+  for (const sub of summaries) reloaded.getSubscription(sub.id);
+  assert.ok(reloaded._profileCache.size <= 3, 'profile LRU cache grew without a bound');
+});
+
 console.log('\nCore layout:');
+
+test('Windows TUN lifecycle owns Dart names and removes legacy adapters', () => {
+  const tun = require('../src/main/tun-adapter');
+  assert.strictEqual(tun.TUN_DEVICE_NAME, 'Dart');
+  assert.strictEqual(tun.TUN_DISPLAY_NAME, 'Dart Tunnel');
+  const cleanup = tun.cleanupScript();
+  for (const name of ['tun0', 'Meta', 'Dart', 'Dart Tunnel']) assert.ok(cleanup.includes(`'${name}'`));
+  assert.ok(cleanup.includes("$connection -eq 'tun0'"));
+  assert.ok(cleanup.includes("$description -match 'sing-tun'"));
+  assert.ok(cleanup.includes('pnputil.exe'));
+  assert.ok(tun.renameScript().includes("Rename-NetAdapter"));
+});
+
+test('system DNS diagnostics use the OS resolver path', () => {
+  const toolbox = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'toolbox.js'), 'utf-8');
+  const start = toolbox.indexOf('async function querySystemDns');
+  const end = toolbox.indexOf('function assessDnsResults', start);
+  const implementation = toolbox.slice(start, end);
+  assert.ok(implementation.includes('dns.promises.lookup'));
+  assert.ok(!implementation.includes('dns.promises.resolve4'));
+  assert.ok(!implementation.includes('dns.promises.resolve6'));
+});
 
 test('selected cores use independent runtime folders', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
@@ -319,6 +672,7 @@ test('selected cores use independent runtime folders', () => {
   assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'mihomo' + ext)), 'mihomo was not migrated');
   assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'geoip.dat')), 'mihomo GeoData was not migrated');
   assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'singbox', 'sing-box' + ext));
+  assert.strictEqual(mgr.resolveBinaryPath('mihomo'), path.join(dir, 'mihomo', 'mihomo' + ext));
   assert.strictEqual(mgr.configPath, path.join(dir, 'singbox', 'config.json'));
 
   mgr.setCoreType('mihomo');

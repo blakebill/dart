@@ -195,9 +195,12 @@ async function main() {
   const rendererState = await handlers['app:getState']();
   const rendererSubA = rendererState.subscriptions.find((s) => s.id === subA.id);
   const rendererSubB = rendererState.subscriptions.find((s) => s.id === subB.id);
-  assert.strictEqual(rendererSubA.nodes.length, 1, 'active profile exposes node summaries');
-  assert.strictEqual(rendererSubB.nodes.length, 0, 'inactive profile payload stays out of renderer IPC');
+  assert.ok(!('nodes' in rendererSubA), 'global state must not hydrate active node details');
+  assert.ok(!('nodes' in rendererSubB), 'inactive profile payload stays out of renderer IPC');
   assert.strictEqual(rendererSubB.nodeCount, 1, 'inactive profile still exposes its node count');
+  const rendererNodes = await handlers['nodes:get']();
+  assert.strictEqual(rendererNodes.activeSub, subA.id);
+  assert.deepStrictEqual(rendererNodes.nodes, [{ name: 'node-of-a', type: 'trojan', server: 's.example.com', port: 443 }]);
 
   // Updating only rules/providers still changes the generated core config.
   const subscriptionStub = require(subscriptionPath);
@@ -205,7 +208,7 @@ async function main() {
   const originalRestartIfRunning = core.restartIfRunning;
   let restartCount = 0;
   subscriptionStub.fetchSubscription = async () => ({
-    nodes: subA.nodes,
+    nodes: state.store.getSubscription(subA.id).nodes,
     format: 'clash',
     rules: ['DOMAIN-SUFFIX,example.com,PROXY'],
     ruleProviders: { remote: { type: 'http', behavior: 'domain', url: 'https://example.com/rules.yaml', format: 'yaml' } },
@@ -387,8 +390,8 @@ async function main() {
   state.singbox.isRunning = originalIsRunning;
   assert.strictEqual(connectionSnapshot.totalConnections, 1000);
   assert.strictEqual(connectionSnapshot.connections.length, 600);
-  assert.strictEqual(connectionSnapshot.connections[0].id, 'c400');
-  assert.strictEqual(connectionSnapshot.connections[599].id, 'c999');
+  assert.strictEqual(connectionSnapshot.connections[0].id, 'c999');
+  assert.strictEqual(connectionSnapshot.connections[599].id, 'c400');
   assert.ok(!('ignored' in connectionSnapshot.connections[0]));
   assert.ok(!('ignored' in connectionSnapshot.connections[0].metadata));
   console.log('✓ connection IPC keeps only the newest sanitized window');
@@ -570,6 +573,14 @@ async function main() {
   const selectedBackup = await handlers['tools:backupSelect']();
   assert.strictEqual(selectedBackup.summary.localRules, 1);
   await assert.rejects(handlers['tools:backupRestore'](null, { token: 'wrong-token' }), /expired/);
+  const selectedForChangeCheck = await handlers['tools:backupSelect']();
+  const backupText = fs.readFileSync(backupPath, 'utf-8');
+  fs.writeFileSync(backupPath, backupText + '\n', 'utf-8');
+  await assert.rejects(
+    handlers['tools:backupRestore'](null, { token: selectedForChangeCheck.token }),
+    /changed after selection/
+  );
+  fs.writeFileSync(backupPath, backupText, 'utf-8');
   const selectedAgain = await handlers['tools:backupSelect']();
   const restoredBackup = await handlers['tools:backupRestore'](null, { token: selectedAgain.token });
   assert.strictEqual(restoredBackup.restored, true);

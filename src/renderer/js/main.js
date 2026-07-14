@@ -10,10 +10,11 @@
   // ---------- Language ----------
   function setLanguage(lang) {
     setLang(lang);
+    // Keep the renderer state ahead of the async settings write. Otherwise
+    // renderSettings() briefly reads the previous language and resets the
+    // enhanced select label even though the rest of the UI has translated.
+    if (App.state && App.state.settings) App.state.settings.language = lang;
     applyI18n();
-    if (App.refreshSelects) App.refreshSelects();
-    const sel = $('#setLanguage');
-    if (sel) sel.value = lang;
     // Re-render dynamic content that isn't covered by data-i18n.
     App.renderStatus();
     App.renderSubs();
@@ -31,6 +32,11 @@
     }
     syncTopbarTitle();
     if (App.renderThemeLabel) App.renderThemeLabel();
+    const sel = $('#setLanguage');
+    if (sel) sel.value = lang;
+    // Refresh after every dynamic render so labels mirror the final option
+    // text and selected value, including controls rebuilt during translation.
+    if (App.refreshSelects) App.refreshSelects();
   }
 
   // ---------- Tab switching ----------
@@ -71,18 +77,24 @@
   }
 
   function showRulesTab() {
-    afterPaint(() => {
-      (App.ensureLocalRulesLoaded || App.loadLocalRules)();
-      afterPaint(() => (App.ensureCustomRuleSetsLoaded || App.loadCustomRuleSets)(), 40);
-      afterPaint(() => (App.ensureRuleGroupsLoaded || App.loadRuleGroups)(), 80);
-      afterPaint(() => (App.ensureRulesLoaded || App.loadRules)(), 120);
-    });
+    const tasks = [
+      ['ensureLocalRulesLoaded', 'loadLocalRules', 0],
+      ['ensureCustomRuleSetsLoaded', 'loadCustomRuleSets', 40],
+      ['ensureRuleGroupsLoaded', 'loadRuleGroups', 80],
+      ['ensureRulesLoaded', 'loadRules', 120],
+    ];
+    for (const [preferred, fallback, delay] of tasks) {
+      afterPaint(() => {
+        if (!document.hidden && App.currentTab === 'rules') (App[preferred] || App[fallback])();
+      }, delay);
+    }
   }
 
   function onTabShown(tab) {
     const previousTab = App.currentTab;
     App.currentTab = tab;
     if (previousTab === 'conns' && tab !== 'conns') App.clearConnections();
+    if (previousTab === 'nodes' && tab !== 'nodes' && App.releaseNodes) App.releaseNodes();
     if (connTimer) {
       clearInterval(connTimer);
       connTimer = null;
@@ -93,7 +105,7 @@
       App.loadConnections();
       connTimer = setInterval(App.loadConnections, 2000);
     } else if (tab === 'nodes') {
-      App.renderNodes(); // refresh delay results that arrived while hidden
+      App.loadNodes();
       App.refreshGroupSelections();
     } else if (tab === 'logs') {
       App.flushLogs();
@@ -114,6 +126,8 @@
         connTimer = null;
       }
       if (App.currentTab === 'conns') App.clearConnections();
+      if (App.releaseNodes) App.releaseNodes();
+      if (App.releaseRuleCache) App.releaseRuleCache();
     } else {
       onTabShown(App.currentTab);
       App.trafficChart.draw();
@@ -133,6 +147,7 @@
     if (App.state.activeSub !== prevActiveSub) {
       App.delays.clear();
       prevActiveSub = App.state.activeSub;
+      if (App.releaseNodes) App.releaseNodes();
       if (App.invalidateRuleCaches) App.invalidateRuleCaches();
     }
     // setLanguage re-renders everything below; only invoke it on an actual change.
@@ -141,7 +156,7 @@
     App.applyTheme(App.state.settings && App.state.settings.theme);
     App.renderStatus();
     App.renderSubs();
-    App.renderNodes();
+    if (App.currentTab === 'nodes') App.loadNodes();
     App.renderSettings();
     App.renderMode();
     App.renderUsage();
@@ -156,6 +171,7 @@
     App.miniChart.push(s.up || 0, s.down || 0);
   });
   if (api && api.onSubsChanged) api.onSubsChanged(() => {
+    if (App.releaseNodes) App.releaseNodes();
     if (App.invalidateRuleCaches) App.invalidateRuleCaches();
     refresh();
   });

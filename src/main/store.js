@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PROFILE_FIELDS = ['nodes', 'clashRules', 'clashRuleProviders', 'raw'];
-const PROFILE_CACHE_LIMIT = 3;
+const PROFILE_CACHE_LIMIT = 2;
 
 /**
  * Minimal JSON persistence store (a zero-dependency replacement for electron-store).

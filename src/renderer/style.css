@@ -2,10 +2,15 @@
 :root {
   --bg: transparent;
   --sidebar: transparent;
-  --surface: rgba(40, 40, 42, 0.88);
-  --surface-raised: rgba(48, 48, 50, 0.94);
-  --surface-hover: rgba(58, 58, 60, 0.8);
-  --field: rgba(28, 28, 30, 0.86);
+  --surface: rgba(38, 38, 41, 0.66);
+  --surface-raised: rgba(46, 46, 49, 0.82);
+  --surface-hover: rgba(62, 62, 66, 0.76);
+  --field: rgba(24, 24, 27, 0.62);
+  --surface-highlight: rgba(255, 255, 255, 0.055);
+  --surface-filter: blur(16px) saturate(1.12);
+  --raised-filter: blur(22px) saturate(1.16);
+  --dialog-surface: rgba(42, 42, 45, 0.96);
+  --modal-scrim: rgba(4, 7, 9, 0.46);
   --border: rgba(255, 255, 255, 0.1);
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #ffffff;
@@ -21,8 +26,8 @@
   --on-accent: #003545;
   --code-bg: rgba(22, 22, 24, 0.92);
   --code-text: #e8e8e8;
-  --shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.45);
-  --panel-shadow: 0 2px 8px rgba(0, 0, 0, 0.22), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --shadow: 0 18px 48px -24px rgba(0, 0, 0, 0.72), 0 4px 14px -8px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --panel-shadow: 0 10px 28px -22px rgba(0, 0, 0, 0.72), 0 2px 8px -6px rgba(0, 0, 0, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.07);
   --motion-standard: 200ms cubic-bezier(0.4, 0, 0.2, 1);
   --motion-fast: 140ms cubic-bezier(0.4, 0, 0.2, 1);
   --row-height: 62px;
@@ -31,10 +36,13 @@
 :root[data-theme='light'] {
   --bg: transparent;
   --sidebar: transparent;
-  --surface: rgba(255, 255, 255, 0.86);
-  --surface-raised: rgba(255, 255, 255, 0.94);
-  --surface-hover: rgba(0, 0, 0, 0.05);
-  --field: rgba(255, 255, 255, 0.82);
+  --surface: rgba(255, 255, 255, 0.62);
+  --surface-raised: rgba(255, 255, 255, 0.8);
+  --surface-hover: rgba(255, 255, 255, 0.74);
+  --field: rgba(255, 255, 255, 0.56);
+  --surface-highlight: rgba(255, 255, 255, 0.42);
+  --dialog-surface: rgba(250, 251, 252, 0.96);
+  --modal-scrim: rgba(18, 22, 26, 0.26);
   --border: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.14);
   --text: #1a1a1a;
@@ -50,8 +58,8 @@
   --on-accent: #ffffff;
   --code-bg: rgba(248, 248, 248, 0.94);
   --code-text: #1a1a1a;
-  --shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.12);
-  --panel-shadow: 0 2px 8px rgba(0, 0, 0, 0.06), inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+  --shadow: 0 18px 48px -24px rgba(0, 0, 0, 0.32), 0 4px 14px -8px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  --panel-shadow: 0 10px 28px -22px rgba(0, 0, 0, 0.3), 0 2px 8px -6px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.72);
 }
 
 * {
@@ -681,8 +689,9 @@ textarea,
 
 .content {
   min-width: 0;
+  min-height: 0;
   flex: 1;
-  padding: 26px 28px 42px;
+  padding: 26px;
   overflow: auto;
 }
 
@@ -721,13 +730,32 @@ textarea,
 
 .tab {
   display: none;
-  width: min(100%, 1180px);
+  width: 100%;
   margin: 0 auto;
 }
 
 .tab.active {
   display: block;
   animation: tabEnter var(--motion-standard);
+}
+
+#tab-nodes.active,
+#tab-conns.active,
+#tab-logs.active {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+#tab-nodes > .panel,
+#tab-conns > .panel,
+#tab-logs > .panel {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  margin-bottom: 0;
 }
 
 h1 {
@@ -759,7 +787,14 @@ h3 {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
+  background-image: linear-gradient(135deg, var(--surface-highlight), transparent 58%);
   box-shadow: var(--panel-shadow);
+  -webkit-backdrop-filter: var(--surface-filter);
+  backdrop-filter: var(--surface-filter);
+}
+
+.tab > .panel:last-child {
+  margin-bottom: 0;
 }
 
 .panel > h2 {
@@ -784,8 +819,11 @@ h3 {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
+  background-image: linear-gradient(135deg, var(--surface-highlight), transparent 58%);
   box-shadow: var(--panel-shadow);
   text-align: left;
+  -webkit-backdrop-filter: var(--surface-filter);
+  backdrop-filter: var(--surface-filter);
 }
 
 button.card {
@@ -828,16 +866,6 @@ button.card:focus-visible {
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.card-value-sm {
-  font-size: 15px;
-  font-weight: 650;
-  line-height: 1.35;
-  white-space: normal;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
 }
 
 .card-hint {
@@ -1323,10 +1351,12 @@ select[data-enhanced] {
   max-height: 280px;
   padding: 4px;
   overflow: auto;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: var(--surface-raised);
-  box-shadow: var(--shadow);
+  background: var(--dialog-surface);
+  box-shadow: var(--panel-shadow);
+  -webkit-backdrop-filter: var(--raised-filter);
+  backdrop-filter: var(--raised-filter);
   transform-origin: top center;
   animation: dropdownIn var(--motion-fast);
 }
@@ -1575,7 +1605,23 @@ input[type='checkbox']:checked::after {
 }
 
 .node-list {
-  padding: 10px;
+  min-height: 0;
+  max-height: none;
+  flex: 1;
+  margin-top: 0;
+  padding: 0;
+  padding-right: 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  scrollbar-gutter: stable;
+}
+
+#tab-conns .conn-list {
+  min-height: 0;
+  max-height: none;
+  flex: 1;
+  scrollbar-gutter: stable;
 }
 
 .conn-list.is-empty {
@@ -1938,6 +1984,14 @@ input[type='checkbox']:checked::after {
   overflow-wrap: anywhere;
 }
 
+#tab-logs .log-box {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  flex: 1;
+  scrollbar-gutter: stable;
+}
+
 .log-time {
   color: var(--text-faint);
   font-weight: 400;
@@ -1999,7 +2053,7 @@ input[type='checkbox']:checked::after {
   align-items: center;
   justify-content: center;
   padding: 28px;
-  background: rgba(4, 7, 9, 0.72);
+  background: var(--modal-scrim);
   animation: modalFade var(--motion-fast);
 }
 
@@ -2008,11 +2062,13 @@ input[type='checkbox']:checked::after {
   max-height: calc(100vh - 56px);
   padding: 22px;
   overflow: auto;
-  border: 0;
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--surface-raised);
-  box-shadow: var(--shadow);
+  background: var(--dialog-surface);
+  box-shadow: var(--panel-shadow);
   animation: modalIn var(--motion-standard);
+  -webkit-backdrop-filter: var(--raised-filter);
+  backdrop-filter: var(--raised-filter);
 }
 
 .modal-lg {
@@ -2554,8 +2610,11 @@ input[type='checkbox']:checked::after {
   border-radius: 6px;
   color: var(--text);
   background: var(--surface-raised);
+  background-image: linear-gradient(135deg, var(--surface-highlight), transparent 62%);
   box-shadow: var(--shadow);
   animation: toastIn var(--motion-standard);
+  -webkit-backdrop-filter: var(--raised-filter);
+  backdrop-filter: var(--raised-filter);
 }
 
 .toast.err {
@@ -2603,7 +2662,6 @@ input[type='checkbox']:checked::after {
     min-width: 188px;
   }
 
-  .content,
   .topbar {
     padding-right: 18px;
     padding-left: 18px;
@@ -2663,7 +2721,7 @@ input[type='checkbox']:checked::after {
 
 @media (max-width: 720px) {
   .content {
-    padding: 16px 14px 28px;
+    padding: 16px;
   }
 
   .panel {

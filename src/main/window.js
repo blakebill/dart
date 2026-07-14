@@ -52,6 +52,7 @@ function createWindow(startHidden = false) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      spellcheck: false,
       // Explicit: throttle animations/timers when the page is in the background
       // (default true, but pinning it documents the contract — paired with the
       // setFrameRate cycle below to crush paint cost while hidden in the tray).

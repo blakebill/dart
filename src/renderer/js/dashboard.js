@@ -42,9 +42,11 @@
 
     const running = !!(App.state.status && App.state.status.running);
     const raw = running && typeof App.currentNodeName === 'function' ? App.currentNodeName() : '';
-    const name = running ? (raw && raw !== '-' ? raw : t('dash.noNode')) : t('dash.needRunning');
+    const hasNode = !!(running && raw && raw !== '-');
+    const name = running ? (hasNode ? raw : t('dash.noNode')) : t('dash.needRunning');
     nodeEl.textContent = name;
     nodeEl.title = name;
+    nodeEl.className = 'card-value';
 
     if (!running || !raw || raw === '-') {
       delayEl.textContent = running ? t('dash.noDelay') : t('dash.needRunning');

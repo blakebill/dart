@@ -59,7 +59,7 @@
   }
 
   function renderConnections(data) {
-    const allConnections = data.connections || [];
+    const allConnections = Array.isArray(data.connections) ? data.connections : [];
     $('#connStats').textContent = t(
       'conns.stats',
       Number.isFinite(data.totalConnections) ? data.totalConnections : allConnections.length,
@@ -74,9 +74,7 @@
       return;
     }
     list.classList.remove('is-empty');
-    connectionItems = allConnections
-      .slice()
-      .sort((a, b) => String(b.start || '').localeCompare(String(a.start || '')));
+    connectionItems = allConnections;
     renderConnectionWindow();
   }
 
@@ -102,14 +100,18 @@
     }
   });
 
-  let connScrollQueued = false;
-  $('#connList').addEventListener('scroll', () => {
-    if (connScrollQueued) return;
-    connScrollQueued = true;
+  let connRenderQueued = false;
+  function queueConnectionRender() {
+    if (connRenderQueued) return;
+    connRenderQueued = true;
     requestAnimationFrame(() => {
-      connScrollQueued = false;
+      connRenderQueued = false;
       renderConnectionWindow();
     });
+  }
+  $('#connList').addEventListener('scroll', queueConnectionRender);
+  window.addEventListener('resize', () => {
+    if (App.currentTab === 'conns') queueConnectionRender();
   });
 
   $('#connClose').addEventListener('click', async () => {

@@ -66,6 +66,7 @@
   });
   function closeConvertModal() {
     invalidateConversion();
+    $('#convertInput').value = '';
     $('#convertModal').classList.add('hidden');
   }
   $('#convertClose').addEventListener('click', closeConvertModal);
@@ -128,7 +129,7 @@
     }
     if (!lastConvertOutput) return;
     const sub = await call(api.importSubscription, { name: t('convert.importName'), content: lastConvertOutput });
-    toast(t('toast.subSaved', sub.nodes.length));
+    toast(t('toast.subSaved', sub.nodeCount));
     await App.refresh();
   });
   $('#convertCopyBtn').addEventListener('click', async () => {

@@ -62,7 +62,7 @@
     }
     return escapeHtml(line) + '\n';
   }
-  const LOG_LIMIT = 200000;
+  const LOG_LIMIT = 120000;
   const LOG_FLUSH_LINES = 400;
   let logBuf = [];
   let logBufStart = 0;

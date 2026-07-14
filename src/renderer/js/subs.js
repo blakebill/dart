@@ -110,7 +110,7 @@
     btn.textContent = t('subs.fetching');
     try {
       const sub = await call(api.addSubscription, { name, url });
-      toast(t('toast.subAdded', sub.name, sub.nodes.length));
+      toast(t('toast.subAdded', sub.name, sub.nodeCount));
       $('#subUrl').value = '';
       $('#subName').value = '';
       await App.refresh();

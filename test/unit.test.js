@@ -153,6 +153,7 @@ test('frameless window exposes Mica-safe custom desktop controls', () => {
   assert.ok(windowMain.includes("backgroundMaterial: 'mica'"));
   assert.ok(windowMain.includes("return '#00000000'"));
   assert.ok(windowMain.includes("setBackgroundMaterial('mica')"));
+  assert.ok(windowMain.includes('spellcheck: false'));
   for (const id of ['windowMinimize', 'windowMaximize', 'windowClose']) {
     assert.ok(indexHtml.includes(`id="${id}"`), `missing custom control: ${id}`);
   }
@@ -299,6 +300,7 @@ test('large live lists use bounded virtual windows', () => {
   assert.ok(nodes.includes('NODE_COLUMNS = 2'), 'node virtualization must remain two-column aware');
   assert.ok(nodes.includes('node-grid-window'));
   assert.ok(conns.includes('VIRTUAL_CONNECTION_ROW_HEIGHT'));
+  assert.ok(conns.includes("window.addEventListener('resize'"), 'connection virtualization must follow window resizing');
   assert.ok(conns.includes("list.classList.add('is-empty')"));
   assert.ok(conns.includes("list.classList.remove('is-empty')"));
   assert.ok(rules.includes('VIRTUAL_RULE_ROW_HEIGHT'));
@@ -306,6 +308,47 @@ test('large live lists use bounded virtual windows', () => {
   assert.ok(css.includes('.virtual-spacer'));
   assert.ok(css.includes('.conn-list.is-empty'));
   assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+  const nodeList = css.slice(css.indexOf('.node-list {'), css.indexOf('.conn-list.is-empty'));
+  assert.ok(nodeList.includes('border: 0'));
+  assert.ok(nodeList.includes('background: transparent'));
+  assert.ok(nodeList.includes('padding-right: 8px'), 'node cards need space before the scrollbar');
+  assert.ok(nodeList.includes('scrollbar-gutter: stable'));
+  assert.ok(nodes.includes("App.currentTab !== 'nodes' || nodeWindowFrame"), 'node virtualization must follow window resizing');
+});
+
+test('node, connection and log workspaces fill the available window', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const workspace = css.slice(css.indexOf('#tab-nodes.active,'), css.indexOf('h1 {'));
+  assert.ok(workspace.includes('#tab-conns.active'));
+  assert.ok(workspace.includes('#tab-conns > .panel'));
+  assert.ok(workspace.includes('height: 100%'));
+  assert.ok(workspace.includes('flex: 1'));
+  assert.ok(css.includes('#tab-conns .conn-list'));
+  assert.ok(css.includes('#tab-logs .log-box'));
+  assert.ok(css.includes('max-height: none'));
+});
+
+test('page surfaces keep an even outer inset without trailing panel space', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const content = css.slice(css.indexOf('.content {'), css.indexOf('* {', css.indexOf('.content {')));
+  const tab = css.slice(css.indexOf('.tab {'), css.indexOf('.tab.active'));
+  assert.ok(content.includes('padding: 26px'));
+  assert.ok(tab.includes('width: 100%'));
+  assert.ok(css.includes('.tab > .panel:last-child'));
+});
+
+test('heavy renderer data is bounded and released outside its active view', () => {
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
+  const logs = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
+  const tools = fs.readFileSync(path.join(rendererDir, 'js', 'tools.js'), 'utf-8');
+  assert.ok(main.includes('App.releaseNodes'));
+  assert.ok(main.includes('App.releaseRuleCache'));
+  assert.ok(nodes.includes('api.getNodes()'));
+  assert.ok(rules.includes('ruleItems = []'));
+  assert.ok(logs.includes('LOG_LIMIT = 120000'));
+  assert.ok(tools.includes("$('#convertInput').value = ''"));
 });
 
 test('node strategies keep profile order and expose a stable sidebar readout', () => {
@@ -321,6 +364,7 @@ test('node strategies keep profile order and expose a stable sidebar readout', (
 test('dashboard status cards expose current node latency and click actions', () => {
   const dash = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
   assert.ok(indexHtml.includes('id="dashNode"'));
   assert.ok(indexHtml.includes('id="dashDelay"'));
   assert.ok(indexHtml.includes('data-dash-action="power"'));
@@ -328,6 +372,8 @@ test('dashboard status cards expose current node latency and click actions', () 
   assert.ok(indexHtml.includes('data-dash-action="nodes"'));
   assert.ok(indexHtml.includes('data-dash-action="testDelay"'));
   assert.ok(dash.includes('renderDashNodeCards'));
+  assert.ok(dash.includes("nodeEl.className = 'card-value'"));
+  assert.ok(!css.includes('.card-value-sm'));
   assert.ok(dash.includes("action === 'testDelay'"));
   assert.ok(main.includes('App.showTab = showTab'));
 });
@@ -366,7 +412,9 @@ test('light theme uses quiet system surfaces and independently framed dashboard 
   const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
   assert.ok(css.includes('--bg: transparent'));
   assert.ok(css.includes('--sidebar: transparent'));
-  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.86)'));
+  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.62)'));
+  assert.ok(css.includes('--surface-filter: blur(16px) saturate(1.12)'));
+  assert.ok(css.includes('backdrop-filter: var(--surface-filter)'));
   assert.ok(css.includes('--text-faint: #6e6e6e'));
   assert.ok(css.includes('--panel-shadow:'));
   assert.ok(css.includes('.rule-proxy.geodata-status'));
@@ -376,12 +424,66 @@ test('language changes refresh enhanced select labels immediately', () => {
   const select = fs.readFileSync(path.join(rendererDir, 'js', 'select.js'), 'utf-8');
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
   const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const languageFlow = main.slice(
+    main.indexOf('function setLanguage(lang)'),
+    main.indexOf('// ---------- Tab switching ----------')
+  );
   assert.ok(select.includes('function refreshSelects('));
   assert.ok(select.includes('selectSync.get(sel)'));
-  assert.ok(main.includes('App.refreshSelects()'));
+  assert.ok(languageFlow.includes('App.state.settings.language = lang'));
+  assert.ok(languageFlow.indexOf('App.state.settings.language = lang') < languageFlow.indexOf('App.renderSettings()'));
+  assert.ok(languageFlow.indexOf('App.renderSettings()') < languageFlow.indexOf('App.refreshSelects()'));
+  const selectElement = { value: 'zh' };
+  let mirroredLanguage = null;
+  const noop = () => {};
+  const sandbox = {
+    App: {
+      state: { settings: { language: 'zh' }, status: {} },
+      currentTab: 'dashboard',
+      renderStatus: noop,
+      renderSubs: noop,
+      renderNodes: noop,
+      renderSettings: noop,
+      renderMode: noop,
+      renderUsage: noop,
+      renderCoreStatus: noop,
+      refreshSelects: () => { mirroredLanguage = selectElement.value; },
+    },
+    setLang: noop,
+    applyI18n: noop,
+    syncTopbarTitle: noop,
+    $: (selector) => (selector === '#setLanguage' ? selectElement : null),
+  };
+  vm.runInNewContext(`${languageFlow}\nsetLanguage('en');`, sandbox);
+  assert.strictEqual(sandbox.App.state.settings.language, 'en');
+  assert.strictEqual(mirroredLanguage, 'en');
   assert.ok(main.includes('{ ...previous, ...status }'), 'compact status events must preserve core version fields');
   assert.ok(css.includes('.btn.primary:hover:not(:disabled)'));
   assert.ok(css.includes('background: var(--accent-hover)'), 'primary hover must retain a contrast-safe blue background');
+});
+
+test('secondary popups keep card styling without exposing background text', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const dropdown = css.slice(css.indexOf('.ui-select-menu {'), css.indexOf('.ui-select-opt {'));
+  const modal = css.slice(css.indexOf('.modal-card {'), css.indexOf('.modal-lg {'));
+  assert.ok(css.includes('--dialog-surface: rgba(250, 251, 252, 0.96)'));
+  for (const rule of [dropdown, modal]) {
+    assert.ok(rule.includes('background: var(--dialog-surface)'));
+    assert.ok(rule.includes('box-shadow: var(--panel-shadow)'));
+    assert.ok(rule.includes('backdrop-filter: var(--raised-filter)'));
+    assert.ok(!rule.includes('linear-gradient'));
+  }
+});
+
+test('main surfaces keep their existing subtle highlight', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const panel = css.slice(css.indexOf('.panel {'), css.indexOf('.panel > h2'));
+  const card = css.slice(css.indexOf('.card {'), css.indexOf('button.card {'));
+  const toast = css.slice(css.indexOf('.toast {'), css.indexOf('.toast.err'));
+  assert.ok(css.includes('--surface-highlight: rgba(255, 255, 255, 0.42)'));
+  for (const rule of [panel, card, toast]) {
+    assert.ok(rule.includes('background-image: linear-gradient'));
+  }
 });
 
 console.log('\nGitHub release helper:');
@@ -627,7 +729,7 @@ test('profile payloads load on demand with a bounded cache', () => {
   assert.strictEqual(reloaded._profileCache.size, 0, 'startup should not hydrate profile payloads');
   assert.ok(summaries.every((sub) => !('nodes' in sub) && sub.nodeCount === 1));
   for (const sub of summaries) reloaded.getSubscription(sub.id);
-  assert.ok(reloaded._profileCache.size <= 3, 'profile LRU cache grew without a bound');
+  assert.ok(reloaded._profileCache.size <= 2, 'profile LRU cache grew without a bound');
 });
 
 console.log('\nCore layout:');

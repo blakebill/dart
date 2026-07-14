@@ -17,6 +17,7 @@
   let ruleSrc = 'config';
   let rulesReady = false;
   let rulesLoading = null;
+  let ruleLoadGeneration = 0;
   let localRulesReady = false;
   let localRulesLoading = null;
   let ruleGroupsReady = false;
@@ -81,18 +82,22 @@
       return;
     }
     if (rulesLoading) return rulesLoading;
-    rulesLoading = (async () => {
+    const generation = ruleLoadGeneration;
+    const request = (async () => {
       try {
-        normalizeRules(await api.getRules());
+        const data = await api.getRules();
+        if (generation !== ruleLoadGeneration) return;
+        normalizeRules(data);
         rulesReady = true;
         renderRules();
       } catch (e) {
         /* ignore */
-      } finally {
-        rulesLoading = null;
       }
-    })();
-    return rulesLoading;
+    })().finally(() => {
+      if (rulesLoading === request) rulesLoading = null;
+    });
+    rulesLoading = request;
+    return request;
   }
 
   $('#ruleFilter').addEventListener('input', () => {
@@ -296,9 +301,21 @@
   });
 
   function invalidateRuleCaches() {
+    ruleLoadGeneration++;
+    rulesLoading = null;
     rulesReady = false;
     localRulesReady = false;
     ruleGroupsReady = false;
+  }
+
+  function releaseRuleCache() {
+    ruleLoadGeneration++;
+    rulesLoading = null;
+    rulesReady = false;
+    ruleItems = [];
+    visibleRuleItems = [];
+    $('#ruleList').textContent = '';
+    $('#ruleCount').textContent = '';
   }
 
   App.loadRules = loadRules;
@@ -308,4 +325,5 @@
   App.ensureLocalRulesLoaded = () => loadLocalRules({ force: false });
   App.ensureRuleGroupsLoaded = () => loadRuleGroups({ force: false });
   App.invalidateRuleCaches = invalidateRuleCaches;
+  App.releaseRuleCache = releaseRuleCache;
 })();

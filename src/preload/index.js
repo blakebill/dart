@@ -10,6 +10,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('api', {
   // State
   getState: () => ipcRenderer.invoke('app:getState'),
+  getNodes: () => ipcRenderer.invoke('nodes:get'),
   coreStatus: () => ipcRenderer.invoke('core:status'),
 
   // Frameless window controls

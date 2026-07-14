@@ -13,10 +13,15 @@
   const FALLBACK_GROUP = '🛟 Fallback';
   let nodeRows = [];
   let filteredNodeCount = 0;
+  let nodeItems = [];
+  let loadedNodeSub;
+  let nodeLoad = null;
+  let nodeLoadGeneration = 0;
 
   let groupNow = { proxy: null, auto: null, fallback: null };
   let groupRefresh = null;
   let currentNodeFrame = 0;
+  let nodeWindowFrame = 0;
 
   function currentNodeName() {
     if (!(App.state.status && App.state.status.running)) return '-';
@@ -70,13 +75,64 @@
   setInterval(() => {
     if (!document.hidden && App.state.status && App.state.status.running) refreshGroupSelections();
   }, 5000);
-  window.addEventListener('resize', renderCurrentNode);
+  window.addEventListener('resize', () => {
+    renderCurrentNode();
+    if (App.currentTab !== 'nodes' || nodeWindowFrame) return;
+    nodeWindowFrame = requestAnimationFrame(() => {
+      nodeWindowFrame = 0;
+      renderNodeWindow();
+    });
+  });
 
-  // Only the active profile's nodes are used (profiles are not merged), matching
-  // the config the core actually runs. Returns the raw array (no copying).
+  // Node details are loaded only while this tab is in use. Keeping them out of
+  // the global state avoids cloning every node through app:getState.
   function activeNodes() {
-    const sub = (App.state.subscriptions || []).find((s) => s.id === App.state.activeSub);
-    return sub && Array.isArray(sub.nodes) ? sub.nodes : [];
+    return loadedNodeSub === App.state.activeSub ? nodeItems : [];
+  }
+
+  function releaseNodes() {
+    nodeLoadGeneration++;
+    nodeLoad = null;
+    nodeItems = [];
+    loadedNodeSub = undefined;
+    nodeRows = [];
+    filteredNodeCount = 0;
+    const list = $('#nodeList');
+    if (list) list.textContent = '';
+    const count = $('#nodeCount');
+    if (count) count.textContent = '';
+  }
+
+  async function loadNodes(options = {}) {
+    const activeSub = App.state.activeSub || null;
+    if (!options.force && loadedNodeSub === activeSub) {
+      renderNodes();
+      return nodeItems;
+    }
+    if (!activeSub) {
+      nodeItems = [];
+      loadedNodeSub = null;
+      renderNodes();
+      return nodeItems;
+    }
+    if (nodeLoad) return nodeLoad;
+
+    const generation = ++nodeLoadGeneration;
+    const request = (async () => {
+      const result = await api.getNodes();
+      if (generation !== nodeLoadGeneration || (result.activeSub || null) !== (App.state.activeSub || null)) return [];
+      nodeItems = Array.isArray(result.nodes) ? result.nodes : [];
+      loadedNodeSub = result.activeSub || null;
+      renderNodes();
+      return nodeItems;
+    })().catch(() => {
+      if (generation === nodeLoadGeneration) releaseNodes();
+      return [];
+    }).finally(() => {
+      if (nodeLoad === request) nodeLoad = null;
+    });
+    nodeLoad = request;
+    return request;
   }
 
   function delayClass(v) {
@@ -170,10 +226,17 @@
   function renderNodes() {
     const list = $('#nodeList');
     if (!list) return;
+    if (loadedNodeSub !== (App.state.activeSub || null)) {
+      nodeRows = [];
+      filteredNodeCount = 0;
+      list.textContent = '';
+      $('#nodeCount').textContent = '';
+      return;
+    }
     const filter = ($('#nodeFilter').value || '').toLowerCase();
     const nodes = activeNodes().filter((n) => n.name.toLowerCase().includes(filter));
     filteredNodeCount = nodes.length;
-    nodeRows = [{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes];
+    nodeRows = App.state.activeSub ? [{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes] : [];
     $('#nodeCount').textContent = t('nodes.count', nodes.length);
     renderNodeWindow();
   }
@@ -272,6 +335,7 @@
     testAllRunning = true;
     const button = $('#testAllBtn');
     button.disabled = true;
+    await loadNodes();
     const names = activeNodes().map((n) => n.name);
     // Limited-concurrency pool to avoid hammering the core (and any shared
     // upstream server). User-configurable; clamp to a sane range.
@@ -320,7 +384,8 @@
   });
   $('#testAllBtn').addEventListener('click', testAll);
 
-  App.activeNodes = activeNodes;
+  App.loadNodes = loadNodes;
+  App.releaseNodes = releaseNodes;
   App.renderNodes = renderNodes;
   App.currentNodeName = currentNodeName;
   App.renderCurrentNode = renderCurrentNode;

@@ -69,7 +69,7 @@ const MAX_IPC_CONNECTIONS = 600;
 
 function recentConnections(items, limit) {
   const key = (item) => String(item.start || '') + '\0' + String(item.id || '');
-  if (items.length <= limit) return items.slice().sort((a, b) => key(a).localeCompare(key(b)));
+  if (items.length <= limit) return items.slice().sort((a, b) => key(b).localeCompare(key(a)));
   const heap = [];
   const swap = (a, b) => { [heap[a], heap[b]] = [heap[b], heap[a]]; };
   const siftUp = (index) => {
@@ -101,7 +101,7 @@ function recentConnections(items, limit) {
       siftDown(0);
     }
   }
-  return heap.sort((a, b) => key(a).localeCompare(key(b)));
+  return heap.sort((a, b) => key(b).localeCompare(key(a)));
 }
 const CORE_CONFIG_SETTINGS = new Set([
   'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
@@ -173,6 +173,18 @@ async function writeAtomicText(file, text) {
   }
 }
 
+async function readBackupDocument(file) {
+  const stat = await fs.promises.stat(file);
+  if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error('backup is not a file or exceeds 64 MB');
+  const text = await fs.promises.readFile(file, 'utf-8');
+  const document = JSON.parse(text);
+  return {
+    document,
+    normalized: toolbox.validateBackupDocument(document),
+    digest: crypto.createHash('sha256').update(text).digest('hex'),
+  };
+}
+
 /** Remove decorative built-in group emoji from standalone converted files. */
 function plainConversionLabels(value) {
   if (typeof value === 'string') {
@@ -185,20 +197,32 @@ function plainConversionLabels(value) {
   return value;
 }
 
+function subscriptionResult(sub) {
+  return {
+    id: sub.id,
+    name: sub.name || '',
+    format: sub.format || 'unknown',
+    nodeCount: Array.isArray(sub.nodes) ? sub.nodes.length : Math.max(0, Number(sub.nodeCount) || 0),
+  };
+}
+
+function nodeResult(node) {
+  return {
+    name: node.name,
+    type: node.type,
+    server: node.server,
+    port: node.port,
+  };
+}
+
 /** Register every IPC handler. Called once during boot. */
 function registerIpc() {
   const toolContext = { state, core, proxy, isAdmin: isWindowsAdmin };
   ipcMain.handle('app:getState', async () => {
     const activeSub = core.getActiveSubId();
-    const active = activeSub ? core.getActiveSubscription() : null;
-    const activeNodes = new Map(
-      active && Array.isArray(active.nodes)
-        ? [[active.id, active.nodes.map((n) => ({ name: n.name, type: n.type, server: n.server, port: n.port }))]]
-        : []
-    );
     return {
-      // The renderer receives summaries for every profile and node details only
-      // for the active one, keeping inactive profiles out of its heap.
+      // Profile payloads and node details are loaded through focused IPC calls,
+      // keeping the normal dashboard state compact.
       subscriptions: state.store.listSubscriptions().map((s) => ({
         id: s.id,
         name: s.name,
@@ -209,12 +233,20 @@ function registerIpc() {
         updatedAt: s.updatedAt || 0,
         userInfo: s.userInfo || null,
         nodeCount: s.nodeCount || 0,
-        nodes: activeNodes.get(s.id) || [],
       })),
       settings: state.store.getSettings(),
       selected: state.store.get('selected'),
       activeSub,
       status: await coreStatusInfo(),
+    };
+  });
+
+  ipcMain.handle('nodes:get', () => {
+    const activeSub = core.getActiveSubId();
+    const active = activeSub ? core.getActiveSubscription() : null;
+    return {
+      activeSub,
+      nodes: active && Array.isArray(active.nodes) ? active.nodes.map(nodeResult) : [],
     };
   });
 
@@ -246,7 +278,7 @@ function registerIpc() {
     // where activeSub was never set — see getActiveSubId.)
     if (isFirst) state.store.set('activeSub', sub.id);
     core.rescheduleAutoUpdate();
-    return sub;
+    return subscriptionResult(sub);
   });
 
   // Update a specific subscription.
@@ -274,7 +306,7 @@ function registerIpc() {
     // the Clash API keeps serving outbounds the UI no longer shows (delay
     // tests "time out", selecting a node fails with 400).
     if (configChanged && id === core.getActiveSubId()) await core.restartIfRunning();
-    return sub;
+    return subscriptionResult(sub);
   });
 
   ipcMain.handle('sub:remove', async (_e, { id }) => {
@@ -332,7 +364,7 @@ function registerIpc() {
     core.rescheduleAutoUpdate();
     // A URL change replaced the node list — apply it if this is the live profile.
     if (urlChanged && url && sub.id === core.getActiveSubId()) await core.restartIfRunning();
-    return sub;
+    return subscriptionResult(sub);
   });
 
   // Import from pasted text (Clash YAML or share links).
@@ -357,7 +389,7 @@ function registerIpc() {
       configHash: subscription.configFingerprint(result),
     };
     state.store.upsertSubscription(sub);
-    return sub;
+    return subscriptionResult(sub);
   });
 
   // Raw profile content (the fetched/imported source text) for in-app editing.
@@ -912,13 +944,10 @@ function registerIpc() {
     });
     if (result.canceled || !result.filePaths || !result.filePaths[0]) return null;
     const file = result.filePaths[0];
-    const stat = await fs.promises.stat(file);
-    if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error('backup is not a file or exceeds 64 MB');
-    const document = JSON.parse(await fs.promises.readFile(file, 'utf-8'));
-    const normalized = toolbox.validateBackupDocument(document);
+    const { document, normalized, digest } = await readBackupDocument(file);
     const token = crypto.randomUUID();
     const summary = toolbox.backupSummary(document, normalized);
-    pendingBackup = { token, normalized, summary, expiresAt: Date.now() + 10 * 60 * 1000 };
+    pendingBackup = { token, file, digest, expiresAt: Date.now() + 10 * 60 * 1000 };
     return { token, fileName: path.basename(file), summary };
   });
 
@@ -928,7 +957,13 @@ function registerIpc() {
       pendingBackup = null;
       throw new Error('backup selection expired; select the file again');
     }
-    const restored = pendingBackup.normalized;
+    const selected = pendingBackup;
+    const loaded = await readBackupDocument(selected.file);
+    if (loaded.digest !== selected.digest) {
+      pendingBackup = null;
+      throw new Error('backup file changed after selection; select it again');
+    }
+    const restored = loaded.normalized;
     const currentSettings = state.store.getSettings();
     const knownSettings = new Set(Object.keys(currentSettings));
     restored.settings = Object.fromEntries(

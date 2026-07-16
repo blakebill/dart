@@ -825,6 +825,30 @@ async function main() {
   await handlers['sub:setActive'](null, { id: subB.id });
   assert.strictEqual(core.getActiveSubId(), subB.id, 'explicit activation switches the profile');
 
+  const originalAutoCandidateRunning = state.singbox.isRunning;
+  const originalApplyAutoCandidate = core.applyMeasuredAutoCandidate;
+  let appliedAutoCandidate = null;
+  state.singbox.isRunning = () => true;
+  core.applyMeasuredAutoCandidate = async (name) => {
+    appliedAutoCandidate = name;
+    return name;
+  };
+  try {
+    assert.strictEqual(
+      await handlers['node:autoCandidate'](null, { name: 'node-of-b' }),
+      'node-of-b'
+    );
+    assert.strictEqual(appliedAutoCandidate, 'node-of-b');
+    await assert.rejects(
+      handlers['node:autoCandidate'](null, { name: 'not-in-profile' }),
+      /not part of the active config/
+    );
+  } finally {
+    core.applyMeasuredAutoCandidate = originalApplyAutoCandidate;
+    state.singbox.isRunning = originalAutoCandidateRunning;
+  }
+  console.log('✓ test-all can apply its fastest valid node to Auto');
+
   const selectedBeforeFailure = state.store.get('selected');
   const originalSelectRunning = state.singbox.isRunning;
   const originalSetClashSelector = core.setClashSelector;
@@ -1325,6 +1349,49 @@ async function main() {
     http.request = originalHttpRequest;
   }
   console.log('✓ malformed Clash API responses cannot masquerade as successful state changes');
+
+  const originalAutoRunning = state.singbox.isRunning;
+  const originalAutoCoreType = state.singbox.getCoreType;
+  const originalAutoApiEnabled = state.store.getSettings().enableClashApi;
+  let autoRequest = null;
+  let autoRequestBody = '';
+  let autoCoreType = 'sing-box';
+  state.singbox.isRunning = () => true;
+  state.singbox.getCoreType = () => autoCoreType;
+  state.store.updateSettings({ enableClashApi: true });
+  http.request = (options, callback) => {
+    autoRequest = options;
+    const request = new EventEmitter();
+    request.write = (chunk) => { autoRequestBody += chunk.toString(); };
+    request.end = () => {
+      const response = new EventEmitter();
+      response.statusCode = 204;
+      response.headers = {};
+      callback(response);
+      queueMicrotask(() => response.emit('end'));
+    };
+    request.destroy = (error) => request.emit('error', error);
+    return request;
+  };
+  try {
+    assert.strictEqual(await core.applyMeasuredAutoCandidate('fast-node'), 'fast-node');
+    assert.strictEqual(autoRequest.method, 'PUT');
+    assert.strictEqual(autoRequest.path, '/proxies/%E2%99%BB%EF%B8%8F%20Auto');
+    assert.deepStrictEqual(JSON.parse(autoRequestBody), { name: 'fast-node' });
+
+    autoCoreType = 'mihomo';
+    autoRequestBody = '';
+    assert.strictEqual(await core.applyMeasuredAutoCandidate('mihomo-fast'), 'mihomo-fast');
+    assert.strictEqual(autoRequest.method, 'PUT');
+    assert.strictEqual(autoRequest.path, '/proxies/%E2%99%BB%EF%B8%8F%20Auto');
+    assert.deepStrictEqual(JSON.parse(autoRequestBody), { name: 'mihomo-fast' });
+  } finally {
+    http.request = originalHttpRequest;
+    state.singbox.isRunning = originalAutoRunning;
+    state.singbox.getCoreType = originalAutoCoreType;
+    state.store.updateSettings({ enableClashApi: originalAutoApiEnabled });
+  }
+  console.log('✓ both cores apply the fastest measured node through the same managed Auto selector');
 
   assert.strictEqual(core.modeChangeNeedsRestart('mihomo', 'rule', 'block'), true);
   assert.strictEqual(core.modeChangeNeedsRestart('mihomo', 'block', 'direct'), true);

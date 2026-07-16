@@ -825,6 +825,17 @@ function registerIpc() {
     return core.testNodeDelay(name);
   });
 
+  ipcMain.handle('node:autoCandidate', async (_e, { name }) => {
+    reqStr(name, 'name');
+    if (!state.singbox.isRunning()) throw new Error('core not running');
+    const active = core.getActiveSubscription();
+    const validNames = new Set(
+      ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean)
+    );
+    if (!validNames.has(name)) throw new Error('node is not part of the active config');
+    return core.applyMeasuredAutoCandidate(name);
+  });
+
   // Resolve the live outer selector plus the health-check groups. Outside the
   // Nodes tab only the active automatic group is queried, keeping polling tiny.
   ipcMain.handle('node:groupSelections', async (_e, { all = false } = {}) => {

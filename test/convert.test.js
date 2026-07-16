@@ -441,6 +441,32 @@ test('custom latency URL is used by both cores health-check groups', () => {
   assert.ok(mihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type)).every((group) => group.url === testUrl));
 });
 
+test('Auto groups actively track lower HTTP RTT without a wide sticky margin', () => {
+  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
+  const singbox = buildSingboxConfig([node]);
+  const singboxAuto = singbox.outbounds.find((outbound) => outbound.tag === '♻️ Auto');
+  assert.strictEqual(singboxAuto.type, 'selector');
+  assert.deepStrictEqual(singboxAuto.outbounds, ['n']);
+  assert.strictEqual(singboxAuto.default, 'n');
+  const headlessAuto = buildSingboxConfig([node], { enableClashApi: false })
+    .outbounds.find((outbound) => outbound.tag === '♻️ Auto');
+  assert.strictEqual(headlessAuto.type, 'urltest');
+  assert.strictEqual(headlessAuto.tolerance, 1);
+
+  const mihomo = buildMihomoConfig([node]);
+  const mihomoAuto = mihomo['proxy-groups'].find((group) => group.name === '♻️ Auto');
+  assert.strictEqual(mihomoAuto.type, 'select');
+  assert.deepStrictEqual(mihomoAuto.proxies, ['n']);
+  const mihomoHeadlessAuto = buildMihomoConfig([node], { enableClashApi: false })
+    ['proxy-groups'].find((group) => group.name === '♻️ Auto');
+  assert.strictEqual(mihomoHeadlessAuto.type, 'url-test');
+  assert.strictEqual(mihomoHeadlessAuto.interval, 60);
+  assert.strictEqual(mihomoHeadlessAuto.tolerance, 1);
+  assert.strictEqual(mihomoHeadlessAuto.lazy, true);
+  assert.strictEqual(mihomoHeadlessAuto.timeout, 5000);
+  assert.strictEqual(mihomoHeadlessAuto['max-failed-times'], 2);
+});
+
 test('interface binding only in TUN mode (VPN/WireGuard coexistence)', () => {
   const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
   const tun = buildSingboxConfig([node], { enableTun: true });

@@ -2,7 +2,10 @@
 
 const AUTO_GROUP = '♻️ Auto';
 const FALLBACK_GROUP = '🛟 Fallback';
-const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
+const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
+const AUTO_TEST_TOLERANCE_MS = 1;
+const AUTO_TEST_INTERVAL_SECONDS = 60;
+const AUTO_TEST_TIMEOUT_MS = 5000;
 
 /**
  * Core converter
@@ -918,15 +921,22 @@ function buildSingboxConfig(nodes, opts = {}) {
     outbounds: [AUTO_GROUP, FALLBACK_GROUP, ...nodeTags, 'direct'],
     default: defaultOutbound,
   };
-  const autoGroup = {
-    type: 'urltest',
-    tag: AUTO_GROUP,
-    outbounds: nodeTags,
-    url: latencyUrl,
-    interval: '1m',
-    tolerance: 50,
-    idle_timeout: '30m',
-  };
+  // Sing-Box's Clash API updates per-node delay history without asking a
+  // URLTest group to re-elect. With the API enabled, Dart owns this selector
+  // and applies the winner after user/background sweeps. Keep the native group
+  // as a no-API fallback so Auto still works in headless configurations.
+  const autoGroup = enableClashApi
+    ? { type: 'selector', tag: AUTO_GROUP, outbounds: nodeTags, default: nodeTags[0] }
+    : {
+        type: 'urltest',
+        tag: AUTO_GROUP,
+        outbounds: nodeTags,
+        url: latencyUrl,
+        interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
+        tolerance: AUTO_TEST_TOLERANCE_MS,
+        idle_timeout: '30m',
+        interrupt_exist_connections: false,
+      };
   const fallbackGroup = {
     type: 'urltest',
     tag: FALLBACK_GROUP,
@@ -1172,6 +1182,20 @@ function buildMihomoConfig(nodes, opts = {}) {
   for (const name of proxyNames) addManual(name);
   addManual('DIRECT');
 
+  const autoGroup = enableClashApi
+    ? { name: AUTO_GROUP, type: 'select', proxies: proxyNames }
+    : {
+        name: AUTO_GROUP,
+        type: 'url-test',
+        proxies: proxyNames,
+        url: latencyUrl,
+        interval: AUTO_TEST_INTERVAL_SECONDS,
+        tolerance: AUTO_TEST_TOLERANCE_MS,
+        timeout: AUTO_TEST_TIMEOUT_MS,
+        'max-failed-times': 2,
+        lazy: true,
+      };
+
   const rules = [];
   if (clashMode === 'block') {
     rules.push('MATCH,REJECT');
@@ -1208,8 +1232,17 @@ function buildMihomoConfig(nodes, opts = {}) {
     proxies,
     'proxy-groups': [
       { name: '🚀 Proxy', type: 'select', proxies: manualProxies },
-      { name: AUTO_GROUP, type: 'url-test', proxies: proxyNames, url: latencyUrl, interval: 60 },
-      { name: FALLBACK_GROUP, type: 'fallback', proxies: proxyNames, url: latencyUrl, interval: 60, lazy: true },
+      autoGroup,
+      {
+        name: FALLBACK_GROUP,
+        type: 'fallback',
+        proxies: proxyNames,
+        url: latencyUrl,
+        interval: AUTO_TEST_INTERVAL_SECONDS,
+        timeout: AUTO_TEST_TIMEOUT_MS,
+        'max-failed-times': 2,
+        lazy: true,
+      },
     ],
     rules,
   };

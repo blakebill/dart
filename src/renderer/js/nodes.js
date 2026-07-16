@@ -107,6 +107,7 @@
   }
 
   function releaseNodes() {
+    const currentDelayName = currentNodeName();
     for (const name of delayRequests.keys()) {
       if (delays.get(name) === 'testing') delays.delete(name);
     }
@@ -130,6 +131,11 @@
     if (list) list.textContent = '';
     const count = $('#nodeCount');
     if (count) count.textContent = '';
+    // Test-all can add thousands of entries. Keep only the value shown by the
+    // dashboard and release the rest when this workspace is no longer active.
+    for (const name of delays.keys()) {
+      if (name !== currentDelayName) delays.delete(name);
+    }
   }
 
   async function loadNodes(options = {}) {
@@ -190,8 +196,8 @@
     const d = delays.get(name);
     const delayHtml =
       d !== undefined ? `<span class="node-delay ${delayClass(d)}">${delayText(d)}</span>` : '<span class="node-delay"></span>';
-    // The urltest group's current pick: shown on the Auto row ("当前: X") and
-    // as a ⚡ marker on that node's own row.
+    // The automatic group's current pick: shown on the Auto row ("当前: X")
+    // and as a marker on that node's own row.
     let tagHtml = type ? `<span class="node-tag">${escapeHtml(String(type))}</span>` : '';
     if (server && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
     if (server && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
@@ -376,6 +382,8 @@
     // upstream server). User-configurable; clamp to a sane range.
     const concurrency = Math.max(1, Math.min(32, parseInt(App.state.settings.testConcurrency, 10) || 8));
     let idx = 0;
+    let bestName = null;
+    let bestDelay = Infinity;
     async function worker() {
       while (!run.cancelled && idx < names.length) {
         const name = names[idx++];
@@ -386,7 +394,13 @@
         scheduleDelayUpdate(name);
         try {
           const result = await api.testNodeDelay(name);
-          if (!run.cancelled && delayRequests.get(name) === token) delays.set(name, result);
+          if (!run.cancelled && delayRequests.get(name) === token) {
+            delays.set(name, result);
+            if (result < bestDelay) {
+              bestDelay = result;
+              bestName = name;
+            }
+          }
         } catch (e) {
           if (!run.cancelled && delayRequests.get(name) === token) delays.set(name, 'timeout');
         } finally {
@@ -400,7 +414,12 @@
     }
     try {
       await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
-      if (!run.cancelled) refreshGroupSelections(); // the full sweep usually changes group picks
+      if (!run.cancelled && bestName && api.applyAutoCandidate) {
+        try { await api.applyAutoCandidate(bestName); } catch (e) {
+          toast(e.message || String(e), true);
+        }
+      }
+      if (!run.cancelled) await refreshGroupSelections();
     } finally {
       if (testAllRun === run) {
         testAllRun = null;

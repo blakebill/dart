@@ -1,6 +1,6 @@
 {
   "name": "dart",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Desktop network control for sing-box and mihomo on Windows",
   "main": "src/main/index.js",
   "author": "singbox-gui",

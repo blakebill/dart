@@ -496,6 +496,8 @@ test('heavy renderer data is bounded and released outside its active view', () =
   assert.ok(rules.includes('ruleItems = []'));
   assert.ok(rules.includes('generation !== ruleLoadGeneration'));
   assert.ok(logs.includes('LOG_LIMIT = 120000'));
+  assert.ok(nodes.includes('for (const name of delays.keys())'));
+  assert.ok(nodes.includes('api.applyAutoCandidate(bestName)'));
   assert.ok(!indexHtml.includes('class="modal hidden"'), 'dialog DOM must not remain resident in the main renderer');
   assert.ok(dialogHost.includes('dialogWindow = null'));
   assert.ok(dialogHost.includes('dialogContext = null'));
@@ -1132,10 +1134,14 @@ test('legacy duplicate or missing record ids are repaired without dropping recor
 test('settings merge defaults with stored values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
   const store = new Store(dir);
-  store.updateSettings({ mixedPort: 1234 });
+  store.updateSettings({
+    mixedPort: 1234,
+    testUrl: 'http://www.gstatic.com/generate_204',
+  });
   const s = new Store(dir).getSettings();
   assert.strictEqual(s.mixedPort, 1234);
   assert.strictEqual(s.clashApiPort, 9090); // default still present
+  assert.strictEqual(s.testUrl, 'https://www.gstatic.com/generate_204');
 });
 
 test('large subscription payloads migrate to independent profile files', () => {
@@ -1184,7 +1190,7 @@ test('profile payloads load on demand with a bounded cache', () => {
   assert.strictEqual(reloaded._profileCache.size, 0, 'startup should not hydrate profile payloads');
   assert.ok(summaries.every((sub) => !('nodes' in sub) && sub.nodeCount === 1));
   for (const sub of summaries) reloaded.getSubscription(sub.id);
-  assert.ok(reloaded._profileCache.size <= 2, 'profile LRU cache grew without a bound');
+  assert.ok(reloaded._profileCache.size <= 1, 'profile LRU cache retained more than the active payload');
 });
 
 test('repeated payload updates do not retain retired digest entries', () => {

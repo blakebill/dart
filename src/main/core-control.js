@@ -27,8 +27,11 @@ const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 // Reuse sockets for the frequent Clash API calls (connection polling, latency
 // tests) instead of opening a fresh TCP connection each time.
-const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 2 });
 const MAX_CLASH_RESPONSE_BYTES = 32 * 1024 * 1024;
+const APP_PROXY_GROUP = '🚀 Proxy';
+const AUTO_PROXY_GROUP = '♻️ Auto';
+const MANAGED_AUTO_INTERVAL_MS = 60_000;
 let tunWasActive = false;
 let tunAdaptersClean = false;
 const remoteUpdateTokens = new Map();
@@ -37,6 +40,11 @@ let lifecycleClosing = false;
 let staleProxyHealPromise = null;
 let configMutationTail = Promise.resolve();
 let customRuleMutationTail = Promise.resolve();
+let managedAutoTimer = null;
+let managedAutoRun = null;
+let managedAutoGeneration = 0;
+let autoSelectionRevision = 0;
+let autoSelectorTail = Promise.resolve();
 
 function assertLifecycleOpen() {
   if (!lifecycleClosing) return;
@@ -623,6 +631,7 @@ async function startCoreNow() {
   persistLastRunning(true);
   sendStatus();
   startTrafficStream();
+  startManagedAutoSelection();
   try {
     maybeFetchGeodata();
     // Pull anything the subscription's rules reference but that isn't on disk
@@ -864,6 +873,7 @@ async function stopCoreNow(remember) {
   // Mark the stop as intentional so the exit handler doesn't fire a "core
   // crashed" notification for a stop/restart we initiated.
   state.coreStopping = true;
+  stopManagedAutoSelection();
   stopTrafficStream();
   stopProxyGuard();
   if (state.systemProxyOn) {
@@ -1009,6 +1019,7 @@ function setSystemProxyEnabled(enable) {
 
 async function cleanup() {
   lifecycleClosing = true;
+  stopManagedAutoSelection();
   cancelAllRemoteUpdates();
   if (typeof state.cancelPendingUpdates === 'function') {
     await state.cancelPendingUpdates();
@@ -1027,6 +1038,7 @@ async function cleanup() {
   }
   proxy.beginShutdown();
   await stopCore(undefined, { allowDuringCoreUpdate: true });
+  clashAgent.destroy();
 }
 
 /** Restart the core if it is running, so config changes (e.g. rules) apply. */
@@ -1180,10 +1192,130 @@ function clashApi(method, apiPath, body) {
   });
 }
 
-/** Switch the proxy selector to a given outbound live via the Clash API. */
+function usesManagedAutoSelection() {
+  const settings = state.store.getSettings();
+  return settings.enableClashApi;
+}
+
+function queueAutoCandidate(name, revision) {
+  const apply = () => {
+    if (
+      revision !== autoSelectionRevision ||
+      !state.singbox.isRunning() ||
+      !usesManagedAutoSelection()
+    ) return null;
+    return clashApi('PUT', '/proxies/' + encodeURIComponent(AUTO_PROXY_GROUP), { name }).then(() => name);
+  };
+  const operation = autoSelectorTail.then(apply, apply);
+  autoSelectorTail = operation.catch(() => {});
+  return operation;
+}
+
+/** Apply the fastest result from the visible node sweep without testing twice. */
+function applyMeasuredAutoCandidate(name) {
+  if (!state.singbox.isRunning()) throw new Error('core not running');
+  if (usesManagedAutoSelection()) {
+    return queueAutoCandidate(name, ++autoSelectionRevision);
+  }
+  return null;
+}
+
+/** Measure every member and update Dart's core-independent Auto selector. */
+function refreshManagedAutoSelection({ force = false, generation = managedAutoGeneration } = {}) {
+  if (!state.singbox.isRunning() || !usesManagedAutoSelection()) return Promise.resolve(null);
+  if (managedAutoRun && managedAutoRun.generation === generation) {
+    if (force && !managedAutoRun.force) {
+      return managedAutoRun.promise
+        .catch(() => null)
+        .then(() => refreshManagedAutoSelection({ force: true, generation }));
+    }
+    return managedAutoRun.promise;
+  }
+
+  const token = {};
+  const promise = (async () => {
+    if (!force) {
+      const outer = await clashApi('GET', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP));
+      if (!outer || outer.now !== AUTO_PROXY_GROUP) return null;
+    }
+    const group = await clashApi('GET', '/proxies/' + encodeURIComponent(AUTO_PROXY_GROUP));
+    const names = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
+    if (!names.length) return null;
+
+    const revision = autoSelectionRevision;
+    const concurrency = Math.max(1, Math.min(
+      16,
+      Number(state.store.getSettings().testConcurrency) || 8,
+      names.length
+    ));
+    let cursor = 0;
+    let bestName = null;
+    let bestDelay = Infinity;
+    async function worker() {
+      while (cursor < names.length && generation === managedAutoGeneration) {
+        const name = names[cursor++];
+        try {
+          const delay = await testNodeDelay(name);
+          if (delay < bestDelay) {
+            bestDelay = delay;
+            bestName = name;
+          }
+        } catch (_) {
+          /* Unreachable nodes do not participate in this election. */
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency }, worker));
+    if (
+      !bestName ||
+      generation !== managedAutoGeneration ||
+      revision !== autoSelectionRevision
+    ) return null;
+    return queueAutoCandidate(bestName, revision);
+  })().finally(() => {
+    if (managedAutoRun && managedAutoRun.token === token) managedAutoRun = null;
+  });
+  managedAutoRun = { token, generation, force, promise };
+  return promise;
+}
+
+function stopManagedAutoSelection() {
+  managedAutoGeneration++;
+  autoSelectionRevision++;
+  if (managedAutoTimer) clearTimeout(managedAutoTimer);
+  managedAutoTimer = null;
+  managedAutoRun = null;
+}
+
+function startManagedAutoSelection() {
+  stopManagedAutoSelection();
+  if (!usesManagedAutoSelection()) return;
+  const generation = managedAutoGeneration;
+  const tick = async () => {
+    managedAutoTimer = null;
+    try { await refreshManagedAutoSelection({ generation }); } catch (_) {}
+    if (
+      generation !== managedAutoGeneration ||
+      !state.singbox.isRunning() ||
+      !usesManagedAutoSelection()
+    ) return;
+    managedAutoTimer = setTimeout(tick, MANAGED_AUTO_INTERVAL_MS);
+    if (managedAutoTimer.unref) managedAutoTimer.unref();
+  };
+  managedAutoTimer = setTimeout(tick, 250);
+  if (managedAutoTimer.unref) managedAutoTimer.unref();
+}
+
+/** Switch the outer proxy selector live via the Clash API. */
 let selectorTail = Promise.resolve();
 function setClashSelector(name) {
-  const select = () => clashApi('PUT', '/proxies/' + encodeURIComponent('🚀 Proxy'), { name });
+  const select = async () => {
+    const result = await clashApi('PUT', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP), { name });
+    if (name === AUTO_PROXY_GROUP && usesManagedAutoSelection()) {
+      refreshManagedAutoSelection({ force: true }).catch(() => null);
+    }
+    return result;
+  };
   const operation = selectorTail.then(select, select);
   selectorTail = operation.catch(() => {});
   return operation;
@@ -1898,6 +2030,7 @@ module.exports = {
   startProxyGuard,
   stopProxyGuard,
   testNodeDelay,
+  applyMeasuredAutoCandidate,
   clashApi,
   setClashSelector,
   setProxyMode,

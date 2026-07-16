@@ -39,8 +39,14 @@ function pickLatestTag(tags) {
 }
 
 /** HTTPS GET → parsed JSON, proxy-first with direct fallback. */
-async function getJson(url, proxyPort, log, headers = {}) {
-  const { body } = await fetch.getBufferWithFallback(url, { proxyPort, log, headers });
+async function getJson(url, proxyPort, log, headers = {}, options = {}) {
+  const { body } = await fetch.getBufferWithFallback(url, {
+    proxyPort,
+    log,
+    headers,
+    signal: options.signal,
+    maxBytes: 8 * 1024 * 1024,
+  });
   return JSON.parse(body.toString('utf-8'));
 }
 
@@ -50,20 +56,22 @@ async function getJson(url, proxyPort, log, headers = {}) {
  *   `release` is the full GitHub release object only when the API answered
  *   (the jsDelivr path knows tags, not assets).
  */
-async function latestReleaseTag(repo, proxyPort = 0, log = () => {}) {
+async function latestReleaseTag(repo, proxyPort = 0, log = () => {}, options = {}) {
   try {
     const rel = await getJson(
       `https://api.github.com/repos/${repo}/releases/latest`,
       proxyPort,
       log,
-      { Accept: 'application/vnd.github+json' }
+      { Accept: 'application/vnd.github+json' },
+      options
     );
     if (rel.tag_name) return { tag: rel.tag_name, release: rel, source: 'github' };
     throw new Error(rel.message || 'no tag_name in the API response');
   } catch (e) {
+    if (options.signal && options.signal.aborted) throw e;
     log(`[gui] GitHub API lookup failed for ${repo} (${e.message}); trying jsDelivr`);
   }
-  const data = await getJson(`https://data.jsdelivr.com/v1/packages/gh/${repo}`, proxyPort, log);
+  const data = await getJson(`https://data.jsdelivr.com/v1/packages/gh/${repo}`, proxyPort, log, {}, options);
   const tag = pickLatestTag((data.versions || []).map((v) => v.version));
   if (!tag) throw new Error(`no release tags for ${repo} via jsDelivr`);
   return { tag, release: null, source: 'jsdelivr' };

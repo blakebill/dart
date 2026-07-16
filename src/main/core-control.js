@@ -5,8 +5,8 @@ const fs = require('fs');
 const http = require('http');
 const { app } = require('electron');
 
-const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus, refreshTray } = require('./state');
-const { isWindowsAdmin, ensureAdminForTun } = require('./admin');
+const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, sendStatus, refreshTray } = require('./state');
+const { isWindowsAdmin, isWindowsAdminSync, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
 const { buildSingboxConfig, buildMihomoConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
 const { geoDataUrls } = require('./singbox');
@@ -16,6 +16,7 @@ const proxy = require('./proxy');
 const fetch = require('./fetch');
 const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
 const { buildDelayApiPath } = require('./delay');
+const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 /**
  * Core control: everything that drives the sing-box core — building the
@@ -30,6 +31,90 @@ const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
 const MAX_CLASH_RESPONSE_BYTES = 32 * 1024 * 1024;
 let tunWasActive = false;
 let tunAdaptersClean = false;
+const remoteUpdateTokens = new Map();
+let remoteUpdateEpoch = 0;
+let lifecycleClosing = false;
+let staleProxyHealPromise = null;
+let configMutationTail = Promise.resolve();
+let customRuleMutationTail = Promise.resolve();
+
+function assertLifecycleOpen() {
+  if (!lifecycleClosing) return;
+  const error = new Error('app is shutting down');
+  error.code = 'DART_SHUTDOWN';
+  throw error;
+}
+
+/** Serialize persisted config changes through their restart/rollback phase. */
+function queueConfigMutation(operation) {
+  const apply = () => {
+    assertLifecycleOpen();
+    return operation();
+  };
+  const task = configMutationTail.then(apply, apply);
+  configMutationTail = task.catch(() => {});
+  return task;
+}
+
+/** Keep binary rule-set file snapshots ordered without blocking other downloads. */
+function queueCustomRuleMutation(operation) {
+  const apply = () => {
+    assertLifecycleOpen();
+    return operation();
+  };
+  const task = customRuleMutationTail.then(apply, apply);
+  customRuleMutationTail = task.catch(() => {});
+  return task;
+}
+
+function remoteUpdateKey(scope, id) {
+  return `${scope}:${id}`;
+}
+
+/** Last-started manual update wins; background updates yield to active work. */
+function beginRemoteUpdate(scope, id, { background = false } = {}) {
+  const key = remoteUpdateKey(scope, id);
+  if (background && remoteUpdateTokens.has(key)) return null;
+  const token = Symbol(key);
+  remoteUpdateTokens.set(key, token);
+  return token;
+}
+
+function assertRemoteUpdate(scope, id, token) {
+  if (!token || remoteUpdateTokens.get(remoteUpdateKey(scope, id)) !== token) {
+    throw new Error('a newer update superseded this request');
+  }
+}
+
+function finishRemoteUpdate(scope, id, token) {
+  const key = remoteUpdateKey(scope, id);
+  if (remoteUpdateTokens.get(key) === token) remoteUpdateTokens.delete(key);
+}
+
+function cancelRemoteUpdate(scope, id) {
+  remoteUpdateTokens.delete(remoteUpdateKey(scope, id));
+}
+
+function cancelAllRemoteUpdates() {
+  remoteUpdateEpoch += 1;
+  remoteUpdateTokens.clear();
+}
+
+function responseLatch(resolve, reject) {
+  let settled = false;
+  return {
+    ok(value) {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    },
+    fail(error) {
+      if (settled) return;
+      settled = true;
+      reject(error instanceof Error ? error : new Error(String(error || 'request failed')));
+    },
+  };
+}
 
 // Locally served control panel: the active core hosts zashboard at
 // http://127.0.0.1:<api-port>/ui/ — the same origin as the Clash API. That
@@ -37,6 +122,7 @@ let tunAdaptersClean = false;
 // and Chrome blocking public-site requests to 127.0.0.1 ("failed to fetch").
 // Both core configs use Zashboard's latest-release URL for the first download.
 const PANEL_UI_URL = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip';
+const SYSTEM_PROXY_OWNER_KEY = 'ownedSystemProxyServer';
 
 /** The control panel served at /ui: { dir, downloadUrl }. */
 function panelUiInfo() {
@@ -49,6 +135,39 @@ function panelUiInfo() {
 /** The local proxy port to tunnel rule-set downloads through (0 = direct). */
 function currentProxyPort() {
   return state.singbox && state.singbox.isRunning() ? state.store.getSettings().mixedPort || 0 : 0;
+}
+
+/** Exact endpoint Dart persisted before changing the Windows proxy registry. */
+function persistedSystemProxyOwnership() {
+  return state.store ? state.store.get(SYSTEM_PROXY_OWNER_KEY) || null : null;
+}
+
+function forgetSystemProxyOwnership(expectedServer = null) {
+  if (!state.store) return false;
+  const current = persistedSystemProxyOwnership();
+  if (expectedServer && current && current !== expectedServer) return false;
+  state.store.set(SYSTEM_PROXY_OWNER_KEY, null);
+  return true;
+}
+
+/** Persist ownership first, so a crash after the registry write is recoverable. */
+async function enableOwnedSystemProxy(port) {
+  if (process.platform !== 'win32') return false;
+  const server = `127.0.0.1:${port}`;
+  state.store.set(SYSTEM_PROXY_OWNER_KEY, server);
+  try {
+    const enabled = await proxy.enableSystemProxy('127.0.0.1', port);
+    if (!enabled) {
+      forgetSystemProxyOwnership(server);
+      return false;
+    }
+    state.systemProxyOn = true;
+    state.systemProxyServer = server;
+    return true;
+  } catch (error) {
+    try { forgetSystemProxyOwnership(server); } catch (recoveryError) { error.recoveryError = recoveryError; }
+    throw error;
+  }
 }
 
 function detectCustomRuleSetFormat(url) {
@@ -68,19 +187,179 @@ function normalizeCustomRuleSetFormat(format, url) {
   return url ? detectCustomRuleSetFormat(url) : 'clash';
 }
 
+function customRuleSetSourceKey(item) {
+  if (!item) return '';
+  return JSON.stringify([
+    String(item.url || ''),
+    normalizeCustomRuleSetFormat(item.format, item.url),
+    String(item.target || 'proxy'),
+  ]);
+}
+
+function mergeProcessedCustomRuleSet(latest, processed) {
+  const next = {
+    ...latest,
+    format: processed.format,
+    kind: processed.kind,
+    count: processed.count ?? null,
+    error: processed.error || null,
+    updatedAt: processed.updatedAt || Date.now(),
+  };
+  delete next.rule;
+  delete next.rules;
+  if (Object.prototype.hasOwnProperty.call(processed, 'rule')) next.rule = processed.rule;
+  if (Object.prototype.hasOwnProperty.call(processed, 'rules')) next.rules = processed.rules;
+  return next;
+}
+
+function restoreAutoUpdatedSubscription(snapshot, applied) {
+  const latest = state.store.getSubscription(snapshot.id, { includeRaw: true });
+  if (
+    !latest ||
+    latest.url !== applied.sourceUrl ||
+    latest.updatedAt !== applied.updatedAt ||
+    subscription.configFingerprint(latest) !== applied.configHash
+  ) {
+    throw new Error('config changed again before auto-update rollback');
+  }
+  state.store.upsertSubscription({
+    ...latest,
+    nodes: snapshot.nodes || [],
+    format: snapshot.format || 'unknown',
+    clashRules: snapshot.clashRules || [],
+    clashRuleProviders: snapshot.clashRuleProviders || {},
+    userInfo: Object.prototype.hasOwnProperty.call(snapshot, 'userInfo') ? snapshot.userInfo : null,
+    configHash: snapshot.configHash || subscription.configFingerprint(snapshot),
+    updatedAt: snapshot.updatedAt || 0,
+    autoUpdateLastAttemptAt: Date.now(),
+    raw: Object.prototype.hasOwnProperty.call(snapshot, 'raw') ? snapshot.raw : '',
+  });
+}
+
+function snapshotFile(target, suffix) {
+  const targetExisted = !!(target && fs.existsSync(target));
+  let backup = null;
+  if (targetExisted) {
+    backup = uniqueSibling(target, suffix);
+    try {
+      fs.linkSync(target, backup);
+    } catch (_) {
+      fs.copyFileSync(target, backup);
+    }
+  }
+  return { target, backup, targetExisted, appliedFingerprint: null };
+}
+
+function discardFileSnapshot(snapshot) {
+  if (!snapshot || !snapshot.backup) return;
+  try { fs.unlinkSync(snapshot.backup); } catch (_) {}
+  snapshot.backup = null;
+}
+
+function restoreFileSnapshot(snapshot) {
+  if (!snapshot || !snapshot.target) return;
+  if (snapshot.targetExisted) {
+    if (!snapshot.backup || !fs.existsSync(snapshot.backup)) {
+      throw new Error('update rollback file is missing: ' + path.basename(snapshot.target));
+    }
+    replaceFileSync(snapshot.backup, snapshot.target);
+    snapshot.backup = null;
+  } else {
+    try { fs.unlinkSync(snapshot.target); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function snapshotCustomRuleSetUpdate(record) {
+  const binaryTouched = normalizeCustomRuleSetFormat(record.format, record.url) === 'sing-box';
+  const target = binaryTouched
+    ? path.join(state.singbox.ensureCoreDir('sing-box'), customRuleSetFileName(record.id))
+    : null;
+  return { record, ...snapshotFile(target, 'auto-update-backup'), applied: null };
+}
+
+function discardCustomRuleSetUpdateSnapshot(snapshot) {
+  discardFileSnapshot(snapshot);
+}
+
+function restoreCustomRuleSetUpdateFile(snapshot) {
+  restoreFileSnapshot(snapshot);
+}
+
+function restoreAutoUpdatedCustomRuleSets(snapshots) {
+  const latestRecords = snapshots.map((snapshot) => {
+    const latest = state.store.getCustomRuleSet(snapshot.record.id);
+    if (
+      !latest ||
+      !snapshot.applied ||
+      customRuleSetSourceKey(latest) !== snapshot.applied.sourceKey ||
+      latest.updatedAt !== snapshot.applied.updatedAt
+    ) {
+      const error = new Error('remote rule changed again before auto-update rollback');
+      error.code = 'DART_UPDATE_SUPERSEDED';
+      throw error;
+    }
+    return latest;
+  });
+
+  snapshots.forEach((snapshot, index) => {
+    restoreCustomRuleSetUpdateFile(snapshot);
+    const previous = snapshot.record;
+    state.store.upsertCustomRuleSet({
+      ...latestRecords[index],
+      format: previous.format,
+      kind: previous.kind,
+      count: previous.count ?? null,
+      error: previous.error || null,
+      updatedAt: previous.updatedAt || 0,
+      autoUpdateLastAttemptAt: Date.now(),
+      rule: previous.rule || null,
+      rules: Array.isArray(previous.rules) ? previous.rules : [],
+    });
+  });
+}
+
 /** The id of the subscription (profile) currently in use; falls back to the first. */
+let sessionActiveSubId = null;
 function getActiveSubId() {
   const subs = state.store.listSubscriptions();
-  if (!subs.length) return null;
+  if (!subs.length) {
+    sessionActiveSubId = null;
+    return null;
+  }
   const active = state.store.get('activeSub');
-  if (active && subs.some((s) => s.id === active)) return active;
+  if (active && subs.some((s) => s.id === active)) {
+    sessionActiveSubId = active;
+    return active;
+  }
+  if (sessionActiveSubId && subs.some((s) => s.id === sessionActiveSubId)) {
+    return sessionActiveSubId;
+  }
   // Legacy stores (pre-profiles) or a stale pointer: pin the fallback choice.
   // Left unpinned, `activeSub` stays null while the core runs subs[0] — and
   // the next sub:add would silently make the NEW subscription active without
   // a restart (UI shows its nodes, the Clash API doesn't know them: delay
   // tests "time out" and selecting a node fails with 400).
-  state.store.set('activeSub', subs[0].id);
-  return subs[0].id;
+  sessionActiveSubId = subs[0].id;
+  try {
+    state.store.set('activeSub', sessionActiveSubId);
+  } catch (error) {
+    // A transient disk failure must not prevent an otherwise valid profile from
+    // starting or let a later sub:add switch the live profile in this session.
+    sendLog('[gui] failed to persist the active config fallback: ' + error.message);
+  }
+  return sessionActiveSubId;
+}
+
+function persistLastRunning(value) {
+  try {
+    state.store.set('lastRunning', value);
+  } catch (error) {
+    // The process has already changed state. Keep renderer/tray state truthful
+    // and report only the auto-resume preference write as degraded.
+    sendLog('[gui] failed to persist the core auto-resume state: ' + error.message);
+  }
 }
 
 /** Load the active profile and migrate legacy duplicate/reserved node names. */
@@ -89,10 +368,17 @@ function getActiveSubscription() {
   const sub = id ? state.store.getSubscription(id) : null;
   if (!sub || !Array.isArray(sub.nodes)) return sub;
   const nodes = subscription.uniqueNodeNames(sub.nodes);
-  if (nodes.some((node, index) => node.name !== sub.nodes[index].name)) {
+  if (nodes.length !== sub.nodes.length || nodes.some((node, index) => node.name !== (sub.nodes[index] && sub.nodes[index].name))) {
     sub.nodes = nodes;
     sub.configHash = subscription.configFingerprint(sub);
-    state.store.upsertSubscription(sub);
+    try {
+      state.store.upsertSubscription(sub);
+    } catch (error) {
+      // Name normalization is enough to build a valid runtime config. A
+      // read-only disk should only postpone this legacy migration, not prevent
+      // the otherwise usable profile from starting in the current session.
+      sendLog('[gui] failed to persist normalized node names: ' + error.message);
+    }
   }
   return sub;
 }
@@ -150,7 +436,7 @@ function customRuleSetFileName(id) {
  * Build extraRules/extraRuleSets from the user's local rules + pre-processed
  * custom rule-sets. Local rules come first (most specific user intent).
  */
-function collectCustomRules() {
+function collectCustomRules(coreType = 'sing-box') {
   const extraRules = [];
   const extraRuleSets = [];
   for (const lr of state.store.get('localRules') || []) {
@@ -158,12 +444,19 @@ function collectCustomRules() {
     const rule = buildLocalRuleObject(lr);
     if (rule) extraRules.push(rule);
   }
-  for (const c of state.store.get('customRuleSets') || []) {
-    if (c.enabled === false) continue;
+  for (const meta of state.store.listCustomRuleSets()) {
+    if (meta.enabled === false) continue;
+    const c = state.store.getCustomRuleSet(meta.id);
+    if (!c) continue;
     if (c.kind === 'inline') {
-      if (Array.isArray(c.rules) && c.rules.length) extraRules.push(...c.rules);
-      else if (c.rule) extraRules.push(...splitInlineRule(c.rule));
-    } else if (c.kind === 'ruleset') {
+      if (Array.isArray(c.rules) && c.rules.length) {
+        for (const rule of c.rules) extraRules.push(rule);
+      } else if (c.rule) {
+        for (const rule of splitInlineRule(c.rule)) extraRules.push(rule);
+      }
+    } else if (c.kind === 'ruleset' && coreType !== 'mihomo') {
+      // Mihomo cannot consume sing-box .srs binaries. Emitting a RULE-SET
+      // matcher without a Mihomo rule-provider makes the whole config invalid.
       const p = path.join(state.singbox.coreDir('sing-box'), customRuleSetFileName(c.id));
       if (state.singbox._validSrs(p)) {
         const tag = 'custom-' + c.id;
@@ -176,7 +469,7 @@ function collectCustomRules() {
 }
 
 /** Download + convert one custom rule-set, returning the processed record. */
-async function processCustomRuleSet(c) {
+async function processCustomRuleSet(c, { beforeCommit } = {}) {
   const proxyPort = currentProxyPort();
   const format = normalizeCustomRuleSetFormat(c.format, c.url);
   if (format === 'sing-box') {
@@ -188,7 +481,8 @@ async function processCustomRuleSet(c) {
       if (!state.singbox._validSrs(tmp)) {
         throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
       }
-      fs.renameSync(tmp, dest);
+      if (beforeCommit) await beforeCommit();
+      replaceFileSync(tmp, dest);
     } finally {
       try { fs.unlinkSync(tmp); } catch (_) {}
     }
@@ -196,10 +490,12 @@ async function processCustomRuleSet(c) {
   }
   const { body } = await fetch.getBufferWithFallback(c.url, {
     proxyPort,
+    maxBytes: 32 * 1024 * 1024,
     headers: { 'User-Agent': 'clash-verge/v2.0.2' },
   });
   const { rule, rules, count } = ruleListToSingboxRule(body.toString('utf-8'), c.target);
   if (!rules.length) throw new Error('no rules parsed from the list (unsupported format?)');
+  if (beforeCommit) await beforeCommit();
   return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
 }
 
@@ -218,8 +514,8 @@ function buildCurrentConfig(coreType = null) {
   // default — CN/private direct, everything else proxied — so the user's local
   // rules and custom rule-sets are what actually steer routing.
   const clashRules = settings.useBuiltinRules ? [] : allRules;
-  const { extraRules, extraRuleSets } = collectCustomRules();
-  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.mihomoGeoDataReady() : false;
+  const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
+  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.mihomoGeoDataReady(false) : false;
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
   const commonOpts = {
@@ -267,7 +563,7 @@ function currentRouteInfo() {
   // rules are dropped so the Rules view shows what actually runs.
   const settings = state.store.getSettings();
   const clashRules = settings.useBuiltinRules ? [] : rules;
-  const { extraRules, extraRuleSets } = collectCustomRules();
+  const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
   // Only the route is needed here, so skip converting every node to an outbound.
   const route = buildRoute({
     ruleSetDir: state.singbox.resolveRuleSetDir(),
@@ -292,6 +588,14 @@ function ruleGroupInfo() {
 }
 
 async function startCoreNow() {
+  assertLifecycleOpen();
+  // A fast manual Start can otherwise race the startup stale-proxy cleanup:
+  // the cleanup may observe and disable the freshly enabled local proxy.
+  if (staleProxyHealPromise) await staleProxyHealPromise;
+  assertLifecycleOpen();
+  if (state.singbox.getCoreType() === 'mihomo') {
+    await state.singbox.validateMihomoGeoData();
+  }
   const { config, settings } = buildCurrentConfig();
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
@@ -299,6 +603,7 @@ async function startCoreNow() {
   if ((settings.enableTun || tunWasActive) && !tunAdaptersClean) {
     tunAdaptersClean = await cleanupTunAdapters(sendLog);
   }
+  assertLifecycleOpen();
   await state.singbox.start(config);
   tunWasActive = !!settings.enableTun;
   if (tunWasActive) {
@@ -309,23 +614,27 @@ async function startCoreNow() {
   }
   if (settings.autoSetSystemProxy && !settings.enableTun) {
     try {
-      await proxy.enableSystemProxy('127.0.0.1', settings.mixedPort);
-      state.systemProxyOn = true;
-      startProxyGuard(settings.mixedPort);
+      const enabled = await enableOwnedSystemProxy(settings.mixedPort);
+      if (enabled) startProxyGuard(settings.mixedPort);
     } catch (e) {
       sendLog('[gui] failed to set system proxy: ' + e.message);
     }
   }
-  state.store.set('lastRunning', true);
+  persistLastRunning(true);
   sendStatus();
   startTrafficStream();
-  maybeFetchGeodata();
-  // Pull anything the subscription's rules reference but that isn't on disk yet
-  // — GEOSITE/GEOIP categories and RULE-SET providers — now that the proxy can
-  // carry the download. Best-effort, non-blocking; applies on the next start.
-  const { rules, providers } = effectiveSub();
-  maybeFetchGeoCategories(rules);
-  maybeFetchRuleProviders(rules, providers);
+  try {
+    maybeFetchGeodata();
+    // Pull anything the subscription's rules reference but that isn't on disk
+    // yet. This housekeeping is non-fatal and applies on the next start.
+    if (settings.coreType === 'sing-box') {
+      const { rules, providers } = effectiveSub();
+      maybeFetchGeoCategories(rules);
+      maybeFetchRuleProviders(rules, providers);
+    }
+  } catch (error) {
+    sendLog('[gui] post-start rule data check failed (non-fatal): ' + error.message);
+  }
 }
 
 // Self-heal for installs that booted without geodata (e.g. dev runs, or a
@@ -335,6 +644,7 @@ async function startCoreNow() {
 // start gets the full CN-direct routing. Best-effort and non-blocking; it
 // does not restart the running core.
 const geodataFetchTried = {};
+const backgroundFetchKeys = new Set();
 function maybeFetchGeodata() {
   const key = state.singbox.getCoreType();
   if (geodataFetchTried[key] || geoDataReady()) return;
@@ -398,15 +708,31 @@ function availableGeoSet(clashRules) {
  * (isolating per-item failures), count successes, log a summary, and never
  * reject into the caller. `perItem` returns true when it fetched something.
  */
-function runBackgroundFetch(label, items, perItem) {
-  if (!items.length) return;
+function runBackgroundFetch(label, items, perItem, keyFor) {
+  const admitted = [];
+  for (const item of items) {
+    const key = keyFor ? keyFor(item) : null;
+    if (key && backgroundFetchKeys.has(key)) continue;
+    if (key) backgroundFetchKeys.add(key);
+    admitted.push({ item, key });
+  }
+  if (!admitted.length) return;
   (async () => {
     let got = 0;
-    for (const item of items) {
-      try { if (await perItem(item)) got += 1; } catch (_) { /* skip a failed item */ }
+    for (const entry of admitted) {
+      try {
+        if (await perItem(entry.item)) got += 1;
+      } catch (_) {
+        /* skip a failed item */
+      } finally {
+        if (entry.key) backgroundFetchKeys.delete(entry.key);
+      }
     }
     if (got) sendLog(`[gui] fetched ${got} ${label}; restart to apply`);
-  })().catch((e) => sendLog(`[gui] ${label} fetch failed (non-fatal): ` + e.message));
+  })().catch((e) => {
+    for (const entry of admitted) if (entry.key) backgroundFetchKeys.delete(entry.key);
+    sendLog(`[gui] ${label} fetch failed (non-fatal): ` + e.message);
+  });
 }
 
 /**
@@ -415,7 +741,7 @@ function runBackgroundFetch(label, items, perItem) {
  * Returns true when a valid .srs landed at dest.
  */
 async function fetchSrs(repo, file, dest, proxyPort) {
-  const tmp = dest + '.tmp';
+  const tmp = uniqueSibling(dest, 'tmp');
   for (const url of geoDataUrls(repo, file)) {
     try {
       await fetch.downloadWithFallback(url, tmp, { proxyPort });
@@ -424,7 +750,13 @@ async function fetchSrs(repo, file, dest, proxyPort) {
       continue;
     }
     if (state.singbox._validSrs(tmp)) {
-      try { fs.renameSync(tmp, dest); return true; } catch (_) { return false; }
+      try {
+        replaceFileSync(tmp, dest);
+        return true;
+      } catch (_) {
+        try { fs.unlinkSync(tmp); } catch (_) {}
+        return false;
+      }
     }
     try { fs.unlinkSync(tmp); } catch (_) {}
   }
@@ -442,8 +774,11 @@ function maybeFetchGeoCategories(clashRules) {
     (c) => !state.singbox._validSrs(path.join(dir, c.file))
   );
   const proxyPort = currentProxyPort();
-  runBackgroundFetch('subscription rule-set(s)', missing, (c) =>
-    fetchSrs(c.repo, c.file, path.join(dir, c.file), proxyPort)
+  runBackgroundFetch(
+    'subscription rule-set(s)',
+    missing,
+    (c) => fetchSrs(c.repo, c.file, path.join(dir, c.file), proxyPort),
+    (c) => 'geo:' + path.join(dir, c.file)
   );
 }
 
@@ -504,6 +839,7 @@ function maybeFetchRuleProviders(clashRules, providers) {
   runBackgroundFetch('rule-provider(s)', todo, async ({ p, f }) => {
     const { body } = await fetch.getBufferWithFallback(p.url, {
       proxyPort,
+      maxBytes: 32 * 1024 * 1024,
       headers: { 'User-Agent': 'clash-verge/v2.0.2' },
     });
     const m = parseRuleList(body.toString('utf-8'));
@@ -512,12 +848,12 @@ function maybeFetchRuleProviders(clashRules, providers) {
     const tmp = f + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(m), 'utf-8');
-      fs.renameSync(tmp, f);
+      replaceFileSync(tmp, f);
     } finally {
       try { fs.unlinkSync(tmp); } catch (_) {}
     }
     return true;
-  });
+  }, ({ f }) => 'provider:' + f);
 }
 
 /**
@@ -531,18 +867,30 @@ async function stopCoreNow(remember) {
   stopTrafficStream();
   stopProxyGuard();
   if (state.systemProxyOn) {
+    const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
+    let released = true;
     try {
-      await proxy.disableSystemProxy();
+      if (ownedServer) await proxy.disableSystemProxyIfOurs(ownedServer);
+      else sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
     } catch (e) {
       sendLog('[gui] failed to disable system proxy: ' + e.message);
+      released = !!ownedServer && proxy.disableSystemProxySyncIfOurs(ownedServer);
+      if (released) sendLog('[gui] cleared the system proxy using the synchronous fallback');
+      else sendLog('[gui] retained system proxy ownership so shutdown can retry cleanup');
     }
-    state.systemProxyOn = false;
+    if (released) {
+      try { forgetSystemProxyOwnership(ownedServer); } catch (error) {
+        sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
+      }
+      state.systemProxyOn = false;
+      state.systemProxyServer = null;
+    }
   }
   try {
     await state.singbox.stop();
     if (tunWasActive) tunAdaptersClean = await cleanupTunAdapters(sendLog);
     tunWasActive = false;
-    if (remember) state.store.set('lastRunning', false);
+    if (remember) persistLastRunning(false);
   } finally {
     state.coreStopping = false;
     sendStatus();
@@ -567,11 +915,12 @@ function startProxyGuard(port) {
       const active = await proxy.isSystemProxyActive(server);
       if (generation !== proxyGuardGeneration || !state.systemProxyOn) return;
       if (!active) {
-        await proxy.enableSystemProxy('127.0.0.1', port);
+        const restored = await proxy.enableSystemProxy('127.0.0.1', port);
+        if (!restored) return;
         // Stop may have landed while reg.exe was still writing. Clear the
         // just-written value again instead of leaving a dead local proxy.
         if (!state.systemProxyOn) {
-          await proxy.disableSystemProxy();
+          await proxy.disableSystemProxyIfOurs(server);
           return;
         }
         sendLog('[gui] system proxy was changed by another app; restored');
@@ -602,33 +951,108 @@ function queueLifecycle(operation) {
 }
 
 function startCore() {
-  return queueLifecycle(() => (state.singbox.isRunning() ? true : startCoreNow()));
+  try {
+    assertLifecycleOpen();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return queueLifecycle(() => {
+    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    return state.singbox.isRunning() ? true : startCoreNow();
+  });
 }
 
-function stopCore(remember) {
-  return queueLifecycle(() => stopCoreNow(remember));
+function stopCore(remember, { allowDuringCoreUpdate = false } = {}) {
+  return queueLifecycle(() => {
+    if (!allowDuringCoreUpdate && state.singbox.isCoreDownloadInProgress()) {
+      throw new Error('wait for the core update to finish');
+    }
+    return stopCoreNow(remember);
+  });
+}
+
+/** Explicit user restart: stop and start as one lifecycle transaction. */
+function restartCore() {
+  return queueLifecycle(async () => {
+    assertLifecycleOpen();
+    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    if (state.singbox.isRunning()) await stopCoreNow();
+    return startCoreNow();
+  });
+}
+
+/** Apply a manual system-proxy toggle in the same queue as core start/stop. */
+function setSystemProxyEnabled(enable) {
+  return queueLifecycle(async () => {
+    if (enable) {
+      if (!state.singbox.isRunning()) throw new Error('start the core before enabling the system proxy');
+      const port = state.store.getSettings().mixedPort;
+      const enabled = await enableOwnedSystemProxy(port);
+      if (enabled) startProxyGuard(port);
+    } else {
+      stopProxyGuard();
+      const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
+      if (ownedServer) await proxy.disableSystemProxyIfOurs(ownedServer);
+      else if (state.systemProxyOn) {
+        sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
+      }
+      try { forgetSystemProxyOwnership(ownedServer); } catch (error) {
+        sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
+      }
+      state.systemProxyOn = false;
+      state.systemProxyServer = null;
+    }
+    sendStatus();
+    return state.systemProxyOn;
+  });
 }
 
 async function cleanup() {
-  try {
-    await stopCore();
-  } catch (e) {
-    /* ignore */
+  lifecycleClosing = true;
+  cancelAllRemoteUpdates();
+  if (typeof state.cancelPendingUpdates === 'function') {
+    await state.cancelPendingUpdates();
   }
+  if (autoUpdateTimer) {
+    clearInterval(autoUpdateTimer);
+    autoUpdateTimer = null;
+  }
+  if (geoInitialTimer) {
+    clearTimeout(geoInitialTimer);
+    geoInitialTimer = null;
+  }
+  if (geoTimer) {
+    clearInterval(geoTimer);
+    geoTimer = null;
+  }
+  proxy.beginShutdown();
+  await stopCore(undefined, { allowDuringCoreUpdate: true });
 }
 
 /** Restart the core if it is running, so config changes (e.g. rules) apply. */
 let restartPromise = null;
+let restartGeneration = 0;
 async function restartIfRunning() {
+  restartGeneration += 1;
   if (restartPromise) return restartPromise;
   restartPromise = queueLifecycle(async () => {
+    let appliedGeneration = 0;
+    let restarts = 0;
     try {
-      if (!state.singbox.isRunning()) return;
-      await stopCoreNow();
-      await startCoreNow();
-      sendLog('[gui] core restarted to apply changes');
+      if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+      while (appliedGeneration !== restartGeneration) {
+        appliedGeneration = restartGeneration;
+        if (!state.singbox.isRunning()) return false;
+        await stopCoreNow();
+        await startCoreNow();
+        restarts += 1;
+      }
+      sendLog(`[gui] core restarted to apply changes${restarts > 1 ? ` (${restarts} passes)` : ''}`);
+      return true;
     } catch (e) {
       sendLog('[gui] restart to apply changes failed: ' + e.message);
+      sendStatus();
+      throw e;
     } finally {
       restartPromise = null;
     }
@@ -643,6 +1067,7 @@ async function restartIfRunning() {
  */
 function testNodeDelay(name) {
   return new Promise((resolve, reject) => {
+    const done = responseLatch(resolve, reject);
     const settings = state.store.getSettings();
     // Keep `url` first: this is the documented Clash API shape and avoids older
     // compatibility layers silently falling back to their built-in test URL.
@@ -665,8 +1090,8 @@ function testNodeDelay(name) {
           bytes += c.length;
           if (bytes > 1024 * 1024) {
             tooLarge = true;
+            done.fail(new Error('delay response too large'));
             res.destroy();
-            reject(new Error('delay response too large'));
             return;
           }
           chunks.push(c);
@@ -675,15 +1100,17 @@ function testNodeDelay(name) {
           if (tooLarge) return;
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            if (typeof data.delay === 'number') resolve(data.delay);
-            else reject(new Error(data.message || 'timeout'));
+            if (typeof data.delay === 'number') done.ok(data.delay);
+            else done.fail(new Error(data.message || 'timeout'));
           } catch (e) {
-            reject(new Error('timeout'));
+            done.fail(new Error('timeout'));
           }
         });
+        res.once('aborted', () => done.fail(new Error('delay response aborted')));
+        res.once('error', done.fail);
       }
     );
-    req.on('error', reject);
+    req.on('error', done.fail);
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.end();
   });
@@ -692,6 +1119,7 @@ function testNodeDelay(name) {
 /** Generic Clash API request (sing-box external controller). Resolves parsed JSON. */
 function clashApi(method, apiPath, body) {
   return new Promise((resolve, reject) => {
+    const done = responseLatch(resolve, reject);
     const settings = state.store.getSettings();
     const payload = body ? JSON.stringify(body) : null;
     const headers = { Authorization: 'Bearer ' + state.clashApiSecret };
@@ -702,34 +1130,50 @@ function clashApi(method, apiPath, body) {
     const req = http.request(
       { host: '127.0.0.1', port: settings.clashApiPort, path: apiPath, method, headers, timeout: 6000, agent: clashAgent },
       (res) => {
-        const chunks = [];
+        res.once('aborted', () => done.fail(new Error('clash api response aborted')));
+        res.once('error', done.fail);
+        const contentLength = parseInt((res.headers && res.headers['content-length']) || '0', 10);
+        if (contentLength > MAX_CLASH_RESPONSE_BYTES) {
+          done.fail(new Error('clash api response too large'));
+          res.resume();
+          return;
+        }
+        const bodyBuffer = contentLength > 0 ? Buffer.allocUnsafe(contentLength) : null;
+        const chunks = bodyBuffer ? null : [];
         let bytes = 0;
         let tooLarge = false;
         res.on('data', (c) => {
+          if (tooLarge) return;
+          const offset = bytes;
           bytes += c.length;
-          if (bytes > MAX_CLASH_RESPONSE_BYTES) {
+          if (bytes > MAX_CLASH_RESPONSE_BYTES || (bodyBuffer && bytes > bodyBuffer.length)) {
             tooLarge = true;
+            done.fail(new Error('clash api response too large'));
             res.destroy();
-            reject(new Error('clash api response too large'));
             return;
           }
-          chunks.push(c);
+          if (bodyBuffer) c.copy(bodyBuffer, offset);
+          else chunks.push(c);
         });
         res.on('end', () => {
           if (tooLarge) return;
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            return reject(new Error('clash api ' + res.statusCode));
+          if (bodyBuffer && bytes !== bodyBuffer.length) {
+            done.fail(new Error('clash api response ended early'));
+            return;
           }
-          const text = Buffer.concat(chunks).toString('utf-8');
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return done.fail(new Error('clash api ' + res.statusCode));
+          }
+          const text = (bodyBuffer || Buffer.concat(chunks)).toString('utf-8');
           try {
-            resolve(text ? JSON.parse(text) : {});
+            done.ok(text ? JSON.parse(text) : {});
           } catch (e) {
-            resolve({});
+            done.fail(new Error('invalid JSON from Clash API'));
           }
         });
       }
     );
-    req.on('error', reject);
+    req.on('error', done.fail);
     req.on('timeout', () => req.destroy(new Error('timeout')));
     if (payload) req.write(payload);
     req.end();
@@ -737,106 +1181,308 @@ function clashApi(method, apiPath, body) {
 }
 
 /** Switch the proxy selector to a given outbound live via the Clash API. */
+let selectorTail = Promise.resolve();
 function setClashSelector(name) {
-  return clashApi('PUT', '/proxies/' + encodeURIComponent('🚀 Proxy'), { name });
+  const select = () => clashApi('PUT', '/proxies/' + encodeURIComponent('🚀 Proxy'), { name });
+  const operation = selectorTail.then(select, select);
+  selectorTail = operation.catch(() => {});
+  return operation;
 }
 
 /**
  * Set the proxy mode (rule / global / direct). Persists it, applies it live via
  * the Clash API when running, refreshes the tray, and notifies the renderer.
  */
-async function setProxyMode(mode) {
-  state.store.updateSettings({ clashMode: mode });
-  if (state.singbox.isRunning()) {
-    try {
-      await clashApi('PATCH', '/configs', { mode });
-    } catch (e) {
-      /* ignore */
+let modeRevision = 0;
+function modeChangeNeedsRestart(coreType, currentMode, nextMode) {
+  return coreType === 'mihomo' && currentMode !== nextMode &&
+    (currentMode === 'block' || nextMode === 'block');
+}
+
+function setProxyMode(mode) {
+  const apply = async () => {
+    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    const previous = state.store.getSettings().clashMode;
+    const running = state.singbox.isRunning();
+    const rebuild = modeChangeNeedsRestart(state.singbox.getCoreType(), previous, mode);
+    if (running && rebuild) {
+      state.store.updateSettings({ clashMode: mode });
+      try {
+        await restartIfRunning();
+      } catch (error) {
+        state.store.updateSettings({ clashMode: previous });
+        // restartIfRunning stops the old core before starting the rebuilt
+        // config. If the new mode fails validation/startup, restore the old
+        // mode and bring that known-good configuration back online.
+        if (!state.singbox.isRunning()) {
+          try {
+            await startCore();
+          } catch (recoveryError) {
+            error.recoveryError = recoveryError;
+            sendLog('[gui] failed to restore the previous proxy mode: ' + recoveryError.message);
+          }
+        }
+        throw error;
+      }
+    } else {
+      if (running) await clashApi('PATCH', '/configs', { mode });
+      state.store.updateSettings({ clashMode: mode });
     }
-  }
-  refreshTray();
-  if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-    state.mainWindow.webContents.send('mode:changed', mode);
-  }
-  return mode;
+    modeRevision += 1;
+    refreshTray();
+    sendToMain('mode:changed', mode);
+    return mode;
+  };
+  return queueConfigMutation(apply);
+}
+
+function getModeRevision() {
+  return modeRevision;
 }
 
 /** Refresh subscriptions + custom rule-sets whose auto-update interval is due (one tick). */
+const AUTO_UPDATE_RETRY_MAX_MS = 5 * 60 * 1000;
+function autoUpdateDue(item, minutes, now = Date.now()) {
+  const intervalMs = minutes * 60000;
+  return minutes > 0 &&
+    now - (item.updatedAt || 0) >= intervalMs &&
+    now - (item.autoUpdateLastAttemptAt || 0) >= Math.min(intervalMs, AUTO_UPDATE_RETRY_MAX_MS);
+}
+
 let autoUpdateRunning = false;
 async function autoUpdateTick() {
-  if (autoUpdateRunning) return;
+  if (lifecycleClosing || autoUpdateRunning) return;
   autoUpdateRunning = true;
   try {
     await runAutoUpdateTick();
+  } catch (error) {
+    // Timer callbacks do not observe returned promises. Keep an unexpected
+    // store/network failure from becoming an unhandled rejection.
+    sendLog('[gui] automatic update pass failed: ' + error.message);
   } finally {
     autoUpdateRunning = false;
   }
 }
 
 async function runAutoUpdateTick() {
+  const epoch = remoteUpdateEpoch;
   const subs = state.store.listSubscriptions();
   let changed = false;
   let activeConfigChanged = false;
+  let activeConfigRollback = null;
   for (const sub of subs) {
+    if (epoch !== remoteUpdateEpoch) return;
     const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
-    if (mins > 0 && sub.url && Date.now() - (sub.updatedAt || 0) >= mins * 60000) {
+    if (sub.url && autoUpdateDue(sub, mins)) {
+      const token = beginRemoteUpdate('subscription', sub.id, { background: true });
+      if (!token) continue;
+      let sourceUrl = sub.url;
       try {
         const current = state.store.getSubscription(sub.id);
-        if (!current) continue;
+        if (!current || !current.url) continue;
+        sourceUrl = current.url;
         const proxyPort = current.updateViaProxy ? currentProxyPort() : 0;
-        const r = await subscription.fetchSubscription(current.url, sendLog, { proxyPort });
-        if (r.nodes.length) {
+        const r = await subscription.fetchSubscription(sourceUrl, sendLog, { proxyPort });
+        if (!r.nodes.length) throw new Error('no nodes parsed from the updated config');
+        const applied = await queueConfigMutation(() => {
+          assertRemoteUpdate('subscription', sub.id, token);
+          const latest = state.store.getSubscription(current.id);
+          if (!latest || latest.url !== sourceUrl) return null;
+          const previous = state.store.getSubscription(current.id, { includeRaw: true }) || current;
           const nextHash = subscription.configFingerprint(r);
-          const configChanged = (current.configHash || subscription.configFingerprint(current)) !== nextHash;
-          current.nodes = r.nodes;
-          current.format = r.format;
-          current.clashRules = r.rules || [];
-          current.clashRuleProviders = r.ruleProviders || {};
-          current.raw = r.raw || current.raw || '';
-          current.userInfo = r.userInfo || current.userInfo;
-          current.updatedAt = Date.now();
-          current.configHash = nextHash;
-          state.store.upsertSubscription(current);
-          changed = true;
-          if (configChanged && current.id === getActiveSubId()) activeConfigChanged = true;
-          sendLog('[gui] auto-updated config: ' + current.name);
+          const configChanged = (latest.configHash || subscription.configFingerprint(latest)) !== nextHash;
+          const updatedAt = Date.now();
+          const next = {
+            ...latest,
+            nodes: r.nodes,
+            format: r.format,
+            clashRules: r.rules || [],
+            clashRuleProviders: r.ruleProviders || {},
+            userInfo: r.userInfo || null,
+            updatedAt,
+            autoUpdateLastAttemptAt: updatedAt,
+            configHash: nextHash,
+          };
+          if (r.raw) next.raw = r.raw;
+          state.store.upsertSubscription(next);
+          return { next, previous, configChanged, updatedAt, nextHash };
+        });
+        if (!applied) {
+          sendLog('[gui] discarded stale config auto-update: ' + current.name);
+          continue;
         }
+        changed = true;
+        if (applied.configChanged && applied.next.id === getActiveSubId()) {
+          activeConfigChanged = true;
+          activeConfigRollback = {
+            snapshot: applied.previous,
+            applied: { sourceUrl, updatedAt: applied.updatedAt, configHash: applied.nextHash },
+          };
+        }
+        sendLog('[gui] auto-updated config: ' + applied.next.name);
       } catch (e) {
+        try {
+          const recorded = await queueConfigMutation(() => {
+            assertRemoteUpdate('subscription', sub.id, token);
+            const latest = state.store.getSubscription(sub.id);
+            if (!latest || latest.url !== sourceUrl) return false;
+            state.store.upsertSubscription({ id: latest.id, autoUpdateLastAttemptAt: Date.now() });
+            return true;
+          });
+          if (!recorded) {
+            sendLog('[gui] discarded stale config auto-update error: ' + sub.name);
+            continue;
+          }
+        } catch (_) {
+          sendLog('[gui] discarded stale config auto-update error: ' + sub.name);
+          continue;
+        }
         sendLog('[gui] auto-update failed for ' + sub.name + ': ' + e.message);
+      } finally {
+        finishRemoteUpdate('subscription', sub.id, token);
       }
     }
   }
   if (changed) {
-    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-      state.mainWindow.webContents.send('subs:changed');
-    }
+    sendToMain('subs:changed');
     // The live profile's node list changed: restart so the core serves the
     // same outbounds the UI shows (custom rule-set auto-update already does
     // this; subscriptions must too, or selection/delay tests start failing).
-    if (activeConfigChanged) await restartIfRunning();
+    if (activeConfigChanged) {
+      await queueConfigMutation(async () => {
+        // A user may have switched profiles while the download was in flight.
+        // The updated profile is no longer live, so no restart is needed.
+        if (!activeConfigRollback || getActiveSubId() !== activeConfigRollback.snapshot.id) return;
+        try {
+          await restartIfRunning();
+        } catch (error) {
+          let recoveryError = null;
+          try {
+            restoreAutoUpdatedSubscription(activeConfigRollback.snapshot, activeConfigRollback.applied);
+            sendToMain('subs:changed');
+            sendLog('[gui] restored the previous active config after an auto-update restart failure');
+          } catch (restoreError) {
+            recoveryError = restoreError;
+          }
+          if (!state.singbox.isRunning()) {
+            try {
+              await startCore();
+            } catch (startError) {
+              if (!recoveryError) recoveryError = startError;
+            }
+          }
+          if (recoveryError) {
+            error.recoveryError = recoveryError;
+            sendLog('[gui] failed to recover from the config auto-update error: ' + recoveryError.message);
+          }
+        }
+      });
+    }
   }
 
   // Custom rule-sets on a schedule: re-download + convert, then restart the
   // running core once so the refreshed rules actually apply (same as a manual
   // refresh).
-  const crs = state.store.get('customRuleSets') || [];
+  const crs = state.store.listCustomRuleSets();
   let crsChanged = false;
-  for (let i = 0; i < crs.length; i++) {
-    const c = crs[i];
+  const crsRollbacks = [];
+  for (const c of crs) {
+    if (epoch !== remoteUpdateEpoch) return;
     const mins = parseInt(c.autoUpdateMinutes || 0, 10);
-    if (mins > 0 && c.enabled !== false && c.url && Date.now() - (c.updatedAt || 0) >= mins * 60000) {
-      try {
-        crs[i] = await processCustomRuleSet(c);
-        crsChanged = true;
-        sendLog('[gui] auto-updated rule-set: ' + c.name);
-      } catch (e) {
-        sendLog('[gui] rule-set auto-update failed for ' + c.name + ': ' + e.message);
-      }
+    if (c.enabled !== false && c.url && autoUpdateDue(c, mins)) {
+      await queueCustomRuleMutation(async () => {
+        const token = beginRemoteUpdate('rule-set', c.id, { background: true });
+        if (!token) return;
+        let sourceKey = customRuleSetSourceKey(c);
+        let rollback = null;
+        let committed = false;
+        try {
+          const current = state.store.getCustomRuleSet(c.id);
+          if (!current || current.enabled === false || !current.url) return;
+          sourceKey = customRuleSetSourceKey(current);
+          rollback = snapshotCustomRuleSetUpdate(current);
+          const assertCurrent = () => {
+            assertRemoteUpdate('rule-set', c.id, token);
+            const latest = state.store.getCustomRuleSet(c.id);
+            if (!latest || customRuleSetSourceKey(latest) !== sourceKey) {
+              throw new Error('rule-set changed while auto-update was in progress');
+            }
+            return latest;
+          };
+          const processed = await processCustomRuleSet(current, { beforeCommit: assertCurrent });
+          const updated = mergeProcessedCustomRuleSet(assertCurrent(), processed);
+          updated.autoUpdateLastAttemptAt = updated.updatedAt;
+          state.store.upsertCustomRuleSet(updated);
+          rollback.applied = { sourceKey, updatedAt: updated.updatedAt };
+          crsRollbacks.push(rollback);
+          committed = true;
+          crsChanged = true;
+          sendLog('[gui] auto-updated rule-set: ' + c.name);
+        } catch (e) {
+          try {
+            assertRemoteUpdate('rule-set', c.id, token);
+            const latest = state.store.getCustomRuleSet(c.id);
+            if (!latest || customRuleSetSourceKey(latest) !== sourceKey) {
+              sendLog('[gui] discarded stale rule-set auto-update: ' + c.name);
+              return;
+            }
+            state.store.upsertCustomRuleSet({
+              id: latest.id,
+              autoUpdateLastAttemptAt: Date.now(),
+              error: String(e.message || e).slice(0, 500),
+            });
+          } catch (_) {
+            sendLog('[gui] discarded stale rule-set auto-update: ' + c.name);
+            return;
+          }
+          sendLog('[gui] rule-set auto-update failed for ' + c.name + ': ' + e.message);
+        } finally {
+          if (!committed && rollback) {
+            try {
+              restoreCustomRuleSetUpdateFile(rollback);
+              discardCustomRuleSetUpdateSnapshot(rollback);
+            } catch (restoreError) {
+              sendLog('[gui] failed to restore a remote-rule file after update error: ' + restoreError.message);
+            }
+          }
+          finishRemoteUpdate('rule-set', c.id, token);
+        }
+      });
     }
   }
   if (crsChanged) {
-    state.store.set('customRuleSets', crs);
-    await restartIfRunning();
+    await queueCustomRuleMutation(() => queueConfigMutation(async () => {
+      sendToMain('dialog:changed', { scope: 'rules' });
+      let discardSnapshots = true;
+      try {
+        await restartIfRunning();
+      } catch (error) {
+        let recoveryError = null;
+        try {
+          restoreAutoUpdatedCustomRuleSets(crsRollbacks);
+          sendToMain('dialog:changed', { scope: 'rules' });
+          sendLog('[gui] restored previous remote rules after an auto-update restart failure');
+        } catch (restoreError) {
+          recoveryError = restoreError;
+          // A newer user edit owns the files now, so old snapshots are stale.
+          // For an actual I/O failure, preserve the backup as the last good copy.
+          discardSnapshots = restoreError.code === 'DART_UPDATE_SUPERSEDED';
+        }
+        if (!state.singbox.isRunning()) {
+          try {
+            await startCore();
+          } catch (startError) {
+            if (!recoveryError) recoveryError = startError;
+          }
+        }
+        if (recoveryError) {
+          error.recoveryError = recoveryError;
+          sendLog('[gui] failed to recover from the remote-rule auto-update error: ' + recoveryError.message);
+        }
+      } finally {
+        if (discardSnapshots) crsRollbacks.forEach(discardCustomRuleSetUpdateSnapshot);
+      }
+    }));
   }
 }
 
@@ -846,8 +1492,9 @@ let autoUpdateTimer = null;
 function rescheduleAutoUpdate() {
   const hasDue = (list) => (list || []).some((x) => parseInt(x.autoUpdateMinutes || 0, 10) > 0 && x.url);
   const need =
-    hasDue(state.store.listSubscriptions()) || hasDue(state.store.get('customRuleSets'));
-  if (need && !autoUpdateTimer) {
+    hasDue(state.store.listSubscriptions()) ||
+    hasDue(state.store.listCustomRuleSets().filter((item) => item.enabled !== false));
+  if (!lifecycleClosing && need && !autoUpdateTimer) {
     autoUpdateTimer = setInterval(autoUpdateTick, 60000);
   } else if (!need && autoUpdateTimer) {
     clearInterval(autoUpdateTimer);
@@ -858,26 +1505,130 @@ function rescheduleAutoUpdate() {
 // Weekly geodata refresh. The rule-sets are bundled (and self-heal on start),
 // but stay fresh on their own: once a week re-download geoip-cn/geosite-cn.
 const GEO_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+const GEO_RETRY_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const GEO_RUNTIME_FILES = Object.freeze({
+  'sing-box': ['geoip-cn.srs', 'geosite-cn.srs', 'geodata-meta.json'],
+  mihomo: [
+    'geoip.dat',
+    'geosite.dat',
+    'country.mmdb',
+    'geodata-meta.json',
+    '.mihomo-geodata-validation.json',
+  ],
+});
 let geoTimer = null;
+let geoInitialTimer = null;
+
+function fileFingerprint(file) {
+  try {
+    const stat = fs.statSync(file);
+    return `${stat.size}:${stat.mtimeMs}`;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function snapshotGeoData(coreType) {
+  const dir = state.singbox.ensureCoreDir(coreType);
+  const snapshots = [];
+  try {
+    for (const file of GEO_RUNTIME_FILES[coreType] || []) {
+      snapshots.push(snapshotFile(path.join(dir, file), 'geo-update-backup'));
+    }
+    return snapshots;
+  } catch (error) {
+    snapshots.forEach(discardFileSnapshot);
+    throw error;
+  }
+}
+
+function markGeoDataApplied(snapshots) {
+  for (const snapshot of snapshots) {
+    snapshot.appliedFingerprint = fileFingerprint(snapshot.target);
+  }
+}
+
+function restoreGeoData(snapshots) {
+  for (const snapshot of snapshots) {
+    if (fileFingerprint(snapshot.target) !== snapshot.appliedFingerprint) {
+      const error = new Error('GeoData changed again before auto-update rollback');
+      error.code = 'DART_UPDATE_SUPERSEDED';
+      throw error;
+    }
+  }
+  snapshots.forEach(restoreFileSnapshot);
+}
+
+async function refreshGeoData(onProgress = () => {}) {
+  const coreType = state.singbox.getCoreType();
+  const successKey = 'geoUpdatedAt_' + coreType.replace(/[^a-z0-9]/gi, '');
+  const snapshots = snapshotGeoData(coreType);
+  try {
+    const dir = await state.singbox.updateGeoData(onProgress, currentProxyPort());
+    markGeoDataApplied(snapshots);
+    if (
+      !lifecycleClosing &&
+      state.singbox.getCoreType() === coreType &&
+      state.singbox.isRunning()
+    ) {
+      try {
+        await restartIfRunning();
+      } catch (error) {
+        let recoveryError = null;
+        try {
+          restoreGeoData(snapshots);
+          sendLog('[gui] restored previous geodata after an update restart failure');
+        } catch (restoreError) {
+          recoveryError = restoreError;
+        }
+        if (
+          !lifecycleClosing &&
+          !state.singbox.isRunning() &&
+          state.singbox.getCoreType() === coreType
+        ) {
+          try {
+            await startCore();
+          } catch (startError) {
+            if (!recoveryError) recoveryError = startError;
+          }
+        }
+        if (recoveryError) {
+          error.recoveryError = recoveryError;
+          sendLog('[gui] failed to recover from the geodata update error: ' + recoveryError.message);
+        }
+        throw error;
+      }
+    }
+    state.store.set(successKey, Date.now());
+    return dir;
+  } finally {
+    snapshots.forEach(discardFileSnapshot);
+  }
+}
 
 async function checkGeoUpdate() {
-  const checkedKey = 'geoCheckedAt_' + state.singbox.getCoreType().replace(/[^a-z0-9]/gi, '');
-  let last = state.store.get(checkedKey) || 0;
-  if (!last) {
+  if (lifecycleClosing) return;
+  const coreType = state.singbox.getCoreType();
+  const suffix = coreType.replace(/[^a-z0-9]/gi, '');
+  const successKey = 'geoUpdatedAt_' + suffix;
+  const attemptKey = 'geoAttemptedAt_' + suffix;
+  let lastSuccess = state.store.get(successKey) || 0;
+  if (!lastSuccess) {
     // First run on this version: seed the clock from the last known update
     // (or now for bundled geodata) so we don't re-download immediately.
     const meta = state.singbox.geoMeta();
     const stamps = Object.values(meta).map((m) => (m && m.updatedAt) || 0);
-    last = Math.max(0, ...stamps) || Date.now();
-    state.store.set(checkedKey, last);
+    lastSuccess = Math.max(0, ...stamps) || Date.now();
+    state.store.set(successKey, lastSuccess);
   }
-  if (Date.now() - last < GEO_UPDATE_INTERVAL_MS) return;
-  // Advance the clock first, so a failure retries next week — not every tick.
-  state.store.set(checkedKey, Date.now());
+  const now = Date.now();
+  if (now - lastSuccess < GEO_UPDATE_INTERVAL_MS) return;
+  if (now - (state.store.get(attemptKey) || 0) < GEO_RETRY_INTERVAL_MS) return;
+  state.store.set(attemptKey, now);
   try {
-    await state.singbox.updateGeoData(() => {}, currentProxyPort());
+    await refreshGeoData();
     sendLog('[gui] geodata weekly auto-update complete');
-    await restartIfRunning();
   } catch (e) {
     sendLog('[gui] geodata weekly auto-update failed: ' + e.message);
   }
@@ -885,24 +1636,16 @@ async function checkGeoUpdate() {
 
 /** Start the weekly geodata refresh: a check shortly after boot, then every 6h. */
 function startGeoAutoUpdate() {
-  if (geoTimer) return;
-  setTimeout(() => checkGeoUpdate().catch(() => {}), 30000);
+  if (lifecycleClosing || geoTimer) return;
+  geoInitialTimer = setTimeout(() => {
+    geoInitialTimer = null;
+    checkGeoUpdate().catch(() => {});
+  }, 30000);
   geoTimer = setInterval(() => checkGeoUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
 }
 
 // Name of the Windows logon task used for elevated auto-start (see below).
 const AUTOSTART_TASK = 'Dart-AutoStart';
-
-/** True if the current Windows process already holds administrator rights. */
-function isAdminSync() {
-  if (process.platform !== 'win32') return true;
-  try {
-    const { spawnSync } = require('child_process');
-    return spawnSync('net', ['session'], { windowsHide: true }).status === 0;
-  } catch (_) {
-    return false;
-  }
-}
 
 /** Set (or clear) the plain HKCU "Run" login item via Electron. */
 function setRunItem(enable, silent) {
@@ -989,7 +1732,7 @@ function createAutostartTask() {
   try {
     // UTF-16LE + BOM (﻿) to match the XML declaration schtasks expects.
     fs.writeFileSync(tmp, '﻿' + buildAutostartTaskXml(), { encoding: 'utf16le' });
-    const ok = runSchtasks(['/create', '/tn', AUTOSTART_TASK, '/xml', tmp, '/f'], !isAdminSync());
+    const ok = runSchtasks(['/create', '/tn', AUTOSTART_TASK, '/xml', tmp, '/f'], !isWindowsAdminSync());
     sendLog('[gui] autostart task ' + (ok ? '(re)created' : 'create failed'));
     return ok;
   } catch (e) {
@@ -1002,9 +1745,13 @@ function createAutostartTask() {
 
 /** Delete the elevated logon task if present. */
 function deleteAutostartTask() {
-  if (runSchtasks(['/delete', '/tn', AUTOSTART_TASK, '/f'], !isAdminSync())) {
+  const removed = runSchtasks(['/delete', '/tn', AUTOSTART_TASK, '/f'], !isWindowsAdminSync());
+  if (removed) {
     sendLog('[gui] autostart task removed');
+  } else {
+    sendLog('[gui] autostart task remove failed');
   }
+  return removed;
 }
 
 /**
@@ -1019,11 +1766,11 @@ function deleteAutostartTask() {
 function applyAutoLaunchWindows(enable, silent, interactive) {
   const wantTask = !!enable && !!state.store.getSettings().enableTun;
   if (wantTask) {
-    const admin = isAdminSync();
+    const admin = isWindowsAdminSync();
     if (admin) {
       // (Re)create silently to keep the stored exe path current (e.g. post-update).
-      createAutostartTask();
-      setRunItem(false);
+      if (createAutostartTask()) setRunItem(false);
+      else setRunItem(enable, silent);
       return;
     }
     if (interactive && createAutostartTask()) {
@@ -1040,7 +1787,10 @@ function applyAutoLaunchWindows(enable, silent, interactive) {
     return;
   }
   // No elevated task wanted: drop any we created, use the plain Run item.
-  if (autostartTaskExists() && (isAdminSync() || interactive)) deleteAutostartTask();
+  if (autostartTaskExists() && (isWindowsAdminSync() || interactive)) {
+    const removed = deleteAutostartTask();
+    if (!removed && interactive) throw new Error('failed to remove the elevated auto-start task');
+  }
   setRunItem(enable, silent);
 }
 
@@ -1072,23 +1822,58 @@ function applyAutoLaunch(enable, silent, { interactive = false } = {}) {
  * startCore re-asserts the proxy once the core is up. Callers that auto-resume
  * await this first so the clear can't race the re-enable.
  */
-async function healStaleSystemProxy() {
-  if (process.platform !== 'win32') return;
-  try {
-    const settings = state.store.getSettings();
-    const ours = await proxy.isSystemProxyActive(`127.0.0.1:${settings.mixedPort}`);
-    if (ours) {
-      await proxy.disableSystemProxy();
-      state.systemProxyOn = false;
-      sendLog('[gui] cleared a stale system proxy left from a previous session');
+function healStaleSystemProxy() {
+  if (process.platform !== 'win32') return Promise.resolve();
+  if (staleProxyHealPromise) return staleProxyHealPromise;
+  let tracked;
+  tracked = (async () => {
+    const server = persistedSystemProxyOwnership();
+    if (!/^127\.0\.0\.1:\d{1,5}$/.test(String(server || ''))) {
+      if (server) {
+        try { forgetSystemProxyOwnership(); } catch (_) {}
+        sendLog('[gui] discarded an invalid persisted system proxy ownership record');
+      }
+      return;
     }
-  } catch (_) {
-    /* best-effort */
-  }
+    try {
+      const disabled = await proxy.disableSystemProxyIfOurs(server);
+      forgetSystemProxyOwnership(server);
+      state.systemProxyOn = false;
+      state.systemProxyServer = null;
+      if (disabled) {
+        sendLog('[gui] cleared a stale system proxy left from a previous session');
+      }
+    } catch (error) {
+      // Startup is the one place where a synchronous fallback is preferable to
+      // leaving Windows pointed at a dead localhost port after a crash.
+      if (proxy.disableSystemProxySyncIfOurs(server)) {
+        try { forgetSystemProxyOwnership(server); } catch (_) {}
+        state.systemProxyOn = false;
+        state.systemProxyServer = null;
+        sendLog('[gui] cleared a stale system proxy using the startup fallback');
+      } else {
+        sendLog('[gui] failed to verify or clear a stale system proxy: ' + error.message);
+      }
+    }
+  })().finally(() => {
+    if (staleProxyHealPromise === tracked) staleProxyHealPromise = null;
+  });
+  staleProxyHealPromise = tracked;
+  return tracked;
 }
 
 module.exports = {
   currentProxyPort,
+  enableOwnedSystemProxy,
+  persistedSystemProxyOwnership,
+  forgetSystemProxyOwnership,
+  beginRemoteUpdate,
+  assertRemoteUpdate,
+  finishRemoteUpdate,
+  cancelRemoteUpdate,
+  cancelAllRemoteUpdates,
+  queueConfigMutation,
+  queueCustomRuleMutation,
   getActiveSubId,
   getActiveSubscription,
   activeSubData,
@@ -1099,12 +1884,16 @@ module.exports = {
   processCustomRuleSet,
   detectCustomRuleSetFormat,
   normalizeCustomRuleSetFormat,
+  customRuleSetSourceKey,
+  mergeProcessedCustomRuleSet,
   buildCurrentConfig,
   currentRouteInfo,
   ruleGroupInfo,
   startCore,
   stopCore,
+  restartCore,
   restartIfRunning,
+  setSystemProxyEnabled,
   cleanup,
   startProxyGuard,
   stopProxyGuard,
@@ -1112,7 +1901,11 @@ module.exports = {
   clashApi,
   setClashSelector,
   setProxyMode,
+  getModeRevision,
+  modeChangeNeedsRestart,
   rescheduleAutoUpdate,
+  refreshGeoData,
+  checkGeoUpdate,
   startGeoAutoUpdate,
   applyAutoLaunch,
   healStaleSystemProxy,

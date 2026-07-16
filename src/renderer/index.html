@@ -11,7 +11,13 @@
     <!-- Sets data-theme before the stylesheet loads, so first paint matches the
          saved theme (no dark→light flash). Must precede the stylesheet link. -->
     <script src="theme-init.js"></script>
-    <link rel="stylesheet" href="style.css?v=43" />
+    <link rel="stylesheet" href="style.css?v=50" />
+    <link rel="stylesheet" href="styles/surfaces.css?v=1" />
+    <link rel="stylesheet" href="styles/controls.css?v=1" />
+    <link rel="stylesheet" href="styles/lists.css?v=1" />
+    <link rel="stylesheet" href="styles/workspaces.css?v=1" />
+    <link rel="stylesheet" href="styles/tools.css?v=1" />
+    <link rel="stylesheet" href="styles/motion.css?v=1" />
   </head>
   <body>
     <div class="app">
@@ -51,6 +57,7 @@
           </span>
         </div>
         <nav class="nav">
+          <span id="navIndicator" class="nav-indicator" aria-hidden="true"></span>
           <button class="nav-item active" data-tab="dashboard" data-i18n="nav.dashboard">概览</button>
           <button class="nav-item" data-tab="subs" data-i18n="nav.subs">配置</button>
           <button class="nav-item" data-tab="nodes" data-i18n="nav.nodes">节点</button>
@@ -174,9 +181,9 @@
         </section>
 
         <!-- Rules -->
-        <section class="tab" id="tab-rules">
+        <section class="tab canvas-page" id="tab-rules">
           <h1 data-i18n="nav.rules">规则</h1>
-          <div class="panel">
+          <div class="workspace-section">
             <div class="row">
               <h2 data-i18n="localrules.section">本地规则</h2>
               <button id="lrAdd" class="btn primary" data-i18n="localrules.add">添加本地规则</button>
@@ -184,7 +191,7 @@
             <p class="hint" data-i18n="localrules.hint"></p>
             <div id="lrList" class="sub-list"></div>
           </div>
-          <div class="panel">
+          <div class="workspace-section">
             <h2 data-i18n="customrs.title">远程规则</h2>
             <p class="hint section-intro" data-i18n="customrs.hint"></p>
             <div class="form-row">
@@ -201,7 +208,7 @@
             </div>
             <div id="crsList" class="sub-list"></div>
           </div>
-          <div class="panel">
+          <div class="workspace-section">
             <div class="row">
               <h2 data-i18n="rulegroups.section">策略组</h2>
               <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
@@ -209,7 +216,7 @@
             <p class="hint" data-i18n="rulegroups.hint"></p>
             <div id="ruleGroupList" class="sub-list"></div>
           </div>
-          <div class="panel">
+          <div class="workspace-section">
             <div class="row">
               <input id="ruleFilter" class="input grow" data-i18n-ph="rules.searchPh" />
               <span class="hint" id="ruleCount"></span>
@@ -221,21 +228,19 @@
         </section>
 
         <!-- Connections -->
-        <section class="tab" id="tab-conns">
+        <section class="tab live-workspace" id="tab-conns">
           <h1 data-i18n="nav.conns">连接</h1>
-          <div class="panel">
-            <div class="row">
-              <span class="hint grow" id="connStats"></span>
-              <button id="connClose" class="btn danger" data-i18n="conns.closeAll">关闭全部</button>
-            </div>
-            <div id="connList" class="conn-list"></div>
+          <div class="row workspace-commandbar">
+            <span class="hint grow" id="connStats"></span>
+            <button id="connClose" class="btn danger" data-i18n="conns.closeAll">关闭全部</button>
           </div>
+          <div id="connList" class="conn-list"></div>
         </section>
 
         <!-- Subscriptions -->
-        <section class="tab" id="tab-subs">
+        <section class="tab canvas-page" id="tab-subs">
           <h1 data-i18n="subs.title">配置</h1>
-          <div class="panel">
+          <div class="workspace-section">
             <h2 data-i18n="subs.add">添加配置</h2>
             <div class="form-row">
               <input id="subName" class="input" data-i18n-ph="subs.namePh" />
@@ -244,7 +249,7 @@
             </div>
             <p class="hint" data-i18n="subs.hint"></p>
           </div>
-          <div class="panel hidden" id="subEditPanel">
+          <div class="workspace-section hidden" id="subEditPanel">
             <h2 data-i18n="subs.editTitle">编辑配置</h2>
             <div class="setting-row">
               <label data-i18n="subs.namePh">名称（可选）</label>
@@ -278,29 +283,27 @@
               <button id="editCancel" class="btn" data-i18n="subs.editCancel">取消</button>
             </div>
           </div>
-          <div class="panel">
+          <div class="workspace-section">
             <h2 data-i18n="subs.listTitle">配置列表</h2>
             <div id="subList" class="sub-list"></div>
           </div>
         </section>
 
         <!-- Nodes -->
-        <section class="tab" id="tab-nodes">
+        <section class="tab live-workspace" id="tab-nodes">
           <h1 data-i18n="nodes.title">节点</h1>
-          <div class="panel">
-            <div class="form-row">
-              <input id="nodeFilter" class="input grow" data-i18n-ph="nodes.searchPh" />
-              <button id="testAllBtn" class="btn" data-i18n="nodes.testAll">全部测速</button>
-              <span class="hint" id="nodeCount"></span>
-            </div>
-            <div id="nodeList" class="node-list"></div>
+          <div class="form-row workspace-commandbar">
+            <input id="nodeFilter" class="input grow" data-i18n-ph="nodes.searchPh" />
+            <button id="testAllBtn" class="btn" data-i18n="nodes.testAll">全部测速</button>
+            <span class="hint" id="nodeCount"></span>
           </div>
+          <div id="nodeList" class="node-list"></div>
         </section>
 
         <!-- Tools -->
-        <section class="tab" id="tab-tools">
+        <section class="tab canvas-page" id="tab-tools">
           <h1 data-i18n="tools.title">工具</h1>
-          <div class="panel">
+          <div class="tool-list">
             <div class="setting-row">
               <div class="setting-label">
                 <span data-i18n="dash.openPanel">打开控制面板</span>
@@ -368,15 +371,13 @@
         </section>
 
         <!-- Logs -->
-        <section class="tab" id="tab-logs">
+        <section class="tab live-workspace" id="tab-logs">
           <h1 data-i18n="logs.title">日志</h1>
-          <div class="panel">
-            <div class="row">
-              <button id="logClear" class="btn" data-i18n="logs.clear">清空</button>
-              <label class="check"><input type="checkbox" id="logAutoScroll" checked /> <span data-i18n="logs.autoScroll">自动滚动</span></label>
-            </div>
-            <pre id="logBox" class="log-box"></pre>
+          <div class="row workspace-commandbar">
+            <button id="logClear" class="btn" data-i18n="logs.clear">清空</button>
+            <label class="check"><input type="checkbox" id="logAutoScroll" checked /> <span data-i18n="logs.autoScroll">自动滚动</span></label>
           </div>
+          <pre id="logBox" class="log-box"></pre>
         </section>
 
         <!-- Settings -->
@@ -522,284 +523,6 @@
       </div>
     </div>
 
-    <!-- Local rule editor modal -->
-    <div id="localRuleModal" class="modal hidden">
-      <div class="modal-card">
-        <h3 id="lrModalTitle" data-i18n="localrules.title">添加本地规则</h3>
-        <div class="setting-row">
-          <label data-i18n="localrules.name">名称（可选）</label>
-          <input id="lrName" class="input" />
-        </div>
-        <div class="setting-row">
-          <label data-i18n="localrules.type">类型</label>
-          <select id="lrType" class="input small">
-            <option value="domain">DOMAIN</option>
-            <option value="domain_suffix">DOMAIN-SUFFIX</option>
-            <option value="domain_keyword">DOMAIN-KEYWORD</option>
-            <option value="ip_cidr">IP-CIDR</option>
-            <option value="process_name">PROCESS-NAME</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <label data-i18n="localrules.target">目标</label>
-          <select id="lrTarget" class="input small">
-            <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
-            <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-            <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
-          </select>
-        </div>
-        <label class="modal-label" data-i18n="localrules.values">规则内容（每行一个）</label>
-        <textarea id="lrValues" class="textarea" data-i18n-ph="localrules.valuesPh"></textarea>
-        <div class="row save-row">
-          <button id="lrSave" class="btn primary" data-i18n="localrules.save">保存</button>
-          <button id="lrCancel" class="btn" data-i18n="subs.editCancel">取消</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Config conversion modal -->
-    <div id="convertModal" class="modal hidden">
-      <div class="modal-card modal-xl">
-        <h3 id="convertTitle" data-i18n="convert.title">配置双向转换</h3>
-        <p id="convertInputHint" class="hint" data-i18n="convert.inputHint"></p>
-        <div class="row convert-target-row">
-          <span class="modal-label" data-i18n="convert.targetLabel">输出格式</span>
-          <div id="convertTarget" class="mode-switch convert-target" role="group">
-            <button class="btn primary" data-convert-target="auto" data-i18n="convert.targetAuto">自动</button>
-            <button class="btn" data-convert-target="sing-box" data-i18n="convert.targetSingbox">Sing-Box</button>
-            <button class="btn" data-convert-target="clash" data-i18n="convert.targetClash">Clash</button>
-          </div>
-        </div>
-        <textarea id="convertInput" class="textarea" data-i18n-ph="convert.inputPh"></textarea>
-        <div class="row convert-actions">
-          <button id="convertBtn" class="btn primary" data-i18n="convert.preview">转换预览</button>
-          <button id="convertImportBtn" class="btn" data-i18n="convert.import">转换并保存为配置</button>
-          <button id="convertCopyBtn" class="btn" data-i18n="convert.copy">复制结果</button>
-          <button id="convertExportBtn" class="btn" data-i18n="convert.export">导出当前配置</button>
-        </div>
-        <div class="row convert-output-head">
-          <span class="modal-label"><span id="convertOutputTitle" data-i18n="convert.outputTitle">转换结果</span> <span id="convertMeta" class="hint"></span></span>
-        </div>
-        <pre id="convertOutput" class="code convert-output"></pre>
-        <div class="row save-row">
-          <button id="convertClose" class="btn" data-i18n="tools.close">关闭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Core management modal -->
-    <div id="coreModal" class="modal hidden">
-      <div class="modal-card modal-lg">
-        <h3 data-i18n="settings.coreManageTitle">内核管理</h3>
-        <div class="setting-row">
-          <label data-i18n="settings.runningCore">运行内核</label>
-          <select id="setCoreType" class="input small">
-            <option value="sing-box">sing-box</option>
-            <option value="mihomo">mihomo</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">
-            <span data-i18n="settings.corePath">内核路径</span>
-            <span id="coreModalStatus" class="hint"></span>
-          </div>
-          <button id="coreOpenFolderBtn" class="btn" data-i18n="settings.openCoreFolder">打开目录</button>
-        </div>
-        <div class="row save-row">
-          <button id="coreApplyBtn" class="btn primary" data-i18n="settings.applyCore">应用内核</button>
-          <button id="coreRestartBtn" class="btn" data-i18n="dash.restartCore">重启内核</button>
-          <button id="coreUpdateBtn" class="btn" data-i18n="settings.updateCore">更新内核</button>
-          <button id="coreCloseBtn" class="btn" data-i18n="tools.close">关闭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- GeoData management modal -->
-    <div id="geoModal" class="modal hidden">
-      <div class="modal-card modal-lg">
-        <h3 data-i18n="settings.geoManageTitle">GeoData 管理</h3>
-        <p class="hint" data-i18n="settings.geoHint"></p>
-        <div id="geoDataList" class="rule-list"></div>
-        <div class="row save-row">
-          <button id="geoDataUpdateBtn" class="btn primary" data-i18n="settings.updateGeo">更新 GeoData</button>
-          <button id="geoDataCloseBtn" class="btn" data-i18n="tools.close">关闭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Custom rule-set editor modal -->
-    <div id="crsModal" class="modal hidden">
-      <div class="modal-card modal-lg">
-        <h3 data-i18n="customrs.editTitle">编辑远程规则</h3>
-        <div class="setting-row">
-          <label data-i18n="customrs.namePh">名称</label>
-          <input id="crsEditName" class="input" />
-        </div>
-        <div class="setting-row">
-          <label data-i18n="customrs.urlPh">远程规则链接</label>
-          <input id="crsEditUrl" class="input grow" />
-        </div>
-        <div class="setting-row">
-          <label data-i18n="localrules.target">目标</label>
-          <select id="crsEditTarget" class="input small">
-            <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
-            <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-            <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <label data-i18n="subs.autoUpdate">自动更新周期</label>
-          <select id="crsEditAutoUpdate" class="input small">
-            <option value="0" data-i18n="subs.autoUpdateOff">关闭</option>
-            <option value="60">1 h</option>
-            <option value="360">6 h</option>
-            <option value="720">12 h</option>
-            <option value="1440">24 h</option>
-            <option value="4320">3 d</option>
-            <option value="10080">7 d</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <label data-i18n="customrs.enabledLabel">启用</label>
-          <input id="crsEditEnabled" type="checkbox" />
-        </div>
-        <div class="row save-row">
-          <button id="crsEditSave" class="btn primary" data-i18n="subs.editSave">保存</button>
-          <button id="crsEditRefresh" class="btn" data-i18n="customrs.refresh">刷新</button>
-          <button id="crsEditCancel" class="btn" data-i18n="subs.editCancel">取消</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Profile raw-content editor modal -->
-    <div id="rawModal" class="modal hidden">
-      <div class="modal-card modal-xl">
-        <h3><span data-i18n="subs.rawTitle">编辑配置内容</span> <span id="rawName" class="hint"></span></h3>
-        <p class="hint" data-i18n="subs.rawHint"></p>
-        <div id="rawEditorWrap" class="editor-wrap">
-          <pre id="rawHighlight" class="editor-highlight" aria-hidden="true"></pre>
-          <textarea id="rawContent" class="textarea raw-editor" spellcheck="false"></textarea>
-        </div>
-        <div class="row save-row">
-          <button id="rawSave" class="btn primary" data-i18n="subs.editSave">保存</button>
-          <button id="rawCancel" class="btn" data-i18n="subs.editCancel">取消</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- UWP loopback exemption modal -->
-    <div id="uwpModal" class="modal hidden">
-      <div class="modal-card modal-lg">
-        <h3 data-i18n="uwp.title">UWP 回环豁免</h3>
-        <p class="hint uwp-intro" data-i18n="uwp.hint"></p>
-        <div class="row uwp-toolbar">
-          <select id="uwpScope" class="input small">
-            <option value="all" data-i18n="uwp.scopeAll">全部</option>
-            <option value="user" data-i18n="uwp.scopeUser">用户应用</option>
-            <option value="system" data-i18n="uwp.scopeSystem">系统应用</option>
-          </select>
-          <input id="uwpFilter" class="input grow" data-i18n-ph="uwp.searchPh" />
-          <button id="uwpReload" class="btn" data-i18n="uwp.reload">刷新</button>
-        </div>
-        <div class="row uwp-selection-row">
-          <button id="uwpSelectAll" class="btn" data-i18n="uwp.selectAll">全选</button>
-          <button id="uwpInvert" class="btn" data-i18n="uwp.invert">反选</button>
-          <span class="hint grow" id="uwpStatus"></span>
-        </div>
-        <div id="uwpList" class="uwp-list"></div>
-        <div class="row save-row uwp-footer">
-          <button id="uwpApply" class="btn primary" data-i18n="uwp.apply">应用</button>
-          <button id="uwpCancel" class="btn" data-i18n="subs.editCancel">取消</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Route inspector -->
-    <div id="routeModal" class="modal hidden">
-      <div class="modal-card modal-lg toolbox-modal">
-        <h3 data-i18n="toolbox.routeTitle">路由检查器</h3>
-        <p class="hint" data-i18n="toolbox.routeHint"></p>
-        <div class="form-row">
-          <input id="routeInput" class="input grow" value="www.google.com" data-i18n-ph="toolbox.routePlaceholder" />
-          <button id="routeRun" class="btn primary" data-i18n="toolbox.inspect">检查</button>
-        </div>
-        <div id="routeResult" class="tool-result"><p class="tool-empty" data-i18n="toolbox.notRun">尚未运行</p></div>
-        <div class="row save-row"><button id="routeClose" class="btn" data-i18n="tools.close">关闭</button></div>
-      </div>
-    </div>
-
-    <!-- One-click diagnostics -->
-    <div id="diagModal" class="modal hidden">
-      <div class="modal-card modal-xl toolbox-modal">
-        <h3 data-i18n="toolbox.diagTitle">一键网络诊断</h3>
-        <p class="hint" data-i18n="toolbox.diagHint"></p>
-        <div class="row tool-actions">
-          <button id="diagRun" class="btn primary" data-i18n="toolbox.runDiagnostics">开始诊断</button>
-          <button id="diagExport" class="btn hidden" data-i18n="toolbox.exportReport">导出报告</button>
-        </div>
-        <div id="diagResult" class="tool-result grow"><p class="tool-empty" data-i18n="toolbox.notRun">尚未运行</p></div>
-        <div class="row save-row"><button id="diagClose" class="btn" data-i18n="tools.close">关闭</button></div>
-      </div>
-    </div>
-
-    <!-- Dual-core config checker -->
-    <div id="configCheckModal" class="modal hidden">
-      <div class="modal-card modal-xl toolbox-modal">
-        <h3 data-i18n="toolbox.configTitle">配置检查器</h3>
-        <p class="hint" data-i18n="toolbox.configHint"></p>
-        <div class="row tool-actions">
-          <button id="configCheckRun" class="btn primary" data-i18n="toolbox.validateBoth">校验两个内核</button>
-        </div>
-        <div id="configCheckResult" class="tool-result grow"><p class="tool-empty" data-i18n="toolbox.notRun">尚未运行</p></div>
-        <div class="row save-row"><button id="configCheckClose" class="btn" data-i18n="tools.close">关闭</button></div>
-      </div>
-    </div>
-
-    <!-- Port inspector -->
-    <div id="portModal" class="modal hidden">
-      <div class="modal-card modal-lg toolbox-modal">
-        <h3 data-i18n="toolbox.portTitle">端口检查</h3>
-        <p class="hint" data-i18n="toolbox.portHint"></p>
-        <div class="form-row">
-          <input id="portInput" class="input grow" value="7890, 9090" data-i18n-ph="toolbox.portPlaceholder" />
-          <button id="portRun" class="btn primary" data-i18n="toolbox.inspect">检查</button>
-        </div>
-        <div id="portResult" class="tool-result"><p class="tool-empty" data-i18n="toolbox.notRun">尚未运行</p></div>
-        <div class="row save-row"><button id="portClose" class="btn" data-i18n="tools.close">关闭</button></div>
-      </div>
-    </div>
-
-    <!-- Backup and restore -->
-    <div id="backupModal" class="modal hidden">
-      <div class="modal-card modal-lg toolbox-modal">
-        <h3 data-i18n="toolbox.backupTitle">备份与恢复</h3>
-        <p class="hint" data-i18n="toolbox.backupHint"></p>
-        <div class="row tool-actions">
-          <button id="backupExport" class="btn primary" data-i18n="toolbox.exportBackup">导出备份</button>
-          <button id="backupSelect" class="btn" data-i18n="toolbox.selectBackup">选择备份文件</button>
-        </div>
-        <div id="backupResult" class="tool-result"><p class="tool-empty" data-i18n="toolbox.backupEmpty">尚未选择备份</p></div>
-        <div class="row save-row">
-          <button id="backupRestore" class="btn danger hidden" data-i18n="toolbox.restoreBackup">确认恢复</button>
-          <button id="backupClose" class="btn" data-i18n="tools.close">关闭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- DNS comparison -->
-    <div id="dnsModal" class="modal hidden">
-      <div class="modal-card modal-lg toolbox-modal">
-        <h3 data-i18n="toolbox.dnsTitle">DNS 对比</h3>
-        <p class="hint" data-i18n="toolbox.dnsHint"></p>
-        <div class="form-row">
-          <input id="dnsInput" class="input grow" value="www.google.com" data-i18n-ph="toolbox.dnsPlaceholder" />
-          <button id="dnsRun" class="btn primary" data-i18n="toolbox.compare">对比</button>
-        </div>
-        <div id="dnsResult" class="tool-result"><p class="tool-empty" data-i18n="toolbox.notRun">尚未运行</p></div>
-        <div class="row save-row"><button id="dnsClose" class="btn" data-i18n="tools.close">关闭</button></div>
-      </div>
-    </div>
-
     <div id="toast" class="toast hidden"></div>
     <!-- Classic scripts sharing the window.App namespace; util.js bootstraps
          it, feature modules attach their pieces, main.js (last) boots the app. -->
@@ -809,15 +532,7 @@
     <script src="js/select.js"></script>
     <script src="js/charts.js"></script>
     <script src="js/dashboard.js"></script>
-    <script src="js/nodes.js"></script>
-    <script src="js/subs.js"></script>
-    <script src="js/rules.js"></script>
-    <script src="js/rulesets.js"></script>
-    <script src="js/conns.js"></script>
-    <script src="js/logs.js"></script>
-    <script src="js/settings.js"></script>
-    <script src="js/tools.js"></script>
-    <script src="js/toolbox.js"></script>
+    <script src="js/updates.js"></script>
     <script src="js/main.js"></script>
   </body>
 </html>

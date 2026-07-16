@@ -2,104 +2,35 @@
 // Remote rules on the Rules tab, plus GeoData status management in Settings.
 (function () {
   const App = window.App;
-  const { $, toast, call, fmtBytes, fmtDate, escapeHtml } = App;
+  const { $, toast, call, escapeHtml } = App;
   const api = window.api;
   const { t } = window.i18n;
 
-  // ---------- GeoData status ----------
-  async function loadGeoDataStatus() {
-    if (!api) return;
-    try {
-      renderGeoDataStatus(await api.getRuleSets());
-    } catch (e) {
-      /* ignore */
-    }
-  }
-  function renderGeoDataStatus(items) {
-    const list = $('#geoDataList');
-    if (!list) return;
-    list.innerHTML = '';
-    if (!items || !items.length) {
-      list.innerHTML = `<p class="hint">${t('ruleset.missing')}</p>`;
-      return;
-    }
-    for (const it of items || []) {
-      let details;
-      let status;
-      let statusClass = 'ready';
-      if (!it.present) {
-        details = '-';
-        status = t('ruleset.missing');
-        statusClass = 'problem';
-      } else if (!it.valid) {
-        details = `${fmtDate(it.updatedAt)} · ${fmtBytes(it.size)}`;
-        status = t('ruleset.invalid');
-        statusClass = 'problem';
-      } else {
-        details = `${fmtDate(it.updatedAt)} · ${fmtBytes(it.size)}`;
-        status = it.location === 'updated' ? t('ruleset.updated') : t('ruleset.bundled');
-      }
-      const div = document.createElement('div');
-      div.className = 'rule-item geodata-item';
-      div.innerHTML = `
-        <span class="rule-type">${escapeHtml(it.file || it.tag)}</span>
-        <span class="rule-payload geodata-details" title="${escapeHtml(details)}">${escapeHtml(details)}</span>
-        <span class="rule-proxy geodata-status ${statusClass}">${escapeHtml(status)}</span>`;
-      list.appendChild(div);
-    }
-  }
-
-  async function updateGeoData(btn) {
-    const prog = $('#downloadProgress');
-    btn.disabled = true;
-    btn.textContent = t('settings.updatingGeo');
-    if (prog) prog.classList.remove('hidden');
-    try {
-      await call(api.updateGeoData);
-      toast(t('settings.geoUpdated'));
-      await loadGeoDataStatus();
-    } finally {
-      btn.disabled = false;
-      btn.textContent = t('settings.updateGeo');
-      if (prog) setTimeout(() => prog.classList.add('hidden'), 1500);
-    }
-  }
-
   const geoManageBtn = $('#geoManageBtn');
-  if (geoManageBtn) {
-    geoManageBtn.addEventListener('click', async () => {
-      $('#geoModal').classList.remove('hidden');
-      await loadGeoDataStatus();
-    });
-  }
-  const geoDataCloseBtn = $('#geoDataCloseBtn');
-  if (geoDataCloseBtn) geoDataCloseBtn.addEventListener('click', () => $('#geoModal').classList.add('hidden'));
-  const geoModal = $('#geoModal');
-  if (geoModal) {
-    geoModal.addEventListener('click', (e) => {
-      if (e.target.id === 'geoModal') geoModal.classList.add('hidden');
-    });
-  }
-  const geoDataUpdateBtn = $('#geoDataUpdateBtn');
-  if (geoDataUpdateBtn) geoDataUpdateBtn.addEventListener('click', () => updateGeoData(geoDataUpdateBtn));
+  if (geoManageBtn) geoManageBtn.addEventListener('click', () => App.openDialog('geodata'));
 
   // ---------- Remote rules ----------
   let customRuleSetsReady = false;
   let customRuleSetsLoading = null;
+  let customRuleSetsGeneration = 0;
   async function loadCustomRuleSets(options = {}) {
     if (options.force === false && customRuleSetsReady) return;
     if (customRuleSetsLoading) return customRuleSetsLoading;
-    customRuleSetsLoading = (async () => {
+    const generation = customRuleSetsGeneration;
+    const request = (async () => {
       try {
-        renderCustomRuleSets(await api.listCustomRuleSets());
+        const items = await api.listCustomRuleSets();
+        if (generation !== customRuleSetsGeneration) return;
+        renderCustomRuleSets(items);
         customRuleSetsReady = true;
       } catch (e) {
         /* ignore */
-      } finally {
-        customRuleSetsLoading = null;
       }
-    })();
-    return customRuleSetsLoading;
+    })().finally(() => {
+      if (customRuleSetsLoading === request) customRuleSetsLoading = null;
+    });
+    customRuleSetsLoading = request;
+    return request;
   }
   function renderCustomRuleSets(items) {
     const list = $('#crsList');
@@ -115,18 +46,21 @@
       const cnt = it.kind === 'ruleset' ? t('customrs.srs') : t('customrs.rules', it.count || 0);
       const au = parseInt(it.autoUpdateMinutes || 0, 10);
       const auInfo = au > 0 ? ' · ' + t('subs.autoUpdateInfo', au) : '';
+      const formatLabel = escapeHtml(fmt[it.format] || it.format || '');
+      const targetLabel = escapeHtml(tgt[it.target] || it.target || '');
+      const id = escapeHtml(it.id);
       const div = document.createElement('div');
       div.className = 'sub-item';
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(it.name)}${it.enabled ? '' : ' · ⏸'}</div>
-          <div class="sub-meta">${fmt[it.format] || it.format} · ${tgt[it.target] || it.target} · ${cnt}${auInfo}${it.error ? ' · ⚠ ' + escapeHtml(it.error) : ''}</div>
+          <div class="sub-meta">${formatLabel} · ${targetLabel} · ${cnt}${auInfo}${it.error ? ' · ⚠ ' + escapeHtml(it.error) : ''}</div>
         </div>
         <div class="sub-actions">
-          <button class="btn" data-act="toggle" data-id="${it.id}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
-          <button class="btn" data-act="edit" data-id="${it.id}">${t('subs.edit')}</button>
-          <button class="btn" data-act="refresh" data-id="${it.id}">${t('customrs.refresh')}</button>
-          <button class="btn danger" data-act="remove" data-id="${it.id}">${t('customrs.remove')}</button>
+          <button class="btn" data-act="toggle" data-id="${id}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
+          <button class="btn" data-act="edit" data-id="${id}">${t('subs.edit')}</button>
+          <button class="btn" data-act="refresh" data-id="${id}">${t('customrs.refresh')}</button>
+          <button class="btn danger" data-act="remove" data-id="${id}">${t('customrs.remove')}</button>
         </div>`;
       list.appendChild(div);
     }
@@ -134,21 +68,23 @@
       b.addEventListener('click', async () => {
         const id = b.dataset.id;
         const act = b.dataset.act;
-        if (act === 'edit') {
-          const it = (await api.listCustomRuleSets()).find((x) => x.id === id);
-          if (it) openCrsModal(it);
-          return;
-        }
         b.disabled = true;
         try {
+          if (act === 'edit') {
+            const it = (await call(api.listCustomRuleSets)).find((x) => x.id === id);
+            if (it) await App.openDialog('remote-rule', { id });
+            return;
+          }
           if (act === 'remove') await call(api.removeCustomRuleSet, { id });
           else if (act === 'refresh') await call(api.refreshCustomRuleSet, { id });
           else if (act === 'toggle') {
-            const it = (await api.listCustomRuleSets()).find((x) => x.id === id);
+            const it = (await call(api.listCustomRuleSets)).find((x) => x.id === id);
             await call(api.editCustomRuleSet, { id, enabled: !(it && it.enabled) });
           }
-          await loadCustomRuleSets();
-          if (App.state.status && App.state.status.running) App.loadRules();
+          if (App.invalidateRuleCaches) App.invalidateRuleCaches();
+          await Promise.all([loadCustomRuleSets({ force: true }), App.loadRules({ force: true })]);
+        } catch (_) {
+          /* call() already showed the error */
         } finally {
           b.disabled = false;
         }
@@ -156,21 +92,6 @@
     });
   }
 
-  // Custom rule-set editor modal.
-  let editingCrsId = null;
-  function openCrsModal(it) {
-    editingCrsId = it.id;
-    $('#crsEditName').value = it.name || '';
-    $('#crsEditUrl').value = it.url || '';
-    $('#crsEditTarget').value = it.target;
-    $('#crsEditAutoUpdate').value = String(it.autoUpdateMinutes || 0);
-    $('#crsEditEnabled').checked = it.enabled !== false;
-    $('#crsModal').classList.remove('hidden');
-  }
-  function closeCrsModal() {
-    editingCrsId = null;
-    $('#crsModal').classList.add('hidden');
-  }
   function resetCrsForm() {
     $('#crsName').value = '';
     $('#crsUrl').value = '';
@@ -191,65 +112,31 @@
       });
       toast(t('customrs.added'));
       resetCrsForm();
-      await loadCustomRuleSets();
-      if (App.state.status && App.state.status.running) App.loadRules();
+      if (App.invalidateRuleCaches) App.invalidateRuleCaches();
+      await Promise.all([loadCustomRuleSets({ force: true }), App.loadRules({ force: true })]);
+    } catch (_) {
+      /* call() already showed the error */
     } finally {
       btn.disabled = false;
       btn.textContent = t('customrs.add');
     }
   });
 
-  // Custom rule-set editor modal: save / refresh now / cancel.
-  $('#crsEditCancel').addEventListener('click', closeCrsModal);
-  $('#crsModal').addEventListener('click', (e) => {
-    if (e.target.id === 'crsModal') closeCrsModal();
-  });
-  $('#crsEditSave').addEventListener('click', async () => {
-    if (!editingCrsId) return;
-    const url = $('#crsEditUrl').value.trim();
-    if (!url) return toast(t('toast.needUrl'), true);
-    const btn = $('#crsEditSave');
-    btn.disabled = true;
-    try {
-      await call(api.editCustomRuleSet, {
-        id: editingCrsId,
-        name: $('#crsEditName').value.trim(),
-        url,
-        target: $('#crsEditTarget').value,
-        autoUpdateMinutes: parseInt($('#crsEditAutoUpdate').value, 10) || 0,
-        enabled: $('#crsEditEnabled').checked,
-      });
-      toast(t('settings.saved'));
-      closeCrsModal();
-      await loadCustomRuleSets();
-      if (App.state.status && App.state.status.running) App.loadRules();
-    } finally {
-      btn.disabled = false;
-    }
-  });
-  $('#crsEditRefresh').addEventListener('click', async () => {
-    if (!editingCrsId) return;
-    const btn = $('#crsEditRefresh');
-    btn.disabled = true;
-    btn.textContent = t('subs.fetching');
-    try {
-      await call(api.refreshCustomRuleSet, { id: editingCrsId });
-      toast(t('customrs.added'));
-      await loadCustomRuleSets();
-      if (App.state.status && App.state.status.running) App.loadRules();
-    } finally {
-      btn.disabled = false;
-      btn.textContent = t('customrs.refresh');
-    }
-  });
-
-  App.loadGeoDataStatus = loadGeoDataStatus;
-  App.loadRuleSets = loadGeoDataStatus;
   App.loadCustomRuleSets = loadCustomRuleSets;
   App.ensureCustomRuleSetsLoaded = () => loadCustomRuleSets({ force: false });
   const invalidateRuleCaches = App.invalidateRuleCaches;
   App.invalidateRuleCaches = () => {
+    customRuleSetsGeneration++;
+    customRuleSetsLoading = null;
     customRuleSetsReady = false;
     if (invalidateRuleCaches) invalidateRuleCaches();
+  };
+  const releaseRuleCache = App.releaseRuleCache;
+  App.releaseRuleCache = () => {
+    customRuleSetsGeneration++;
+    customRuleSetsLoading = null;
+    customRuleSetsReady = false;
+    $('#crsList').textContent = '';
+    if (releaseRuleCache) releaseRuleCache();
   };
 })();

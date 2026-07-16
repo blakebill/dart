@@ -22,7 +22,7 @@ function run(cmd) {
   // UTF-8 code page first so the output decodes correctly.
   const full = process.platform === 'win32' ? 'chcp 65001>nul & ' + cmd : cmd;
   return new Promise((resolve, reject) => {
-    exec(full, { windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    exec(full, { windowsHide: true, maxBuffer: 16 * 1024 * 1024, timeout: 45000 }, (err, stdout, stderr) => {
       if (err) return reject(new Error((stderr || err.message || '').toString().trim()));
       resolve((stdout || '').toString());
     });
@@ -31,6 +31,12 @@ function run(cmd) {
 
 const MAP_PATH =
   'HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings';
+const APP_CACHE_TTL_MS = 5 * 60_000;
+
+let appCache = null;
+let appCacheAt = 0;
+let appEnumeration = null;
+let appCacheGeneration = 0;
 
 /** Run a PowerShell script via -EncodedCommand (avoids all cmd quoting). */
 function runPowerShell(script) {
@@ -112,18 +118,18 @@ async function listViaFirewallApi() {
   }
 }
 
+function parseExemptedSids(output) {
+  const set = new Set();
+  for (const match of String(output || '').matchAll(/S-1-15-2-[0-9-]+/gi)) set.add(match[0]);
+  return set;
+}
+
 /** SIDs (app containers) currently exempted from loopback isolation. */
-async function listExemptedSids() {
-  if (process.platform !== 'win32') return new Set();
-  try {
-    // Output labels are localized, but the SID tokens are not — match those.
-    const out = await run('CheckNetIsolation LoopbackExempt -s');
-    const set = new Set();
-    for (const m of out.matchAll(/S-1-15-2-[0-9-]+/gi)) set.add(m[0]);
-    return set;
-  } catch (e) {
-    return new Set();
-  }
+async function listExemptedSids(execute = run) {
+  if (process.platform !== 'win32' && execute === run) return new Set();
+  // A failed query must not look like an empty exemption list: applying that
+  // state would clear exemptions that the user could not see in the dialog.
+  return parseExemptedSids(await execute('CheckNetIsolation LoopbackExempt -s'));
 }
 
 /**
@@ -197,7 +203,7 @@ async function listPackages() {
  *      other tools stay visible and are not silently wiped on Apply (which
  *      rewrites the whole exemption list).
  */
-async function listApps(onLog = () => {}) {
+async function enumerateApps(onLog) {
   if (process.platform !== 'win32') return [];
   // Union of every source — the count can only grow, never shrink.
   const [api, exempted, mapped, packages] = await Promise.all([
@@ -254,6 +260,45 @@ async function listApps(onLog = () => {}) {
   return apps.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function cloneApps(apps) {
+  return apps.map((app) => ({ ...app }));
+}
+
+function invalidateAppCache() {
+  appCache = null;
+  appCacheAt = 0;
+  appCacheGeneration++;
+}
+
+/**
+ * Cache the expensive AppContainer enumeration and share an in-flight scan.
+ * Explicit reloads bypass a completed cache, while still joining a scan that
+ * is already running so opening the panel cannot spawn duplicate PowerShell
+ * and CheckNetIsolation processes.
+ */
+async function listApps(onLog = () => {}, options = {}) {
+  if (process.platform !== 'win32') return [];
+  const force = options && options.force === true;
+  const now = Date.now();
+  if (!force && appCache && now - appCacheAt < APP_CACHE_TTL_MS) {
+    return cloneApps(appCache);
+  }
+
+  if (!appEnumeration) {
+    const generation = appCacheGeneration;
+    appEnumeration = enumerateApps(onLog).then((apps) => {
+      if (generation === appCacheGeneration) {
+        appCache = apps;
+        appCacheAt = Date.now();
+      }
+      return apps;
+    }).finally(() => {
+      appEnumeration = null;
+    });
+  }
+  return cloneApps(await appEnumeration);
+}
+
 // A readable label for an AppContainer. Many containers carry an UNRESOLVED
 // display name — "@{Package?ms-resource://...}", a bare "ms-resource:..." token,
 // or empty — which is useless to show. In those cases derive the name from the
@@ -281,15 +326,37 @@ function prettyName(a) {
  * Replace the loopback exemption list with exactly the given SIDs.
  * Requires administrator rights (clearing/adding exemptions is privileged).
  */
-async function setExemptions(sids) {
-  if (process.platform !== 'win32') throw new Error('only supported on Windows');
-  await run('CheckNetIsolation LoopbackExempt -c');
-  for (const sid of sids || []) {
-    if (/^S-1-15-2-[0-9-]+$/i.test(sid)) {
-      await run(`CheckNetIsolation LoopbackExempt -a -p="${sid}"`);
+async function replaceExemptions(sids, execute = run) {
+  const next = [...new Set(sids || [])];
+  if (next.some((sid) => !/^S-1-15-2-[0-9-]+$/i.test(String(sid)))) throw new Error('invalid AppContainer SID');
+  const previous = [...await listExemptedSids(execute)];
+  const same = previous.length === next.length && previous.every((sid) => next.includes(sid));
+  if (same) return true;
+
+  const apply = async (items) => {
+    await execute('CheckNetIsolation LoopbackExempt -c');
+    for (const sid of items) await execute(`CheckNetIsolation LoopbackExempt -a -p="${sid}"`);
+  };
+  try {
+    await apply(next);
+    return true;
+  } catch (error) {
+    try {
+      await apply(previous);
+    } catch (rollbackError) {
+      throw new Error(`${error.message}; restoring previous exemptions failed: ${rollbackError.message}`);
     }
+    throw error;
   }
-  return true;
 }
 
-module.exports = { listApps, setExemptions, familyNameToSid, prettyName };
+async function setExemptions(sids) {
+  if (process.platform !== 'win32') throw new Error('only supported on Windows');
+  try {
+    return await replaceExemptions(sids);
+  } finally {
+    invalidateAppCache();
+  }
+}
+
+module.exports = { listApps, setExemptions, replaceExemptions, familyNameToSid, prettyName };

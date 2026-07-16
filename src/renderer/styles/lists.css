@@ -1,0 +1,380 @@
+/* Repeated data rows */
+.sub-list {
+  margin-top: 10px;
+}
+
+.sub-item,
+.conn-item {
+  min-width: 0;
+  min-height: var(--row-height);
+  padding: 11px 12px;
+  gap: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sub-item:first-child,
+.conn-item:first-child {
+  border-top: 1px solid var(--border);
+}
+
+.sub-item:hover,
+.conn-item:hover {
+  background: var(--surface-hover);
+}
+
+.sub-item.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+  background: var(--accent-soft);
+}
+
+.sub-info,
+.conn-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.sub-name,
+.node-name,
+.conn-host {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-meta {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-actions,
+.node-right,
+.conn-right {
+  display: flex;
+  min-width: 0;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+}
+
+.sub-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sub-activate-btn {
+  width: 72px;
+}
+
+.node-list,
+#tab-conns .conn-list,
+#tab-rules .rule-list {
+  position: relative;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  scrollbar-gutter: stable;
+}
+
+.node-list,
+#tab-conns .conn-list {
+  min-height: 0;
+  max-height: none;
+  flex: 1;
+  margin-top: 0;
+  padding-right: 8px;
+}
+
+.node-list {
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+
+#tab-rules .rule-list {
+  min-height: 120px;
+  max-height: calc(100vh - 190px);
+  margin-top: 10px;
+  padding-right: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.conn-list.is-empty {
+  display: grid;
+  place-items: center;
+}
+
+.conn-empty-state {
+  margin: 0;
+  padding: 24px;
+  text-align: center;
+}
+
+.canvas-page .sub-list > .hint,
+.canvas-page .rule-list > .hint {
+  display: grid;
+  min-height: 96px;
+  margin: 0;
+  padding: 20px;
+  place-items: center;
+  text-align: center;
+}
+
+.node-grid-window {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.node-item {
+  height: 68px;
+  min-height: 68px;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: space-between;
+  padding: 8px 10px;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  cursor: pointer;
+  transition: border-color var(--motion-standard), background-color var(--motion-standard), transform var(--motion-standard), box-shadow var(--motion-standard);
+}
+
+.node-item:first-child {
+  border-top: 1px solid var(--border);
+}
+
+.node-item:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  transform: translateY(-1px);
+  box-shadow: var(--panel-shadow);
+}
+
+.node-item.active {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.node-top,
+.node-bottom,
+.node-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.node-top {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.node-identity {
+  min-width: 0;
+  flex: 1;
+}
+
+.node-bottom {
+  gap: 7px;
+}
+
+.node-bottom .sub-meta {
+  min-width: 0;
+  flex: 1;
+}
+
+.node-tag,
+.node-active,
+.node-delay,
+.conn-net,
+.rule-type,
+.rule-proxy {
+  display: inline-flex;
+  align-items: center;
+  min-height: 19px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.node-tag {
+  margin-left: 6px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  background: var(--field);
+}
+
+.node-item:hover .node-tag {
+  border-color: color-mix(in srgb, var(--text-dim) 62%, var(--border));
+  color: var(--text);
+}
+
+.node-item.active .node-tag {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 65%, var(--field));
+}
+
+.node-active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.node-delay {
+  min-width: 55px;
+  justify-content: center;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.node-delay.good {
+  color: var(--green);
+}
+
+.node-delay.mid,
+.node-delay.testing {
+  color: var(--yellow);
+}
+
+.node-delay.bad {
+  color: var(--red);
+}
+
+.node-test-btn,
+.conn-close {
+  min-width: var(--control-height-compact);
+  min-height: var(--control-height-compact);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  background: transparent;
+  cursor: pointer;
+}
+
+.node-test-btn {
+  min-height: 26px;
+  padding-block: 2px;
+}
+
+.node-test-btn:hover,
+.conn-close:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.rule-item {
+  height: 44px;
+  min-height: 44px;
+  padding: 8px 10px;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rule-type {
+  width: 116px;
+  overflow: hidden;
+  color: var(--accent);
+  background: var(--accent-soft);
+  text-overflow: ellipsis;
+}
+
+.rule-payload {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.geodata-details {
+  color: var(--text-dim);
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.rule-proxy.geodata-status {
+  min-width: 64px;
+  justify-content: center;
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 13%, var(--surface));
+}
+
+.rule-proxy.geodata-status.problem {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, var(--surface));
+}
+
+.rule-proxy {
+  max-width: 170px;
+  overflow: hidden;
+  color: var(--teal);
+  background: rgba(85, 194, 163, 0.1);
+  text-overflow: ellipsis;
+}
+
+.rule-more {
+  padding: 12px;
+  text-align: center;
+}
+
+.conn-item {
+  height: 62px;
+  content-visibility: auto;
+  contain-intrinsic-size: 62px;
+}
+
+.conn-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.conn-net {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.conn-net.udp {
+  color: var(--yellow);
+  background: rgba(226, 173, 85, 0.1);
+}
+
+.conn-right {
+  max-width: 48%;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.conn-chains {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conn-traffic {
+  font-variant-numeric: tabular-nums;
+}
+
+.virtual-spacer {
+  width: 1px;
+  pointer-events: none;
+}

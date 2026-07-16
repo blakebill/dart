@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('api', {
   // State
   getState: () => ipcRenderer.invoke('app:getState'),
   getNodes: () => ipcRenderer.invoke('nodes:get'),
+  getRecentLogs: () => ipcRenderer.invoke('logs:get'),
+  clearRecentLogs: () => ipcRenderer.invoke('logs:clear'),
   coreStatus: () => ipcRenderer.invoke('core:status'),
 
   // Frameless window controls
@@ -18,6 +20,16 @@ contextBridge.exposeInMainWorld('api', {
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggleMaximize'),
   isWindowMaximized: () => ipcRenderer.invoke('window:isMaximized'),
   closeWindow: () => ipcRenderer.invoke('window:close'),
+
+  // Native secondary dialogs. The main renderer may open an allowlisted
+  // dialog; only that child window can read its context, close itself or
+  // report a completed change back to the main page.
+  prepareDialog: () => ipcRenderer.invoke('dialog:prepare'),
+  openDialog: (type, payload = {}) => ipcRenderer.invoke('dialog:open', { type, payload }),
+  getDialogContext: () => ipcRenderer.invoke('dialog:getContext'),
+  dialogViewReady: () => ipcRenderer.invoke('dialog:viewReady'),
+  closeDialog: () => ipcRenderer.invoke('dialog:close'),
+  dialogChanged: (scope, message = '') => ipcRenderer.invoke('dialog:changed', { scope, message }),
 
   // Subscriptions
   addSubscription: (payload) => ipcRenderer.invoke('sub:add', payload),
@@ -60,7 +72,8 @@ contextBridge.exposeInMainWorld('api', {
   setTun: (enable) => ipcRenderer.invoke('tun:set', { enable }),
 
   // UWP loopback exemption tool
-  listUwpApps: () => ipcRenderer.invoke('uwp:list'),
+  warmUwpApps: () => ipcRenderer.invoke('uwp:warm'),
+  listUwpApps: (force = false) => ipcRenderer.invoke('uwp:list', { force: !!force }),
   setUwpLoopback: (sids) => ipcRenderer.invoke('uwp:set', { sids }),
 
   // Diagnostics and maintenance toolbox
@@ -140,5 +153,15 @@ contextBridge.exposeInMainWorld('api', {
     const handler = (_e, maximized) => cb(!!maximized);
     ipcRenderer.on('window:maximized', handler);
     return () => ipcRenderer.removeListener('window:maximized', handler);
+  },
+  onDialogChanged: (cb) => {
+    const handler = (_e, change) => cb(change);
+    ipcRenderer.on('dialog:changed', handler);
+    return () => ipcRenderer.removeListener('dialog:changed', handler);
+  },
+  onDialogContext: (cb) => {
+    const handler = (_e, context) => cb(context);
+    ipcRenderer.on('dialog:context', handler);
+    return () => ipcRenderer.removeListener('dialog:context', handler);
   },
 });

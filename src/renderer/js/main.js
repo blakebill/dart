@@ -7,6 +7,34 @@
   const api = window.api;
   const { setLang, getLang, applyI18n } = window.i18n;
 
+  const TAB_MODULES = Object.freeze({
+    subs: ['js/subs.js'],
+    nodes: ['js/nodes.js'],
+    rules: ['js/rules.js', 'js/rulesets.js'],
+    conns: ['js/conns.js'],
+    logs: ['js/logs.js'],
+    settings: ['js/settings.js'],
+    tools: ['js/tools.js', 'js/toolbox.js'],
+  });
+  const loadedTabs = new Set(['dashboard']);
+  let localSettingsRevision = 0;
+
+  App.commitSettings = function commitSettings(settings) {
+    localSettingsRevision++;
+    App.state.settings = settings || {};
+    return App.state.settings;
+  };
+  App.patchSettings = function patchSettings(patch) {
+    return App.commitSettings({ ...(App.state.settings || {}), ...(patch || {}) });
+  };
+
+  async function ensureTabModules(tab) {
+    if (loadedTabs.has(tab) || !TAB_MODULES[tab]) return;
+    await App.loadScripts(TAB_MODULES[tab]);
+    loadedTabs.add(tab);
+  }
+  App.ensureTabModules = ensureTabModules;
+
   // ---------- Language ----------
   function setLanguage(lang) {
     setLang(lang);
@@ -17,14 +45,13 @@
     applyI18n();
     // Re-render dynamic content that isn't covered by data-i18n.
     App.renderStatus();
-    App.renderSubs();
-    App.renderNodes();
-    App.renderSettings();
+    if (App.renderSubs) App.renderSubs();
+    if (App.renderNodes) App.renderNodes();
+    if (App.renderSettings) App.renderSettings();
     App.renderMode();
     App.renderUsage();
-    App.renderCoreStatus(App.state.status);
-    if (App.refreshToolsLanguage) App.refreshToolsLanguage();
-    if (App.currentTab === 'rules') {
+    if (App.renderCoreStatus) App.renderCoreStatus(App.state.status);
+    if (App.currentTab === 'rules' && App.loadRules) {
       App.loadRules({ force: false });
       App.loadLocalRules({ force: true });
       App.loadRuleGroups({ force: true });
@@ -40,6 +67,85 @@
   }
 
   // ---------- Tab switching ----------
+  const nav = document.querySelector('.nav');
+  const navIndicator = $('#navIndicator');
+  const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)');
+  let navIndicatorFrame = 0;
+  let navIndicatorAnimation = null;
+  let navIndicatorY = 0;
+
+  function currentNavIndicatorY() {
+    const playState = navIndicatorAnimation && navIndicatorAnimation.playState;
+    if (playState !== 'running' && playState !== 'pending') return navIndicatorY;
+    try {
+      const indicatorRect = navIndicator.getBoundingClientRect();
+      const navRect = nav.getBoundingClientRect();
+      return indicatorRect.top - navRect.top + (indicatorRect.height - navIndicator.offsetHeight) / 2;
+    } catch (_) {
+      return navIndicatorY;
+    }
+  }
+
+  function cancelNavIndicatorAnimation() {
+    if (navIndicatorAnimation && navIndicatorAnimation.playState !== 'idle') {
+      navIndicatorAnimation.cancel();
+    }
+    if (navIndicator) navIndicator.style.transformOrigin = '50% 50%';
+  }
+
+  function moveNavIndicator(targetY, immediate) {
+    const fromY = currentNavIndicatorY();
+    cancelNavIndicatorAnimation();
+
+    const delta = targetY - fromY;
+    navIndicatorY = targetY;
+    navIndicator.style.transform = `translateY(${targetY}px) scaleY(1)`;
+    const canAnimate = nav.classList.contains('indicator-ready') &&
+      !immediate && !(reducedMotion && reducedMotion.matches) && Math.abs(delta) >= 1;
+    if (!canAnimate) {
+      navIndicator.style.transformOrigin = '50% 50%';
+      if (!nav.classList.contains('indicator-ready')) {
+        requestAnimationFrame(() => nav.classList.add('indicator-ready'));
+      }
+      return;
+    }
+
+    const distance = Math.abs(delta);
+    const stretch = Math.min(2.35, 1.25 + distance / 90);
+    const middleY = fromY + delta * 0.35;
+    navIndicator.style.transformOrigin = delta > 0 ? '50% 0%' : '50% 100%';
+    const keyframes = [
+      { transform: `translateY(${fromY}px) scaleY(1)`, offset: 0 },
+      { transform: `translateY(${middleY}px) scaleY(${stretch})`, offset: 0.42 },
+      { transform: `translateY(${targetY}px) scaleY(1)`, offset: 1 },
+    ];
+    const timing = {
+      duration: Math.min(320, 220 + distance * 0.35),
+      easing: 'cubic-bezier(0.65, 0, 0.35, 1)',
+    };
+    // Reuse one WAAPI object and cancel it while idle so no finished effects accumulate.
+    if (!navIndicatorAnimation) {
+      navIndicatorAnimation = navIndicator.animate(keyframes, timing);
+      navIndicatorAnimation.onfinish = cancelNavIndicatorAnimation;
+    } else {
+      navIndicatorAnimation.effect.setKeyframes(keyframes);
+      navIndicatorAnimation.effect.updateTiming(timing);
+      navIndicatorAnimation.play();
+    }
+  }
+
+  function syncNavIndicator(button, immediate = false) {
+    if (!nav || !navIndicator || !button) return;
+    if (navIndicatorFrame) cancelAnimationFrame(navIndicatorFrame);
+    const update = () => {
+      navIndicatorFrame = 0;
+      const y = button.offsetTop + (button.offsetHeight - navIndicator.offsetHeight) / 2;
+      moveNavIndicator(Math.round(y), immediate);
+    };
+    if (immediate) update();
+    else navIndicatorFrame = requestAnimationFrame(update);
+  }
+
   function syncTopbarTitle(button) {
     const active = button || document.querySelector('.nav-item.active');
     const title = $('#topbarTitle');
@@ -57,16 +163,31 @@
       const panel = $('#tab-' + tab);
       if (panel) panel.classList.add('active');
     }
-    onTabShown(tab);
+    syncNavIndicator(btn);
+    onTabShown(tab).catch((error) => App.toast(error.message || String(error), true));
   }
   App.showTab = showTab;
 
   $$('.nav-item').forEach((btn) => {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
   });
+  syncNavIndicator(document.querySelector('.nav-item.active'), true);
+  window.addEventListener('resize', () => {
+    syncNavIndicator(document.querySelector('.nav-item.active'), true);
+  });
 
   // Per-tab activation: load rules on demand, start/stop connection polling.
   let connTimer = null;
+  function scheduleConnectionPoll(delay = 2000) {
+    if (connTimer) clearTimeout(connTimer);
+    connTimer = setTimeout(async () => {
+      connTimer = null;
+      if (document.hidden || App.currentTab !== 'conns') return;
+      const data = await App.loadConnections();
+      if (document.hidden || App.currentTab !== 'conns') return;
+      scheduleConnectionPoll(data && data.totalConnections >= 600 ? 4000 : 2000);
+    }, delay);
+  }
   function afterPaint(fn, delay = 0) {
     const run = () => {
       if (window.requestAnimationFrame) window.requestAnimationFrame(fn);
@@ -90,20 +211,27 @@
     }
   }
 
-  function onTabShown(tab) {
+  let tabActivationSequence = 0;
+  async function onTabShown(tab) {
+    const sequence = ++tabActivationSequence;
     const previousTab = App.currentTab;
     App.currentTab = tab;
-    if (previousTab === 'conns' && tab !== 'conns') App.clearConnections();
+    if (previousTab === 'conns' && tab !== 'conns' && App.clearConnections) App.clearConnections();
     if (previousTab === 'nodes' && tab !== 'nodes' && App.releaseNodes) App.releaseNodes();
     if (connTimer) {
-      clearInterval(connTimer);
+      clearTimeout(connTimer);
       connTimer = null;
     }
+    await ensureTabModules(tab);
+    if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== tab) return;
     if (tab === 'rules') {
       showRulesTab();
     } else if (tab === 'conns') {
-      App.loadConnections();
-      connTimer = setInterval(App.loadConnections, 2000);
+      App.loadConnections().then((data) => {
+        if (!document.hidden && App.currentTab === 'conns') {
+          scheduleConnectionPoll(data && data.totalConnections >= 600 ? 4000 : 2000);
+        }
+      });
     } else if (tab === 'nodes') {
       App.loadNodes();
       App.refreshGroupSelections();
@@ -112,24 +240,64 @@
       // Land at the latest line when opening the Logs tab (lines accumulate while hidden).
       const box = $('#logBox');
       if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
+    } else if (tab === 'subs') {
+      App.renderSubs();
+    } else if (tab === 'settings') {
+      App.renderSettings();
+      App.renderCoreStatus(App.state.status);
+      if (App.refreshSelects) App.refreshSelects();
+    } else if (tab === 'tools') {
+      // AppContainer enumeration is cached in the main process and remains the
+      // expensive part of the UWP tool's first open.
+      afterPaint(() => {
+        if (document.hidden || App.currentTab !== 'tools') return;
+        if (api.warmUwpApps) api.warmUwpApps().catch(() => {});
+      });
     } else if (tab === 'dashboard') {
       App.trafficChart.draw();
     }
   }
 
+  // Prewarm the lightweight dialog shell only when the pointer or keyboard is
+  // actually approaching a dialog launcher. This keeps idle Tools visits from
+  // holding a second renderer while preserving a fast click path.
+  const DIALOG_LAUNCHER_SELECTOR = [
+    'button[id$="Open"]',
+    '#coreManageBtn',
+    '#geoManageBtn',
+    '#lrAdd',
+    '#subList button[data-act="editraw"]',
+    '#lrList button[data-act="edit"]',
+    '#crsList button[data-act="edit"]',
+  ].join(',');
+  let lastDialogWarm = 0;
+  function warmDialogNearLauncher(event) {
+    const launcher = event.target.closest && event.target.closest(DIALOG_LAUNCHER_SELECTOR);
+    if (!launcher || !api.prepareDialog) return;
+    const now = Date.now();
+    if (now - lastDialogWarm < 1500) return;
+    lastDialogWarm = now;
+    api.prepareDialog().catch(() => {});
+  }
+  document.addEventListener('pointerover', warmDialogNearLauncher);
+  document.addEventListener('focusin', warmDialogNearLauncher);
+  document.addEventListener('pointerdown', warmDialogNearLauncher, true);
+
   // While hidden (minimized to tray), stop polling and drawing. The main
   // process keeps the tray tooltip live without waking the renderer each second.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
+      cancelNavIndicatorAnimation();
+      tabActivationSequence++;
       if (connTimer) {
-        clearInterval(connTimer);
+        clearTimeout(connTimer);
         connTimer = null;
       }
-      if (App.currentTab === 'conns') App.clearConnections();
+      if (App.currentTab === 'conns' && App.clearConnections) App.clearConnections();
       if (App.releaseNodes) App.releaseNodes();
       if (App.releaseRuleCache) App.releaseRuleCache();
     } else {
-      onTabShown(App.currentTab);
+      onTabShown(App.currentTab).catch((error) => App.toast(error.message || String(error), true));
       App.trafficChart.draw();
       App.miniChart.draw();
     }
@@ -137,32 +305,83 @@
 
   // ---------- Data refresh ----------
   let prevActiveSub;
+  let prevActiveRevision;
+  let prevRuleConfigRevision;
   let refreshSequence = 0;
+  let statusEventRevision = 0;
   async function refresh() {
     const sequence = ++refreshSequence;
+    const statusRevisionAtStart = statusEventRevision;
+    const settingsRevisionAtStart = localSettingsRevision;
     const nextState = await api.getState();
     if (sequence !== refreshSequence) return;
+    // A compact status event can overtake this slower full snapshot. Preserve
+    // that newer runtime truth instead of repainting a stopped/running core
+    // with the stale snapshot that was already in flight.
+    if (statusRevisionAtStart !== statusEventRevision) {
+      const liveStatus = App.state.status || {};
+      const coreChanged = liveStatus.coreType && nextState.status &&
+        liveStatus.coreType !== nextState.status.coreType;
+      nextState.status = coreChanged
+        ? { ...(nextState.status || {}), ...liveStatus, corePath: undefined, coreVersion: undefined }
+        : { ...(nextState.status || {}), ...liveStatus };
+    }
+    if (settingsRevisionAtStart !== localSettingsRevision) {
+      nextState.settings = App.state.settings;
+    }
     App.state = nextState;
-    // Drop stale latency results when the active profile changes.
-    if (App.state.activeSub !== prevActiveSub) {
+    const activeSummary = (App.state.subscriptions || []).find((sub) => sub.id === App.state.activeSub);
+    const activeRevision = activeSummary
+      ? `${activeSummary.id}\0${activeSummary.updatedAt || 0}\0${activeSummary.nodeCount || 0}`
+      : String(App.state.activeSub || '');
+    const ruleConfigRevision = JSON.stringify([
+      App.state.settings && App.state.settings.coreType,
+      !!(App.state.settings && App.state.settings.useBuiltinRules),
+      (App.state.settings && App.state.settings.ruleOverrides) || {},
+    ]);
+    const activeChanged = App.state.activeSub !== prevActiveSub || activeRevision !== prevActiveRevision;
+    // A same-id refresh may still replace every node/rule in the profile.
+    // Drop data tied to its old contents as well as on explicit profile switches.
+    if (activeChanged) {
       App.delays.clear();
       prevActiveSub = App.state.activeSub;
+      prevActiveRevision = activeRevision;
       if (App.releaseNodes) App.releaseNodes();
+    }
+    if (activeChanged || ruleConfigRevision !== prevRuleConfigRevision) {
       if (App.invalidateRuleCaches) App.invalidateRuleCaches();
     }
+    prevRuleConfigRevision = ruleConfigRevision;
     // setLanguage re-renders everything below; only invoke it on an actual change.
     const lang = App.state.settings && App.state.settings.language;
     if (lang && lang !== getLang()) setLanguage(lang);
     App.applyTheme(App.state.settings && App.state.settings.theme);
     App.renderStatus();
-    App.renderSubs();
-    if (App.currentTab === 'nodes') App.loadNodes();
-    App.renderSettings();
+    if (App.renderSubs) App.renderSubs();
+    if (App.currentTab === 'nodes' && App.loadNodes) App.loadNodes();
+    if (App.renderSettings) App.renderSettings();
     App.renderMode();
     App.renderUsage();
     // getState already carries the core path/version, so no extra IPC is needed.
-    App.renderCoreStatus(App.state.status);
-    App.refreshGroupSelections();
+    if (App.renderCoreStatus) App.renderCoreStatus(App.state.status);
+    if (App.refreshGroupSelections) {
+      App.refreshGroupSelections();
+    } else if (App.state.status && App.state.status.running) {
+      // The current-node readout is visible outside the Nodes page. Load its
+      // controller after first paint only when a running core makes it useful.
+      afterPaint(() => {
+        if (document.hidden || !(App.state.status && App.state.status.running)) return;
+        ensureTabModules('nodes')
+          .then(() => App.refreshGroupSelections())
+          .catch(() => {});
+      });
+    }
+  }
+
+  function refreshSafely() {
+    return refresh().catch((error) => {
+      if (!document.hidden) App.toast(error.message || String(error), true);
+    });
   }
 
   // ---------- Event streams ----------
@@ -173,15 +392,30 @@
   if (api && api.onSubsChanged) api.onSubsChanged(() => {
     if (App.releaseNodes) App.releaseNodes();
     if (App.invalidateRuleCaches) App.invalidateRuleCaches();
-    refresh();
+    refreshSafely();
   });
   // Keep the mode buttons in sync when the mode is changed from the tray menu.
   if (api && api.onModeChanged) api.onModeChanged((mode) => {
-    if (App.state.settings) App.state.settings.clashMode = mode;
+    App.patchSettings({ clashMode: mode });
     App.renderMode();
+  });
+  if (api && api.onDialogChanged) api.onDialogChanged((change) => {
+    Promise.resolve().then(async () => {
+      const scope = change && change.scope;
+      if (scope === 'rules' || scope === 'all') {
+        if (App.invalidateRuleCaches) App.invalidateRuleCaches();
+      }
+      if (scope === 'subscriptions' || scope === 'all') {
+        if (App.releaseNodes) App.releaseNodes();
+      }
+      if (scope !== 'geodata') await refresh();
+      if ((scope === 'rules' || scope === 'all') && App.currentTab === 'rules') showRulesTab();
+      if (change && change.message) App.toast(change.message);
+    }).catch((error) => App.toast(error.message || String(error), true));
   });
 
   if (api && api.onStatus) api.onStatus((status) => {
+    statusEventRevision++;
     const previous = App.state.status || {};
     const wasRunning = previous.running;
     const coreChanged = !!(
@@ -193,8 +427,14 @@
       ? { ...previous, ...status, corePath: undefined, coreVersion: undefined }
       : { ...previous, ...status };
     App.renderStatus();
-    App.renderCoreStatus(App.state.status);
-    App.refreshGroupSelections();
+    if (App.renderCoreStatus) App.renderCoreStatus(App.state.status);
+    if (App.refreshGroupSelections) {
+      App.refreshGroupSelections();
+    } else if (App.state.status.running) {
+      ensureTabModules('nodes')
+        .then(() => App.refreshGroupSelections())
+        .catch(() => {});
+    }
     if (App.state.status.coreInstalled && App.state.status.coreVersion === undefined && App.refreshCoreStatus) {
       App.refreshCoreStatus().catch(() => {});
     }
@@ -218,7 +458,7 @@
     App.miniChart.draw();
     return;
   }
-  refresh();
+  refreshSafely();
   App.trafficChart.draw();
   App.miniChart.draw();
   App.initVersion();
@@ -226,8 +466,9 @@
   try {
     const last = parseInt(localStorage.getItem('lastUpdateCheck') || '0', 10);
     if (Date.now() - last > 86400000) {
-      localStorage.setItem('lastUpdateCheck', String(Date.now()));
-      App.runUpdateCheck(true);
+      App.runUpdateCheck(true).then((success) => {
+        if (success) localStorage.setItem('lastUpdateCheck', String(Date.now()));
+      }).catch(() => {});
     }
   } catch (_) {
     App.runUpdateCheck(true);

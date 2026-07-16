@@ -14,10 +14,13 @@ const yaml = require('js-yaml');
 function normalizeClashProxy(p) {
   if (!p || !p.type) return null;
   const type = String(p.type).toLowerCase();
+  const server = typeof p.server === 'string' ? p.server.trim() : '';
+  const port = Number(p.port);
+  if (!server || !Number.isInteger(port) || port < 1 || port > 65535) return null;
   const base = {
     name: p.name,
-    server: p.server,
-    port: parseInt(p.port, 10),
+    server,
+    port,
   };
 
   switch (type) {
@@ -195,9 +198,7 @@ function parseClashConfig(content) {
   const nodes = [];
   for (const p of isClash ? doc.proxies : []) {
     const node = normalizeClashProxy(p);
-    if (node && node.server && node.port) {
-      nodes.push(node);
-    }
+    if (node) nodes.push(node);
   }
 
   const groups = Array.isArray(doc['proxy-groups']) ? doc['proxy-groups'] : [];
@@ -216,6 +217,10 @@ function normalizeRuleProviders(rp) {
   const out = {};
   if (!rp || typeof rp !== 'object') return out;
   for (const [name, def] of Object.entries(rp)) {
+    // Assignment to __proto__ changes the prototype of a normal object instead
+    // of creating a provider. These names are not useful Clash identifiers and
+    // must not be allowed to alter the normalized result's object shape.
+    if (name === '__proto__' || name === 'prototype' || name === 'constructor') continue;
     if (!def || typeof def !== 'object') continue;
     out[name] = {
       type: def.type || 'http',

@@ -124,13 +124,15 @@
     if (!list) return;
     if (options.force === false && ruleGroupsReady) return;
     if (ruleGroupsLoading) return ruleGroupsLoading;
-    ruleGroupsLoading = (async () => {
+    const generation = ruleLoadGeneration;
+    const request = (async () => {
       let info;
       try {
         info = await api.getRuleGroups();
       } catch (e) {
         return;
       }
+      if (generation !== ruleLoadGeneration) return;
       const groups = info.groups || [];
       const overrides = info.overrides || {};
       if (!groups.length) {
@@ -168,10 +170,13 @@
           else next[g] = sel.value;
           sel.disabled = true;
           try {
-            App.state.settings = await call(api.updateSettings, { ruleOverrides: next });
+            App.commitSettings(await call(api.updateSettings, { ruleOverrides: next }));
             info.overrides = next;
             toast(t('settings.saved'));
-            if (App.state.status && App.state.status.running) loadRules();
+            rulesReady = false;
+            await loadRules({ force: true });
+          } catch (_) {
+            /* call() already showed the error */
           } finally {
             sel.disabled = false;
           }
@@ -180,9 +185,10 @@
       if (App.enhanceSelects) App.enhanceSelects(list); // style these freshly-built selects
       ruleGroupsReady = true;
     })().finally(() => {
-      ruleGroupsLoading = null;
+      if (ruleGroupsLoading === request) ruleGroupsLoading = null;
     });
-    return ruleGroupsLoading;
+    ruleGroupsLoading = request;
+    return request;
   }
   $('#ruleGroupRefresh').addEventListener('click', () => loadRuleGroups({ force: true }));
 
@@ -197,17 +203,21 @@
   async function loadLocalRules(options = {}) {
     if (options.force === false && localRulesReady) return;
     if (localRulesLoading) return localRulesLoading;
-    localRulesLoading = (async () => {
+    const generation = ruleLoadGeneration;
+    const request = (async () => {
       try {
-        renderLocalRules(await api.listLocalRules());
+        const items = await api.listLocalRules();
+        if (generation !== ruleLoadGeneration) return;
+        renderLocalRules(items);
         localRulesReady = true;
       } catch (e) {
         /* ignore */
-      } finally {
-        localRulesLoading = null;
       }
-    })();
-    return localRulesLoading;
+    })().finally(() => {
+      if (localRulesLoading === request) localRulesLoading = null;
+    });
+    localRulesLoading = request;
+    return request;
   }
   function renderLocalRules(items) {
     const list = $('#lrList');
@@ -219,17 +229,20 @@
     }
     const tgt = { proxy: t('customrs.targetProxy'), direct: t('customrs.targetDirect'), reject: t('customrs.targetReject') };
     for (const it of items) {
+      const matchLabel = escapeHtml(MATCH_LABELS[it.matchType] || it.matchType || '');
+      const targetLabel = escapeHtml(tgt[it.target] || it.target || '');
+      const id = escapeHtml(it.id);
       const div = document.createElement('div');
       div.className = 'sub-item';
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(it.name || MATCH_LABELS[it.matchType] || it.matchType)}${it.enabled ? '' : ' · ⏸'}</div>
-          <div class="sub-meta">${MATCH_LABELS[it.matchType] || it.matchType} · ${tgt[it.target] || it.target} · ${t('localrules.count', (it.values || []).length)}</div>
+          <div class="sub-meta">${matchLabel} · ${targetLabel} · ${t('localrules.count', (it.values || []).length)}</div>
         </div>
         <div class="sub-actions">
-          <button class="btn" data-act="toggle" data-id="${it.id}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
-          <button class="btn" data-act="edit" data-id="${it.id}">${t('subs.edit')}</button>
-          <button class="btn danger" data-act="remove" data-id="${it.id}">${t('customrs.remove')}</button>
+          <button class="btn" data-act="toggle" data-id="${id}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
+          <button class="btn" data-act="edit" data-id="${id}">${t('subs.edit')}</button>
+          <button class="btn danger" data-act="remove" data-id="${id}">${t('customrs.remove')}</button>
         </div>`;
       list.appendChild(div);
     }
@@ -237,18 +250,20 @@
       b.addEventListener('click', async () => {
         const id = b.dataset.id;
         const act = b.dataset.act;
-        const items2 = await api.listLocalRules();
-        const it = items2.find((x) => x.id === id);
-        if (act === 'edit') {
-          if (it) openLocalRuleModal(it);
-          return;
-        }
         b.disabled = true;
         try {
+          const items2 = await call(api.listLocalRules);
+          const it = items2.find((x) => x.id === id);
+          if (act === 'edit') {
+            if (it) await App.openDialog('local-rule', { id });
+            return;
+          }
           if (act === 'remove') await call(api.removeLocalRule, { id });
           else if (act === 'toggle') await call(api.editLocalRule, { id, enabled: !(it && it.enabled) });
-          await loadLocalRules();
-          if (App.state.status && App.state.status.running) loadRules();
+          invalidateRuleCaches();
+          await Promise.all([loadLocalRules({ force: true }), loadRules({ force: true })]);
+        } catch (_) {
+          /* call() already showed the error */
         } finally {
           b.disabled = false;
         }
@@ -256,53 +271,13 @@
     });
   }
 
-  let editingLrId = null;
-  function openLocalRuleModal(lr) {
-    editingLrId = lr ? lr.id : null;
-    $('#lrModalTitle').textContent = lr ? t('localrules.editTitle') : t('localrules.title');
-    $('#lrName').value = lr ? lr.name || '' : '';
-    $('#lrType').value = lr ? lr.matchType : 'domain';
-    $('#lrTarget').value = lr ? lr.target : 'proxy';
-    $('#lrValues').value = lr ? (lr.values || []).join('\n') : '';
-    $('#localRuleModal').classList.remove('hidden');
-    $('#lrName').focus();
-  }
-  function closeLocalRuleModal() {
-    editingLrId = null;
-    $('#localRuleModal').classList.add('hidden');
-  }
-
-  $('#lrAdd').addEventListener('click', () => openLocalRuleModal(null));
-  $('#lrCancel').addEventListener('click', closeLocalRuleModal);
-  $('#localRuleModal').addEventListener('click', (e) => {
-    if (e.target.id === 'localRuleModal') closeLocalRuleModal();
-  });
-  $('#lrSave').addEventListener('click', async () => {
-    const values = $('#lrValues').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    if (!values.length) return toast(t('localrules.needValues'), true);
-    const payload = {
-      name: $('#lrName').value.trim(),
-      matchType: $('#lrType').value,
-      target: $('#lrTarget').value,
-      values,
-    };
-    const btn = $('#lrSave');
-    btn.disabled = true;
-    try {
-      if (editingLrId) await call(api.editLocalRule, { id: editingLrId, ...payload });
-      else await call(api.addLocalRule, payload);
-      toast(t('settings.saved'));
-      closeLocalRuleModal();
-      await loadLocalRules();
-      if (App.state.status && App.state.status.running) loadRules();
-    } finally {
-      btn.disabled = false;
-    }
-  });
+  $('#lrAdd').addEventListener('click', () => App.openDialog('local-rule'));
 
   function invalidateRuleCaches() {
     ruleLoadGeneration++;
     rulesLoading = null;
+    localRulesLoading = null;
+    ruleGroupsLoading = null;
     rulesReady = false;
     localRulesReady = false;
     ruleGroupsReady = false;
@@ -311,11 +286,17 @@
   function releaseRuleCache() {
     ruleLoadGeneration++;
     rulesLoading = null;
+    localRulesLoading = null;
+    ruleGroupsLoading = null;
     rulesReady = false;
+    localRulesReady = false;
+    ruleGroupsReady = false;
     ruleItems = [];
     visibleRuleItems = [];
     $('#ruleList').textContent = '';
     $('#ruleCount').textContent = '';
+    $('#lrList').textContent = '';
+    $('#ruleGroupList').textContent = '';
   }
 
   App.loadRules = loadRules;

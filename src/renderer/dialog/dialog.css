@@ -1,0 +1,224 @@
+html,
+body.native-dialog-body {
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.native-dialog-body {
+  padding: 0;
+}
+
+.native-dialog-window {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: rgba(18, 18, 20, 0.08);
+  box-shadow: var(--shadow);
+}
+
+:root[data-theme='light'] .native-dialog-window {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.native-dialog-titlebar {
+  display: flex;
+  height: 48px;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  padding-left: 20px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(18, 18, 20, 0.08);
+  -webkit-app-region: drag;
+}
+
+:root[data-theme='light'] .native-dialog-titlebar {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.native-dialog-titlebar strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.native-dialog-close {
+  width: 48px;
+  height: 47px;
+  flex: none;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: 22px/1 "Segoe UI Variable", "Segoe UI", sans-serif;
+  cursor: pointer;
+  transition: color var(--motion-fast), background-color var(--motion-fast);
+  -webkit-app-region: no-drag;
+}
+
+.native-dialog-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.native-dialog-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.dialog-body {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  padding: 22px 24px;
+  overflow: auto;
+}
+
+.dialog-body.dialog-flex {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow: hidden;
+}
+
+.dialog-body.dialog-flex > .hint:first-child {
+  margin-bottom: 18px;
+}
+
+.dialog-footer {
+  display: flex;
+  min-height: 66px;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 12px 20px;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  background: rgba(18, 18, 20, 0.1);
+}
+
+:root[data-theme='light'] .dialog-footer {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.dialog-loading,
+.dialog-error {
+  display: grid;
+  min-height: 220px;
+  flex: 1;
+  place-items: center;
+  padding: 24px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.dialog-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(220px, 1.4fr);
+  gap: 14px;
+}
+
+.dialog-grid .setting-row {
+  margin: 0;
+}
+
+.dialog-progress {
+  margin-top: 14px;
+}
+
+#dialogCoreStatus {
+  display: block;
+  max-width: min(520px, 62vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.dialog-result {
+  min-height: 160px;
+  flex: 1;
+  overflow: auto;
+}
+
+.dialog-convert-input {
+  min-height: 150px;
+  flex: 0 1 38%;
+}
+
+.dialog-convert-output {
+  min-height: 150px;
+  flex: 1 1 42%;
+  overflow: auto;
+}
+
+.dialog-editor-wrap {
+  min-height: 240px;
+  flex: 1;
+}
+
+.dialog-uwp-list {
+  min-height: 160px;
+  flex: 1;
+  overflow: auto;
+}
+
+.dialog-tool-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.dialog-tool-body .tool-result {
+  min-height: 160px;
+  max-height: none;
+  flex: 1;
+  overflow: auto;
+}
+
+.dialog-commandbar {
+  min-height: var(--commandbar-height);
+  flex: none;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 0;
+}
+
+.dialog-tool-body > .hint {
+  flex: none;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .dialog-body {
+    padding: 18px;
+  }
+
+  .dialog-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-footer {
+    min-height: 60px;
+    padding: 10px 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .native-dialog-close {
+    transition: none;
+  }
+}

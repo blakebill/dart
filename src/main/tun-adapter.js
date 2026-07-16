@@ -7,10 +7,12 @@ const TUN_DISPLAY_NAME = 'Dart Tunnel';
 const LEGACY_TUN_NAMES = ['tun0', 'Meta', TUN_DEVICE_NAME, TUN_DISPLAY_NAME];
 const VIRTUAL_ADAPTER_PATTERN = 'sing-tun|wintun|mihomo|clash|meta|tun';
 let adapterQueue = Promise.resolve();
+let renameGeneration = 0;
+let activeRenameProcess = null;
 
-function runPowerShell(script, timeout = 12000) {
+function runPowerShell(script, timeout = 12000, onStart = null) {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
       { timeout, windowsHide: true, maxBuffer: 64 * 1024, encoding: 'utf-8' },
@@ -22,7 +24,17 @@ function runPowerShell(script, timeout = 12000) {
         resolve(String(stdout || '').trim());
       }
     );
+    if (onStart) onStart(child);
   });
+}
+
+function cancelPendingRename() {
+  renameGeneration += 1;
+  const child = activeRenameProcess;
+  activeRenameProcess = null;
+  if (child && !child.killed) {
+    try { child.kill(); } catch (_) {}
+  }
 }
 
 function queueAdapterOperation(operation) {
@@ -75,6 +87,9 @@ function renameScript() {
 
 async function cleanupTunAdapters(log = () => {}) {
   if (process.platform !== 'win32') return true;
+  // Adapter removal is functional; do not let the cosmetic rename poll hold it
+  // behind up to three seconds of Start-Sleep retries during a quick restart.
+  cancelPendingRename();
   return queueAdapterOperation(async () => {
     try {
       const removed = Number(await runPowerShell(cleanupScript())) || 0;
@@ -89,14 +104,26 @@ async function cleanupTunAdapters(log = () => {}) {
 
 async function syncTunDisplayName(log = () => {}) {
   if (process.platform !== 'win32') return true;
+  cancelPendingRename();
+  const generation = renameGeneration;
   return queueAdapterOperation(async () => {
+    if (generation !== renameGeneration) return false;
+    let child = null;
     try {
-      await runPowerShell(renameScript(), 6000);
+      await runPowerShell(renameScript(), 6000, (process) => {
+        child = process;
+        if (generation === renameGeneration) activeRenameProcess = process;
+        else process.kill();
+      });
+      if (generation !== renameGeneration) return false;
       log(`[gui] Windows TUN connection renamed to ${TUN_DISPLAY_NAME}`);
       return true;
     } catch (error) {
+      if (generation !== renameGeneration) return false;
       log(`[gui] could not rename the Windows TUN connection to ${TUN_DISPLAY_NAME} (non-fatal): ${error.message}`);
       return false;
+    } finally {
+      if (activeRenameProcess === child) activeRenameProcess = null;
     }
   });
 }

@@ -16,8 +16,10 @@
     try {
       const data = await api.getConnections();
       if (App.currentTab === 'conns' && !document.hidden) renderConnections(data);
+      return data;
     } catch (e) {
       /* ignore */
+      return null;
     } finally {
       connectionsLoading = false;
     }
@@ -115,9 +117,11 @@
   });
 
   $('#connClose').addEventListener('click', async () => {
-    await call(api.closeAllConnections);
-    toast(t('conns.closed'));
-    loadConnections();
+    try {
+      await call(api.closeAllConnections);
+      toast(t('conns.closed'));
+      loadConnections();
+    } catch (_) {}
   });
 
   App.loadConnections = loadConnections;

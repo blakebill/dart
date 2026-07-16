@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow } = require('electron');
+const { app, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -49,14 +49,10 @@ configureUserDataDir();
 if (process.platform !== 'win32') {
   app.disableHardwareAcceleration();
 }
-// Keep a bounded renderer heap. Profile payloads are loaded on demand, so the
-// renderer no longer needs manual GC hooks or an unbounded old-space budget.
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=192');
-
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
 const { SingBoxManager } = require('./singbox');
-const { createWindow } = require('./window');
+const { createWindow, showMainWindow } = require('./window');
 const { createTray } = require('./tray');
 const { stopTrafficStream } = require('./traffic');
 const core = require('./core-control');
@@ -67,13 +63,12 @@ const uwp = require('./uwp');
 const { isWindowsAdmin } = require('./admin');
 const { cleanupTunAdapters } = require('./tun-adapter');
 
-// Safety net: a stray socket error (e.g. ECONNRESET when the proxy is torn down
-// during a core update) must never crash the app with a fatal error dialog.
-// Keep running — but record the full stack in userData/crash.log so real bugs
-// don't vanish behind the catch-all (the in-app log only gets a one-liner).
+// Record fatal main-process failures before cleanup. Network request objects
+// handle their own operational errors; reaching this boundary means process
+// invariants can no longer be trusted and the app must not keep proxying.
 function recordCrash(kind, err) {
   try {
-    sendLog(`[gui] ${kind} (ignored): ${(err && err.message) || String(err)}`);
+    sendLog(`[gui] ${kind}: ${(err && err.message) || String(err)}`);
   } catch (_) {
     /* in-app logging is best-effort */
   }
@@ -81,7 +76,10 @@ function recordCrash(kind, err) {
     const file = path.join(app.getPath('userData'), 'crash.log');
     // Simple rotation so the file cannot grow without bound.
     try {
-      if (fs.statSync(file).size > 512 * 1024) fs.renameSync(file, file + '.old');
+      if (fs.statSync(file).size > 512 * 1024) {
+        try { fs.unlinkSync(file + '.old'); } catch (_) {}
+        try { fs.renameSync(file, file + '.old'); } catch (_) { fs.truncateSync(file, 0); }
+      }
     } catch (_) {}
     const detail = (err && err.stack) || (err && err.message) || String(err);
     fs.appendFileSync(file, `[${new Date().toISOString()}] ${kind}: ${detail}\n`);
@@ -89,8 +87,30 @@ function recordCrash(kind, err) {
     /* disk logging is best-effort */
   }
 }
-process.on('uncaughtException', (err) => recordCrash('uncaught exception', err));
-process.on('unhandledRejection', (reason) => recordCrash('unhandled rejection', reason));
+
+let fatalExitStarted = false;
+function handleFatalError(kind, error) {
+  recordCrash(kind, error);
+  if (fatalExitStarted) return;
+  fatalExitStarted = true;
+  app.isQuitting = true;
+  setImmediate(async () => {
+    const hardExit = setTimeout(() => app.exit(1), 8000);
+    try {
+      if (state.singbox) await core.cleanup();
+    } catch (cleanupError) {
+      recordCrash('fatal cleanup failed', cleanupError);
+      const ownedServer = state.systemProxyServer ||
+        (state.store && core.persistedSystemProxyOwnership());
+      if (ownedServer) proxy.disableSystemProxySyncIfOurs(ownedServer);
+    } finally {
+      clearTimeout(hardExit);
+      app.exit(1);
+    }
+  });
+}
+process.on('uncaughtException', (error) => handleFatalError('uncaught exception', error));
+process.on('unhandledRejection', (reason) => handleFatalError('unhandled rejection', reason));
 
 async function applyPendingUwpLoopback() {
   const pending = state.store.get('pendingUwpLoopbackSids');
@@ -122,12 +142,13 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  let revealWhenReady = false;
   app.on('second-instance', () => {
-    if (state.mainWindow) {
-      if (state.mainWindow.isMinimized()) state.mainWindow.restore();
-      state.mainWindow.show();
-      state.mainWindow.focus();
+    if (!state.store || (typeof app.isReady === 'function' && !app.isReady())) {
+      revealWhenReady = true;
+      return;
     }
+    showMainWindow();
   });
 
   app.whenReady().then(() => {
@@ -142,10 +163,32 @@ if (!gotLock) {
         stopTrafficStream();
         core.stopProxyGuard();
         if (state.systemProxyOn) {
-          state.systemProxyOn = false;
-          proxy.disableSystemProxy()
-            .catch((e) => sendLog('[gui] failed to clear system proxy after core exit: ' + e.message))
-            .finally(sendStatus);
+          const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
+          if (ownedServer) {
+            proxy.disableSystemProxyIfOurs(ownedServer)
+              .then(() => {
+                try { core.forgetSystemProxyOwnership(ownedServer); } catch (error) {
+                  sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
+                }
+                // A new core may have started while the registry operation was
+                // queued. Do not clear the ownership state of that newer run.
+                if (!state.singbox.isRunning() && state.systemProxyServer === ownedServer) {
+                  state.systemProxyOn = false;
+                  state.systemProxyServer = null;
+                }
+              })
+              .catch((e) => {
+                // Keep ownership so a later Stop/Quit can retry instead of
+                // forgetting a dead proxy that may still be active in Windows.
+                sendLog('[gui] failed to clear system proxy after core exit: ' + e.message);
+              })
+              .finally(sendStatus);
+          } else {
+            sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
+            state.systemProxyOn = false;
+            state.systemProxyServer = null;
+            sendStatus();
+          }
         } else {
           sendStatus();
         }
@@ -157,14 +200,18 @@ if (!gotLock) {
           const zh = (state.store.getSettings().language || 'zh') === 'zh';
           notify(
             zh ? '内核已停止' : 'Core stopped',
-            zh ? '内核意外退出，代理可能已失效。' : 'sing-box exited unexpectedly; the proxy may be down.'
+            zh ? '内核意外退出，代理可能已失效。' : `${state.singbox.coreLabel} exited unexpectedly; the proxy may be down.`
           );
         }
       },
     });
     registerIpc();
     // Sync the OS login-item state with the saved setting.
-    core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
+    try {
+      core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
+    } catch (error) {
+      sendLog('[gui] failed to synchronize auto-launch at startup: ' + error.message);
+    }
     // Clear a system proxy left dangling by a previous exit (so the machine
     // isn't left offline during the boot -> app-start window). Runs concurrently
     // with window load; the auto-resume below awaits it so the clear can't race
@@ -172,7 +219,7 @@ if (!gotLock) {
     const healDone = core.healStaleSystemProxy();
     // Silent start: keep the window in the tray when the setting is on, or when
     // launched at login with --hidden (set on the login item by applyAutoLaunch).
-    const startHidden = !!settings.silentStart || process.argv.includes('--hidden');
+    const startHidden = !revealWhenReady && (!!settings.silentStart || process.argv.includes('--hidden'));
     createWindow(startHidden);
     createTray();
     core.rescheduleAutoUpdate();
@@ -182,15 +229,24 @@ if (!gotLock) {
     // Auto-resume: if the core was running at last quit, start it again so the
     // user does not have to click Start every time they open the app.
     if (state.store.get('lastRunning') && state.singbox.isCoreInstalled()) {
-      state.mainWindow.webContents.once('did-finish-load', async () => {
-        await healDone.catch(() => {}); // ensure any stale-proxy clear lands first
-        core.startCore().catch((e) => sendLog('[gui] auto-resume failed: ' + e.message));
-      });
+      // Core recovery is a main-process responsibility: a renderer load error
+      // must not leave a tray-started app silently offline.
+      healDone
+        .catch(() => {}) // ensure any stale-proxy clear lands first
+        .then(() => core.startCore())
+        .catch((e) => sendLog('[gui] auto-resume failed: ' + e.message));
     }
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      showMainWindow();
     });
+  }).catch((error) => {
+    recordCrash('startup failed', error);
+    try {
+      dialog.showErrorBox('Dart failed to start', (error && error.message) || String(error));
+    } catch (_) {}
+    app.isQuitting = true;
+    app.quit();
   });
 
   app.on('window-all-closed', () => {
@@ -201,8 +257,13 @@ if (!gotLock) {
     if (!app.isQuitting) {
       app.isQuitting = true;
       e.preventDefault();
-      await core.cleanup();
-      app.quit();
+      try {
+        await core.cleanup();
+      } catch (error) {
+        recordCrash('shutdown cleanup failed', error);
+      } finally {
+        app.quit();
+      }
     }
   });
 
@@ -215,11 +276,12 @@ if (!gotLock) {
   // so we never wipe a proxy the user set themselves.
   app.on('session-end', () => {
     try {
+      const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
       state.systemProxyOn = false;
+      state.systemProxyServer = null;
       core.stopProxyGuard();
       proxy.beginShutdown();
-      const port = (state.store && state.store.getSettings().mixedPort) || 7890;
-      proxy.disableSystemProxySyncIfOurs(`127.0.0.1:${port}`);
+      if (ownedServer) proxy.disableSystemProxySyncIfOurs(ownedServer);
     } catch (_) { /* best-effort */ }
   });
 }

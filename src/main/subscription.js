@@ -6,6 +6,8 @@ const linkParser = require('./parsers/share-link');
 const singboxParser = require('./parsers/singbox');
 const { singboxRuleToClashRules } = require('./converter');
 const fetch = require('./fetch');
+const MAX_SUBSCRIPTION_BYTES = 32 * 1024 * 1024;
+const USER_INFO_FIELDS = new Set(['upload', 'download', 'total', 'expire']);
 
 const RESERVED_NODE_NAMES = new Set([
   '🚀 Proxy', '♻️ Auto', '🛟 Fallback',
@@ -14,28 +16,73 @@ const RESERVED_NODE_NAMES = new Set([
 
 function uniqueNodeNames(nodes) {
   const used = new Set(RESERVED_NODE_NAMES);
-  return (nodes || []).map((node, index) => {
+  const nextSuffix = new Map();
+  return (nodes || []).filter((node) => node && typeof node === 'object' && !Array.isArray(node)).map((node, index) => {
     const fallback = `${node.type || 'node'} ${index + 1}`;
     const base = String(node.name || fallback).trim() || fallback;
     let name = base;
-    let suffix = 2;
-    while (used.has(name)) name = `${base} ${suffix++}`;
+    if (used.has(name)) {
+      let suffix = nextSuffix.get(base) || 2;
+      while (used.has(`${base} ${suffix}`)) suffix += 1;
+      name = `${base} ${suffix}`;
+      nextSuffix.set(base, suffix + 1);
+    } else {
+      nextSuffix.set(base, 2);
+    }
     used.add(name);
     return name === node.name ? node : { ...node, name };
   });
 }
 
-/** Stable digest of the parts that change a running core configuration. */
+function updateFingerprint(hash, value, stack = new Set()) {
+  if (value === null || value === undefined) {
+    hash.update('null;');
+    return;
+  }
+  const type = typeof value;
+  if (type === 'string') {
+    hash.update(`s${Buffer.byteLength(value)}:`);
+    hash.update(value);
+    return;
+  }
+  if (type === 'number') {
+    hash.update(`n${Number.isFinite(value) ? value : 'null'};`);
+    return;
+  }
+  if (type === 'boolean') {
+    hash.update(value ? 'b1;' : 'b0;');
+    return;
+  }
+  if (type !== 'object') {
+    hash.update(`x${String(value)};`);
+    return;
+  }
+  if (stack.has(value)) throw new Error('cannot fingerprint a cyclic config');
+  stack.add(value);
+  if (Array.isArray(value)) {
+    hash.update(`a${value.length}[`);
+    for (const item of value) updateFingerprint(hash, item, stack);
+    hash.update(']');
+  } else {
+    const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
+    hash.update(`o${keys.length}{`);
+    for (const key of keys) {
+      updateFingerprint(hash, key, stack);
+      updateFingerprint(hash, value[key], stack);
+    }
+    hash.update('}');
+  }
+  stack.delete(value);
+}
+
+/** Stable, incremental digest of the parts that change a running core config. */
 function configFingerprint(value) {
   const source = value || {};
-  return crypto
-    .createHash('sha256')
-    .update(JSON.stringify([
-      source.nodes || [],
-      source.clashRules || source.rules || [],
-      source.clashRuleProviders || source.ruleProviders || {},
-    ]))
-    .digest('hex');
+  const hash = crypto.createHash('sha256');
+  updateFingerprint(hash, source.nodes || []);
+  updateFingerprint(hash, source.clashRules || source.rules || []);
+  updateFingerprint(hash, source.clashRuleProviders || source.ruleProviders || {});
+  return hash.digest('hex');
 }
 
 /** Parse the airport traffic info header `subscription-userinfo`. */
@@ -45,18 +92,20 @@ function parseUserInfo(headers) {
   const info = {};
   for (const part of String(raw).split(';')) {
     const [k, v] = part.split('=').map((s) => s && s.trim());
-    if (k && v !== undefined) info[k] = Number(v);
+    const value = Number(v);
+    if (USER_INFO_FIELDS.has(k) && v !== undefined && Number.isFinite(value) && value >= 0) info[k] = value;
   }
-  return info;
+  return Object.keys(info).length ? info : null;
 }
 
 /** Decode a base64 body to text if it plausibly is base64, else return null. */
 function maybeBase64Decode(text) {
   // A JSON/YAML body contains characters base64 never does; skip those fast.
-  if (/[{}\s:"']/.test(text)) return null;
-  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(text)) return null;
+  if (/[{}:"']/.test(text)) return null;
+  const compact = text.replace(/\s+/g, '');
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return null;
   try {
-    const decoded = Buffer.from(text, 'base64').toString('utf-8');
+    const decoded = Buffer.from(compact, 'base64').toString('utf-8');
     return decoded && /[ -~]/.test(decoded) ? decoded.trim() : null;
   } catch (e) {
     return null;
@@ -147,12 +196,18 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
       // through the local proxy first and falls back to direct.
       const r = await fetch.getBufferWithFallback(url, {
         proxyPort,
+        maxBytes: MAX_SUBSCRIPTION_BYTES,
         headers: { 'User-Agent': ua, Accept: '*/*' },
       });
       res = { body: r.body.toString('utf-8'), headers: r.headers || {} };
     } catch (e) {
       log(`[sub] UA="${ua}" request error: ${e.message}`);
       last = { nodes: [], groups: [], rules: [], format: 'error', error: e.message };
+      // User-Agent rotation can change a server's HTTP response, but cannot
+      // repair DNS, TCP or TLS reachability. getBufferWithFallback has already
+      // tried the configured proxy and direct path, so fail without repeating
+      // the same 20-35 second network timeout five more times.
+      if (!/^HTTP\s+(?:400|401|403|406)\b/i.test(String(e.message || ''))) throw e;
       continue;
     }
     const body = res.body || '';
@@ -174,6 +229,7 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
 module.exports = {
   fetchSubscription,
   parseSubscriptionContent,
+  parseUserInfo,
   configFingerprint,
   uniqueNodeNames,
 };

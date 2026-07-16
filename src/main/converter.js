@@ -465,16 +465,32 @@ function dnsServerFromAddress(addr, tag, detour) {
     path = s.slice(slash);
     s = s.slice(0, slash);
   }
-  // Split optional port.
+  // Split an optional port. Bracketed IPv6 is required when a port is present;
+  // bare IPv6 remains unambiguous and is kept as-is.
   let server = s;
   let port;
-  const lastColon = s.lastIndexOf(':');
-  if (lastColon > 0 && !s.includes('::')) {
-    const maybePort = s.slice(lastColon + 1);
-    if (/^\d+$/.test(maybePort)) {
-      server = s.slice(0, lastColon);
-      port = parseInt(maybePort, 10);
+  if (s.startsWith('[')) {
+    const end = s.indexOf(']');
+    if (end < 0) throw new Error('invalid bracketed DNS server');
+    server = s.slice(1, end);
+    const suffix = s.slice(end + 1);
+    if (suffix) {
+      if (!/^:\d+$/.test(suffix)) throw new Error('invalid DNS server port');
+      port = Number(suffix.slice(1));
     }
+  } else {
+    const firstColon = s.indexOf(':');
+    const lastColon = s.lastIndexOf(':');
+    if (firstColon > 0 && firstColon === lastColon) {
+      const maybePort = s.slice(lastColon + 1);
+      if (!/^\d+$/.test(maybePort)) throw new Error('invalid DNS server port');
+      server = s.slice(0, lastColon);
+      port = Number(maybePort);
+    }
+  }
+  if (!server) throw new Error('DNS server is empty');
+  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error('invalid DNS server port');
   }
   out.type = type;
   out.server = server;
@@ -767,11 +783,18 @@ function ruleListToSingboxRule(text, target) {
 
 function dedupeNames(items, key, reserved = []) {
   const used = new Set(reserved);
+  const nextSuffix = new Map();
   for (const item of items) {
     const base = String(item[key] || 'node');
     let name = base;
-    let suffix = 2;
-    while (used.has(name)) name = `${base} ${suffix++}`;
+    if (used.has(name)) {
+      let suffix = nextSuffix.get(base) || 2;
+      while (used.has(`${base} ${suffix}`)) suffix += 1;
+      name = `${base} ${suffix}`;
+      nextSuffix.set(base, suffix + 1);
+    } else {
+      nextSuffix.set(base, 2);
+    }
     used.add(name);
     item[key] = name;
   }
@@ -877,6 +900,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     nodes.map(nodeToOutbound).filter(Boolean)
   );
   const nodeTags = nodeOutbounds.map((o) => o.tag);
+  if (!nodeTags.length) throw new Error('No supported proxy nodes are available.');
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
 
   // Default selection: a specific node tag if it still exists, else auto.
@@ -1045,22 +1069,59 @@ function singboxRuleToClashRules(rule, options = {}) {
   }
   if (rule.type === 'logical' && rule.mode === 'or' && Array.isArray(rule.rules)) {
     for (const child of rule.rules) {
-      out.push(...singboxRuleToClashRules({ ...child, outbound: rule.outbound, action: rule.action }, options));
+      for (const converted of singboxRuleToClashRules(
+        { ...child, outbound: rule.outbound, action: rule.action },
+        options
+      )) out.push(converted);
     }
   }
   return out;
 }
 
-function clashRuleToMihomo(raw, overrides) {
+function clashRuleToMihomo(raw, overrides, availableRuleProviders = null) {
   const parts = String(raw || '').split(',').map((s) => s.trim());
   const type = (parts[0] || '').toUpperCase();
   if (!type) return null;
   if (type === 'MATCH' || type === 'FINAL') return null;
   const parsed = parseClashRule(raw);
   if (!parsed || !parsed.value) return null;
+  if (type === 'RULE-SET' && availableRuleProviders && !availableRuleProviders.has(parsed.value)) {
+    return null;
+  }
   const target = clashTargetName(mapClashTarget(parsed.target, overrides));
   const extra = parts.slice(3).filter(Boolean);
   return [type, parsed.value, target, ...extra].join(',');
+}
+
+/**
+ * Imported subscriptions cannot supply files next to the generated runtime
+ * config, and the parser intentionally does not retain arbitrary local paths
+ * or inline payloads. Keep only remote providers Mihomo can fetch by itself.
+ */
+function normalizeMihomoRuleProviders(ruleProviders) {
+  const normalized = {};
+  if (!ruleProviders || typeof ruleProviders !== 'object') return normalized;
+  const behaviors = new Set(['domain', 'ipcidr', 'classical']);
+  const formats = new Set(['yaml', 'text', 'mrs']);
+  for (const [name, provider] of Object.entries(ruleProviders)) {
+    if (name === '__proto__' || name === 'prototype' || name === 'constructor') continue;
+    if (!name || name.length > 256 || /[\r\n,]/.test(name)) continue;
+    if (!provider || typeof provider !== 'object') continue;
+    if (String(provider.type || 'http').toLowerCase() !== 'http') continue;
+    const behavior = String(provider.behavior || 'classical').toLowerCase();
+    const format = String(provider.format || 'yaml').toLowerCase();
+    if (!behaviors.has(behavior) || !formats.has(format)) continue;
+    if (format === 'mrs' && behavior === 'classical') continue;
+    const url = String(provider.url || '').trim();
+    try {
+      const protocol = new URL(url).protocol;
+      if (protocol !== 'http:' && protocol !== 'https:') continue;
+    } catch (_) {
+      continue;
+    }
+    normalized[name] = { type: 'http', behavior, url, format };
+  }
+  return normalized;
 }
 
 function buildMihomoConfig(nodes, opts = {}) {
@@ -1089,22 +1150,37 @@ function buildMihomoConfig(nodes, opts = {}) {
 
   const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
   const proxyNames = proxies.map((p) => p.name);
+  if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
+  const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
+  const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const defaultProxy =
     selected && ([AUTO_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) || proxyNames.includes(selected))
       ? selected === 'direct' ? 'DIRECT' : selected
       : AUTO_GROUP;
-  const manualProxies = [defaultProxy, AUTO_GROUP, FALLBACK_GROUP, ...proxyNames, 'DIRECT'].filter(
-    (name, idx, arr) => name && arr.indexOf(name) === idx
-  );
+  const manualProxies = [];
+  const manualSeen = new Set();
+  const addManual = (name) => {
+    if (name && !manualSeen.has(name)) {
+      manualSeen.add(name);
+      manualProxies.push(name);
+    }
+  };
+  addManual(defaultProxy);
+  addManual(AUTO_GROUP);
+  addManual(FALLBACK_GROUP);
+  for (const name of proxyNames) addManual(name);
+  addManual('DIRECT');
 
   const rules = [];
   if (clashMode === 'block') {
     rules.push('MATCH,REJECT');
   } else {
-    for (const r of extraRules) rules.push(...singboxRuleToClashRules(r));
+    for (const r of extraRules) {
+      for (const converted of singboxRuleToClashRules(r)) rules.push(converted);
+    }
     for (const raw of clashRules || []) {
-      const rule = clashRuleToMihomo(raw, ruleOverrides);
+      const rule = clashRuleToMihomo(raw, ruleOverrides, availableRuleProviders);
       if (!hasGeoData && /^(GEOIP|GEOSITE),/i.test(rule || '')) continue;
       if (rule) rules.push(rule);
     }
@@ -1172,7 +1248,7 @@ function buildMihomoConfig(nodes, opts = {}) {
       if (externalUiDownloadUrl) config['external-ui-url'] = externalUiDownloadUrl;
     }
   }
-  if (ruleProviders && Object.keys(ruleProviders).length) config['rule-providers'] = ruleProviders;
+  if (availableRuleProviders.size) config['rule-providers'] = mihomoRuleProviders;
   return config;
 }
 

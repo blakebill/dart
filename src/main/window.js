@@ -1,11 +1,37 @@
 'use strict';
 
 const path = require('path');
-const { app, BrowserWindow, nativeTheme } = require('electron');
+const { app, BrowserWindow, nativeTheme, dialog } = require('electron');
 
-const { state, isDev } = require('./state');
+const { state, isDev, sendLog } = require('./state');
 
 const isWin = process.platform === 'win32';
+const DEEP_SLEEP_DELAY_MS = 60_000;
+let deepSleepTimer = null;
+
+function clearDeepSleepTimer() {
+  if (deepSleepTimer) clearTimeout(deepSleepTimer);
+  deepSleepTimer = null;
+}
+
+function scheduleDeepSleep(win) {
+  clearDeepSleepTimer();
+  deepSleepTimer = setTimeout(() => {
+    deepSleepTimer = null;
+    if (
+      state.mainWindow === win &&
+      !win.isDestroyed() &&
+      !win.isVisible()
+    ) {
+      // The core, proxy and tray live in the main process. Releasing only this
+      // hidden renderer recovers Chromium DOM/JS memory without interrupting
+      // networking; showMainWindow() recreates it on demand.
+      state.mainWindow = null;
+      win.destroy();
+    }
+  }, DEEP_SLEEP_DELAY_MS);
+  if (deepSleepTimer.unref) deepSleepTimer.unref();
+}
 
 function resolveBackground() {
   // Windows Mica needs a fully transparent window background.
@@ -32,6 +58,7 @@ function applyMica(win) {
 }
 
 function createWindow(startHidden = false) {
+  clearDeepSleepTimer();
   applyNativeThemeSource();
 
   const mainWindow = new BrowserWindow({
@@ -61,7 +88,11 @@ function createWindow(startHidden = false) {
   });
   state.mainWindow = mainWindow;
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html')).catch((error) => {
+    sendLog('[gui] failed to load the main renderer: ' + error.message);
+    try { dialog.showErrorBox('Dart window failed to load', error.message); } catch (_) {}
+    if (!mainWindow.isDestroyed()) mainWindow.destroy();
+  });
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event) => event.preventDefault());
@@ -71,6 +102,7 @@ function createWindow(startHidden = false) {
   mainWindow.once('ready-to-show', () => {
     applyMica(mainWindow);
     if (!startHidden) mainWindow.show();
+    else scheduleDeepSleep(mainWindow);
   });
 
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
@@ -92,10 +124,18 @@ function createWindow(startHidden = false) {
   // catches edge cases where a stray repaint could still wake the GPU.
   mainWindow.on('hide', () => {
     try { mainWindow.webContents.setFrameRate(1); } catch (_) { /* ignore */ }
+    scheduleDeepSleep(mainWindow);
   });
   mainWindow.on('show', () => {
+    clearDeepSleepTimer();
     try { mainWindow.webContents.setFrameRate(60); } catch (_) { /* ignore */ }
     applyMica(mainWindow);
+  });
+  mainWindow.on('closed', () => {
+    if (state.mainWindow === mainWindow) {
+      state.mainWindow = null;
+      clearDeepSleepTimer();
+    }
   });
 
   const sendMaximized = () => {
@@ -110,4 +150,20 @@ function createWindow(startHidden = false) {
   return mainWindow;
 }
 
-module.exports = { createWindow, applyNativeThemeSource };
+function showMainWindow() {
+  let win = state.mainWindow;
+  if (!win || win.isDestroyed()) {
+    win = createWindow(false);
+    win.once('ready-to-show', () => {
+      if (!win.isDestroyed()) win.focus();
+    });
+    return win;
+  }
+  clearDeepSleepTimer();
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return win;
+}
+
+module.exports = { createWindow, showMainWindow, applyNativeThemeSource };

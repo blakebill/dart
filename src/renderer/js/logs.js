@@ -69,6 +69,10 @@
   let logBufLen = 0;
   let logFlushTimer = null;
   let logLen = 0; // total kept text length across chunks
+  let lastLogSequence = 0;
+  let historyLoaded = !(api && api.getRecentLogs);
+  let pendingLiveLogs = [];
+  let clearGeneration = 0;
 
   function scheduleLogFlush(delay = 200) {
     if (logFlushTimer || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
@@ -111,8 +115,11 @@
     scheduleLogFlush(16);
   }
 
-  if (api && api.onLog) api.onLog((value) => {
-    const line = String(value || '');
+  function appendLog(value) {
+    const sequence = value && typeof value === 'object' ? Number(value.sequence) || 0 : 0;
+    if (sequence && sequence <= lastLogSequence) return;
+    if (sequence) lastLogSequence = sequence;
+    const line = String(value && typeof value === 'object' ? value.line || '' : value || '');
     logBuf.push(line);
     logBufLen += line.length + 1;
     while (logBufLen > LOG_LIMIT && logBufStart < logBuf.length) {
@@ -123,14 +130,34 @@
       logBufStart = 0;
     }
     scheduleLogFlush();
+  }
+
+  if (api && api.onLog) api.onLog((value) => {
+    if (!historyLoaded) pendingLiveLogs.push(value);
+    else appendLog(value);
   });
+  if (!historyLoaded) {
+    const historyGeneration = clearGeneration;
+    api.getRecentLogs().then((snapshot) => {
+      if (historyGeneration !== clearGeneration) return;
+      for (const entry of snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : []) appendLog(entry);
+    }).catch(() => {}).finally(() => {
+      historyLoaded = true;
+      for (const entry of pendingLiveLogs) appendLog(entry);
+      pendingLiveLogs = [];
+      scheduleLogFlush(0);
+    });
+  }
 
   $('#logClear').addEventListener('click', () => {
+    clearGeneration++;
+    if (api.clearRecentLogs) api.clearRecentLogs().catch(() => {});
     clearTimeout(logFlushTimer);
     logFlushTimer = null;
     logBuf = [];
     logBufStart = 0;
     logBufLen = 0;
+    pendingLiveLogs = [];
     $('#logBox').textContent = '';
     logLen = 0;
   });

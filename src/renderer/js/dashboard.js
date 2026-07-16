@@ -240,36 +240,50 @@
     list.innerHTML = html;
   }
 
-  async function togglePower() {
-    if (App.state.status && App.state.status.running) {
-      await call(api.stopCore);
-    } else {
-      await call(api.startCore);
-      toast(t('toast.started'));
-    }
+  const dashboardActions = new Map();
+  function runDashboardAction(name, action) {
+    if (dashboardActions.has(name)) return dashboardActions.get(name);
+    const operation = Promise.resolve().then(action).finally(() => dashboardActions.delete(name));
+    dashboardActions.set(name, operation);
+    return operation;
   }
 
-  async function toggleSystemProxy() {
-    const proxySw = $('#quickProxy');
-    if (proxySw && proxySw.disabled) {
-      toast(t('nodes.needRunning'), true);
-      return;
-    }
-    const on = !!(App.state.status && App.state.status.systemProxy);
-    await call(api.setSystemProxy, !on);
-    toast(!on ? t('toast.proxyOn') : t('toast.proxyOff'));
+  function togglePower() {
+    return runDashboardAction('power', async () => {
+      if (App.state.status && App.state.status.running) {
+        await call(api.stopCore);
+      } else {
+        await call(api.startCore);
+        toast(t('toast.started'));
+      }
+    });
   }
 
-  $('#powerBtn').addEventListener('click', togglePower);
-  $('#quickProxy').addEventListener('click', toggleSystemProxy);
+  function toggleSystemProxy() {
+    return runDashboardAction('proxy', async () => {
+      const proxySw = $('#quickProxy');
+      if (proxySw && proxySw.disabled) {
+        toast(t('nodes.needRunning'), true);
+        return;
+      }
+      const on = !!(App.state.status && App.state.status.systemProxy);
+      await call(api.setSystemProxy, !on);
+      toast(!on ? t('toast.proxyOn') : t('toast.proxyOff'));
+    });
+  }
 
-  $('#quickTun').addEventListener('click', async () => {
-    const next = !(App.state.settings && App.state.settings.enableTun);
-    const r = await call(api.setTun, next);
-    if (r && r.restarting) return;
-    if (r && r.settings) App.state.settings = r.settings;
-    renderDashboard();
-    toast(App.state.settings.enableTun ? t('toast.tunOn') : t('toast.tunOff'));
+  $('#powerBtn').addEventListener('click', () => togglePower().catch(() => {}));
+  $('#quickProxy').addEventListener('click', () => toggleSystemProxy().catch(() => {}));
+
+  $('#quickTun').addEventListener('click', () => {
+    runDashboardAction('tun', async () => {
+      const next = !(App.state.settings && App.state.settings.enableTun);
+      const r = await call(api.setTun, next);
+      if (r && r.restarting) return;
+      if (r && r.settings) App.commitSettings(r.settings);
+      renderDashboard();
+      toast(App.state.settings.enableTun ? t('toast.tunOn') : t('toast.tunOff'));
+    }).catch(() => {});
   });
 
   const THEME_ORDER = ['dark', 'light', 'system'];
@@ -281,8 +295,14 @@
     const cur = App.themePref || App.state.settings.theme || 'dark';
     const next = THEME_ORDER[(THEME_ORDER.indexOf(cur) + 1) % THEME_ORDER.length];
     App.applyTheme(next);
+    App.patchSettings({ theme: next });
     if (!api || !api.updateSettings) return;
-    App.state.settings = await call(api.updateSettings, { theme: next });
+    try {
+      App.commitSettings(await call(api.updateSettings, { theme: next }));
+    } catch (_) {
+      App.applyTheme(cur);
+      App.patchSettings({ theme: cur });
+    }
   });
   App.renderThemeLabel = renderThemeLabel;
 
@@ -291,7 +311,7 @@
       const mode = b.dataset.mode;
       try {
         await api.setMode(mode);
-        App.state.settings.clashMode = mode;
+        App.patchSettings({ clashMode: mode });
         renderMode();
         toast(t('toast.modeChanged', t('mode.' + mode)));
       } catch (e) {
@@ -301,10 +321,10 @@
   });
 
   document.querySelectorAll('[data-dash-action]').forEach((card) => {
-    card.addEventListener('click', async () => {
+    card.addEventListener('click', () => {
       const action = card.dataset.dashAction;
-      if (action === 'power') return togglePower();
-      if (action === 'proxy') return toggleSystemProxy();
+      if (action === 'power') return togglePower().catch(() => {});
+      if (action === 'proxy') return toggleSystemProxy().catch(() => {});
       if (action === 'nodes') return App.showTab && App.showTab('nodes');
       if (action === 'testDelay') {
         if (App.testCurrentNodeDelay) return App.testCurrentNodeDelay();

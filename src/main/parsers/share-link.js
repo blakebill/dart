@@ -69,15 +69,16 @@ function safeDecodeURIComponent(str) {
 }
 
 function splitHostPort(hostPart) {
-  const value = String(hostPart || '');
+  // URL-shaped SIP002 links commonly include `/` before `?plugin=...`.
+  const value = String(hostPart || '').replace(/\/$/, '');
   if (value.startsWith('[')) {
     const end = value.indexOf(']');
     if (end < 0 || value[end + 1] !== ':') return null;
-    return { server: value.slice(1, end), port: parseInt(value.slice(end + 2), 10) };
+    return { server: value.slice(1, end), port: Number(value.slice(end + 2)) };
   }
   const colon = value.lastIndexOf(':');
   if (colon <= 0) return null;
-  return { server: value.slice(0, colon), port: parseInt(value.slice(colon + 1), 10) };
+  return { server: value.slice(0, colon), port: Number(value.slice(colon + 1)) };
 }
 
 function parseSsPlugin(value) {
@@ -117,7 +118,7 @@ function parseVmess(uri) {
     type: 'vmess',
     name: cfg.ps || cfg.remark || `${cfg.add}:${cfg.port}`,
     server: cfg.add,
-    port: parseInt(cfg.port, 10),
+    port: Number(cfg.port),
     uuid: cfg.id,
     alterId: parseInt(cfg.aid || 0, 10),
     cipher: cfg.scy || 'auto',
@@ -155,7 +156,7 @@ function parseVless(uri) {
     type: 'vless',
     name: safeDecodeURIComponent(u.hash.slice(1)) || `${u.hostname}:${u.port}`,
     server: u.hostname,
-    port: parseInt(u.port, 10),
+    port: Number(u.port),
     uuid: decodeURIComponent(u.username),
     network: params.type || 'tcp',
     flow: params.flow || '',
@@ -198,7 +199,7 @@ function parseTrojan(uri) {
     type: 'trojan',
     name: safeDecodeURIComponent(u.hash.slice(1)) || `${u.hostname}:${u.port}`,
     server: u.hostname,
-    port: parseInt(u.port, 10),
+    port: Number(u.port),
     password: decodeURIComponent(u.username),
     tls: true,
     servername: params.sni || params.peer || u.hostname,
@@ -248,7 +249,8 @@ function parseShadowsocks(uri) {
     const atIdx = rest.lastIndexOf('@');
     const userInfo = rest.slice(0, atIdx);
     const hostPart = rest.slice(atIdx + 1);
-    const decoded = b64decode(userInfo) || safeDecodeURIComponent(userInfo);
+    const plainCredentials = safeDecodeURIComponent(userInfo);
+    const decoded = plainCredentials.includes(':') ? plainCredentials : b64decode(userInfo);
     const colonIdx = decoded.indexOf(':');
     if (colonIdx <= 0) return null;
     method = decoded.slice(0, colonIdx);
@@ -302,7 +304,7 @@ function parseHysteria2(uri) {
     type: 'hysteria2',
     name: safeDecodeURIComponent(u.hash.slice(1)) || `${u.hostname}:${u.port}`,
     server: u.hostname,
-    port: parseInt(u.port, 10),
+    port: Number(u.port),
     password: decodeURIComponent(u.username) || params.password || '',
     obfs: params.obfs || '',
     obfsPassword: params['obfs-password'] || '',
@@ -325,7 +327,7 @@ function parseTuic(uri) {
     type: 'tuic',
     name: safeDecodeURIComponent(u.hash.slice(1)) || `${u.hostname}:${u.port}`,
     server: u.hostname,
-    port: parseInt(u.port, 10),
+    port: Number(u.port),
     uuid: decodeURIComponent(u.username),
     password: decodeURIComponent(u.password || ''),
     congestionControl: params.congestion_control || 'bbr',
@@ -349,7 +351,7 @@ function parseAnytls(uri) {
     type: 'anytls',
     name: safeDecodeURIComponent(u.hash.slice(1)) || `${u.hostname}:${u.port}`,
     server: u.hostname,
-    port: parseInt(u.port, 10),
+    port: Number(u.port),
     password: decodeURIComponent(u.username || '') || params.password || '',
     servername: params.sni || params.peer || '',
     skipCertVerify: params.insecure === '1' || params.insecure === 'true' || params.allowInsecure === '1',
@@ -363,17 +365,22 @@ function parseSingleLink(uri) {
   uri = uri.trim();
   if (!uri) return null;
   try {
-    if (uri.startsWith('vmess://')) return parseVmess(uri);
-    if (uri.startsWith('vless://')) return parseVless(uri);
-    if (uri.startsWith('trojan://')) return parseTrojan(uri);
-    if (uri.startsWith('ss://')) return parseShadowsocks(uri);
-    if (uri.startsWith('hysteria2://') || uri.startsWith('hy2://')) return parseHysteria2(uri);
-    if (uri.startsWith('tuic://')) return parseTuic(uri);
-    if (uri.startsWith('anytls://')) return parseAnytls(uri);
+    const separator = uri.indexOf('://');
+    if (separator > 0) uri = uri.slice(0, separator).toLowerCase() + uri.slice(separator);
+    let node = null;
+    if (uri.startsWith('vmess://')) node = parseVmess(uri);
+    else if (uri.startsWith('vless://')) node = parseVless(uri);
+    else if (uri.startsWith('trojan://')) node = parseTrojan(uri);
+    else if (uri.startsWith('ss://')) node = parseShadowsocks(uri);
+    else if (uri.startsWith('hysteria2://') || uri.startsWith('hy2://')) node = parseHysteria2(uri);
+    else if (uri.startsWith('tuic://')) node = parseTuic(uri);
+    else if (uri.startsWith('anytls://')) node = parseAnytls(uri);
+    if (!node || typeof node.server !== 'string') return null;
+    node.server = node.server.trim();
+    return node.server && Number.isInteger(node.port) && node.port > 0 && node.port <= 65535 ? node : null;
   } catch (e) {
     return null;
   }
-  return null;
 }
 
 /**

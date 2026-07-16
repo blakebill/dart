@@ -17,11 +17,26 @@
   let loadedNodeSub;
   let nodeLoad = null;
   let nodeLoadGeneration = 0;
+  let testAllRun = null;
+  const delayRequests = new Map();
 
   let groupNow = { proxy: null, auto: null, fallback: null };
   let groupRefresh = null;
+  let groupPollTimer = null;
   let currentNodeFrame = 0;
   let nodeWindowFrame = 0;
+
+  function scheduleGroupPoll() {
+    if (groupPollTimer) {
+      clearTimeout(groupPollTimer);
+      groupPollTimer = null;
+    }
+    if (document.hidden || !(App.state.status && App.state.status.running)) return;
+    groupPollTimer = setTimeout(() => {
+      groupPollTimer = null;
+      refreshGroupSelections();
+    }, 5000);
+  }
 
   function currentNodeName() {
     if (!(App.state.status && App.state.status.running)) return '-';
@@ -68,13 +83,14 @@
       groupNow = next;
       renderCurrentNode();
       if (changed && App.currentTab === 'nodes' && !document.hidden) renderNodes();
-    })().finally(() => { groupRefresh = null; });
+    })().finally(() => {
+      groupRefresh = null;
+      scheduleGroupPoll();
+    });
     return groupRefresh;
   }
-  // Keep the sidebar current-node label fresh without waking a hidden window.
-  setInterval(() => {
-    if (!document.hidden && App.state.status && App.state.status.running) refreshGroupSelections();
-  }, 5000);
+  document.addEventListener('visibilitychange', scheduleGroupPoll);
+  scheduleGroupPoll();
   window.addEventListener('resize', () => {
     renderCurrentNode();
     if (App.currentTab !== 'nodes' || nodeWindowFrame) return;
@@ -91,6 +107,19 @@
   }
 
   function releaseNodes() {
+    for (const name of delayRequests.keys()) {
+      if (delays.get(name) === 'testing') delays.delete(name);
+    }
+    delayRequests.clear();
+    if (testAllRun) {
+      testAllRun.cancelled = true;
+      for (const name of testAllRun.inFlight) {
+        if (delays.get(name) === 'testing') delays.delete(name);
+      }
+    }
+    testAllRun = null;
+    const testAllButton = $('#testAllBtn');
+    if (testAllButton) testAllButton.disabled = false;
     nodeLoadGeneration++;
     nodeLoad = null;
     nodeItems = [];
@@ -234,7 +263,7 @@
       return;
     }
     const filter = ($('#nodeFilter').value || '').toLowerCase();
-    const nodes = activeNodes().filter((n) => n.name.toLowerCase().includes(filter));
+    const nodes = activeNodes().filter((n) => String(n && n.name || '').toLowerCase().includes(filter));
     filteredNodeCount = nodes.length;
     nodeRows = App.state.activeSub ? [{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes] : [];
     $('#nodeCount').textContent = t('nodes.count', nodes.length);
@@ -307,16 +336,21 @@
       toast(t('dash.noNode'), true);
       return;
     }
+    const token = {};
+    delayRequests.set(name, token);
     delays.set(name, 'testing');
     scheduleDelayUpdate(name);
     try {
       const ms = await api.testNodeDelay(name);
-      delays.set(name, ms);
+      if (delayRequests.get(name) === token) delays.set(name, ms);
     } catch (e) {
-      delays.set(name, 'timeout');
+      if (delayRequests.get(name) === token) delays.set(name, 'timeout');
     }
-    scheduleDelayUpdate(name);
-    refreshGroupSelections(); // a fresh delay result may make a group re-pick
+    if (delayRequests.get(name) === token) {
+      delayRequests.delete(name);
+      scheduleDelayUpdate(name);
+      refreshGroupSelections(); // a fresh delay result may make a group re-pick
+    }
   }
 
   async function testCurrentNodeDelay() {
@@ -325,43 +359,53 @@
     await testOne(name);
   }
 
-  let testAllRunning = false;
   async function testAll() {
-    if (testAllRunning) return;
+    if (testAllRun) return;
     if (!App.state.status || !App.state.status.running) {
       toast(t('nodes.needRunning'), true);
       return;
     }
-    testAllRunning = true;
+    const run = { cancelled: false, inFlight: new Set() };
+    testAllRun = run;
     const button = $('#testAllBtn');
     button.disabled = true;
     await loadNodes();
-    const names = activeNodes().map((n) => n.name);
+    if (run.cancelled) return;
+    const names = activeNodes().map((n) => n && n.name).filter(Boolean);
     // Limited-concurrency pool to avoid hammering the core (and any shared
     // upstream server). User-configurable; clamp to a sane range.
     const concurrency = Math.max(1, Math.min(32, parseInt(App.state.settings.testConcurrency, 10) || 8));
     let idx = 0;
-    names.forEach((nm) => {
-      delays.set(nm, 'testing');
-      scheduleDelayUpdate(nm);
-    });
     async function worker() {
-      while (idx < names.length) {
+      while (!run.cancelled && idx < names.length) {
         const name = names[idx++];
-        try {
-          delays.set(name, await api.testNodeDelay(name));
-        } catch (e) {
-          delays.set(name, 'timeout');
-        }
+        const token = {};
+        delayRequests.set(name, token);
+        run.inFlight.add(name);
+        delays.set(name, 'testing');
         scheduleDelayUpdate(name);
+        try {
+          const result = await api.testNodeDelay(name);
+          if (!run.cancelled && delayRequests.get(name) === token) delays.set(name, result);
+        } catch (e) {
+          if (!run.cancelled && delayRequests.get(name) === token) delays.set(name, 'timeout');
+        } finally {
+          run.inFlight.delete(name);
+        }
+        if (!run.cancelled && delayRequests.get(name) === token) {
+          delayRequests.delete(name);
+          scheduleDelayUpdate(name);
+        }
       }
     }
     try {
       await Promise.all(Array.from({ length: Math.min(concurrency, names.length) }, worker));
-      refreshGroupSelections(); // the full sweep usually changes group picks
+      if (!run.cancelled) refreshGroupSelections(); // the full sweep usually changes group picks
     } finally {
-      testAllRunning = false;
-      button.disabled = false;
+      if (testAllRun === run) {
+        testAllRun = null;
+        button.disabled = false;
+      }
     }
   }
 

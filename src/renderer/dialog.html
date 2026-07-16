@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';"
+    />
+    <title>Dart</title>
+    <script src="theme-init.js"></script>
+    <link rel="stylesheet" href="style.css?v=50" />
+    <link rel="stylesheet" href="styles/surfaces.css?v=1" />
+    <link rel="stylesheet" href="styles/controls.css?v=1" />
+    <link rel="stylesheet" href="styles/lists.css?v=1" />
+    <link rel="stylesheet" href="styles/workspaces.css?v=1" />
+    <link rel="stylesheet" href="styles/tools.css?v=1" />
+    <link rel="stylesheet" href="styles/motion.css?v=1" />
+    <link rel="stylesheet" href="dialog/dialog.css?v=2" />
+  </head>
+  <body class="native-dialog-body">
+    <main class="native-dialog-window">
+      <header class="native-dialog-titlebar">
+        <strong id="dialogTitle">Dart</strong>
+        <button id="dialogCloseTop" class="native-dialog-close" type="button" aria-label="Close">×</button>
+      </header>
+      <section id="dialogContent" class="native-dialog-content">
+        <div class="dialog-loading">...</div>
+      </section>
+    </main>
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="i18n.js"></script>
+    <script src="js/util.js"></script>
+    <script src="js/select.js"></script>
+    <script src="dialog/common.js"></script>
+    <script src="dialog/main.js"></script>
+  </body>
+</html>

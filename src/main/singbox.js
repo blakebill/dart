@@ -4,17 +4,101 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
+const { pipeline } = require('stream/promises');
+const { StringDecoder } = require('string_decoder');
 const zlib = require('zlib');
 const yaml = require('js-yaml');
 const fetch = require('./fetch');
 const github = require('./github');
+const { uniqueSibling, replaceFileSync, replaceFileBatchSync, writeJsonAtomicSync } = require('./file-utils');
 
 // Matches ANSI CSI escape sequences (e.g. color codes like "\x1b[38;5;74m").
 const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
+const MIHOMO_GEO_VALIDATION_SCHEMA = 2;
+
+function operationAbortedError() {
+  const error = new Error('operation aborted');
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw operationAbortedError();
+}
 
 /** Remove ANSI escape sequences from a string. */
 function stripAnsi(str) {
   return str.replace(ANSI_PATTERN, '');
+}
+
+/** Run a short-lived helper process and wait for its pipes to close. */
+function runCapturedProcess(command, args, options = {}) {
+  const {
+    cwd,
+    env,
+    timeout = 5000,
+    timeoutMessage = command + ' timed out',
+    outputLimit = 1024 * 1024,
+    cleanAnsi = false,
+    signal = null,
+  } = options;
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(operationAbortedError());
+      return;
+    }
+    let proc;
+    try {
+      proc = spawn(command, args, { cwd, env, windowsHide: true });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let terminationError = null;
+    let killDeadline = null;
+    const append = (current, data) => {
+      const text = cleanAnsi ? stripAnsi(data.toString()) : data.toString();
+      return (current + text).slice(-outputLimit);
+    };
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killDeadline) clearTimeout(killDeadline);
+      if (signal) signal.removeEventListener('abort', abort);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const terminate = (error) => {
+      if (settled || terminationError) return;
+      terminationError = error;
+      try {
+        proc.kill('SIGKILL');
+      } catch (killError) {
+        terminationError.killError = killError;
+        finish(terminationError);
+        return;
+      }
+      // Normally `close` follows immediately and proves all handles are gone.
+      // Keep a finite escape hatch for a broken platform process implementation.
+      killDeadline = setTimeout(() => finish(terminationError), 2000);
+    };
+    const abort = () => terminate(operationAbortedError());
+    const timer = setTimeout(() => terminate(new Error(timeoutMessage)), timeout);
+    if (signal) signal.addEventListener('abort', abort, { once: true });
+
+    proc.stdout.on('data', (data) => { stdout = append(stdout, data); });
+    proc.stderr.on('data', (data) => { stderr = append(stderr, data); });
+    proc.once('close', (code, signal) => {
+      if (terminationError) finish(terminationError);
+      else finish(null, { code, signal, stdout, stderr });
+    });
+    proc.once('error', (error) => finish(error));
+  });
 }
 
 /**
@@ -66,10 +150,13 @@ function sampleIsOneByte(buf) {
   return true;
 }
 
-function validMihomoGeoFile(filePath) {
+function statFingerprint(stat) {
+  return `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino || 0}`;
+}
+
+function validMihomoGeoFile(filePath, knownStat = null) {
   try {
-    if (!fs.existsSync(filePath)) return false;
-    const st = fs.statSync(filePath);
+    const st = knownStat || fs.statSync(filePath);
     if (st.size < 1024) return false;
     const head = Buffer.alloc(Math.min(st.size, 4096));
     const tailSize = Math.min(st.size, 65536);
@@ -134,6 +221,12 @@ class SingBoxManager {
     this.onExit = opts.onExit || (() => {});
     this.coreType = opts.coreType || 'sing-box';
     this.proc = null;
+    this._coreDownloadPromise = null;
+    this._coreDownloadController = null;
+    this._geoUpdatePromises = new Map();
+    this._versionRequests = new Map();
+    this._fileValidationCache = new Map();
+    this._mihomoValidationPromise = null;
     if (!fs.existsSync(this.runtimeDir)) {
       fs.mkdirSync(this.runtimeDir, { recursive: true });
     }
@@ -141,9 +234,29 @@ class SingBoxManager {
   }
 
   setCoreType(type) {
-    this.coreType = type === 'mihomo' ? 'mihomo' : 'sing-box';
+    const nextType = type === 'mihomo' ? 'mihomo' : 'sing-box';
+    if (this._coreDownloadPromise && nextType !== this.getCoreType()) {
+      throw new Error('wait for the core update to finish before switching cores');
+    }
+    this.coreType = nextType;
     this._versionCache = null;
     this.ensureCoreDir();
+  }
+
+  isCoreDownloadInProgress() {
+    return !!this._coreDownloadPromise;
+  }
+
+  cancelCoreDownload() {
+    if (this._coreDownloadController) this._coreDownloadController.abort();
+  }
+
+  waitForCoreDownload() {
+    return this._coreDownloadPromise || Promise.resolve();
+  }
+
+  invalidateVersionCache() {
+    this._versionCache = null;
   }
 
   getCoreType() {
@@ -231,18 +344,39 @@ class SingBoxManager {
   async getCoreVersion(type = this.getCoreType()) {
     const bin = this.resolveBinaryPath(type);
     if (!bin) return null;
-    if (this._versionCache && this._versionCache.bin === bin && this._versionCache.coreType === type) {
-      return this._versionCache.version;
-    }
+    let fingerprint;
     try {
-      const out = await this._runCapture(bin, type === 'mihomo' ? ['-v'] : ['version']);
-      const m = out.match(/version\s+v?(\S+)/i) || out.match(/\bv?(\d+\.\d+\.\d+(?:[-.\w]*)?)/);
-      const version = m ? m[1] : null;
-      this._versionCache = { bin, coreType: type, version };
-      return version;
-    } catch (e) {
+      const stat = fs.statSync(bin);
+      fingerprint = statFingerprint(stat);
+    } catch (_) {
       return null;
     }
+    if (
+      this._versionCache &&
+      this._versionCache.bin === bin &&
+      this._versionCache.coreType === type &&
+      this._versionCache.fingerprint === fingerprint
+    ) {
+      return this._versionCache.version;
+    }
+    const requestKey = `${type}:${bin}:${fingerprint}`;
+    if (this._versionRequests.has(requestKey)) return this._versionRequests.get(requestKey);
+    const request = this._runCapture(bin, type === 'mihomo' ? ['-v'] : ['version'])
+      .then((out) => {
+        const m = out.match(/version\s+v?(\S+)/i) || out.match(/\bv?(\d+\.\d+\.\d+(?:[-.\w]*)?)/);
+        const version = m ? m[1] : null;
+        this._versionCache = { bin, coreType: type, fingerprint, version };
+        return version;
+      })
+      .catch(() => {
+        // Cache a failed probe for this exact binary too. Otherwise every state
+        // refresh respawns a broken or incompatible executable.
+        this._versionCache = { bin, coreType: type, fingerprint, version: null };
+        return null;
+      })
+      .finally(() => this._versionRequests.delete(requestKey));
+    this._versionRequests.set(requestKey, request);
+    return request;
   }
 
   /**
@@ -313,7 +447,10 @@ class SingBoxManager {
   /** A rule-set file is usable only if it exists, is non-empty, and starts with the SRS magic. */
   _validSrs(p) {
     try {
-      if (!fs.existsSync(p) || fs.statSync(p).size < 8) return false;
+      const stat = fs.statSync(p);
+      if (stat.size < 8) return false;
+      const cacheKey = `srs:${p}:${statFingerprint(stat)}`;
+      if (this._fileValidationCache.has(cacheKey)) return this._fileValidationCache.get(cacheKey);
       const fd = fs.openSync(p, 'r');
       const buf = Buffer.alloc(3);
       try {
@@ -321,14 +458,32 @@ class SingBoxManager {
       } finally {
         fs.closeSync(fd);
       }
-      return buf.toString('latin1') === 'SRS';
+      const valid = buf.toString('latin1') === 'SRS';
+      this._rememberFileValidation(cacheKey, valid);
+      return valid;
     } catch (e) {
       return false;
     }
   }
 
   _validGeoFile(p) {
-    return validMihomoGeoFile(p);
+    try {
+      const stat = fs.statSync(p);
+      const cacheKey = `geo:${p}:${statFingerprint(stat)}`;
+      if (this._fileValidationCache.has(cacheKey)) return this._fileValidationCache.get(cacheKey);
+      const valid = validMihomoGeoFile(p, stat);
+      this._rememberFileValidation(cacheKey, valid);
+      return valid;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _rememberFileValidation(key, value) {
+    if (this._fileValidationCache.size >= 64) {
+      this._fileValidationCache.delete(this._fileValidationCache.keys().next().value);
+    }
+    this._fileValidationCache.set(key, value);
   }
 
   _mihomoGeoDataKey(dir, bin) {
@@ -336,10 +491,11 @@ class SingBoxManager {
       const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
       const binStat = fs.statSync(bin);
       return [
-        `${bin}:${binStat.size}:${binStat.mtimeMs}`,
+        `schema:${MIHOMO_GEO_VALIDATION_SCHEMA}`,
+        `${bin}:${statFingerprint(binStat)}`,
         ...files.map((file) => {
           const st = fs.statSync(path.join(dir, file));
-          return `${file}:${st.size}:${st.mtimeMs}`;
+          return `${file}:${statFingerprint(st)}`;
         }),
       ].join('|');
     } catch (_) {
@@ -349,39 +505,67 @@ class SingBoxManager {
 
   _cacheMihomoGeoValidation(dir, key, ok) {
     const file = path.join(dir, '.mihomo-geodata-validation.json');
-    const tmp = file + '.tmp';
     try {
-      fs.writeFileSync(tmp, JSON.stringify({ key, ok }), 'utf-8');
-      fs.renameSync(tmp, file);
-    } catch (_) {
-      try { fs.unlinkSync(tmp); } catch (_) {}
-    }
+      writeJsonAtomicSync(file, { key, ok });
+    } catch (_) {}
   }
 
-  mihomoGeoDataReady() {
+  _mihomoGeoValidationContext() {
     const dir = this.ensureCoreDir('mihomo');
     this.ensureMihomoGeoData();
     const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
-    if (!files.every((file) => this._validGeoFile(path.join(dir, file)))) return false;
+    if (!files.every((file) => this._validGeoFile(path.join(dir, file)))) return { ready: false };
 
     const bin = this.resolveBinaryPath('mihomo');
-    if (!bin) return false;
+    if (!bin) return { ready: false };
     const key = this._mihomoGeoDataKey(dir, bin);
     if (key && this._mihomoGeoValidation && this._mihomoGeoValidation.key === key) {
-      return this._mihomoGeoValidation.ok;
+      return { ready: this._mihomoGeoValidation.ok, dir, bin, key };
     }
     const cacheFile = path.join(dir, '.mihomo-geodata-validation.json');
     try {
       const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
       if (cached && cached.key === key && typeof cached.ok === 'boolean') {
         this._mihomoGeoValidation = { key, ok: cached.ok };
-        return cached.ok;
+        return { ready: cached.ok, dir, bin, key };
       }
     } catch (_) {
       /* no reusable validation result */
     }
 
-    const testConfig = path.join(dir, `.mihomo-geodata-check-${process.pid}.yaml`);
+    return key ? { ready: null, dir, bin, key } : { ready: false };
+  }
+
+  _rememberMihomoGeoValidation(dir, key, ok, error = null, cache = true) {
+    if (!ok) {
+      const detail = error ? ': ' + String(error.message || error).trim() : '';
+      this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules' + detail);
+    }
+    if (cache) {
+      this._mihomoGeoValidation = { key, ok };
+      this._cacheMihomoGeoValidation(dir, key, ok);
+    } else {
+      // A timeout, spawn failure or temporary file lock says nothing about the
+      // GeoData itself. Let the next start retry instead of persisting a false
+      // result for unchanged files forever.
+      this._mihomoGeoValidation = null;
+      try { fs.unlinkSync(path.join(dir, '.mihomo-geodata-validation.json')); } catch (_) {}
+    }
+    return ok;
+  }
+
+  _mihomoValidationFailureIsDeterministic(error) {
+    return /^config validation failed:/i.test(String(error && error.message || error || ''));
+  }
+
+  /** Synchronous compatibility check; startup uses validateMihomoGeoData(). */
+  mihomoGeoDataReady(verify = true) {
+    const context = this._mihomoGeoValidationContext();
+    if (context.ready !== null) return context.ready;
+    if (!verify) return false;
+
+    const { dir, bin, key } = context;
+    const testConfig = uniqueSibling(path.join(dir, '.mihomo-geodata-check.yaml'), 'tmp');
     try {
       fs.writeFileSync(testConfig, yaml.dump(mihomoGeoTestConfig(), { lineWidth: -1, noRefs: true }), 'utf-8');
       const result = spawnSync(bin, ['-t', '-f', testConfig, '-d', dir], {
@@ -393,20 +577,52 @@ class SingBoxManager {
       if (result.error) throw result.error;
       if (typeof result.status !== 'number') throw new Error('mihomo validation process did not return an exit code');
       const ok = result.status === 0;
-      if (!ok) {
-        const msg = String(result.stderr || result.stdout || result.error || '').trim().split(/\r?\n/).slice(-3).join(' | ');
-        this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules' + (msg ? ': ' + msg : ''));
-      }
-      this._mihomoGeoValidation = { key, ok };
-      this._cacheMihomoGeoValidation(dir, key, ok);
-      return ok;
+      const output = String(result.stderr || result.stdout || '').trim().split(/\r?\n/).slice(-3).join(' | ');
+      return this._rememberMihomoGeoValidation(dir, key, ok, output || null);
     } catch (e) {
-      this.onLog('[gui] mihomo geodata validation failed; starting without GEOIP/GEOSITE rules: ' + e.message);
-      this._mihomoGeoValidation = { key, ok: false };
-      return false;
+      return this._rememberMihomoGeoValidation(dir, key, false, e, false);
     } finally {
       try { fs.unlinkSync(testConfig); } catch (_) {}
     }
+  }
+
+  /** Validate Mihomo GeoData without blocking Electron's main thread. */
+  validateMihomoGeoData() {
+    const context = this._mihomoGeoValidationContext();
+    if (context.ready !== null) return Promise.resolve(context.ready);
+    if (this._mihomoValidationPromise && this._mihomoValidationPromise.key === context.key) {
+      return this._mihomoValidationPromise.promise;
+    }
+    const { dir, key } = context;
+    const testConfig = uniqueSibling(path.join(dir, '.mihomo-geodata-check.yaml'), 'tmp');
+    const operation = (async () => {
+      try {
+        await fs.promises.writeFile(
+          testConfig,
+          yaml.dump(mihomoGeoTestConfig(), { lineWidth: -1, noRefs: true }),
+          'utf-8'
+        );
+        await this._checkConfigPath('mihomo', testConfig);
+        return this._rememberMihomoGeoValidation(dir, key, true);
+      } catch (error) {
+        return this._rememberMihomoGeoValidation(
+          dir,
+          key,
+          false,
+          error,
+          this._mihomoValidationFailureIsDeterministic(error)
+        );
+      } finally {
+        try { await fs.promises.unlink(testConfig); } catch (_) {}
+      }
+    })();
+    const promise = operation.finally(() => {
+      if (this._mihomoValidationPromise && this._mihomoValidationPromise.promise === promise) {
+        this._mihomoValidationPromise = null;
+      }
+    });
+    this._mihomoValidationPromise = { key, promise };
+    return promise;
   }
 
   ensureSingBoxGeoData() {
@@ -484,10 +700,10 @@ class SingBoxManager {
     const text = this.getCoreType() === 'mihomo'
       ? yaml.dump(config, { lineWidth: -1, noRefs: true })
       : JSON.stringify(config, null, 2);
-    const tmp = this.configPath + `.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    const tmp = uniqueSibling(this.configPath, 'tmp');
     try {
       fs.writeFileSync(tmp, text, 'utf-8');
-      fs.renameSync(tmp, this.configPath);
+      replaceFileSync(tmp, this.configPath);
     } finally {
       try { fs.unlinkSync(tmp); } catch (_) {}
     }
@@ -517,44 +733,23 @@ class SingBoxManager {
   }
 
   _checkConfigPath(type, configPath) {
-    return new Promise((resolve, reject) => {
-      const bin = this.resolveBinaryPath(type);
-      if (!bin) return reject(new Error(this.coreLabelFor(type) + ' core not found'));
-      const workDir = this.ensureCoreDir(type);
-      const args = type === 'mihomo'
-        ? ['-t', '-f', configPath, '-d', workDir]
-        : ['check', '-c', configPath];
-      const p = spawn(bin, args, {
-        cwd: workDir,
-        env: this._coreEnv(type),
-        windowsHide: true,
-      });
-      let out = '';
-      let err = '';
-      let settled = false;
-      const append = (current, data) => (current + stripAnsi(data.toString())).slice(-2 * 1024 * 1024);
-      p.stdout.on('data', (d) => (out = append(out, d)));
-      p.stderr.on('data', (d) => (err = append(err, d)));
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try { p.kill('SIGKILL'); } catch (_) {}
-        reject(new Error('config validation timed out'));
-      }, 15000);
-      p.on('close', (code) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const output = (err || out).trim();
-        if (code === 0) resolve({ output });
-        else reject(new Error('config validation failed: ' + output));
-      });
-      p.on('error', (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
+    const bin = this.resolveBinaryPath(type);
+    if (!bin) return Promise.reject(new Error(this.coreLabelFor(type) + ' core not found'));
+    const workDir = this.ensureCoreDir(type);
+    const args = type === 'mihomo'
+      ? ['-t', '-f', configPath, '-d', workDir]
+      : ['check', '-c', configPath];
+    return runCapturedProcess(bin, args, {
+      cwd: workDir,
+      env: this._coreEnv(type),
+      timeout: 15000,
+      timeoutMessage: 'config validation timed out',
+      outputLimit: 2 * 1024 * 1024,
+      cleanAnsi: true,
+    }).then(({ code, stdout, stderr }) => {
+      const output = (stderr || stdout).trim();
+      if (code === 0) return { output };
+      throw new Error('config validation failed: ' + output);
     });
   }
 
@@ -563,48 +758,78 @@ class SingBoxManager {
     if (this.proc) {
       throw new Error('core is already running');
     }
-    const bin = this.resolveBinaryPath();
+    const coreType = this.getCoreType();
+    const coreLabel = this.coreLabelFor(coreType);
+    const bin = this.resolveBinaryPath(coreType);
     if (!bin) {
-      throw new Error(this.coreLabel + ' core not found. Download or place the core under Settings first.');
+      throw new Error(coreLabel + ' core not found. Download or place the core under Settings first.');
     }
     if (config) this.writeConfig(config);
 
-    this.onLog(`[gui] Starting ${this.coreLabel} core...`);
-    const workDir = this.ensureCoreDir();
-    const args = this.getCoreType() === 'mihomo'
-      ? ['-f', this.configPath, '-d', workDir]
-      : ['run', '-c', this.configPath, '-D', workDir];
+    this.onLog(`[gui] Starting ${coreLabel} core...`);
+    const workDir = this.ensureCoreDir(coreType);
+    const configPath = this.configPathFor(coreType);
+    const args = coreType === 'mihomo'
+      ? ['-f', configPath, '-d', workDir]
+      : ['run', '-c', configPath, '-D', workDir];
     const proc = spawn(bin, args, {
       cwd: workDir,
-      env: this._coreEnv(),
+      env: this._coreEnv(coreType),
     });
     this.proc = proc;
 
-    const handleData = (buf) => {
+    const remainders = { stdout: '', stderr: '' };
+    const decoders = { stdout: new StringDecoder('utf-8'), stderr: new StringDecoder('utf-8') };
+    const emitLogLine = (line) => {
+      if (line.trim()) this.onLog(line);
+    };
+    const handleData = (stream, buf) => {
       // sing-box emits ANSI color escape codes (e.g. "\x1b[36mINFO\x1b[0m").
       // Strip them so the log view shows plain text instead of garbage.
-      const text = stripAnsi(buf.toString());
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim()) this.onLog(line);
+      const lines = stripAnsi(remainders[stream] + decoders[stream].write(buf)).split(/\r?\n/);
+      remainders[stream] = lines.pop() || '';
+      for (const line of lines) emitLogLine(line);
+      if (remainders[stream].length > 64 * 1024) {
+        emitLogLine(remainders[stream].slice(0, 64 * 1024));
+        remainders[stream] = '';
       }
     };
-    proc.stdout.on('data', handleData);
-    proc.stderr.on('data', handleData);
+    proc.stdout.on('data', (data) => handleData('stdout', data));
+    proc.stderr.on('data', (data) => handleData('stderr', data));
 
-    proc.on('exit', (code, signal) => {
-      this.onLog(`[gui] ${this.coreLabel} exited (code=${code}, signal=${signal})`);
+    let stateFinalized = false;
+    let streamsFinalized = false;
+    let exitInfo = null;
+    const finalizeState = (code, signal, error = null) => {
+      if (stateFinalized) return;
+      stateFinalized = true;
+      exitInfo = { code, signal, error };
+      if (this.proc !== proc) return;
       this.proc = null;
       this.onExit(code, signal);
-    });
-    proc.on('error', (err) => {
-      this.onLog('[gui] core start error: ' + err.message);
-      this.proc = null;
-      this.onExit(-1, null);
+    };
+    const finalizeStreams = (code, signal) => {
+      if (streamsFinalized) return;
+      streamsFinalized = true;
+      emitLogLine(stripAnsi(remainders.stdout + decoders.stdout.end()));
+      emitLogLine(stripAnsi(remainders.stderr + decoders.stderr.end()));
+      const info = exitInfo || { code, signal, error: null };
+      if (info.error) this.onLog('[gui] core start error: ' + info.error.message);
+      else this.onLog(`[gui] ${coreLabel} exited (code=${info.code}, signal=${info.signal})`);
+    };
+    // `exit` updates lifecycle state promptly, while `close` is the point at
+    // which stdout/stderr are guaranteed drained. Ending the decoders at
+    // `exit` can truncate or corrupt a final multibyte log line.
+    proc.once('exit', (code, signal) => finalizeState(code, signal));
+    proc.once('error', (error) => finalizeState(-1, null, error));
+    proc.once('close', (code, signal) => {
+      finalizeState(code, signal);
+      finalizeStreams(code, signal);
     });
 
     // Wait briefly to confirm the process didn't crash immediately.
     await new Promise((r) => setTimeout(r, 600));
-    if (!this.proc) {
+    if (this.proc !== proc) {
       throw new Error('core exited immediately after start; check the logs and config');
     }
     return true;
@@ -621,29 +846,43 @@ class SingBoxManager {
   async stop() {
     if (!this.proc) return;
     const proc = this.proc;
-    return new Promise((resolve) => {
-      let timer = null;
-      const done = () => {
-        if (timer) clearTimeout(timer);
-        resolve();
+    return new Promise((resolve, reject) => {
+      let terminateTimer = null;
+      let deadlineTimer = null;
+      let settled = false;
+      const settle = (error = null) => {
+        if (settled) return;
+        settled = true;
+        if (terminateTimer) clearTimeout(terminateTimer);
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        proc.removeListener('exit', done);
+        if (error) reject(error);
+        else resolve();
       };
+      const done = () => settle();
       proc.once('exit', done);
       try {
         if (process.platform === 'win32') {
           // SIGTERM is unreliable on Windows; use taskkill to kill the process tree.
-          spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F']);
+          const killer = spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true });
+          killer.once('error', () => {});
         } else {
           proc.kill('SIGTERM');
         }
       } catch (e) {
-        resolve();
+        settle(e);
+        return;
       }
-      // Timeout fallback
-      timer = setTimeout(() => {
+      // Escalate once, then fail rather than starting a second core while the
+      // previous process may still own ports or a TUN adapter.
+      terminateTimer = setTimeout(() => {
         try {
           proc.kill('SIGKILL');
-        } catch (_) {}
-        resolve();
+        } catch (error) {
+          settle(error);
+          return;
+        }
+        deadlineTimer = setTimeout(() => settle(new Error('core did not stop after SIGKILL')), 1000);
       }, 3000);
     });
   }
@@ -658,7 +897,31 @@ class SingBoxManager {
    *     used to stop a running core so the .exe is not locked during overwrite
    */
   async downloadCore(version, onProgress = () => {}, opts = {}) {
-    const { proxyPort = 0, beforeInstall = null } = opts;
+    if (this._coreDownloadPromise) throw new Error('core download already in progress');
+    const controller = new AbortController();
+    const operation = this._downloadCore(version, onProgress, { ...opts, signal: controller.signal });
+    this._coreDownloadController = controller;
+    this._coreDownloadPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this._coreDownloadPromise === operation) {
+        this._coreDownloadPromise = null;
+        this._coreDownloadController = null;
+      }
+    }
+  }
+
+  async _downloadCore(version, onProgress, opts) {
+    const { proxyPort = 0, beforeInstall = null, signal = null } = opts;
+    throwIfAborted(signal);
+    const coreType = opts.coreType === undefined
+      ? this.getCoreType()
+      : opts.coreType === 'mihomo' || opts.coreType === 'sing-box'
+        ? opts.coreType
+        : null;
+    if (!coreType) throw new Error('invalid core type');
+    const coreLabel = this.coreLabelFor(coreType);
     const plat = process.platform; // win32 / linux / darwin
     const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
     const goos = plat === 'win32' ? 'windows' : plat === 'darwin' ? 'darwin' : 'linux';
@@ -669,30 +932,43 @@ class SingBoxManager {
     }
     let release = null;
     if (!tag) {
-      const latest = await this._latestVersion(proxyPort);
+      const latest = await this._latestVersion(proxyPort, coreType, signal);
       tag = latest.tag;
       release = latest.release;
     }
     const ver = tag.replace(/^v/, '');
-    const asset = this._coreAsset(ver, goos, arch, release);
+    const asset = this._coreAsset(ver, goos, arch, release, coreType);
 
-    const binDir = this.ensureCoreDir();
+    const binDir = this.ensureCoreDir(coreType);
     const archivePath = path.join(binDir, asset.fileName);
 
     this.onLog('[gui] Downloading core: ' + asset.url + (proxyPort ? ' (via proxy)' : ''));
-    await fetch.downloadWithFallback(asset.url, archivePath, { proxyPort, onProgress, log: (m) => this.onLog(m) });
-    this.onLog('[gui] Download complete, extracting...');
-    if (beforeInstall) await beforeInstall();
-    await this._extractCore(archivePath, binDir, goos);
+    try {
+      await fetch.downloadWithFallback(asset.url, archivePath, {
+        proxyPort,
+        onProgress,
+        signal,
+        log: (m) => this.onLog(m),
+      });
+      throwIfAborted(signal);
+      this.onLog('[gui] Download complete, extracting...');
+      if (beforeInstall) await beforeInstall();
+      throwIfAborted(signal);
+      await this._extractCore(archivePath, binDir, goos, coreType, signal);
+      throwIfAborted(signal);
+    } finally {
+      try { fs.unlinkSync(archivePath); } catch (_) {}
+    }
     // Verify the executable actually landed in the selected core folder before
     // claiming success.
-    const installed = path.join(binDir, this.binName);
+    const binName = this.binNameFor(coreType);
+    const installed = path.join(binDir, binName);
     if (!fs.existsSync(installed)) {
-      throw new Error('extraction finished but ' + this.binName + ' was not found in ' + binDir);
+      throw new Error('extraction finished but ' + binName + ' was not found in ' + binDir);
     }
-    this.onLog('[gui] Core installed at ' + installed);
+    this.onLog(`[gui] ${coreLabel} core installed at ${installed}`);
     // Invalidate the cached version so the next query reflects the new core.
-    this._versionCache = null;
+    this.invalidateVersionCache();
     return installed;
   }
 
@@ -701,62 +977,82 @@ class SingBoxManager {
    * folder so the bundled (or stale) geodata can be updated from within the app.
    */
   async updateGeoData(onProgress = () => {}, proxyPort = 0) {
-    if (this.getCoreType() === 'mihomo') {
+    const coreType = this.getCoreType();
+    if (coreType === 'mihomo') {
       return this.updateMihomoGeoData(onProgress, proxyPort);
     }
+    return this._coalesceGeoUpdate('sing-box', () => this._updateSingBoxGeoData(onProgress, proxyPort));
+  }
+
+  async _downloadAndInstallGeoFiles(dir, files, options) {
+    const { proxyPort, onProgress, validator, updateLabel, successLabel } = options;
+    const staged = [];
+    let done = 0;
+    try {
+      for (const item of files) {
+        const dest = path.join(dir, item.file);
+        const tmp = uniqueSibling(dest, 'tmp');
+        let accepted = false;
+        let lastError = null;
+        for (const url of item.urls) {
+          this.onLog(`[gui] ${updateLabel}: ${url}${proxyPort ? ' (via proxy)' : ''}`);
+          try {
+            await fetch.downloadWithFallback(url, tmp, {
+              proxyPort,
+              log: (message) => this.onLog(message),
+              onProgress: (progress) => onProgress((done + progress) / files.length),
+            });
+          } catch (error) {
+            lastError = error;
+            try { fs.unlinkSync(tmp); } catch (_) {}
+            continue;
+          }
+          if (!validator(tmp)) {
+            lastError = new Error('downloaded file failed validation (blocked or redirected)');
+            try { fs.unlinkSync(tmp); } catch (_) {}
+            continue;
+          }
+          this.onLog(`[gui] ${successLabel}: ${url}`);
+          accepted = true;
+          break;
+        }
+        if (!accepted) {
+          throw new Error(
+            'download failed for ' + item.file + ' from all sources' +
+              (lastError ? ': ' + lastError.message : '') +
+              (proxyPort ? '' : '. Start the core first so the download can go through the proxy.')
+          );
+        }
+        staged.push({ source: tmp, target: dest });
+        done += 1;
+        try { onProgress(done / files.length); } catch (_) {}
+      }
+      replaceFileBatchSync(staged);
+    } finally {
+      for (const entry of staged) {
+        try { fs.unlinkSync(entry.source); } catch (_) {}
+      }
+    }
+  }
+
+  async _updateSingBoxGeoData(onProgress, proxyPort) {
     const binDir = this.ensureCoreDir('sing-box');
     const files = [
-      { file: 'geoip-cn.srs', repo: 'sing-geoip' },
-      { file: 'geosite-cn.srs', repo: 'sing-geosite' },
+      { file: 'geoip-cn.srs', urls: geoDataUrls('sing-geoip', 'geoip-cn.srs') },
+      { file: 'geosite-cn.srs', urls: geoDataUrls('sing-geosite', 'geosite-cn.srs') },
     ];
-    let done = 0;
-    for (const f of files) {
-      // Download to a temp file first, validate, then swap in — so a failed or
-      // blocked download (e.g. an HTML error page) never replaces a good file.
-      // Walk the candidate sources (raw + jsDelivr mirrors); each is tried
-      // proxy-first then direct, and the first one yielding a valid .srs wins.
-      const dest = path.join(binDir, f.file);
-      const tmp = dest + '.tmp';
-      let ok = false;
-      let lastErr = null;
-      for (const url of geoDataUrls(f.repo, f.file)) {
-        this.onLog('[gui] Updating geodata: ' + url + (proxyPort ? ' (via proxy)' : ''));
-        try {
-          await fetch.downloadWithFallback(url, tmp, {
-            proxyPort,
-            log: (m) => this.onLog(m),
-            onProgress: (p) => onProgress((done + p) / files.length),
-          });
-        } catch (e) {
-          lastErr = e;
-          try { fs.unlinkSync(tmp); } catch (_) {}
-          continue; // try the next source
-        }
-        if (!this._validSrs(tmp)) {
-          lastErr = new Error('not a valid rule-set (blocked/redirected)');
-          try { fs.unlinkSync(tmp); } catch (_) {}
-          continue;
-        }
-        fs.renameSync(tmp, dest);
-        this.onLog('[gui] geodata source OK: ' + url);
-        ok = true;
-        break;
-      }
-      if (!ok) {
-        throw new Error(
-          'download failed for ' + f.file + ' from all sources' +
-            (lastErr ? ': ' + lastErr.message : '') +
-            (proxyPort ? '' : '. Start the core first so the download can go through the proxy.')
-        );
-      }
-      done += 1;
-      onProgress(done / files.length);
-    }
-    const meta = this.geoMeta();
+    await this._downloadAndInstallGeoFiles(binDir, files, {
+      proxyPort,
+      onProgress,
+      validator: (file) => this._validSrs(file),
+      updateLabel: 'Updating geodata',
+      successLabel: 'geodata source OK',
+    });
+    const meta = this.geoMeta('sing-box');
     const updatedAt = Date.now();
     for (const f of files) meta[f.file] = { updatedAt };
     try {
-      fs.writeFileSync(path.join(binDir, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
+      writeJsonAtomicSync(this.geoMetaPath('sing-box'), meta);
     } catch (e) {
       /* non-fatal */
     }
@@ -764,53 +1060,28 @@ class SingBoxManager {
     return binDir;
   }
 
-  async updateMihomoGeoData(onProgress = () => {}, proxyPort = 0) {
+  updateMihomoGeoData(onProgress = () => {}, proxyPort = 0) {
+    return this._coalesceGeoUpdate('mihomo', () => this._updateMihomoGeoData(onProgress, proxyPort));
+  }
+
+  async _updateMihomoGeoData(onProgress, proxyPort) {
     const dir = this.ensureCoreDir('mihomo');
-    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'];
-    let done = 0;
-    for (const file of files) {
-      const dest = path.join(dir, file);
-      const tmp = dest + '.tmp';
-      let ok = false;
-      let lastErr = null;
-      for (const url of mihomoGeoDataUrls(file)) {
-        this.onLog('[gui] Updating mihomo geodata: ' + url + (proxyPort ? ' (via proxy)' : ''));
-        try {
-          await fetch.downloadWithFallback(url, tmp, {
-            proxyPort,
-            log: (m) => this.onLog(m),
-            onProgress: (p) => onProgress((done + p) / files.length),
-          });
-        } catch (e) {
-          lastErr = e;
-          try { fs.unlinkSync(tmp); } catch (_) {}
-          continue;
-        }
-        if (!this._validGeoFile(tmp)) {
-          lastErr = new Error('not a valid geodata file (blocked/redirected)');
-          try { fs.unlinkSync(tmp); } catch (_) {}
-          continue;
-        }
-        fs.renameSync(tmp, dest);
-        this.onLog('[gui] mihomo geodata source OK: ' + url);
-        ok = true;
-        break;
-      }
-      if (!ok) {
-        throw new Error(
-          'download failed for ' + file + ' from all sources' +
-            (lastErr ? ': ' + lastErr.message : '') +
-            (proxyPort ? '' : '. Start the core first so the download can go through the proxy.')
-        );
-      }
-      done += 1;
-      onProgress(done / files.length);
-    }
-    const meta = this.geoMeta();
+    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'].map((file) => ({
+      file,
+      urls: mihomoGeoDataUrls(file),
+    }));
+    await this._downloadAndInstallGeoFiles(dir, files, {
+      proxyPort,
+      onProgress,
+      validator: (file) => this._validGeoFile(file),
+      updateLabel: 'Updating mihomo geodata',
+      successLabel: 'mihomo geodata source OK',
+    });
+    const meta = this.geoMeta('mihomo');
     const updatedAt = Date.now();
     for (const file of files) meta[file] = { updatedAt };
     try {
-      fs.writeFileSync(this.geoMetaPath(), JSON.stringify(meta), 'utf-8');
+      writeJsonAtomicSync(this.geoMetaPath('mihomo'), meta);
     } catch (_) {
       /* non-fatal */
     }
@@ -818,29 +1089,45 @@ class SingBoxManager {
     return dir;
   }
 
-  /** Read the stored geodata update times ({ file: { updatedAt } }), or {}. */
-  geoMetaPath() {
-    return path.join(this.coreDir(), 'geodata-meta.json');
+  _coalesceGeoUpdate(type, factory) {
+    const active = this._geoUpdatePromises.get(type);
+    if (active) return active;
+    let tracked;
+    tracked = Promise.resolve().then(factory).finally(() => {
+      if (this._geoUpdatePromises.get(type) === tracked) this._geoUpdatePromises.delete(type);
+    });
+    this._geoUpdatePromises.set(type, tracked);
+    return tracked;
   }
 
-  geoMeta() {
+  /** Read the stored geodata update times ({ file: { updatedAt } }), or {}. */
+  geoMetaPath(type = this.getCoreType()) {
+    return path.join(this.coreDir(type), 'geodata-meta.json');
+  }
+
+  geoMeta(type = this.getCoreType()) {
     try {
-      return JSON.parse(fs.readFileSync(this.geoMetaPath(), 'utf-8'));
+      return JSON.parse(fs.readFileSync(this.geoMetaPath(type), 'utf-8'));
     } catch (e) {
       return {};
     }
   }
 
   /** Latest stable core release tag — GitHub API first, jsDelivr fallback. */
-  async _latestVersion(proxyPort = 0) {
-    const repo = this.getCoreType() === 'mihomo' ? 'MetaCubeX/mihomo' : 'SagerNet/sing-box';
-    const { tag, release, source } = await github.latestReleaseTag(repo, proxyPort, (m) => this.onLog(m));
+  async _latestVersion(proxyPort = 0, type = this.getCoreType(), signal = null) {
+    const repo = type === 'mihomo' ? 'MetaCubeX/mihomo' : 'SagerNet/sing-box';
+    const { tag, release, source } = await github.latestReleaseTag(
+      repo,
+      proxyPort,
+      (m) => this.onLog(m),
+      { signal }
+    );
     if (source !== 'github') this.onLog('[gui] core version resolved via jsDelivr: ' + tag);
     return { tag, release };
   }
 
-  _coreAsset(ver, goos, arch, release) {
-    if (this.getCoreType() !== 'mihomo') {
+  _coreAsset(ver, goos, arch, release, type = this.getCoreType()) {
+    if (type !== 'mihomo') {
       const ext = goos === 'windows' ? 'zip' : 'tar.gz';
       const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
       return { fileName, url: `https://github.com/SagerNet/sing-box/releases/download/v${ver}/${fileName}` };
@@ -850,6 +1137,8 @@ class SingBoxManager {
     const candidates = assets
       .map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }))
       .filter((a) =>
+        path.basename(a.name) === a.name &&
+        !/[\\/]/.test(a.name) &&
         /mihomo/i.test(a.name) &&
         a.name.toLowerCase().includes(goos) &&
         a.name.toLowerCase().includes(arch) &&
@@ -862,109 +1151,88 @@ class SingBoxManager {
     return { fileName, url: `https://github.com/MetaCubeX/mihomo/releases/download/v${ver}/${fileName}` };
   }
 
-  /** Extract the core archive (zip on Windows / tar.gz elsewhere), only the executable. */
-  async _extractCore(archivePath, binDir, goos) {
-    if (this.getCoreType() === 'mihomo') {
-      return this._extractMihomoCore(archivePath, binDir, goos);
-    }
-    if (goos === 'windows') {
-      // Use PowerShell to extract the zip (built into Windows).
-      await this._run('powershell', [
-        '-NoProfile',
-        '-Command',
-        `Expand-Archive -Path '${archivePath}' -DestinationPath '${binDir}' -Force`,
-      ]);
-    } else {
-      await this._run('tar', ['-xzf', archivePath, '-C', binDir]);
-    }
-    // After extraction the executable sits in a subdir sing-box-x.y.z-os-arch/,
-    // so move the executable to the root of binDir.
-    const entries = fs.readdirSync(binDir, { withFileTypes: true });
-    for (const e of entries) {
-      if (e.isDirectory() && e.name.startsWith('sing-box-')) {
-        const inner = path.join(binDir, e.name, this.binName);
-        if (fs.existsSync(inner)) {
-          const target = path.join(binDir, this.binName);
-          fs.copyFileSync(inner, target);
-          if (goos !== 'windows') fs.chmodSync(target, 0o755);
-        }
-      }
-    }
-    // Clean up the archive
+  /** Extract a core into an isolated staging directory, then atomically install it. */
+  async _extractCore(archivePath, binDir, goos, type = this.getCoreType(), signal = null) {
+    throwIfAborted(signal);
+    const binName = this.binNameFor(type);
+    const target = path.join(binDir, binName);
+    const stage = path.join(binDir, `.extract-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+    fs.mkdirSync(stage, { recursive: true });
     try {
-      fs.unlinkSync(archivePath);
-    } catch (_) {}
-  }
-
-  _findExtractedBinary(dir, name, depth = 2) {
-    if (depth < 0) return null;
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch (_) {
-      return null;
-    }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      if (e.isFile() && e.name.toLowerCase() === name.toLowerCase()) return p;
-      if (e.isFile() && /^mihomo/i.test(e.name) && (process.platform !== 'win32' || /\.exe$/i.test(e.name))) return p;
-    }
-    for (const e of entries) {
-      if (e.isDirectory()) {
-        const p = this._findExtractedBinary(path.join(dir, e.name), name, depth - 1);
-        if (p) return p;
+      if (type === 'mihomo' && /\.gz$/i.test(archivePath) && !/\.tar\.gz$/i.test(archivePath)) {
+        await pipeline(
+          fs.createReadStream(archivePath),
+          zlib.createGunzip(),
+          fs.createWriteStream(path.join(stage, binName)),
+          ...(signal ? [{ signal }] : [])
+        );
+      } else if (goos === 'windows') {
+        const quote = (value) => String(value).replace(/'/g, "''");
+        await this._run('powershell', [
+          '-NoProfile',
+          '-Command',
+          `Expand-Archive -LiteralPath '${quote(archivePath)}' -DestinationPath '${quote(stage)}' -Force`,
+        ], { signal });
+      } else {
+        await this._run('tar', ['-xzf', archivePath, '-C', stage], { signal });
       }
-    }
-    return null;
-  }
 
-  async _extractMihomoCore(archivePath, binDir, goos) {
-    const target = path.join(binDir, this.binName);
-    if (/\.gz$/i.test(archivePath)) {
-      const data = zlib.gunzipSync(fs.readFileSync(archivePath));
-      fs.writeFileSync(target, data);
-      if (goos !== 'windows') fs.chmodSync(target, 0o755);
+      throwIfAborted(signal);
+      const found = this._findExtractedBinary(stage, binName, 4, type === 'mihomo');
+      if (!found) throw new Error(`${binName} was not found in the downloaded archive`);
+      if (goos !== 'windows') fs.chmodSync(found, 0o755);
+      const versionOutput = await this._runCapture(found, type === 'mihomo' ? ['-v'] : ['version'], { signal });
+      if (!/\b(?:version\s+v?|v?)\d+\.\d+/i.test(versionOutput)) {
+        throw new Error(`downloaded ${binName} did not report a valid version`);
+      }
+      throwIfAborted(signal);
+      replaceFileSync(found, target);
+    } finally {
+      try { fs.rmSync(stage, { recursive: true, force: true }); } catch (_) {}
       try { fs.unlinkSync(archivePath); } catch (_) {}
-      return;
     }
-    if (goos === 'windows') {
-      await this._run('powershell', [
-        '-NoProfile',
-        '-Command',
-        `Expand-Archive -Path '${archivePath}' -DestinationPath '${binDir}' -Force`,
-      ]);
-    } else {
-      await this._run('tar', ['-xzf', archivePath, '-C', binDir]);
-    }
-    const found = this._findExtractedBinary(binDir, this.binName);
-    if (found) {
-      if (path.resolve(found) !== path.resolve(target)) fs.copyFileSync(found, target);
-      if (goos !== 'windows') fs.chmodSync(target, 0o755);
-    }
-    try { fs.unlinkSync(archivePath); } catch (_) {}
   }
 
-  _run(cmd, args) {
-    return new Promise((resolve, reject) => {
-      const p = spawn(cmd, args);
-      let err = '';
-      p.stderr.on('data', (d) => (err += d.toString()));
-      p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err || cmd + ' failed'))));
-      p.on('error', reject);
-    });
+  _findExtractedBinary(dir, name, depth = 2, allowMihomoPrefix = false) {
+    const find = (root, remaining, predicate) => {
+      if (remaining < 0) return null;
+      let entries;
+      try {
+        entries = fs.readdirSync(root, { withFileTypes: true });
+      } catch (_) {
+        return null;
+      }
+      for (const entry of entries) {
+        if (entry.isFile() && predicate(entry.name)) return path.join(root, entry.name);
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const found = find(path.join(root, entry.name), remaining - 1, predicate);
+        if (found) return found;
+      }
+      return null;
+    };
+
+    // Prefer the canonical filename across the entire archive. Some releases
+    // include helper binaries whose names also begin with `mihomo`.
+    const exact = find(dir, depth, (file) => file.toLowerCase() === name.toLowerCase());
+    if (exact || !allowMihomoPrefix) return exact;
+    const wantsExe = /\.exe$/i.test(name);
+    return find(dir, depth, (file) =>
+      /^mihomo/i.test(file) && (wantsExe ? /\.exe$/i.test(file) : !/\.exe$/i.test(file))
+    );
+  }
+
+  async _run(cmd, args, options = {}) {
+    const { code, stderr } = await runCapturedProcess(cmd, args, { ...options, timeout: 120000 });
+    if (code !== 0) throw new Error(stderr || cmd + ' failed');
   }
 
   /** Run a command and resolve with its captured stdout. */
-  _runCapture(cmd, args) {
-    return new Promise((resolve, reject) => {
-      const p = spawn(cmd, args);
-      let out = '';
-      let err = '';
-      p.stdout.on('data', (d) => (out += d.toString()));
-      p.stderr.on('data', (d) => (err += d.toString()));
-      p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(err || cmd + ' failed'))));
-      p.on('error', reject);
-    });
+  async _runCapture(cmd, args, options = {}) {
+    const { code, stdout, stderr } = await runCapturedProcess(cmd, args, options);
+    if (code !== 0) throw new Error(stderr || cmd + ' failed');
+    return stdout || stderr;
   }
 }
 

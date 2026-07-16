@@ -1,11 +1,10 @@
 'use strict';
-// Settings tab: general/DNS settings, core management, geodata updates and
-// the About section (version display + in-app update check/download).
+// Settings tab: general/DNS settings, core management and GeoData actions.
 (function () {
   const App = window.App;
   const { $, toast, call } = App;
   const api = window.api;
-  const { t } = window.i18n;
+  const { t, getLang } = window.i18n;
 
   function renderSettings() {
     const s = App.state.settings;
@@ -33,7 +32,6 @@
     const el = $('#coreStatus');
     if (!el || !st) return;
     const coreName = st.coreName || st.coreType || (App.state.settings && App.state.settings.coreType) || 'sing-box';
-    const modal = $('#coreModalStatus');
     if (st.coreInstalled) {
       const ver = st.coreVersion
         ? 'v' + st.coreVersion
@@ -42,11 +40,9 @@
           : t('settings.versionUnknown');
       el.textContent = t('settings.currentCoreValue', coreName, ver);
       el.title = st.corePath || ''; // full path on hover
-      if (modal) modal.textContent = st.corePath || t('settings.installed', ver);
     } else {
       el.textContent = t('settings.currentCoreValue', coreName, t('settings.notInstalled'));
       el.title = '';
-      if (modal) modal.textContent = t('settings.notInstalled');
     }
     el.style.color = st.coreInstalled ? 'var(--green)' : 'var(--red)';
   }
@@ -54,23 +50,38 @@
   let coreStatusRequest = null;
   async function refreshCoreStatus() {
     if (!api || !api.coreStatus) return App.state.status;
-    if (coreStatusRequest) return coreStatusRequest;
-    coreStatusRequest = (async () => {
+    const expectedCore = (App.state.settings && App.state.settings.coreType) ||
+      (App.state.status && App.state.status.coreType);
+    if (coreStatusRequest && coreStatusRequest.coreType === expectedCore) return coreStatusRequest.promise;
+    const request = (async () => {
       const st = await api.coreStatus();
+      const currentCore = (App.state.settings && App.state.settings.coreType) ||
+        (App.state.status && App.state.status.coreType);
+      if ((expectedCore && currentCore !== expectedCore) || (st.coreType && expectedCore && st.coreType !== expectedCore)) {
+        return App.state.status;
+      }
       App.state.status = { ...App.state.status, ...st };
       renderCoreStatus(App.state.status);
       return App.state.status;
     })().finally(() => {
-      coreStatusRequest = null;
+      if (coreStatusRequest && coreStatusRequest.promise === request) coreStatusRequest = null;
     });
-    return coreStatusRequest;
+    coreStatusRequest = { coreType: expectedCore, promise: request };
+    return request;
   }
 
   $('#setLanguage').addEventListener('change', async (e) => {
     const lang = e.target.value;
+    const previous = getLang();
     App.setLanguage(lang);
+    App.patchSettings({ language: lang });
     if (!api || !api.updateSettings) return;
-    App.state.settings = await call(api.updateSettings, { language: lang });
+    try {
+      App.commitSettings(await call(api.updateSettings, { language: lang }));
+    } catch (_) {
+      App.setLanguage(previous);
+      App.patchSettings({ language: previous });
+    }
   });
   $('#saveSettings').addEventListener('click', async () => {
     const patch = {
@@ -88,12 +99,18 @@
       testConcurrency: Math.max(1, Math.min(32, parseInt($('#setTestConcurrency').value, 10) || 8)),
       language: $('#setLanguage').value,
     };
-    App.state.settings = await call(api.updateSettings, patch);
-    toast(t('settings.saved'));
+    const rulesChanged = !!App.state.settings.useBuiltinRules !== patch.useBuiltinRules;
+    try {
+      App.commitSettings(await call(api.updateSettings, patch));
+      if (rulesChanged && App.invalidateRuleCaches) App.invalidateRuleCaches();
+      toast(t('settings.saved'));
+    } catch (_) {}
   });
   $('#checkConfigBtn').addEventListener('click', async () => {
-    await call(api.checkConfig);
-    toast(t('settings.checkOk'));
+    try {
+      await call(api.checkConfig);
+      toast(t('settings.checkOk'));
+    } catch (_) {}
   });
 
   // Save DNS settings.
@@ -103,136 +120,20 @@
       dnsLocal: $('#setDnsLocal').value.trim(),
       dnsStrategy: $('#setDnsStrategy').value,
     };
-    App.state.settings = await call(api.updateSettings, patch);
-    toast(t('settings.saved'));
-  });
-
-  // Core management modal: switch selected runtime core and manage/download it.
-  $('#coreManageBtn').addEventListener('click', async () => {
-    $('#coreModal').classList.remove('hidden');
-    $('#setCoreType').value = (App.state.settings && App.state.settings.coreType) || 'sing-box';
-    await refreshCoreStatus();
-  });
-  $('#coreCloseBtn').addEventListener('click', () => $('#coreModal').classList.add('hidden'));
-  $('#coreModal').addEventListener('click', (e) => {
-    if (e.target.id === 'coreModal') $('#coreModal').classList.add('hidden');
-  });
-  $('#coreOpenFolderBtn').addEventListener('click', () => call(api.openCoreFolder));
-  $('#coreRestartBtn').addEventListener('click', async () => {
-    const btn = $('#coreRestartBtn');
-    btn.disabled = true;
     try {
-      await call(api.restartCore);
-      toast(t('toast.restarted'));
-    } finally {
-      btn.disabled = false;
-    }
-  });
-  async function applyCoreTypeSelection() {
-    const coreType = $('#setCoreType').value;
-    if (coreType === ((App.state.settings && App.state.settings.coreType) || 'sing-box')) return false;
-    App.state.settings = await call(api.updateSettings, { coreType });
-    return true;
-  }
-  $('#coreApplyBtn').addEventListener('click', async () => {
-    await applyCoreTypeSelection();
-    toast(t('settings.coreChanged'));
-    await refreshCoreStatus();
+      App.commitSettings(await call(api.updateSettings, patch));
+      toast(t('settings.saved'));
+    } catch (_) {}
   });
 
-  // Update core: always fetch the latest release.
-  $('#coreUpdateBtn').addEventListener('click', async () => {
-    const btn = $('#coreUpdateBtn');
-    const prog = $('#downloadProgress');
-    btn.disabled = true;
-    btn.textContent = t('settings.updatingCore');
-    prog.classList.remove('hidden');
-    try {
-      await applyCoreTypeSelection();
-      // Always fetch the latest core (empty version = latest).
-      await call(api.downloadCore, { version: '' });
-      toast(t('settings.coreDownloaded'));
-      await refreshCoreStatus();
-    } finally {
-      btn.disabled = false;
-      btn.textContent = t('settings.updateCore');
-      setTimeout(() => prog.classList.add('hidden'), 1500);
-    }
-  });
-
-  if (api && api.onDownloadProgress) api.onDownloadProgress((p) => {
-    $('#downloadProgress .bar').style.width = Math.round(p * 100) + '%';
-  });
+  $('#coreManageBtn').addEventListener('click', () => App.openDialog('core'));
 
   // Open the project homepage.
-  $('#homepageBtn').addEventListener('click', () => api.openExternal('https://github.com/blakebill/dart'));
-
-  // ---------- Version / updates ----------
-  let latestUpdateUrl = null;
-  async function initVersion() {
-    try {
-      const v = await api.getVersion();
-      if ($('#appVersion')) $('#appVersion').textContent = 'v' + v;
-      if ($('#aboutVersion')) $('#aboutVersion').textContent = 'v' + v;
-    } catch (_) {}
-  }
-  async function runUpdateCheck(silent) {
-    const status = $('#updateStatus');
-    const dl = $('#downloadUpdateBtn');
-    if (status && !silent) status.textContent = t('about.checking');
-    try {
-      const r = await api.checkUpdate();
-      if (r.error) {
-        if (status && !silent) status.textContent = t('about.checkFailed', r.error);
-        return;
-      }
-      const badge = $('#versionNew');
-      if (r.hasUpdate) {
-        latestUpdateUrl = r.url;
-        if (status) status.textContent = t('about.newVersion', 'v' + r.latest, 'v' + r.current);
-        if (dl) dl.classList.remove('hidden');
-        if (badge) badge.classList.remove('hidden'); // NEW marker by the logo version
-        if (silent) {
-          const msg = t('about.newVersion', 'v' + r.latest, 'v' + r.current);
-          toast(msg);
-          // Desktop notification too, since the silent check often runs while
-          // the window is hidden in the tray.
-          try { api.notify(t('notify.updateTitle'), msg); } catch (_) {}
-        }
-      } else {
-        if (badge) badge.classList.add('hidden');
-        if (status && !silent) status.textContent = t('about.upToDate');
-      }
-    } catch (e) {
-      if (status && !silent) status.textContent = t('about.checkFailed', e.message || String(e));
-    }
-  }
-  $('#checkUpdateBtn').addEventListener('click', () => runUpdateCheck(false));
-  // Download the installer in-app (through the proxy when running) and launch
-  // it; the app quits by itself so the installer can replace its files. If the
-  // automatic download fails, fall back to opening the release page.
-  $('#downloadUpdateBtn').addEventListener('click', async () => {
-    const btn = $('#downloadUpdateBtn');
-    const prog = $('#downloadProgress');
-    btn.disabled = true;
-    btn.textContent = t('about.downloading');
-    prog.classList.remove('hidden');
-    try {
-      await api.downloadUpdate();
-      toast(t('about.installing'));
-    } catch (e) {
-      toast(t('about.fallbackPage', e.message || String(e)), true);
-      if (latestUpdateUrl) api.openExternal(latestUpdateUrl);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = t('about.download');
-      setTimeout(() => prog.classList.add('hidden'), 1500);
-    }
+  $('#homepageBtn').addEventListener('click', () => {
+    call(api.openExternal, 'https://github.com/blakebill/dart').catch(() => {});
   });
 
   App.renderSettings = renderSettings;
   App.renderCoreStatus = renderCoreStatus;
   App.refreshCoreStatus = refreshCoreStatus;
-  App.initVersion = initVersion;
-  App.runUpdateCheck = runUpdateCheck;
 })();

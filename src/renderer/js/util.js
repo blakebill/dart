@@ -17,6 +17,36 @@
   App.$ = (sel) => document.querySelector(sel);
   App.$$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+  // Classic-script module loader shared by the main renderer and native
+  // dialogs. Feature scripts are loaded serially on first use, then retained
+  // for the lifetime of that renderer. A failed request is evicted so a later
+  // navigation can retry instead of inheriting a rejected promise forever.
+  const scriptLoads = new Map();
+  App.loadScript = function loadScript(src) {
+    if (!/^(?:js|dialog)\/[a-z0-9-]+\.js$/i.test(src)) {
+      return Promise.reject(new Error('invalid renderer module'));
+    }
+    if (scriptLoads.has(src)) return scriptLoads.get(src);
+    const load = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.async = false;
+      script.dataset.rendererModule = src;
+      script.addEventListener('load', () => resolve(), { once: true });
+      script.addEventListener('error', () => reject(new Error('failed to load renderer module: ' + src)), { once: true });
+      document.head.appendChild(script);
+    }).catch((error) => {
+      scriptLoads.delete(src);
+      throw error;
+    });
+    scriptLoads.set(src, load);
+    return load;
+  };
+
+  App.loadScripts = async function loadScripts(sources) {
+    for (const src of sources) await App.loadScript(src);
+  };
+
   function toast(msg, isErr = false) {
     const t0 = App.$('#toast');
     t0.textContent = msg;
@@ -34,6 +64,13 @@
       toast(e.message || String(e), true);
       throw e;
     }
+  };
+
+  App.openDialog = function openDialog(type, payload = {}) {
+    // Dialog launchers are UI event boundaries. call() already reports the
+    // error; consume it here so fire-and-forget click handlers do not create an
+    // unhandled rejection in the renderer.
+    return App.call(window.api.openDialog, type, payload).catch(() => null);
   };
 
   const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];

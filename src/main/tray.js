@@ -5,6 +5,7 @@ const { app, Tray, Menu, nativeImage, dialog } = require('electron');
 
 const { state, sendLog, setTrayRefresher } = require('./state');
 const core = require('./core-control');
+const { showMainWindow } = require('./window');
 
 const TRAY_ASSET_DIR = path.join(__dirname, 'assets');
 let trayImages = null;
@@ -36,9 +37,7 @@ function createTray() {
   // requiring this module, which would create a require cycle.
   setTrayRefresher(updateTrayMenu);
   updateTrayMenu();
-  tray.on('double-click', () => {
-    if (state.mainWindow) state.mainWindow.show();
-  });
+  tray.on('double-click', showMainWindow);
   return tray;
 }
 
@@ -63,8 +62,7 @@ function updateTrayMenu() {
       label: running ? 'Stop' : 'Start',
       click: async () => {
         try {
-          if (running) await core.stopCore(true);
-          else await core.startCore();
+          await core.queueConfigMutation(() => running ? core.stopCore(true) : core.startCore());
         } catch (e) {
           dialog.showErrorBox('Operation failed', e.message);
         }
@@ -83,13 +81,18 @@ function updateTrayMenu() {
       })),
     },
     { type: 'separator' },
-    { label: 'Show window', click: () => state.mainWindow && state.mainWindow.show() },
+    { label: 'Show window', click: showMainWindow },
     {
       label: 'Quit',
       click: async () => {
         app.isQuitting = true;
-        await core.cleanup();
-        app.quit();
+        try {
+          await core.cleanup();
+        } catch (error) {
+          sendLog('[gui] shutdown cleanup failed: ' + error.message);
+        } finally {
+          app.quit();
+        }
       },
     },
   ]);

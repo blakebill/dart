@@ -2,7 +2,7 @@
 
 const http = require('http');
 
-const { state } = require('./state');
+const { state, sendToMain } = require('./state');
 
 /**
  * Subscribe to the Clash API `/traffic` stream (one JSON line per second with
@@ -11,6 +11,7 @@ const { state } = require('./state');
  */
 
 let trafficReq = null;
+let trafficRetryTimer = null;
 const MAX_TRAFFIC_BUFFER = 64 * 1024;
 let lastTrayTooltip = '';
 
@@ -47,12 +48,24 @@ function startTrafficStream() {
   // Runs whenever the core is up (independent of window visibility) so the tray
   // tooltip keeps showing live speed while minimized.
   if (!state.singbox || !state.singbox.isRunning()) return;
-  const req = http.request(
+  let req;
+  let retryScheduled = false;
+  const retry = () => {
+    if (retryScheduled || trafficReq !== req || !state.singbox || !state.singbox.isRunning()) return;
+    retryScheduled = true;
+    trafficRetryTimer = setTimeout(() => {
+      trafficRetryTimer = null;
+      if (trafficReq === req) startTrafficStream();
+    }, 1000);
+    if (trafficRetryTimer.unref) trafficRetryTimer.unref();
+  };
+  req = http.request(
     {
       host: '127.0.0.1',
       port: settings.clashApiPort,
       path: '/traffic',
       method: 'GET',
+      timeout: 15000,
       headers: { Authorization: 'Bearer ' + state.clashApiSecret },
     },
     (res) => {
@@ -60,12 +73,12 @@ function startTrafficStream() {
       res.setEncoding('utf-8');
       res.on('data', (chunk) => {
         buf += chunk;
-        if (buf.length > MAX_TRAFFIC_BUFFER && !buf.includes('\n')) {
-          req.destroy(new Error('traffic stream frame too large'));
-          return;
-        }
         let idx;
         while ((idx = buf.indexOf('\n')) >= 0) {
+          if (idx > MAX_TRAFFIC_BUFFER) {
+            req.destroy(new Error('traffic stream frame too large'));
+            return;
+          }
           const line = buf.slice(0, idx).trim();
           buf = buf.slice(idx + 1);
           if (!line) continue;
@@ -74,36 +87,35 @@ function startTrafficStream() {
             const up = t.up || 0;
             const down = t.down || 0;
             updateTrayTooltip(up, down);
-            const windowVisible = state.mainWindow && !state.mainWindow.isDestroyed() &&
+            const windowVisible = state.mainWindow &&
+              (typeof state.mainWindow.isDestroyed !== 'function' || !state.mainWindow.isDestroyed()) &&
               (typeof state.mainWindow.isVisible !== 'function' || state.mainWindow.isVisible()) &&
               (typeof state.mainWindow.isMinimized !== 'function' || !state.mainWindow.isMinimized());
-            if (windowVisible) {
-              state.mainWindow.webContents.send('singbox:traffic', { up, down });
-            }
+            if (windowVisible) sendToMain('singbox:traffic', { up, down });
           } catch (_) {
             /* ignore malformed line */
           }
         }
+        if (buf.length > MAX_TRAFFIC_BUFFER) req.destroy(new Error('traffic stream frame too large'));
       });
-      res.on('end', () => {
-        // The core may have stopped; retry while it is still running.
-        if (trafficReq === req && state.singbox && state.singbox.isRunning()) {
-          setTimeout(() => { if (trafficReq === req) startTrafficStream(); }, 1000);
-        }
-      });
+      res.on('end', retry);
+      res.on('aborted', retry);
+      res.on('error', retry);
     }
   );
-  req.on('error', () => {
-    // Clash API may not be ready immediately after start; retry while running.
-    if (trafficReq === req && state.singbox && state.singbox.isRunning()) {
-      setTimeout(() => { if (trafficReq === req) startTrafficStream(); }, 1000);
-    }
-  });
+  // Clash API may not be ready immediately after start; retry while running.
+  req.on('timeout', () => req.destroy(new Error('traffic stream timed out')));
+  req.on('error', retry);
   req.end();
   trafficReq = req;
 }
 
 function stopTrafficStream() {
+  lastTrayTooltip = '';
+  if (trafficRetryTimer) {
+    clearTimeout(trafficRetryTimer);
+    trafficRetryTimer = null;
+  }
   if (trafficReq) {
     try { trafficReq.destroy(); } catch (_) {}
     trafficReq = null;

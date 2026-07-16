@@ -66,9 +66,9 @@ function ssPlugin(ob) {
 /** Convert one sing-box outbound into an internal node, or null if unsupported. */
 function outboundToNode(ob) {
   if (!ob || typeof ob !== 'object' || !ob.type) return null;
-  const server = ob.server;
-  const port = parseInt(ob.server_port, 10);
-  if (!server || !port) return null; // not a real server outbound (selector/direct/...)
+  const server = typeof ob.server === 'string' ? ob.server.trim() : '';
+  const port = Number(ob.server_port);
+  if (!server || !Number.isInteger(port) || port < 1 || port > 65535) return null;
   const base = { name: ob.tag || `${server}:${port}`, server, port };
 
   switch (ob.type) {

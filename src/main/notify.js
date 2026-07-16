@@ -17,10 +17,8 @@ function notify(title, body) {
     if (s.notifications === false) return;
     const n = new Notification({ title: String(title || 'Dart Network Control'), body: String(body || '') });
     n.on('click', () => {
-      if (state.mainWindow && !state.mainWindow.isDestroyed()) {
-        state.mainWindow.show();
-        state.mainWindow.focus();
-      }
+      // Required lazily to avoid a module cycle during main-process startup.
+      require('./window').showMainWindow();
     });
     n.show();
   } catch (_) {

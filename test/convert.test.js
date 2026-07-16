@@ -20,7 +20,7 @@ const {
   dnsServerFromAddress,
   ruleListToSingboxRule,
 } = require('../src/main/converter');
-const { parseSubscriptionContent } = require('../src/main/subscription');
+const { parseSubscriptionContent, parseUserInfo, uniqueNodeNames, configFingerprint } = require('../src/main/subscription');
 const { geoDataUrls } = require('../src/main/singbox');
 
 let passed = 0;
@@ -88,10 +88,23 @@ test('parse ss:// (SIP002)', () => {
   assert.strictEqual(node.name, 'SG-Node');
 });
 
+test('parse plain SIP002 credentials and reject invalid ports', () => {
+  const node = linkParser.parseSingleLink('SS://aes-128-gcm:plain%20password@ss.example.com:443#Plain');
+  assert.strictEqual(node.cipher, 'aes-128-gcm');
+  assert.strictEqual(node.password, 'plain password');
+  assert.strictEqual(node.port, 443);
+  assert.strictEqual(linkParser.parseSingleLink('trojan://secret@example.com:70000#bad'), null);
+  assert.strictEqual(linkParser.parseSingleLink('ss://YWVzLTEyOC1nY206cA@example.com:443x#bad'), null);
+  const malformedVmess = Buffer.from(JSON.stringify({ add: { host: 'example.com' }, port: 443, id: 'x' })).toString('base64');
+  assert.strictEqual(linkParser.parseSingleLink('vmess://' + malformedVmess), null);
+  const suffixedVmess = Buffer.from(JSON.stringify({ add: 'example.com', port: '443x', id: 'x' })).toString('base64');
+  assert.strictEqual(linkParser.parseSingleLink('vmess://' + suffixedVmess), null);
+});
+
 test('parse ss:// plugin options and IPv6 endpoint', () => {
   const userinfo = Buffer.from('aes-128-gcm:secret').toString('base64');
   const plugin = encodeURIComponent('v2ray-plugin;mode=websocket;tls;host=cdn.example.com;path=/ws');
-  const node = linkParser.parseSingleLink(`ss://${userinfo}@[2001:db8::1]:443?plugin=${plugin}#IPv6-SS`);
+  const node = linkParser.parseSingleLink(`ss://${userinfo}@[2001:db8::1]:443/?plugin=${plugin}#IPv6-SS`);
   assert.strictEqual(node.server, '2001:db8::1');
   assert.strictEqual(node.port, 443);
   assert.strictEqual(node.plugin, 'v2ray-plugin');
@@ -192,6 +205,16 @@ test('parse Clash proxies', () => {
   assert.strictEqual(groups.length, 1);
 });
 
+test('Clash parser rejects malformed endpoints and out-of-range ports', () => {
+  const { nodes } = clashParser.parseClashConfig(`proxies:
+  - { name: good, type: trojan, server: example.com, port: "443", password: p }
+  - { name: negative, type: trojan, server: example.com, port: -1, password: p }
+  - { name: overflow, type: trojan, server: example.com, port: 70000, password: p }
+  - { name: suffix, type: trojan, server: example.com, port: 443x, password: p }
+  - { name: object, type: trojan, server: { host: example.com }, port: 443, password: p }`);
+  assert.deepStrictEqual(nodes.map((node) => node.name), ['good']);
+});
+
 console.log('\nsing-box conversion:');
 
 test('vmess node -> outbound', () => {
@@ -256,6 +279,11 @@ test('deduplicate nodes with duplicate names', () => {
   const config = buildSingboxConfig(nodes, {});
   const tags = config.outbounds.filter((o) => o.type === 'trojan').map((o) => o.tag);
   assert.strictEqual(new Set(tags).size, 2, 'duplicate tags should be deduplicated');
+});
+
+test('configs reject profiles with no supported proxy nodes', () => {
+  assert.throws(() => buildSingboxConfig([{ type: 'unsupported', name: 'bad' }]), /No supported proxy nodes/);
+  assert.throws(() => buildMihomoConfig([{ type: 'unsupported', name: 'bad' }]), /No supported proxy nodes/);
 });
 
 test('node -> Mihomo proxy', () => {
@@ -485,6 +513,13 @@ test('dnsServerFromAddress parses DoH/DoT/UDP', () => {
   assert.strictEqual(doh.type, 'https');
   assert.strictEqual(doh.server, 'dns.google');
   assert.strictEqual(doh.path, '/resolve');
+  assert.deepStrictEqual(dnsServerFromAddress('udp://[2001:4860:4860::8888]:5353', 'v6'), {
+    tag: 'v6', type: 'udp', server: '2001:4860:4860::8888', server_port: 5353,
+  });
+  assert.deepStrictEqual(dnsServerFromAddress('[2001:4860:4860::8844]', 'v6'), {
+    tag: 'v6', type: 'udp', server: '2001:4860:4860::8844',
+  });
+  assert.throws(() => dnsServerFromAddress('udp://1.1.1.1:70000', 'bad'), /invalid DNS server port/);
 });
 
 test('buildSingboxConfig honors custom DNS + strategy', () => {
@@ -721,6 +756,53 @@ test('parseClashConfig extracts rule-providers (type/behavior/url/format)', () =
   assert.strictEqual(r.ruleProviders.reject.url, 'https://example.com/reject.yaml');
 });
 
+test('Mihomo config drops unusable providers and dangling RULE-SET rules', () => {
+  const config = buildMihomoConfig(
+    [{ name: 'node', type: 'trojan', server: 'example.com', port: 443, password: 'p' }],
+    {
+      clashRules: [
+        'RULE-SET,remote,DIRECT',
+        'RULE-SET,local,DIRECT',
+        'RULE-SET,missing,DIRECT',
+        'RULE-SET,bad-mrs,DIRECT',
+        'RULE-SET,constructor,DIRECT',
+      ],
+      ruleProviders: {
+        remote: { type: 'http', behavior: 'domain', format: 'text', url: 'https://example.com/rules.txt' },
+        local: { type: 'file', behavior: 'classical', format: 'yaml', url: '' },
+        missing: { type: 'http', behavior: 'domain', format: 'yaml', url: '' },
+        'bad-mrs': { type: 'http', behavior: 'classical', format: 'mrs', url: 'https://example.com/rules.mrs' },
+        constructor: { type: 'http', behavior: 'domain', format: 'yaml', url: 'https://example.com/constructor.yaml' },
+      },
+    }
+  );
+  assert.deepStrictEqual(Object.keys(config['rule-providers']), ['remote']);
+  assert.deepStrictEqual(config['rule-providers'].remote, {
+    type: 'http', behavior: 'domain', url: 'https://example.com/rules.txt', format: 'text',
+  });
+  assert.ok(config.rules.includes('RULE-SET,remote,DIRECT'));
+  assert.ok(!config.rules.some((rule) => /RULE-SET,(local|missing|bad-mrs|constructor),/.test(rule)));
+});
+
+test('rule-provider names cannot mutate the normalized object prototype', () => {
+  const parsed = clashParser.parseClashConfig([
+    'proxies: []',
+    'rule-providers:',
+    '  __proto__: {type: http, url: https://example.com/proto.yaml}',
+    '  constructor: {type: http, url: https://example.com/ctor.yaml}',
+    '  safe: {type: http, url: https://example.com/safe.yaml}',
+  ].join('\n'));
+  assert.deepStrictEqual(Object.keys(parsed.ruleProviders), ['safe']);
+  assert.strictEqual(Object.getPrototypeOf(parsed.ruleProviders), Object.prototype);
+});
+
+test('subscription user-info accepts only standard finite counters', () => {
+  const info = parseUserInfo({
+    'subscription-userinfo': 'upload=1; download=2; total=3; expire=4; constructor=9; extra=10; bad=Infinity',
+  });
+  assert.deepStrictEqual(info, { upload: 1, download: 2, total: 3, expire: 4 });
+});
+
 test('clashRulesToSingbox emits RULE-SET as one rule per matcher field (OR), honoring target', () => {
   const ruleSetData = {
     direct: { domain_suffix: ['cn', 'qq.com'], ip_cidr: ['1.1.1.0/24'], domain: [], domain_keyword: [], process_name: [] },
@@ -761,6 +843,19 @@ test('parseSingboxConfig converts outbounds to nodes, skipping non-proxies', () 
   assert.strictEqual(vl.reality.publicKey, 'PK');
 });
 
+test('sing-box parser rejects malformed endpoints and out-of-range ports', () => {
+  const { nodes } = singboxParser.parseSingboxConfig(JSON.stringify({
+    outbounds: [
+      { type: 'trojan', tag: 'good', server: 'example.com', server_port: '443', password: 'p' },
+      { type: 'trojan', tag: 'zero', server: 'example.com', server_port: 0, password: 'p' },
+      { type: 'trojan', tag: 'overflow', server: 'example.com', server_port: 65536, password: 'p' },
+      { type: 'trojan', tag: 'suffix', server: 'example.com', server_port: '443x', password: 'p' },
+      { type: 'trojan', tag: 'object', server: { host: 'example.com' }, server_port: 443, password: 'p' },
+    ],
+  }));
+  assert.deepStrictEqual(nodes.map((node) => node.name), ['good']);
+});
+
 test('a sing-box node round-trips back to the same outbound type', () => {
   const { nodes } = singboxParser.parseSingboxConfig(JSON.stringify([
     { type: 'vmess', tag: 'VM', server: 'v.com', server_port: 443, uuid: 'x', security: 'auto', alter_id: 0,
@@ -792,6 +887,8 @@ test('parseSubscriptionContent detects sing-box JSON (raw and base64)', () => {
   assert.ok(!parsed.rules.some((rule) => rule.includes('hijack-dns')));
   const b64 = Buffer.from(json).toString('base64');
   assert.strictEqual(parseSubscriptionContent(b64).format, 'singbox');
+  const wrapped = b64.match(/.{1,76}/g).join('\n');
+  assert.strictEqual(parseSubscriptionContent(wrapped).format, 'singbox');
 });
 
 console.log('\nGeoData mirrors:');
@@ -803,6 +900,48 @@ test('geoDataUrls offers raw + jsDelivr fallbacks for a rule-set', () => {
   // Every URL targets the same repo@branch/file, just via a different host.
   assert.ok(urls.every((u) => u.endsWith('geoip-cn.srs')));
   assert.ok(urls.some((u) => u.includes('jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs')));
+});
+
+console.log('\nLarge input regressions:');
+
+test('node-name normalization drops corrupt non-object entries', () => {
+  assert.deepStrictEqual(
+    uniqueNodeNames([null, [], { name: 'valid', type: 'trojan' }]).map((node) => node.name),
+    ['valid']
+  );
+});
+
+test('duplicate node names are normalized without quadratic suffix scans', () => {
+  const nodes = Array.from({ length: 20000 }, () => ({ name: 'same', type: 'trojan' }));
+  const started = Date.now();
+  const normalized = uniqueNodeNames(nodes);
+  assert.strictEqual(normalized[19999].name, 'same 20000');
+  assert.ok(Date.now() - started < 1500, 'duplicate-name normalization regressed to quadratic time');
+});
+
+test('large Mihomo proxy groups are deduplicated in linear time', () => {
+  const nodes = Array.from({ length: 20000 }, (_, index) => ({
+    name: `node-${index}`, type: 'trojan', server: 'example.com', port: 443, password: 'p',
+  }));
+  const started = Date.now();
+  const config = buildMihomoConfig(nodes, { hasGeoData: false });
+  assert.strictEqual(config['proxy-groups'][0].proxies.length, nodes.length + 3);
+  assert.ok(Date.now() - started < 1500, 'Mihomo proxy-group construction regressed to quadratic time');
+});
+
+test('config fingerprints are stable across object key order without building one giant JSON string', () => {
+  const a = { nodes: [{ name: 'n', server: 'x', port: 443 }], rules: ['MATCH,PROXY'] };
+  const b = { nodes: [{ port: 443, server: 'x', name: 'n' }], rules: ['MATCH,PROXY'] };
+  assert.strictEqual(configFingerprint(a), configFingerprint(b));
+});
+
+test('Mihomo conversion accepts very large inline remote rule lists', () => {
+  const domains = Array.from({ length: 150000 }, (_, index) => `d${index}.example`);
+  const config = buildMihomoConfig(
+    [{ name: 'node', type: 'trojan', server: 'example.com', port: 443, password: 'p' }],
+    { extraRules: [{ domain_suffix: domains, outbound: '🚀 Proxy' }] }
+  );
+  assert.strictEqual(config.rules.length, domains.length + 1);
 });
 
 console.log(`\nDone, ${passed} tests passed.`);

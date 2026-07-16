@@ -1,0 +1,16 @@
+# Normalize text files to LF in the repository (avoids LF↔CRLF noise on Windows).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.exe binary
+*.dll binary
+*.dat binary
+*.mmdb binary
+*.srs binary
+*.pak binary
+*.bin binary

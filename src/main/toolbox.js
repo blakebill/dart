@@ -63,6 +63,19 @@ async function setDiagnosticMode(context, mode) {
   throw new Error(`core mode did not switch to ${mode}`);
 }
 
+async function restoreDiagnosticMode(context, diagnosticMode, runtimeMode, modeRevision) {
+  const userChangedMode = modeRevision !== null && context.core.getModeRevision() !== modeRevision;
+  if (userChangedMode) return;
+  let currentMode = diagnosticMode;
+  try {
+    const current = await context.core.clashApi('GET', '/configs');
+    currentMode = String(current && current.mode || diagnosticMode).toLowerCase();
+  } catch (_) {
+    /* Restore when an older or temporarily unavailable API cannot report mode. */
+  }
+  if (currentMode === diagnosticMode) await setDiagnosticMode(context, runtimeMode);
+}
+
 function withDiagnosticMode(context, mode, operation) {
   return queueDiagnostic(async () => {
     const settings = context.state.store.getSettings();
@@ -71,6 +84,9 @@ function withDiagnosticMode(context, mode, operation) {
     if (!settings.enableClashApi) throw new Error('enable Clash API to run forced-mode diagnostics');
 
     let runtimeMode = settings.clashMode || 'rule';
+    const modeRevision = typeof context.core.getModeRevision === 'function'
+      ? context.core.getModeRevision()
+      : null;
     try {
       const config = await context.core.clashApi('GET', '/configs');
       runtimeMode = String(config && config.mode || runtimeMode).toLowerCase();
@@ -78,11 +94,33 @@ function withDiagnosticMode(context, mode, operation) {
       /* PATCH below still works on cores that omit mode from GET /configs. */
     }
     const changedMode = runtimeMode !== mode;
-    if (changedMode) await setDiagnosticMode(context, mode);
+    if (changedMode) {
+      try {
+        await setDiagnosticMode(context, mode);
+      } catch (error) {
+        try {
+          await restoreDiagnosticMode(context, mode, runtimeMode, modeRevision);
+        } catch (restoreError) {
+          error.restoreError = restoreError;
+        }
+        throw error;
+      }
+    }
+    let operationError = null;
     try {
       return await operation(proxyPort, true);
+    } catch (error) {
+      operationError = error;
+      throw error;
     } finally {
-      if (changedMode) await setDiagnosticMode(context, runtimeMode);
+      if (changedMode) {
+        try {
+          await restoreDiagnosticMode(context, mode, runtimeMode, modeRevision);
+        } catch (restoreError) {
+          if (operationError) operationError.restoreError = restoreError;
+          else throw restoreError;
+        }
+      }
     }
   });
 }
@@ -99,18 +137,43 @@ async function withMihomoGlobalSelector(context, operation) {
   if (!previous || (Array.isArray(group.all) && !group.all.includes(target))) {
     throw new Error('mihomo GLOBAL group does not expose the app proxy selector');
   }
-  const changed = previous !== target;
-  if (changed) await context.core.clashApi('PUT', path, { name: target });
+  return withTemporarySelector(context, path, previous, target, operation);
+}
+
+async function restoreTemporarySelector(context, path, previous, target) {
+  // Do not overwrite a user selection made from another panel while the
+  // diagnostic was running; only undo the temporary value we still own.
+  const current = await context.core.clashApi('GET', path);
+  if (current && current.now === target) {
+    await context.core.clashApi('PUT', path, { name: previous });
+  }
+}
+
+async function withTemporarySelector(context, path, previous, target, operation) {
+  if (previous === target) return operation();
+  try {
+    await context.core.clashApi('PUT', path, { name: target });
+  } catch (error) {
+    try {
+      await restoreTemporarySelector(context, path, previous, target);
+    } catch (restoreError) {
+      error.restoreError = restoreError;
+    }
+    throw error;
+  }
+
+  let operationError = null;
   try {
     return await operation();
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    if (changed) {
-      // Do not overwrite a user selection made from another panel while the
-      // diagnostic was running.
-      const current = await context.core.clashApi('GET', path);
-      if (current && current.now === target) {
-        await context.core.clashApi('PUT', path, { name: previous });
-      }
+    try {
+      await restoreTemporarySelector(context, path, previous, target);
+    } catch (restoreError) {
+      if (operationError) operationError.restoreError = restoreError;
+      else throw restoreError;
     }
   }
 }
@@ -137,17 +200,7 @@ async function withAppProxySelector(context, operation) {
   const target = usableProxySelection(group, preferred);
   if (!target) throw new Error('the app proxy group has no usable proxy outbound');
 
-  await context.core.clashApi('PUT', path, { name: target });
-  try {
-    return await operation();
-  } finally {
-    // Preserve a selection changed by the user from another panel while the
-    // diagnostic was running; only undo the temporary value we still own.
-    const current = await context.core.clashApi('GET', path);
-    if (current && current.now === target) {
-      await context.core.clashApi('PUT', path, { name: previous });
-    }
-  }
+  return withTemporarySelector(context, path, previous, target, operation);
 }
 
 function withForcedProxy(context, operation) {
@@ -286,7 +339,7 @@ function matchClashRule(rule, target, addresses) {
     case 'DOMAIN-SUFFIX': return domainSuffixMatch(target.host, value);
     case 'DOMAIN-KEYWORD': return !!value && target.host.includes(value);
     case 'IP-CIDR':
-    case 'IP-CIDR6': return addresses.some((address) => cidrContains(address, item.payload));
+    case 'IP-CIDR6': return addresses.length ? addresses.some((address) => cidrContains(address, item.payload)) : null;
     case 'DST-PORT': return target.port !== null && Number(value) === target.port;
     case 'MATCH':
     case 'FINAL': return true;
@@ -306,26 +359,51 @@ function arrayValue(value) {
   return Array.isArray(value) ? value : value === undefined ? [] : [value];
 }
 
-function matchSingboxRule(rule, target, addresses, mode) {
+const SINGBOX_RULE_KEYS = new Set([
+  'action', 'outbound', 'invert', 'type', 'mode', 'rules', 'clash_mode',
+  'domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'ip_is_private',
+  'port', 'protocol', 'rule_set',
+]);
+
+function matchSingboxRule(rule, target, addresses, clashMode) {
   if (!rule || typeof rule !== 'object') return false;
-  if ((rule.action === 'sniff' || rule.action === 'hijack-dns') && !rule.outbound) return false;
+  if (rule.type === 'logical') {
+    const results = arrayValue(rule.rules).map((child) => matchSingboxRule(child, target, addresses, clashMode));
+    if (!results.length) return false;
+    const result = String(rule.mode).toLowerCase() === 'or'
+      ? (results.includes(true) ? true : results.includes(null) ? null : false)
+      : (results.includes(false) ? false : results.includes(null) ? null : true);
+    return result === null ? null : rule.invert ? !result : result;
+  }
+  if (rule.action && rule.action !== 'reject' && !rule.outbound) return false;
   const checks = [];
-  if (rule.clash_mode !== undefined) checks.push(String(rule.clash_mode).toLowerCase() === String(mode).toLowerCase());
+  if (rule.clash_mode !== undefined) checks.push(String(rule.clash_mode).toLowerCase() === String(clashMode).toLowerCase());
   if (rule.domain !== undefined) checks.push(arrayValue(rule.domain).some((v) => target.host === String(v).toLowerCase()));
   if (rule.domain_suffix !== undefined) checks.push(arrayValue(rule.domain_suffix).some((v) => domainSuffixMatch(target.host, v)));
   if (rule.domain_keyword !== undefined) checks.push(arrayValue(rule.domain_keyword).some((v) => target.host.includes(String(v).toLowerCase())));
-  if (rule.ip_cidr !== undefined) checks.push(addresses.some((address) => arrayValue(rule.ip_cidr).some((cidr) => cidrContains(address, cidr))));
-  if (rule.ip_is_private !== undefined) checks.push(addresses.some(isPrivateIp) === !!rule.ip_is_private);
+  if (rule.ip_cidr !== undefined) checks.push(addresses.length
+    ? addresses.some((address) => arrayValue(rule.ip_cidr).some((cidr) => cidrContains(address, cidr)))
+    : null);
+  if (rule.ip_is_private !== undefined) checks.push(addresses.length ? addresses.some(isPrivateIp) === !!rule.ip_is_private : null);
   if (rule.port !== undefined) checks.push(target.port !== null && arrayValue(rule.port).map(Number).includes(target.port));
-  if (rule.protocol !== undefined) checks.push(false);
+  if (rule.protocol !== undefined) checks.push(null);
   if (rule.rule_set !== undefined) checks.push(null);
+  if (Object.keys(rule).some((key) => !SINGBOX_RULE_KEYS.has(key))) checks.push(null);
   if (!checks.length) return false;
-  if (checks.includes(false)) return false;
+  if (checks.includes(false)) return rule.invert ? true : false;
   if (checks.includes(null)) return null;
-  return true;
+  return rule.invert ? false : true;
 }
 
 function describeSingboxRule(rule) {
+  if (rule.type === 'logical') {
+    return {
+      type: 'LOGICAL',
+      payload: `${String(rule.mode || 'and').toUpperCase()} (${arrayValue(rule.rules).length})`,
+      target: rule.action === 'reject' ? 'REJECT' : String(rule.outbound || rule.action || ''),
+      raw: rule,
+    };
+  }
   const fields = ['clash_mode', 'domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'ip_is_private', 'rule_set', 'port'];
   const field = fields.find((key) => rule[key] !== undefined) || 'rule';
   return {
@@ -401,7 +479,19 @@ async function inspectRoute(value, context) {
   const target = normalizeTarget(value);
   const resolved = await resolveHost(target);
   const built = context.core.buildCurrentConfig();
-  const { config, settings } = built;
+  const { config } = built;
+  let settings = built.settings;
+  if (context.state.singbox.isRunning() && settings.enableClashApi) {
+    try {
+      const runtime = await context.core.clashApi('GET', '/configs');
+      const runtimeMode = String(runtime && runtime.mode || '').toLowerCase();
+      if (['rule', 'global', 'direct', 'block'].includes(runtimeMode)) {
+        settings = { ...settings, clashMode: runtimeMode };
+      }
+    } catch (_) {
+      /* Persisted mode is the best available fallback. */
+    }
+  }
   const forcedPolicy = modePolicy(settings.clashMode);
   let source = 'generated';
   let entries = [];
@@ -470,7 +560,10 @@ function tcpProbe(host, port, timeout = 1800) {
   return new Promise((resolve) => {
     const started = Date.now();
     const socket = net.connect({ host, port });
+    let settled = false;
     const done = (open, error = null) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
       resolve({ open, error, durationMs: Date.now() - started });
     };
@@ -552,9 +645,12 @@ async function inspectPorts(value, context) {
 
 function encodeDnsName(host) {
   const chunks = [];
+  let wireLength = 1;
   for (const label of host.split('.')) {
     const bytes = Buffer.from(label, 'ascii');
     if (!bytes.length || bytes.length > 63) throw new Error('invalid DNS name');
+    wireLength += bytes.length + 1;
+    if (wireLength > 255) throw new Error('DNS name is too long');
     chunks.push(Buffer.from([bytes.length]), bytes);
   }
   chunks.push(Buffer.from([0]));
@@ -574,10 +670,12 @@ function buildDnsQuery(host, type = 1) {
 
 function readDnsName(buffer, start, depth = 0) {
   if (depth > 12) throw new Error('invalid DNS compression');
+  if (!Number.isInteger(start) || start < 0 || start >= buffer.length) throw new Error('invalid DNS name offset');
   const labels = [];
   let offset = start;
   let next = start;
   let jumped = false;
+  let terminated = false;
   while (offset < buffer.length) {
     const length = buffer[offset];
     if ((length & 0xc0) === 0xc0) {
@@ -587,11 +685,13 @@ function readDnsName(buffer, start, depth = 0) {
       labels.push(nested.name);
       if (!jumped) next = offset + 2;
       jumped = true;
+      terminated = true;
       break;
     }
     offset += 1;
     if (length === 0) {
       if (!jumped) next = offset;
+      terminated = true;
       break;
     }
     if (offset + length > buffer.length) throw new Error('truncated DNS label');
@@ -599,6 +699,7 @@ function readDnsName(buffer, start, depth = 0) {
     offset += length;
     if (!jumped) next = offset;
   }
+  if (!terminated) throw new Error('unterminated DNS name');
   return { name: labels.filter(Boolean).join('.'), next };
 }
 
@@ -608,9 +709,12 @@ function formatIpv6(buffer) {
   return groups.join(':');
 }
 
-function parseDnsMessage(buffer) {
+function parseDnsMessage(buffer, expectedId = null) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) throw new Error('invalid DNS response');
-  const rcode = buffer.readUInt16BE(2) & 0x000f;
+  if (expectedId !== null && buffer.readUInt16BE(0) !== expectedId) throw new Error('DNS response id mismatch');
+  const flags = buffer.readUInt16BE(2);
+  if (!(flags & 0x8000)) throw new Error('DNS packet is not a response');
+  const rcode = flags & 0x000f;
   if (rcode !== 0) throw new Error('DNS server returned code ' + rcode);
   const questions = buffer.readUInt16BE(4);
   const answers = buffer.readUInt16BE(6);
@@ -648,10 +752,16 @@ function dnsEndpoint(value) {
     return { raw, scheme: 'udp', host: raw, port: 53, url: new URL(endpointUrl) };
   }
   const unbracketed = raw.match(/^([a-z0-9]+):\/\/(.+)$/i);
-  if (unbracketed && net.isIP(unbracketed[2]) === 6) {
+  const unbracketedRest = unbracketed && unbracketed[2];
+  const unbracketedSlash = unbracketedRest ? unbracketedRest.indexOf('/') : -1;
+  const unbracketedHost = unbracketedRest
+    ? unbracketedRest.slice(0, unbracketedSlash < 0 ? undefined : unbracketedSlash)
+    : '';
+  if (unbracketed && net.isIP(unbracketedHost) === 6) {
     const scheme = unbracketed[1].toLowerCase();
     const port = ({ udp: 53, tcp: 53, tls: 853, https: 443, h3: 443, http3: 443 }[scheme] || 0);
-    return { raw, scheme, host: unbracketed[2], port, url: new URL(`${scheme}://[${unbracketed[2]}]:${port}`) };
+    const suffix = unbracketedSlash < 0 ? '' : unbracketedRest.slice(unbracketedSlash);
+    return { raw, scheme, host: unbracketedHost, port, url: new URL(`${scheme}://[${unbracketedHost}]:${port}${suffix}`) };
   }
   const url = new URL(raw.includes('://') ? raw : 'udp://' + raw);
   const scheme = url.protocol.slice(0, -1).toLowerCase();
@@ -667,19 +777,22 @@ function dnsEndpoint(value) {
 function udpDnsQuery(endpoint, packet) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket(net.isIP(endpoint.host) === 6 ? 'udp6' : 'udp4');
+    let settled = false;
+    const finish = (error, message = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch (_) {}
+      if (error) reject(error);
+      else resolve(message);
+    };
     const timer = setTimeout(() => {
-      socket.close();
-      reject(new Error('DNS query timed out'));
+      finish(new Error('DNS query timed out'));
     }, DNS_TIMEOUT);
-    socket.once('error', (error) => {
-      clearTimeout(timer);
-      socket.close();
-      reject(error);
-    });
-    socket.once('message', (message) => {
-      clearTimeout(timer);
-      socket.close();
-      resolve(message);
+    socket.once('error', (error) => finish(error));
+    socket.on('message', (message) => {
+      if (message.length < 2 || message.readUInt16BE(0) !== packet.readUInt16BE(0)) return;
+      finish(null, message);
     });
     socket.send(packet, endpoint.port, endpoint.host);
   });
@@ -718,7 +831,7 @@ async function streamDnsQuery(endpoint, packet, secure, proxyPort = 0) {
       if (expected !== null && data.length >= expected + 2) {
         settled = true;
         clearTimeout(timer);
-        socket.end();
+        socket.destroy();
         resolve(data.slice(2, expected + 2));
       }
     });
@@ -728,7 +841,12 @@ async function streamDnsQuery(endpoint, packet, secure, proxyPort = 0) {
       clearTimeout(timer);
       reject(error);
     });
-    socket.once('close', () => clearTimeout(timer));
+    socket.once('close', () => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      reject(new Error('DNS connection closed before a complete response'));
+    });
   });
 }
 
@@ -759,7 +877,7 @@ async function queryDnsType(address, host, type, proxyPort) {
   else if (endpoint.scheme === 'tls') response = await streamDnsQuery(endpoint, packet, true, proxyPort);
   else if (['https', 'h3', 'http3'].includes(endpoint.scheme)) response = await dohDnsQuery(endpoint, packet, proxyPort);
   else throw new Error(endpoint.scheme + ' DNS diagnostics are not supported');
-  return parseDnsMessage(response);
+  return parseDnsMessage(response, packet.readUInt16BE(0));
 }
 
 async function queryConfiguredDns(address, host, proxyPort = 0) {
@@ -772,8 +890,10 @@ async function queryConfiguredDns(address, host, proxyPort = 0) {
   if (!records.length && settled.every((item) => item.status === 'rejected')) {
     throw settled[0].reason;
   }
+  const answers = [...new Set(records.filter((record) => record.type !== 'CNAME').map((record) => record.value))];
+  if (!answers.length) throw new Error('DNS returned no address records');
   return {
-    answers: [...new Set(records.filter((record) => record.type !== 'CNAME').map((record) => record.value))],
+    answers,
     records,
     durationMs: Date.now() - started,
   };
@@ -884,10 +1004,13 @@ async function networkDiagnostics(context) {
   const settings = context.state.store.getSettings();
   const running = context.state.singbox.isRunning();
   const server = `127.0.0.1:${settings.mixedPort}`;
+  const dnsCheck = running && settings.enableTun
+    ? queueDiagnostic(() => querySystemDns('www.gstatic.com'))
+    : querySystemDns('www.gstatic.com');
   const [mixed, apiPort, dnsProbe, directIp, proxiedIp, apiProbe, systemProxy, admin] = await Promise.all([
     tcpProbe('127.0.0.1', settings.mixedPort),
     tcpProbe('127.0.0.1', settings.clashApiPort),
-    querySystemDns('www.gstatic.com').catch((error) => ({ error: errorText(error) })),
+    dnsCheck.catch((error) => ({ error: errorText(error) })),
     (running && settings.enableTun
       ? withDiagnosticMode(context, 'direct', () => externalIp(0))
       : externalIp(0)
@@ -978,13 +1101,14 @@ function extractErrorLocation(message) {
 }
 
 async function checkAllConfigs(context) {
-  const active = context.state.store.getSubscription(context.core.getActiveSubId());
+  const active = context.state.store.getSubscription(context.core.getActiveSubId(), { includeRaw: true });
   const sourceNodes = active && Array.isArray(active.nodes) ? active.nodes.length : 0;
   const sourceRules = active && Array.isArray(active.clashRules) ? active.clashRules.length : 0;
   const sourceText = active && typeof active.raw === 'string' ? active.raw : '';
   const results = [];
   for (const coreType of ['sing-box', 'mihomo']) {
     try {
+      if (coreType === 'mihomo') await context.state.singbox.validateMihomoGeoData();
       const { config } = context.core.buildCurrentConfig(coreType);
       const text = configText(coreType, config);
       const installed = context.state.singbox.isCoreInstalled(coreType);
@@ -1036,7 +1160,7 @@ function buildBackup(store, appVersion) {
     createdAt: new Date().toISOString(),
     data: {
       settings: store.getSettings(),
-      subscriptions: store.getSubscriptions(),
+      subscriptions: store.getSubscriptions({ includeRaw: true }),
       activeSub: store.get('activeSub'),
       selected: store.get('selected'),
       customRuleSets: store.get('customRuleSets') || [],
@@ -1057,12 +1181,44 @@ function validateBackupDocument(document) {
   if (!subscriptions || !customRuleSets || !localRules) throw new Error('backup lists are invalid');
   if (subscriptions.length > 500 || customRuleSets.length > 2000 || localRules.length > 10000) throw new Error('backup exceeds supported item limits');
   const ids = new Set();
+  let nodeCount = 0;
   for (const sub of subscriptions) {
     if (!isPlainObject(sub) || typeof sub.id !== 'string' || !sub.id || sub.id.length > 256 || ids.has(sub.id)) {
       throw new Error('backup contains an invalid or duplicate config id');
     }
     ids.add(sub.id);
     if (sub.nodes !== undefined && !Array.isArray(sub.nodes)) throw new Error('backup config nodes are invalid');
+    if (Array.isArray(sub.nodes)) {
+      nodeCount += sub.nodes.length;
+      if (nodeCount > 100000 || sub.nodes.some((node) => !isPlainObject(node))) throw new Error('backup config nodes are invalid');
+    }
+  }
+  const ruleIds = new Set();
+  for (const item of customRuleSets) {
+    if (!isPlainObject(item) || typeof item.id !== 'string' || !item.id || item.id.length > 256 || ruleIds.has(item.id)) {
+      throw new Error('backup contains an invalid or duplicate remote rule id');
+    }
+    ruleIds.add(item.id);
+    if (item.target !== undefined && !['proxy', 'direct', 'reject'].includes(item.target)) throw new Error('backup remote rule target is invalid');
+    if (item.format !== undefined && !['clash', 'sing-box'].includes(item.format)) throw new Error('backup remote rule format is invalid');
+    if (item.kind !== undefined && !['inline', 'ruleset'].includes(item.kind)) throw new Error('backup remote rule kind is invalid');
+    if (item.rules !== undefined && (!Array.isArray(item.rules) || item.rules.length > 100000 || item.rules.some((rule) => !isPlainObject(rule)))) {
+      throw new Error('backup remote rule payload is invalid');
+    }
+  }
+  const localIds = new Set();
+  for (const item of localRules) {
+    if (!isPlainObject(item) || typeof item.id !== 'string' || !item.id || item.id.length > 256 || localIds.has(item.id)) {
+      throw new Error('backup contains an invalid or duplicate local rule id');
+    }
+    localIds.add(item.id);
+    if (item.matchType !== undefined && !['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name'].includes(item.matchType)) {
+      throw new Error('backup local rule type is invalid');
+    }
+    if (item.target !== undefined && !['proxy', 'direct', 'reject'].includes(item.target)) throw new Error('backup local rule target is invalid');
+    if (item.values !== undefined && (!Array.isArray(item.values) || item.values.length > 100000 || item.values.some((value) => typeof value !== 'string'))) {
+      throw new Error('backup local rule values are invalid');
+    }
   }
   const activeSub = ids.has(data.activeSub) ? data.activeSub : subscriptions[0] ? subscriptions[0].id : null;
   return {

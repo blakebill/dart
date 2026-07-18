@@ -106,21 +106,17 @@
     return loadedNodeSub === App.state.activeSub ? nodeItems : [];
   }
 
-  function releaseNodes() {
-    const currentDelayName = currentNodeName();
-    for (const name of delayRequests.keys()) {
-      if (delays.get(name) === 'testing') delays.delete(name);
-    }
-    delayRequests.clear();
-    if (testAllRun) {
-      testAllRun.cancelled = true;
-      for (const name of testAllRun.inFlight) {
+  function releaseNodes({ cancelTests = true } = {}) {
+    if (cancelTests) {
+      for (const name of delayRequests.keys()) {
         if (delays.get(name) === 'testing') delays.delete(name);
       }
+      delayRequests.clear();
+      if (testAllRun) testAllRun.cancelled = true;
+      testAllRun = null;
+      const testAllButton = $('#testAllBtn');
+      if (testAllButton) testAllButton.disabled = false;
     }
-    testAllRun = null;
-    const testAllButton = $('#testAllBtn');
-    if (testAllButton) testAllButton.disabled = false;
     nodeLoadGeneration++;
     nodeLoad = null;
     nodeItems = [];
@@ -131,11 +127,6 @@
     if (list) list.textContent = '';
     const count = $('#nodeCount');
     if (count) count.textContent = '';
-    // Test-all can add thousands of entries. Keep only the value shown by the
-    // dashboard and release the rest when this workspace is no longer active.
-    for (const name of delays.keys()) {
-      if (name !== currentDelayName) delays.delete(name);
-    }
   }
 
   async function loadNodes(options = {}) {

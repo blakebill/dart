@@ -224,7 +224,11 @@
     const previousTab = App.currentTab;
     App.currentTab = tab;
     if (previousTab === 'conns' && tab !== 'conns' && App.clearConnections) App.clearConnections();
-    if (previousTab === 'nodes' && tab !== 'nodes' && App.releaseNodes) App.releaseNodes();
+    // Keep the small session-only latency cache and let an explicit sweep finish
+    // while releasing the heavier node list whenever the user changes pages.
+    if (previousTab === 'nodes' && tab !== 'nodes' && App.releaseNodes) {
+      App.releaseNodes({ cancelTests: false });
+    }
     if (connTimer) {
       clearTimeout(connTimer);
       connTimer = null;

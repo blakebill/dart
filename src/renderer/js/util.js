@@ -9,7 +9,9 @@
   // Renderer-wide state, replaced wholesale by refresh() in main.js — always
   // reference it as App.state, never capture the object in a local.
   App.state = { subscriptions: [], settings: {}, status: {} };
-  // Latency results keyed by node name: number (ms) | 'timeout' | 'testing'
+  // Session-only latency results keyed by node name. Profile changes clear this
+  // map in main.js; closing the renderer naturally discards it without I/O.
+  // Values: number (ms) | 'timeout' | 'testing'.
   App.delays = new Map();
   // The visible tab; nodes.js consults it to skip re-renders while hidden.
   App.currentTab = 'dashboard';

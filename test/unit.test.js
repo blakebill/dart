@@ -548,10 +548,12 @@ test('heavy renderer data is bounded and released outside its active view', () =
   assert.ok(main.includes('App.releaseRuleCache'));
   assert.ok(nodes.includes('api.getNodes()'));
   assert.ok(nodes.includes('run.cancelled'));
+  assert.ok(nodes.includes('function releaseNodes({ cancelTests = true } = {})'));
+  assert.ok(main.includes('App.releaseNodes({ cancelTests: false })'));
   assert.ok(rules.includes('ruleItems = []'));
   assert.ok(rules.includes('generation !== ruleLoadGeneration'));
   assert.ok(logs.includes('LOG_LIMIT = 120000'));
-  assert.ok(nodes.includes('for (const name of delays.keys())'));
+  assert.ok(!nodes.includes('for (const name of delays.keys())'));
   assert.ok(nodes.includes('api.applyAutoCandidate(bestName)'));
   assert.ok(!indexHtml.includes('class="modal hidden"'), 'dialog DOM must not remain resident in the main renderer');
   assert.ok(dialogHost.includes('dialogWindow = null'));

@@ -10,7 +10,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vm = require('vm');
-const { buildDelayApiPath } = require('../src/main/delay');
+const { buildDelayApiPath, selectAutoTestBatch } = require('../src/main/delay');
 
 let passed = 0;
 function test(name, fn) {
@@ -33,6 +33,34 @@ test('manual latency request carries the configured URL in Clash API order', () 
   assert.strictEqual(parsed.searchParams.get('url'), 'https://example.com/ping?q=a&x=1');
   assert.strictEqual(parsed.searchParams.get('timeout'), '5000');
   assert.ok(parsed.search.startsWith('?url='));
+});
+
+test('background Auto checks rotate bounded batches while retaining the winner', () => {
+  const names = Array.from({ length: 100 }, (_, i) => `node-${i}`);
+  const first = selectAutoTestBatch(names, 'node-50', 0, false);
+  const second = selectAutoTestBatch(names, 'node-50', first.nextCursor, false);
+  assert.strictEqual(first.candidates.length, 17);
+  assert.strictEqual(second.candidates.length, 17);
+  assert.ok(first.candidates.includes('node-50'));
+  assert.ok(second.candidates.includes('node-50'));
+  assert.deepStrictEqual(
+    first.candidates.filter((name) => name !== 'node-50'),
+    names.slice(0, 16)
+  );
+  assert.deepStrictEqual(
+    second.candidates.filter((name) => name !== 'node-50'),
+    names.slice(16, 32)
+  );
+  assert.deepStrictEqual(selectAutoTestBatch(names, 'node-50', 32, true).candidates, names);
+});
+
+test('background Auto batches scale gradually and normalize duplicate names', () => {
+  const names = Array.from({ length: 1000 }, (_, i) => `node-${i}`);
+  assert.strictEqual(selectAutoTestBatch(names, 'node-500').candidates.length, 101);
+  assert.deepStrictEqual(
+    selectAutoTestBatch(['a', 'a', '', null, 'b'], 'a').candidates,
+    ['a', 'b']
+  );
 });
 
 // i18n.js is a browser IIFE; evaluate it with a stub window to get the DICT.
@@ -417,6 +445,27 @@ test('large live lists use bounded virtual windows', () => {
   assert.ok(nodes.includes("App.currentTab !== 'nodes' || nodeWindowFrame"), 'node virtualization must follow window resizing');
 });
 
+test('background renderer work is bounded to visible and useful content', () => {
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
+  const editors = fs.readFileSync(path.join(rendererDir, 'dialog', 'editors.js'), 'utf-8');
+  const logs = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
+  const settings = fs.readFileSync(path.join(rendererDir, 'js', 'settings.js'), 'utf-8');
+  const ipc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf-8');
+  assert.ok(ipc.includes('MAX_IPC_CONNECTIONS = 300'));
+  assert.ok(main.includes('function connectionPollDelay(data)'));
+  assert.ok(main.includes('data.totalConnections > shown ? 5000 : 3000'));
+  assert.ok(charts.includes('function isCanvasVisible()'));
+  assert.ok(charts.includes('canvas.getClientRects().length > 0'));
+  assert.ok(editors.includes('RAW_FORMAT_LIMIT = 4 * 1024 * 1024'));
+  assert.ok(editors.includes('JSON.stringify(JSON.parse(text), null, 2)'));
+  assert.ok(!main.includes("if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight"));
+  assert.ok(logs.includes("if (drained && $('#logAutoScroll').checked)"));
+  assert.ok(logs.includes('for (const entry of pendingLiveLogs) enqueueLog(entry)'));
+  assert.ok(settings.includes('function changedSettingsPatch(candidate)'));
+  assert.ok(settings.includes("if (!Object.keys(patch).length)"));
+});
+
 test('node, connection and log workspaces use a direct full-height canvas', () => {
   const css = readRendererCss();
   const workspace = css.slice(css.indexOf('.live-workspace.active {'), css.indexOf('h1 {'));
@@ -775,6 +824,8 @@ test('UWP enumeration is prefetched, deduplicated and explicitly refreshable', (
   assert.ok(source.includes('APP_CACHE_TTL_MS = 5 * 60_000'));
   assert.ok(source.includes('if (!appEnumeration)'));
   assert.ok(source.includes('return cloneApps(await appEnumeration)'));
+  assert.ok(source.includes('scheduleAppCacheExpiry(generation)'));
+  assert.ok(source.includes('appCacheExpiryTimer.unref'));
   assert.ok(preload.includes('warmUwpApps:'));
   assert.ok(main.includes('api.warmUwpApps()'));
   assert.ok(dialog.includes('api.listUwpApps(force)'));

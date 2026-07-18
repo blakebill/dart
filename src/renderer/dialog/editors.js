@@ -134,6 +134,17 @@
   });
 
   const RAW_HIGHLIGHT_LIMIT = 300000;
+  const RAW_FORMAT_LIMIT = 4 * 1024 * 1024;
+
+  function formatProfileForEditing(value) {
+    const text = typeof value === 'string' ? value : '';
+    if (text.length > RAW_FORMAT_LIMIT) return text;
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch (_) {
+      return text;
+    }
+  }
 
   function escapeBasic(value) {
     return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -181,7 +192,7 @@
     const input = $('#rawContent');
     const highlight = $('#rawHighlight');
     const wrap = $('#rawEditorWrap');
-    input.value = raw.raw;
+    input.value = formatProfileForEditing(raw.raw);
 
     let renderTimer = null;
     function renderHighlight() {

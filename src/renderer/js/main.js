@@ -178,14 +178,18 @@
 
   // Per-tab activation: load rules on demand, start/stop connection polling.
   let connTimer = null;
-  function scheduleConnectionPoll(delay = 2000) {
+  function connectionPollDelay(data) {
+    const shown = data && Array.isArray(data.connections) ? data.connections.length : 0;
+    return data && data.totalConnections > shown ? 5000 : 3000;
+  }
+  function scheduleConnectionPoll(delay = 3000) {
     if (connTimer) clearTimeout(connTimer);
     connTimer = setTimeout(async () => {
       connTimer = null;
       if (document.hidden || App.currentTab !== 'conns') return;
       const data = await App.loadConnections();
       if (document.hidden || App.currentTab !== 'conns') return;
-      scheduleConnectionPoll(data && data.totalConnections >= 600 ? 4000 : 2000);
+      scheduleConnectionPoll(connectionPollDelay(data));
     }, delay);
   }
   function afterPaint(fn, delay = 0) {
@@ -229,7 +233,7 @@
     } else if (tab === 'conns') {
       App.loadConnections().then((data) => {
         if (!document.hidden && App.currentTab === 'conns') {
-          scheduleConnectionPoll(data && data.totalConnections >= 600 ? 4000 : 2000);
+          scheduleConnectionPoll(connectionPollDelay(data));
         }
       });
     } else if (tab === 'nodes') {
@@ -237,9 +241,6 @@
       App.refreshGroupSelections();
     } else if (tab === 'logs') {
       App.flushLogs();
-      // Land at the latest line when opening the Logs tab (lines accumulate while hidden).
-      const box = $('#logBox');
-      if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
     } else if (tab === 'subs') {
       App.renderSubs();
     } else if (tab === 'settings') {

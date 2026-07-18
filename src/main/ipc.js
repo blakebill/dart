@@ -72,7 +72,7 @@ const SETTING_KEYS = new Set([
 ]);
 
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
-const MAX_IPC_CONNECTIONS = 600;
+const MAX_IPC_CONNECTIONS = 300;
 const MAX_CONFIG_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_AUTO_UPDATE_MINUTES = 365 * 24 * 60;
 
@@ -367,6 +367,10 @@ function mergeFetchedSubscription(latest, result, { replaceRaw = false } = {}) {
   return next;
 }
 
+function subscriptionFetchOptions(extra = {}) {
+  return { coreType: state.store.getSettings().coreType, ...extra };
+}
+
 function currentRuleSetForUpdate(id, sourceKey, token = null) {
   if (token) core.assertRemoteUpdate('rule-set', id, token);
   const latest = state.store.getCustomRuleSet(id);
@@ -435,7 +439,7 @@ function registerIpc() {
   // Add/update a subscription (fetch and parse).
   ipcMain.handle('sub:add', async (_e, { name, url }) => {
     reqUrl(url, 'url');
-    const result = await subscription.fetchSubscription(url, sendLog);
+    const result = await subscription.fetchSubscription(url, sendLog, subscriptionFetchOptions());
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
@@ -474,7 +478,11 @@ function registerIpc() {
     const sourceUrl = sub.url;
     try {
       const proxyPort = sub.updateViaProxy ? core.currentProxyPort() : 0;
-      const result = await subscription.fetchSubscription(sourceUrl, sendLog, { proxyPort });
+      const result = await subscription.fetchSubscription(
+        sourceUrl,
+        sendLog,
+        subscriptionFetchOptions({ proxyPort })
+      );
       if (!result.nodes.length) {
         throw new Error('no nodes parsed (format: ' + result.format + ')');
       }
@@ -584,7 +592,11 @@ function registerIpc() {
         const proxyPort = (updateViaProxy !== undefined ? updateViaProxy : !!original.updateViaProxy)
           ? core.currentProxyPort()
           : 0;
-        fetched = await subscription.fetchSubscription(url, sendLog, { proxyPort });
+        fetched = await subscription.fetchSubscription(
+          url,
+          sendLog,
+          subscriptionFetchOptions({ proxyPort })
+        );
         if (!fetched.nodes.length) throw new Error('no nodes parsed from the new URL');
       }
       return await core.queueConfigMutation(async () => {
@@ -762,6 +774,10 @@ function registerIpc() {
     );
     const previous = state.store.getSettings();
     validateSettingsPatch(patch, previous);
+    patch = Object.fromEntries(
+      Object.entries(patch).filter(([key, value]) => value !== previous[key])
+    );
+    if (!Object.keys(patch).length) return previous;
     const coreTypeChanged = Object.prototype.hasOwnProperty.call(patch, 'coreType') &&
       patch.coreType !== (previous.coreType || 'sing-box');
     const configChanged = [...CORE_CONFIG_SETTINGS].some(

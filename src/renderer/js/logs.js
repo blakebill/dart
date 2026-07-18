@@ -63,7 +63,7 @@
     return escapeHtml(line) + '\n';
   }
   const LOG_LIMIT = 120000;
-  const LOG_FLUSH_LINES = 400;
+  const LOG_FLUSH_LINES = 240;
   let logBuf = [];
   let logBufStart = 0;
   let logBufLen = 0;
@@ -92,7 +92,8 @@
     }
     logBufStart = end;
     logBufLen -= len;
-    if (logBufStart >= logBuf.length) {
+    const drained = logBufStart >= logBuf.length;
+    if (drained) {
       logBuf = [];
       logBufStart = 0;
       logBufLen = 0;
@@ -111,13 +112,15 @@
       logLen -= box.firstChild._len || box.firstChild.textContent.length;
       box.removeChild(box.firstChild);
     }
-    if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
+    // During history backfill, reading scrollHeight after every chunk forces a
+    // full synchronous layout. Scroll once after the final chunk instead.
+    if (drained && $('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
     scheduleLogFlush(16);
   }
 
-  function appendLog(value) {
+  function enqueueLog(value) {
     const sequence = value && typeof value === 'object' ? Number(value.sequence) || 0 : 0;
-    if (sequence && sequence <= lastLogSequence) return;
+    if (sequence && sequence <= lastLogSequence) return false;
     if (sequence) lastLogSequence = sequence;
     const line = String(value && typeof value === 'object' ? value.line || '' : value || '');
     logBuf.push(line);
@@ -129,7 +132,11 @@
       logBuf = logBuf.slice(logBufStart);
       logBufStart = 0;
     }
-    scheduleLogFlush();
+    return true;
+  }
+
+  function appendLog(value) {
+    if (enqueueLog(value)) scheduleLogFlush();
   }
 
   if (api && api.onLog) api.onLog((value) => {
@@ -140,10 +147,10 @@
     const historyGeneration = clearGeneration;
     api.getRecentLogs().then((snapshot) => {
       if (historyGeneration !== clearGeneration) return;
-      for (const entry of snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : []) appendLog(entry);
+      for (const entry of snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : []) enqueueLog(entry);
     }).catch(() => {}).finally(() => {
       historyLoaded = true;
-      for (const entry of pendingLiveLogs) appendLog(entry);
+      for (const entry of pendingLiveLogs) enqueueLog(entry);
       pendingLiveLogs = [];
       scheduleLogFlush(0);
     });

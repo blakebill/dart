@@ -80,6 +80,8 @@
     const down = new Array(size).fill(0);
     let sessionUp = 0;
     let sessionDown = 0;
+    let lastUp = 0;
+    let lastDown = 0;
     const pad = fill ? 8 : 2;
     const base = fill ? 4 : 1;
 
@@ -170,12 +172,19 @@
       ctx.globalAlpha = 1;
     }
 
+    function isCanvasVisible() {
+      return !document.hidden && (
+        canvas.offsetParent !== null ||
+        (typeof canvas.getClientRects === 'function' && canvas.getClientRects().length > 0)
+      );
+    }
     function draw() {
-      if (document.hidden) return; // window in tray: skip the canvas work
+      if (!isCanvasVisible()) return;
       const dpr = window.devicePixelRatio || 1;
       const W = canvas.clientWidth || fallbackW;
       const H = canvas.clientHeight || fallbackH;
       if (!W) return; // tab hidden, nothing to size against
+      setLabels(lastUp, lastDown);
       if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
         canvas.width = Math.round(W * dpr);
         canvas.height = Math.round(H * dpr);
@@ -198,18 +207,20 @@
     }
     function push(u, d) {
       // Clash /traffic is ~1 Hz; treat each sample as one second of throughput.
-      sessionUp += Math.max(0, Number(u) || 0);
-      sessionDown += Math.max(0, Number(d) || 0);
-      up.push(u); up.shift();
-      down.push(d); down.shift();
-      setLabels(u, d);
+      lastUp = Math.max(0, Number(u) || 0);
+      lastDown = Math.max(0, Number(d) || 0);
+      sessionUp += lastUp;
+      sessionDown += lastDown;
+      up.push(lastUp); up.shift();
+      down.push(lastDown); down.shift();
       draw();
     }
     function reset() {
       up.fill(0); down.fill(0);
       sessionUp = 0;
       sessionDown = 0;
-      setLabels(0, 0);
+      lastUp = 0;
+      lastDown = 0;
       draw();
     }
     window.addEventListener('resize', draw);

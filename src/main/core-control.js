@@ -15,7 +15,7 @@ const subscription = require('./subscription');
 const proxy = require('./proxy');
 const fetch = require('./fetch');
 const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
-const { buildDelayApiPath } = require('./delay');
+const { buildDelayApiPath, selectAutoTestBatch } = require('./delay');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 /**
@@ -43,6 +43,7 @@ let customRuleMutationTail = Promise.resolve();
 let managedAutoTimer = null;
 let managedAutoRun = null;
 let managedAutoGeneration = 0;
+let managedAutoCursor = 0;
 let autoSelectionRevision = 0;
 let autoSelectorTail = Promise.resolve();
 
@@ -1220,7 +1221,7 @@ function applyMeasuredAutoCandidate(name) {
   return null;
 }
 
-/** Measure every member and update Dart's core-independent Auto selector. */
+/** Refresh Dart's core-independent Auto selector from a full or rotating sweep. */
 function refreshManagedAutoSelection({ force = false, generation = managedAutoGeneration } = {}) {
   if (!state.singbox.isRunning() || !usesManagedAutoSelection()) return Promise.resolve(null);
   if (managedAutoRun && managedAutoRun.generation === generation) {
@@ -1241,19 +1242,22 @@ function refreshManagedAutoSelection({ force = false, generation = managedAutoGe
     const group = await clashApi('GET', '/proxies/' + encodeURIComponent(AUTO_PROXY_GROUP));
     const names = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
     if (!names.length) return null;
+    const batch = selectAutoTestBatch(names, group && group.now, managedAutoCursor, force);
+    if (!force) managedAutoCursor = batch.nextCursor;
+    const candidates = batch.candidates;
 
     const revision = autoSelectionRevision;
     const concurrency = Math.max(1, Math.min(
       16,
       Number(state.store.getSettings().testConcurrency) || 8,
-      names.length
+      candidates.length
     ));
     let cursor = 0;
     let bestName = null;
     let bestDelay = Infinity;
     async function worker() {
-      while (cursor < names.length && generation === managedAutoGeneration) {
-        const name = names[cursor++];
+      while (cursor < candidates.length && generation === managedAutoGeneration) {
+        const name = candidates[cursor++];
         try {
           const delay = await testNodeDelay(name);
           if (delay < bestDelay) {
@@ -1281,6 +1285,7 @@ function refreshManagedAutoSelection({ force = false, generation = managedAutoGe
 
 function stopManagedAutoSelection() {
   managedAutoGeneration++;
+  managedAutoCursor = 0;
   autoSelectionRevision++;
   if (managedAutoTimer) clearTimeout(managedAutoTimer);
   managedAutoTimer = null;
@@ -1414,7 +1419,10 @@ async function runAutoUpdateTick() {
         if (!current || !current.url) continue;
         sourceUrl = current.url;
         const proxyPort = current.updateViaProxy ? currentProxyPort() : 0;
-        const r = await subscription.fetchSubscription(sourceUrl, sendLog, { proxyPort });
+        const r = await subscription.fetchSubscription(sourceUrl, sendLog, {
+          proxyPort,
+          coreType: state.store.getSettings().coreType,
+        });
         if (!r.nodes.length) throw new Error('no nodes parsed from the updated config');
         const applied = await queueConfigMutation(() => {
           assertRemoteUpdate('subscription', sub.id, token);

@@ -37,6 +37,7 @@ let appCache = null;
 let appCacheAt = 0;
 let appEnumeration = null;
 let appCacheGeneration = 0;
+let appCacheExpiryTimer = null;
 
 /** Run a PowerShell script via -EncodedCommand (avoids all cmd quoting). */
 function runPowerShell(script) {
@@ -264,7 +265,24 @@ function cloneApps(apps) {
   return apps.map((app) => ({ ...app }));
 }
 
+function clearAppCacheExpiry() {
+  if (appCacheExpiryTimer) clearTimeout(appCacheExpiryTimer);
+  appCacheExpiryTimer = null;
+}
+
+function scheduleAppCacheExpiry(generation) {
+  clearAppCacheExpiry();
+  appCacheExpiryTimer = setTimeout(() => {
+    appCacheExpiryTimer = null;
+    if (generation !== appCacheGeneration) return;
+    appCache = null;
+    appCacheAt = 0;
+  }, APP_CACHE_TTL_MS);
+  if (appCacheExpiryTimer.unref) appCacheExpiryTimer.unref();
+}
+
 function invalidateAppCache() {
+  clearAppCacheExpiry();
   appCache = null;
   appCacheAt = 0;
   appCacheGeneration++;
@@ -285,11 +303,15 @@ async function listApps(onLog = () => {}, options = {}) {
   }
 
   if (!appEnumeration) {
+    clearAppCacheExpiry();
+    appCache = null;
+    appCacheAt = 0;
     const generation = appCacheGeneration;
     appEnumeration = enumerateApps(onLog).then((apps) => {
       if (generation === appCacheGeneration) {
         appCache = apps;
         appCacheAt = Date.now();
+        scheduleAppCacheExpiry(generation);
       }
       return apps;
     }).finally(() => {

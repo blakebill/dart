@@ -138,15 +138,19 @@ process.resourcesPath = tmpDir;
 // Stub the subscription fetcher so handler-level tests need no network: each
 // URL yields one distinct node.
 const subscriptionPath = path.join(__dirname, '..', 'src', 'main', 'subscription.js');
+const subscriptionFetchCalls = [];
 require.cache[require.resolve(subscriptionPath)] = {
   exports: {
-    fetchSubscription: async (url) => ({
-      nodes: [{ name: 'node-of-' + new URL(url).pathname.slice(1), type: 'trojan', server: 's.example.com', port: 443, password: 'p' }],
-      format: 'links',
-      rules: [],
-      raw: 'stub',
-      userInfo: null,
-    }),
+    fetchSubscription: async (url, _log, options = {}) => {
+      subscriptionFetchCalls.push({ url, options });
+      return {
+        nodes: [{ name: 'node-of-' + new URL(url).pathname.slice(1), type: 'trojan', server: 's.example.com', port: 443, password: 'p' }],
+        format: 'links',
+        rules: [],
+        raw: 'stub',
+        userInfo: null,
+      };
+    },
     parseSubscriptionContent: () => ({ nodes: [], format: 'unknown', rules: [], raw: '' }),
     configFingerprint: (value) => JSON.stringify([
       value.nodes || [],
@@ -361,6 +365,11 @@ async function main() {
 
   const subA = await handlers['sub:add'](null, { name: 'A', url: 'https://example.com/a' });
   assert.strictEqual(state.store.get('activeSub'), subA.id, 'the first subscription becomes active');
+  assert.strictEqual(
+    subscriptionFetchCalls.at(-1).options.coreType,
+    state.store.getSettings().coreType,
+    'subscription fetch did not request the active core format'
+  );
 
   state.store.set('activeSub', null); // simulate a legacy store
   const subB = await handlers['sub:add'](null, { name: 'B', url: 'https://example.com/b' });
@@ -1201,10 +1210,28 @@ async function main() {
   const originalSettingsRestart = core.restartIfRunning;
   const originalApplyAutoLaunch = core.applyAutoLaunch;
   const originalSetCoreType = state.singbox.setCoreType;
+  const originalUpdateSettings = state.store.updateSettings;
   let settingsRestartCount = 0;
   state.singbox.isRunning = () => true;
   core.restartIfRunning = async () => { settingsRestartCount += 1; };
   try {
+    const unchangedSettings = state.store.getSettings();
+    let settingsWriteCount = 0;
+    let autoLaunchApplyCount = 0;
+    state.store.updateSettings = function countSettingsWrite(patch) {
+      settingsWriteCount += 1;
+      return originalUpdateSettings.call(this, patch);
+    };
+    core.applyAutoLaunch = () => { autoLaunchApplyCount += 1; };
+    await handlers['settings:update'](null, {
+      autoLaunch: unchangedSettings.autoLaunch,
+      silentStart: unchangedSettings.silentStart,
+    });
+    assert.strictEqual(settingsWriteCount, 0, 'an unchanged settings save still wrote to disk');
+    assert.strictEqual(autoLaunchApplyCount, 0, 'an unchanged settings save touched OS login registration');
+    state.store.updateSettings = originalUpdateSettings;
+    core.applyAutoLaunch = originalApplyAutoLaunch;
+
     const testUrl = 'https://example.com/dart-204';
     await handlers['settings:update'](null, { testUrl });
     assert.strictEqual(settingsRestartCount, 1, 'changing the health-check URL must rebuild a running core config');
@@ -1296,6 +1323,7 @@ async function main() {
     state.singbox.setCoreType = originalSetCoreType;
     core.restartIfRunning = originalSettingsRestart;
     core.applyAutoLaunch = originalApplyAutoLaunch;
+    state.store.updateSettings = originalUpdateSettings;
   }
   console.log('✓ settings reject invalid values and apply custom health-check URLs to both cores');
 
@@ -1680,9 +1708,9 @@ async function main() {
   core.clashApi = originalClashApi;
   state.singbox.isRunning = originalIsRunning;
   assert.strictEqual(connectionSnapshot.totalConnections, 1000);
-  assert.strictEqual(connectionSnapshot.connections.length, 600);
+  assert.strictEqual(connectionSnapshot.connections.length, 300);
   assert.strictEqual(connectionSnapshot.connections[0].id, 'c999');
-  assert.strictEqual(connectionSnapshot.connections[599].id, 'c400');
+  assert.strictEqual(connectionSnapshot.connections[299].id, 'c700');
   assert.ok(!('ignored' in connectionSnapshot.connections[0]));
   assert.ok(!('ignored' in connectionSnapshot.connections[0].metadata));
   assert.strictEqual(failedConnectionSnapshot.running, true, 'a transient API error was reported as a stopped core');

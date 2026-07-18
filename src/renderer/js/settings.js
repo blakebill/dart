@@ -6,6 +6,29 @@
   const api = window.api;
   const { t, getLang } = window.i18n;
 
+  function changedSettingsPatch(candidate) {
+    const current = App.state.settings || {};
+    return Object.fromEntries(
+      Object.entries(candidate).filter(([key, value]) => current[key] !== value)
+    );
+  }
+
+  async function persistChangedSettings(candidate, button) {
+    const patch = changedSettingsPatch(candidate);
+    if (!Object.keys(patch).length) {
+      toast(t('settings.saved'));
+      return null;
+    }
+    button.disabled = true;
+    try {
+      App.commitSettings(await call(api.updateSettings, patch));
+      toast(t('settings.saved'));
+      return patch;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   function renderSettings() {
     const s = App.state.settings;
     $('#setMixedPort').value = s.mixedPort;
@@ -83,8 +106,8 @@
       App.patchSettings({ language: previous });
     }
   });
-  $('#saveSettings').addEventListener('click', async () => {
-    const patch = {
+  $('#saveSettings').addEventListener('click', async (event) => {
+    const candidate = {
       mixedPort: parseInt($('#setMixedPort').value, 10),
       clashApiPort: parseInt($('#setClashPort').value, 10),
       logLevel: $('#setLogLevel').value,
@@ -99,11 +122,9 @@
       testConcurrency: Math.max(1, Math.min(32, parseInt($('#setTestConcurrency').value, 10) || 8)),
       language: $('#setLanguage').value,
     };
-    const rulesChanged = !!App.state.settings.useBuiltinRules !== patch.useBuiltinRules;
     try {
-      App.commitSettings(await call(api.updateSettings, patch));
-      if (rulesChanged && App.invalidateRuleCaches) App.invalidateRuleCaches();
-      toast(t('settings.saved'));
+      const patch = await persistChangedSettings(candidate, event.currentTarget);
+      if (patch && 'useBuiltinRules' in patch && App.invalidateRuleCaches) App.invalidateRuleCaches();
     } catch (_) {}
   });
   $('#checkConfigBtn').addEventListener('click', async () => {
@@ -114,15 +135,14 @@
   });
 
   // Save DNS settings.
-  $('#saveDns').addEventListener('click', async () => {
-    const patch = {
+  $('#saveDns').addEventListener('click', async (event) => {
+    const candidate = {
       dnsRemote: $('#setDnsRemote').value.trim(),
       dnsLocal: $('#setDnsLocal').value.trim(),
       dnsStrategy: $('#setDnsStrategy').value,
     };
     try {
-      App.commitSettings(await call(api.updateSettings, patch));
-      toast(t('settings.saved'));
+      await persistChangedSettings(candidate, event.currentTarget);
     } catch (_) {}
   });
 

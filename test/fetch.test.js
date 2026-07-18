@@ -185,6 +185,68 @@ async function main() {
       fetch.getBufferWithFallback = originalGetBufferWithFallback;
     }
     console.log('✓ subscription network failures stop before User-Agent retries');
+
+    const nativeConfig = JSON.stringify({
+      outbounds: [{
+        type: 'trojan', tag: 'native-node', server: 'native.example.com',
+        server_port: 443, password: 'secret',
+      }],
+    });
+    const clashConfig = [
+      'proxies:',
+      '  - name: clash-node',
+      '    type: trojan',
+      '    server: clash.example.com',
+      '    port: 443',
+      '    password: secret',
+    ].join('\n');
+    const requestedAgents = [];
+    try {
+      fetch.getBufferWithFallback = async (_url, options) => {
+        requestedAgents.push(options.headers['User-Agent']);
+        return { body: Buffer.from(nativeConfig), headers: {} };
+      };
+      const native = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'sing-box' }
+      );
+      assert.strictEqual(native.format, 'singbox');
+      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        const ua = options.headers['User-Agent'];
+        requestedAgents.push(ua);
+        return {
+          body: Buffer.from(ua.startsWith('sing-box/') ? 'format unavailable' : clashConfig),
+          headers: {},
+        };
+      };
+      const fallback = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'sing-box' }
+      );
+      assert.strictEqual(fallback.format, 'clash');
+      assert.deepStrictEqual(requestedAgents.slice(0, 2), ['sing-box/1.13.0', 'mihomo/1.18.10']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        requestedAgents.push(options.headers['User-Agent']);
+        return { body: Buffer.from(clashConfig), headers: {} };
+      };
+      const mihomo = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'mihomo' }
+      );
+      assert.strictEqual(mihomo.format, 'clash');
+      assert.deepStrictEqual(requestedAgents, ['mihomo/1.18.10']);
+    } finally {
+      fetch.getBufferWithFallback = originalGetBufferWithFallback;
+    }
+    console.log('✓ subscription requests prefer the active core format and fall back across ecosystems');
   } finally {
     await new Promise((resolve) => tunnelInspectionProxy.close(resolve));
     await new Promise((resolve) => proxyServer.close(resolve));

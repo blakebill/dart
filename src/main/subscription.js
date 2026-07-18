@@ -114,7 +114,7 @@ function maybeBase64Decode(text) {
 
 /**
  * Auto-detect the content format and parse it into a unified array of node objects.
- * Prefer Clash YAML (with conversion), then fall back to share links / base64 subscription.
+ * Native sing-box JSON is checked before Clash YAML and share-link subscriptions.
  */
 function parseSubscriptionContent(content) {
   const text = String(content || '').trim();
@@ -165,23 +165,29 @@ function parseSubscriptionContent(content) {
   return { nodes: [], groups: [], rules: [], format: 'unknown' };
 }
 
-// Many airports gate their Clash/sing-box output behind a recognized client
-// User-Agent. Try a few common ones until we actually get usable nodes.
-const SUB_USER_AGENTS = [
+// Many airports select an output format from the client User-Agent. Ask for the
+// active core's native format first, then fall back to the other ecosystem.
+const SINGBOX_USER_AGENTS = ['sing-box/1.13.0'];
+const CLASH_USER_AGENTS = [
+  'mihomo/1.18.10',
   'clash-verge/v2.0.2',
   'ClashforWindows/0.20.39',
-  'mihomo/1.18.10',
-  'sing-box/1.13.0',
   'clash.meta',
   'Clash/2023.08.17',
 ];
 
+function subscriptionUserAgents(coreType) {
+  return coreType === 'sing-box'
+    ? [...SINGBOX_USER_AGENTS, ...CLASH_USER_AGENTS]
+    : [...CLASH_USER_AGENTS, ...SINGBOX_USER_AGENTS];
+}
+
 /**
- * Fetch and parse a subscription. Retries with different client User-Agents so
- * airports that only serve a real config to "Clash" clients still work.
+ * Fetch and parse a subscription. Requests the active core's native format
+ * first, then retries with compatible client User-Agents when necessary.
  * @param {string} url subscription URL
  * @param {function} log
- * @param {{proxyPort?:number}} opts when proxyPort is set, the request tunnels
+ * @param {{proxyPort?:number,coreType?:string}} opts when proxyPort is set, the request tunnels
  *   through the local mixed proxy first and falls back to a direct connection
  *   (for airports whose subscription endpoint is itself blocked).
  * @returns {{ nodes, groups, format, userInfo }}
@@ -189,7 +195,7 @@ const SUB_USER_AGENTS = [
 async function fetchSubscription(url, log = () => {}, opts = {}) {
   const proxyPort = opts.proxyPort || 0;
   let last = null;
-  for (const ua of SUB_USER_AGENTS) {
+  for (const ua of subscriptionUserAgents(opts.coreType)) {
     let res;
     try {
       // One HTTP path for both modes: with proxyPort the request tunnels

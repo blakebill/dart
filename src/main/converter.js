@@ -1,5 +1,11 @@
 'use strict';
 
+const {
+  normalizePolicyGroups,
+  singboxPolicyOutbounds,
+  mihomoPolicyGroups,
+} = require('./policy-groups');
+
 const AUTO_GROUP = '♻️ Auto';
 const FALLBACK_GROUP = '🛟 Fallback';
 const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
@@ -509,7 +515,7 @@ function dnsServerFromAddress(addr, tag, detour) {
  * 'direct' | 'proxy' | 'reject' (so the sub's matching is kept but its
  * outbound is the user's choice). DIRECT/REJECT in the rule itself always win.
  */
-function mapClashTarget(name, overrides) {
+function mapClashTarget(name, overrides, availableTargets = null) {
   const n = String(name || '').trim();
   if (/^DIRECT$/i.test(n)) return 'direct';
   if (/^REJECT/i.test(n)) return 'reject'; // handled as an action below
@@ -517,9 +523,10 @@ function mapClashTarget(name, overrides) {
     const ov = overrides[n];
     if (ov === 'direct') return 'direct';
     if (ov === 'reject') return 'reject';
-    // 'proxy' (or unknown) falls through to the selector below.
+    if (ov === 'proxy') return '🚀 Proxy';
   }
-  // All proxy groups / node references collapse onto our single selector.
+  // Keep a source group/node target when the generated config contains it.
+  if (availableTargets instanceof Set && availableTargets.has(n)) return n;
   return '🚀 Proxy';
 }
 
@@ -541,14 +548,14 @@ function parseClashRule(raw) {
 
 /**
  * Distinct subscription policy-group names referenced by proxy-bound rules
- * (i.e. excluding DIRECT/REJECT and MATCH/FINAL). These are the groups the user
+ * (including MATCH/FINAL targets, excluding DIRECT/REJECT). These are the groups the user
  * can remap via `overrides`. Returned sorted for a stable UI.
  */
 function extractRuleGroups(clashRules) {
   const groups = new Set();
   for (const raw of clashRules || []) {
     const r = parseClashRule(raw);
-    if (!r || r.type === 'MATCH' || r.type === 'FINAL') continue;
+    if (!r) continue;
     const n = String(r.target || '').trim();
     if (!n || /^DIRECT$/i.test(n) || /^REJECT/i.test(n)) continue;
     groups.add(n);
@@ -626,15 +633,27 @@ function extractGeoCategories(clashRules) {
  *   emitted when its provider has been downloaded + parsed into here.
  * @returns {{ rules: object[], usedGeoTags: Set<string> }}
  */
-function clashRulesToSingbox(clashRules, hasGeo = true, overrides = null, geoAvailable = null, ruleSetData = null) {
+function clashRulesToSingbox(
+  clashRules,
+  hasGeo = true,
+  overrides = null,
+  geoAvailable = null,
+  ruleSetData = null,
+  availableTargets = null
+) {
   const avail = resolveGeoAvailable(geoAvailable, hasGeo);
   const out = [];
   const usedGeoTags = new Set();
+  let finalTarget = null;
   for (const raw of clashRules || []) {
     const parsed = parseClashRule(raw);
     if (!parsed) continue;
     const { type, value } = parsed;
-    const target = mapClashTarget(parsed.target, overrides);
+    const target = mapClashTarget(parsed.target, overrides, availableTargets);
+    if (type === 'MATCH' || type === 'FINAL') {
+      if (finalTarget === null) finalTarget = target;
+      continue;
+    }
     const apply = (rule) => {
       if (target === 'reject') rule.action = 'reject';
       else rule.outbound = target;
@@ -702,7 +721,7 @@ function clashRulesToSingbox(clashRules, hasGeo = true, overrides = null, geoAva
         break;
     }
   }
-  return { rules: out, usedGeoTags };
+  return { rules: out, usedGeoTags, finalTarget };
 }
 
 /**
@@ -816,7 +835,16 @@ function dedupeTags(outbounds) {
  * converting every node.
  */
 function buildRoute(opts = {}) {
-  const { ruleSetDir = null, clashRules = [], extraRules = [], extraRuleSets = [], ruleOverrides = null, geoAvailable = null, ruleSetData = null } = opts;
+  const {
+    ruleSetDir = null,
+    clashRules = [],
+    extraRules = [],
+    extraRuleSets = [],
+    ruleOverrides = null,
+    geoAvailable = null,
+    ruleSetData = null,
+    availableTargets = null,
+  } = opts;
   // Local .srs only. A `remote` rule-set would be fetched during start-up via
   // download_detour, and sing-box treats a failed fetch as FATAL — so a fresh
   // install with no geodata (and raw.githubusercontent.com blocked, or no
@@ -828,7 +856,14 @@ function buildRoute(opts = {}) {
   // Which geo rule-sets are backed by a real local .srs. Defaults to the bundled
   // CN pair; the caller passes a wider set once extra category .srs are on disk.
   const avail = resolveGeoAvailable(geoAvailable, hasGeo);
-  const { rules: convertedRules, usedGeoTags } = clashRulesToSingbox(clashRules, hasGeo, ruleOverrides, avail, ruleSetData);
+  const { rules: convertedRules, usedGeoTags, finalTarget } = clashRulesToSingbox(
+    clashRules,
+    hasGeo,
+    ruleOverrides,
+    avail,
+    ruleSetData,
+    availableTargets
+  );
 
   // Define a local rule_set for every geo tag that is both available and used,
   // plus the CN pair (needed by the direct fallback + DNS). The file is always
@@ -855,8 +890,10 @@ function buildRoute(opts = {}) {
       // Converted from the subscription's Clash rules (above the geoip/geosite fallback).
       ...convertedRules,
       ...geoDirectRule,
+      ...(finalTarget === 'reject' ? [{ action: 'reject' }] : []),
     ],
     rule_set: [...geoRuleSets, ...extraRuleSets],
+    final: finalTarget && finalTarget !== 'reject' ? finalTarget : '🚀 Proxy',
   };
 }
 
@@ -886,6 +923,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     selected = null,
     clashMode = 'rule',
     clashRules = [],
+    policyGroups = [],
     ruleOverrides = null, // { [policyGroupName]: 'direct'|'proxy'|'reject' }
     geoAvailable = null, // Set of geo rule-set tags backed by a local .srs
     ruleSetData = null, // RULE-SET provider name -> parsed matcher arrays
@@ -905,10 +943,16 @@ function buildSingboxConfig(nodes, opts = {}) {
   const nodeTags = nodeOutbounds.map((o) => o.tag);
   if (!nodeTags.length) throw new Error('No supported proxy nodes are available.');
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
+  const sourceGroups = normalizePolicyGroups(policyGroups, nodeTags);
+  const sourceGroupNames = sourceGroups.map((group) => group.name);
+  const availableTargets = new Set([AUTO_GROUP, FALLBACK_GROUP, ...nodeTags, ...sourceGroupNames]);
 
   // Default selection: a specific node tag if it still exists, else auto.
   const defaultOutbound =
-    selected && ([AUTO_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) || nodeTags.includes(selected))
+    selected && (
+      [AUTO_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) ||
+      availableTargets.has(selected)
+    )
       ? selected
       : AUTO_GROUP;
 
@@ -918,7 +962,7 @@ function buildSingboxConfig(nodes, opts = {}) {
   const proxyGroup = {
     type: 'selector',
     tag: '🚀 Proxy',
-    outbounds: [AUTO_GROUP, FALLBACK_GROUP, ...nodeTags, 'direct'],
+    outbounds: [AUTO_GROUP, FALLBACK_GROUP, ...sourceGroupNames, ...nodeTags, 'direct'],
     default: defaultOutbound,
   };
   // Sing-Box's Clash API updates per-node delay history without asking a
@@ -949,7 +993,15 @@ function buildSingboxConfig(nodes, opts = {}) {
 
   // Only "direct" remains a special outbound; block / dns are handled via route
   // rule actions (reject / hijack-dns) in sing-box 1.12+.
-  const outbounds = [proxyGroup, autoGroup, fallbackGroup, ...nodeOutbounds, { type: 'direct', tag: 'direct' }];
+  const sourceGroupOutbounds = singboxPolicyOutbounds(sourceGroups, latencyUrl, AUTO_TEST_INTERVAL_SECONDS);
+  const outbounds = [
+    proxyGroup,
+    autoGroup,
+    fallbackGroup,
+    ...sourceGroupOutbounds,
+    ...nodeOutbounds,
+    { type: 'direct', tag: 'direct' },
+  ];
 
   // Inbounds (sing-box 1.12+: sniffing is a route rule action, not an inbound field)
   const inbounds = [];
@@ -975,7 +1027,16 @@ function buildSingboxConfig(nodes, opts = {}) {
   });
 
   const avail = resolveGeoAvailable(geoAvailable, !!ruleSetDir);
-  const route = buildRoute({ ruleSetDir, clashRules, extraRules, extraRuleSets, ruleOverrides, geoAvailable: avail, ruleSetData });
+  const route = buildRoute({
+    ruleSetDir,
+    clashRules,
+    extraRules,
+    extraRuleSets,
+    ruleOverrides,
+    geoAvailable: avail,
+    ruleSetData,
+    availableTargets,
+  });
 
   const config = {
     log: {
@@ -1004,7 +1065,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     route: {
       rules: route.rules,
       rule_set: route.rule_set,
-      final: '🚀 Proxy',
+      final: route.final,
       default_domain_resolver: 'local-dns',
     },
   };
@@ -1049,15 +1110,19 @@ function dedupeProxyNames(proxies) {
 function clashTargetName(target) {
   if (target === 'direct') return 'DIRECT';
   if (target === 'reject') return 'REJECT';
-  return '🚀 Proxy';
+  return target || '🚀 Proxy';
 }
 
 function singboxRuleToClashRules(rule, options = {}) {
   if (!rule || typeof rule !== 'object' || ['sniff', 'hijack-dns'].includes(rule.action)) return [];
-  const outbound = String(rule.outbound || '').toLowerCase();
+  const rawOutbound = String(rule.outbound || '').trim();
+  const outbound = rawOutbound.toLowerCase();
+  const preservedOutbound = options.preserveOutbound && rawOutbound && !/[\r\n,]/.test(rawOutbound)
+    ? rawOutbound
+    : '🚀 Proxy';
   const target = rule.action === 'reject' || ['block', 'reject'].includes(outbound)
     ? 'REJECT'
-    : outbound === 'direct' ? 'DIRECT' : '🚀 Proxy';
+    : outbound === 'direct' ? 'DIRECT' : preservedOutbound;
   const out = [];
   const add = (type, vals) => {
     const values = Array.isArray(vals) ? vals : vals === undefined ? [] : [vals];
@@ -1088,17 +1153,18 @@ function singboxRuleToClashRules(rule, options = {}) {
   return out;
 }
 
-function clashRuleToMihomo(raw, overrides, availableRuleProviders = null) {
+function clashRuleToMihomo(raw, overrides, availableRuleProviders = null, availableTargets = null) {
   const parts = String(raw || '').split(',').map((s) => s.trim());
   const type = (parts[0] || '').toUpperCase();
   if (!type) return null;
-  if (type === 'MATCH' || type === 'FINAL') return null;
   const parsed = parseClashRule(raw);
-  if (!parsed || !parsed.value) return null;
+  if (!parsed) return null;
+  const target = clashTargetName(mapClashTarget(parsed.target, overrides, availableTargets));
+  if (type === 'MATCH' || type === 'FINAL') return `MATCH,${target}`;
+  if (!parsed.value) return null;
   if (type === 'RULE-SET' && availableRuleProviders && !availableRuleProviders.has(parsed.value)) {
     return null;
   }
-  const target = clashTargetName(mapClashTarget(parsed.target, overrides));
   const extra = parts.slice(3).filter(Boolean);
   return [type, parsed.value, target, ...extra].join(',');
 }
@@ -1144,6 +1210,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     selected = null,
     clashMode = 'rule',
     clashRules = [],
+    policyGroups = [],
     ruleOverrides = null,
     ruleProviders = {},
     enableIpv6 = true,
@@ -1161,11 +1228,17 @@ function buildMihomoConfig(nodes, opts = {}) {
   const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
   const proxyNames = proxies.map((p) => p.name);
   if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
+  const sourceGroups = normalizePolicyGroups(policyGroups, proxyNames);
+  const sourceGroupNames = sourceGroups.map((group) => group.name);
+  const availableTargets = new Set([AUTO_GROUP, FALLBACK_GROUP, ...proxyNames, ...sourceGroupNames]);
   const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
   const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const defaultProxy =
-    selected && ([AUTO_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) || proxyNames.includes(selected))
+    selected && (
+      [AUTO_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) ||
+      availableTargets.has(selected)
+    )
       ? selected === 'direct' ? 'DIRECT' : selected
       : AUTO_GROUP;
   const manualProxies = [];
@@ -1179,6 +1252,7 @@ function buildMihomoConfig(nodes, opts = {}) {
   addManual(defaultProxy);
   addManual(AUTO_GROUP);
   addManual(FALLBACK_GROUP);
+  for (const name of sourceGroupNames) addManual(name);
   for (const name of proxyNames) addManual(name);
   addManual('DIRECT');
 
@@ -1197,6 +1271,7 @@ function buildMihomoConfig(nodes, opts = {}) {
       };
 
   const rules = [];
+  let finalRule = 'MATCH,🚀 Proxy';
   if (clashMode === 'block') {
     rules.push('MATCH,REJECT');
   } else {
@@ -1204,9 +1279,10 @@ function buildMihomoConfig(nodes, opts = {}) {
       for (const converted of singboxRuleToClashRules(r)) rules.push(converted);
     }
     for (const raw of clashRules || []) {
-      const rule = clashRuleToMihomo(raw, ruleOverrides, availableRuleProviders);
+      const rule = clashRuleToMihomo(raw, ruleOverrides, availableRuleProviders, availableTargets);
       if (!hasGeoData && /^(GEOIP|GEOSITE),/i.test(rule || '')) continue;
-      if (rule) rules.push(rule);
+      if (/^MATCH,/i.test(rule || '')) finalRule = rule;
+      else if (rule) rules.push(rule);
     }
     if (!rules.length) {
       rules.push(
@@ -1217,8 +1293,13 @@ function buildMihomoConfig(nodes, opts = {}) {
         ...(hasGeoData ? ['GEOIP,CN,DIRECT'] : [])
       );
     }
-    rules.push('MATCH,🚀 Proxy');
+    rules.push(finalRule);
   }
+
+  const sourceProxyGroups = mihomoPolicyGroups(sourceGroups, latencyUrl, {
+    interval: AUTO_TEST_INTERVAL_SECONDS,
+    timeout: AUTO_TEST_TIMEOUT_MS,
+  });
 
   const config = {
     'mixed-port': mixedPort,
@@ -1243,6 +1324,7 @@ function buildMihomoConfig(nodes, opts = {}) {
         'max-failed-times': 2,
         lazy: true,
       },
+      ...sourceProxyGroups,
     ],
     rules,
   };

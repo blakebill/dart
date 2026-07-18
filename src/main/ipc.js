@@ -61,6 +61,7 @@ function senderWindow(event) {
 // Where converted rules may route to.
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
 const VALID_CRS_FORMATS = ['clash', 'sing-box'];
+const VALID_SUBSCRIPTION_UA_MODES = ['auto', 'sing-box', 'clash'];
 
 // Settings keys the renderer may write; anything else in a patch is dropped so
 // a malformed payload cannot pollute the persisted store.
@@ -340,8 +341,13 @@ function subscriptionResult(sub) {
     id: sub.id,
     name: sub.name || '',
     format: sub.format || 'unknown',
+    userAgentMode: subscriptionUserAgentMode(sub.userAgentMode),
     nodeCount: Array.isArray(sub.nodes) ? sub.nodes.length : Math.max(0, Number(sub.nodeCount) || 0),
   };
+}
+
+function subscriptionUserAgentMode(value) {
+  return VALID_SUBSCRIPTION_UA_MODES.includes(value) ? value : 'auto';
 }
 
 function currentSubscriptionForUpdate(id, sourceUrl, token = null) {
@@ -356,6 +362,7 @@ function mergeFetchedSubscription(latest, result, { replaceRaw = false } = {}) {
   const next = {
     ...latest,
     nodes: result.nodes,
+    policyGroups: result.policyGroups || [],
     format: result.format,
     clashRules: result.rules || [],
     clashRuleProviders: result.ruleProviders || {},
@@ -408,6 +415,7 @@ function registerIpc() {
         name: s.name,
         url: s.url,
         format: s.format,
+        userAgentMode: subscriptionUserAgentMode(s.userAgentMode),
         autoUpdateMinutes: s.autoUpdateMinutes || 0,
         updateViaProxy: !!s.updateViaProxy,
         updatedAt: s.updatedAt || 0,
@@ -437,9 +445,14 @@ function registerIpc() {
   });
 
   // Add/update a subscription (fetch and parse).
-  ipcMain.handle('sub:add', async (_e, { name, url }) => {
+  ipcMain.handle('sub:add', async (_e, { name, url, userAgentMode = 'auto' }) => {
     reqUrl(url, 'url');
-    const result = await subscription.fetchSubscription(url, sendLog, subscriptionFetchOptions());
+    reqEnum(userAgentMode, VALID_SUBSCRIPTION_UA_MODES, 'userAgentMode');
+    const result = await subscription.fetchSubscription(
+      url,
+      sendLog,
+      subscriptionFetchOptions({ userAgentMode })
+    );
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
@@ -448,7 +461,9 @@ function registerIpc() {
       name: name || new URL(url).hostname,
       url,
       format: result.format,
+      userAgentMode,
       nodes: result.nodes,
+      policyGroups: result.policyGroups || [],
       clashRules: result.rules || [],
       clashRuleProviders: result.ruleProviders || {},
       raw: result.raw || '',
@@ -481,7 +496,10 @@ function registerIpc() {
       const result = await subscription.fetchSubscription(
         sourceUrl,
         sendLog,
-        subscriptionFetchOptions({ proxyPort })
+        subscriptionFetchOptions({
+          proxyPort,
+          userAgentMode: subscriptionUserAgentMode(sub.userAgentMode),
+        })
       );
       if (!result.nodes.length) {
         throw new Error('no nodes parsed (format: ' + result.format + ')');
@@ -565,46 +583,56 @@ function registerIpc() {
     return id;
   }));
 
-  // Edit a subscription's name / url / auto-update interval. Re-fetches if the
-  // URL changed.
-  ipcMain.handle('sub:edit', async (_e, { id, name, url, autoUpdateMinutes, updateViaProxy }) => {
+  // Edit subscription metadata. A URL or User-Agent mode change re-fetches the
+  // source immediately so the stored format matches the selected request mode.
+  ipcMain.handle('sub:edit', async (_e, {
+    id, name, url, autoUpdateMinutes, updateViaProxy, userAgentMode,
+  }) => {
     reqStr(id, 'id');
     if (autoUpdateMinutes !== undefined) reqAutoUpdateMinutes(autoUpdateMinutes);
     if (updateViaProxy !== undefined) reqBoolean(updateViaProxy, 'updateViaProxy');
+    if (userAgentMode !== undefined) reqEnum(userAgentMode, VALID_SUBSCRIPTION_UA_MODES, 'userAgentMode');
     const original = state.store.getSubscription(id);
     if (!original) throw new Error('config not found');
     // Imported profiles legitimately have an empty URL; validate only when set.
     if (url) reqUrl(url, 'url');
     const sourceUrl = original.url;
     const requestedUrl = url !== undefined ? url : sourceUrl;
+    const originalUserAgentMode = subscriptionUserAgentMode(original.userAgentMode);
+    const requestedUserAgentMode = userAgentMode !== undefined ? userAgentMode : originalUserAgentMode;
     const urlChanged = requestedUrl !== sourceUrl;
-    const token = urlChanged ? core.beginRemoteUpdate('subscription', id) : null;
+    const userAgentModeChanged = requestedUserAgentMode !== originalUserAgentMode;
+    const sourceChanged = urlChanged || userAgentModeChanged;
+    const token = sourceChanged ? core.beginRemoteUpdate('subscription', id) : null;
     const applyEdits = (sub) => {
       if (name !== undefined) sub.name = name;
       if (url !== undefined) sub.url = url;
       if (autoUpdateMinutes !== undefined) sub.autoUpdateMinutes = autoUpdateMinutes;
       if (updateViaProxy !== undefined) sub.updateViaProxy = updateViaProxy;
+      if (userAgentMode !== undefined) sub.userAgentMode = userAgentMode;
       return sub;
     };
     try {
       let fetched = null;
-      if (urlChanged && url) {
+      if (sourceChanged && requestedUrl) {
         const proxyPort = (updateViaProxy !== undefined ? updateViaProxy : !!original.updateViaProxy)
           ? core.currentProxyPort()
           : 0;
         fetched = await subscription.fetchSubscription(
-          url,
+          requestedUrl,
           sendLog,
-          subscriptionFetchOptions({ proxyPort })
+          subscriptionFetchOptions({ proxyPort, userAgentMode: requestedUserAgentMode })
         );
-        if (!fetched.nodes.length) throw new Error('no nodes parsed from the new URL');
+        if (!fetched.nodes.length) throw new Error('no nodes parsed from the selected subscription format');
       }
       return await core.queueConfigMutation(async () => {
         const latest = currentSubscriptionForUpdate(id, sourceUrl, token);
         const sub = fetched
           ? mergeFetchedSubscription(applyEdits({ ...latest }), fetched, { replaceRaw: true })
           : applyEdits({ ...latest });
-        const shouldRestart = urlChanged && !!url && sub.id === core.getActiveSubId();
+        const configChanged = !!fetched &&
+          (latest.configHash || subscription.configFingerprint(latest)) !== sub.configHash;
+        const shouldRestart = configChanged && sub.id === core.getActiveSubId();
         const previous = shouldRestart ? state.store.getSubscription(id, { includeRaw: true }) : null;
         const wasRunning = shouldRestart && state.singbox.isRunning();
         state.store.upsertSubscription(sub);
@@ -645,6 +673,7 @@ function registerIpc() {
       url: '',
       format: result.format,
       nodes: result.nodes,
+      policyGroups: result.policyGroups || [],
       clashRules: result.rules || [],
       clashRuleProviders: result.ruleProviders || {},
       raw: String(content || ''),
@@ -667,7 +696,10 @@ function registerIpc() {
     reqStr(id, 'id');
     const sub = state.store.getSubscription(id, { includeRaw: true });
     if (!sub) throw new Error('config not found');
-    return { raw: sub.raw || null };
+    const raw = sub.raw || null;
+    return {
+      raw: raw ? subscription.formatSubscriptionForEditing(raw, sub.userAgentMode) : null,
+    };
   });
   ipcMain.handle('sub:saveRaw', async (_e, { id, content }) => {
     reqStr(id, 'id');
@@ -682,6 +714,7 @@ function registerIpc() {
       const sub = {
         ...previous,
         nodes: result.nodes,
+        policyGroups: result.policyGroups || [],
         format: result.format,
         clashRules: result.rules || [],
         clashRuleProviders: result.ruleProviders || {},
@@ -727,6 +760,7 @@ function registerIpc() {
       const config = plainConversionLabels(buildMihomoConfig(result.nodes, {
         ...settings,
         clashRules: result.rules || [],
+        policyGroups: result.policyGroups || [],
         ruleProviders: result.ruleProviders || {},
       }));
       return {
@@ -740,6 +774,7 @@ function registerIpc() {
       ...settings,
       ruleSetDir: state.singbox.resolveRuleSetDir(),
       clashRules: result.rules || [],
+      policyGroups: result.policyGroups || [],
     }));
     return { config, nodeCount: result.nodes.length, format: result.format, target: 'sing-box' };
   });

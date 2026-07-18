@@ -1,12 +1,14 @@
 'use strict';
 
+const { singboxPolicyGroups } = require('../policy-groups');
+
 /**
  * sing-box config parser
  *
  * Parses a sing-box JSON config (or a bare outbounds array) into the app's
  * unified internal node objects — the inverse of converter.nodeToOutbound — so
- * a sing-box-format subscription can be added directly. Non-proxy outbounds
- * (direct/block/dns/selector/urltest/...) are skipped.
+ * a sing-box-format subscription can be added directly. Policy outbounds are
+ * retained separately; direct/block/dns and unsupported transports are skipped.
  */
 
 /** TLS fields from a sing-box outbound's `tls` block -> internal node fields. */
@@ -114,19 +116,19 @@ function outboundToNode(ob) {
 /**
  * Parse sing-box JSON content into nodes.
  * Accepts a full config ({ outbounds: [...] }) or a bare outbounds array.
- * @returns {{ nodes: object[], routeRules: object[], isSingbox: boolean }}
+ * @returns {{ nodes: object[], groups: object[], routeRules: object[], routeFinal: string, isSingbox: boolean }}
  */
 function parseSingboxConfig(content) {
   let doc;
   try {
     doc = JSON.parse(content);
   } catch (e) {
-    return { nodes: [], routeRules: [], isSingbox: false };
+    return { nodes: [], groups: [], routeRules: [], routeFinal: '', isSingbox: false };
   }
   let outbounds = null;
   if (Array.isArray(doc)) outbounds = doc;
   else if (doc && Array.isArray(doc.outbounds)) outbounds = doc.outbounds;
-  if (!outbounds) return { nodes: [], routeRules: [], isSingbox: false };
+  if (!outbounds) return { nodes: [], groups: [], routeRules: [], routeFinal: '', isSingbox: false };
 
   const nodes = [];
   for (const ob of outbounds) {
@@ -136,7 +138,10 @@ function parseSingboxConfig(content) {
   const routeRules = !Array.isArray(doc) && doc.route && Array.isArray(doc.route.rules)
     ? doc.route.rules
     : [];
-  return { nodes, routeRules, isSingbox: true };
+  const routeFinal = !Array.isArray(doc) && doc.route && typeof doc.route.final === 'string'
+    ? doc.route.final
+    : '';
+  return { nodes, groups: singboxPolicyGroups(outbounds, nodes), routeRules, routeFinal, isSingbox: true };
 }
 
 module.exports = { parseSingboxConfig, outboundToNode };

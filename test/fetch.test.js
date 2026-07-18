@@ -243,10 +243,51 @@ async function main() {
       );
       assert.strictEqual(mihomo.format, 'clash');
       assert.deepStrictEqual(requestedAgents, ['mihomo/1.18.10']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        const ua = options.headers['User-Agent'];
+        requestedAgents.push(ua);
+        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
+        return { body: Buffer.from(ua.startsWith('clash-verge/') ? encodedLinks : clashConfig), headers: {} };
+      };
+      const forcedClash = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'sing-box', userAgentMode: 'clash' }
+      );
+      assert.strictEqual(forcedClash.format, 'clash');
+      assert.deepStrictEqual(requestedAgents.slice(0, 2), ['clash-verge/v2.0.2', 'ClashforWindows/0.20.39']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        requestedAgents.push(options.headers['User-Agent']);
+        return { body: Buffer.from(nativeConfig), headers: {} };
+      };
+      const forcedSingbox = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'mihomo', userAgentMode: 'sing-box' }
+      );
+      assert.strictEqual(forcedSingbox.format, 'singbox');
+      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        requestedAgents.push(options.headers['User-Agent']);
+        return { body: Buffer.from('format unavailable'), headers: {} };
+      };
+      const unavailable = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'mihomo', userAgentMode: 'sing-box' }
+      );
+      assert.strictEqual(unavailable.nodes.length, 0);
+      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
     } finally {
       fetch.getBufferWithFallback = originalGetBufferWithFallback;
     }
-    console.log('✓ subscription requests prefer the active core format and fall back across ecosystems');
+    console.log('✓ subscription requests support automatic fallback and pinned User-Agent ecosystems');
   } finally {
     await new Promise((resolve) => tunnelInspectionProxy.close(resolve));
     await new Promise((resolve) => proxyServer.close(resolve));

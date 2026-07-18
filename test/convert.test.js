@@ -20,8 +20,15 @@ const {
   dnsServerFromAddress,
   ruleListToSingboxRule,
 } = require('../src/main/converter');
-const { parseSubscriptionContent, parseUserInfo, uniqueNodeNames, configFingerprint } = require('../src/main/subscription');
+const {
+  parseSubscriptionContent,
+  parseUserInfo,
+  uniqueNodeNames,
+  configFingerprint,
+  formatSubscriptionForEditing,
+} = require('../src/main/subscription');
 const { geoDataUrls } = require('../src/main/singbox');
+const { normalizePolicyGroups } = require('../src/main/policy-groups');
 
 let passed = 0;
 function test(name, fn) {
@@ -146,6 +153,13 @@ test('parse base64 bulk subscription', () => {
   const nodes = linkParser.parseSubscriptionLinks(b64);
   assert.strictEqual(nodes.length, 2);
   assert.strictEqual(nodes[0].name, 'node1');
+  assert.strictEqual(formatSubscriptionForEditing(b64), links);
+  const clashEditable = formatSubscriptionForEditing(b64, 'clash');
+  const singboxEditable = formatSubscriptionForEditing(b64, 'sing-box');
+  assert.strictEqual(parseSubscriptionContent(clashEditable).format, 'clash');
+  assert.strictEqual(parseSubscriptionContent(clashEditable).nodes.length, 2);
+  assert.strictEqual(parseSubscriptionContent(singboxEditable).format, 'singbox');
+  assert.strictEqual(parseSubscriptionContent(singboxEditable).nodes.length, 2);
 });
 
 console.log('\nClash config parsing:');
@@ -203,6 +217,42 @@ test('parse Clash proxies', () => {
   assert.strictEqual(nodes[1].type, 'ss');
   assert.strictEqual(nodes[2].type, 'trojan');
   assert.strictEqual(groups.length, 1);
+  const normalized = parseSubscriptionContent(clashYaml);
+  assert.deepStrictEqual(normalized.policyGroups[0], {
+    name: 'PROXY',
+    type: 'select',
+    members: ['HK-vmess', 'US-ss', 'JP-trojan'],
+  });
+});
+
+test('Clash policy groups survive both core generators', () => {
+  const parsed = parseSubscriptionContent(`${clashYaml}
+rules:
+  - DOMAIN-SUFFIX,example.com,PROXY
+  - MATCH,PROXY
+`);
+  const singbox = buildSingboxConfig(parsed.nodes, {
+    policyGroups: parsed.policyGroups,
+    clashRules: parsed.rules,
+    ruleSetDir: null,
+  });
+  const mihomo = buildMihomoConfig(parsed.nodes, {
+    policyGroups: parsed.policyGroups,
+    clashRules: parsed.rules,
+  });
+
+  assert.ok(singbox.outbounds.some((outbound) => outbound.tag === 'PROXY' && outbound.type === 'selector'));
+  assert.strictEqual(singbox.route.final, 'PROXY');
+  assert.ok(mihomo['proxy-groups'].some((group) => group.name === 'PROXY' && group.type === 'select'));
+  assert.strictEqual(mihomo.rules.at(-1), 'MATCH,PROXY');
+});
+
+test('base64 Clash configs decode for parsing and editing', () => {
+  const encoded = Buffer.from(clashYaml).toString('base64');
+  const parsed = parseSubscriptionContent(encoded);
+  assert.strictEqual(parsed.format, 'clash');
+  assert.strictEqual(parsed.nodes.length, 3);
+  assert.strictEqual(formatSubscriptionForEditing(encoded), clashYaml.trim());
 });
 
 test('Clash parser rejects malformed endpoints and out-of-range ports', () => {
@@ -687,7 +737,7 @@ test('parse anytls:// share link', () => {
 
 console.log('\nSubscription rule policy-group overrides:');
 
-test('extractRuleGroups returns distinct proxy groups, excluding DIRECT/REJECT/MATCH', () => {
+test('extractRuleGroups includes final policy targets and excludes DIRECT/REJECT', () => {
   const rules = [
     'DOMAIN-SUFFIX,netflix.com,Streaming',
     'DOMAIN-SUFFIX,google.com,ProxyPick',
@@ -695,8 +745,9 @@ test('extractRuleGroups returns distinct proxy groups, excluding DIRECT/REJECT/M
     'GEOIP,CN,DIRECT',
     'DOMAIN-KEYWORD,ad,REJECT',
     'MATCH,ProxyPick',
+    'FINAL,FinalOnly',
   ];
-  assert.deepStrictEqual(extractRuleGroups(rules), ['ProxyPick', 'Streaming']);
+  assert.deepStrictEqual(extractRuleGroups(rules), ['FinalOnly', 'ProxyPick', 'Streaming']);
 });
 
 test('clashRulesToSingbox honors per-group outbound overrides', () => {
@@ -713,6 +764,40 @@ test('clashRulesToSingbox honors per-group outbound overrides', () => {
   assert.strictEqual(out[2].action, 'reject'); // Ads -> reject
   assert.ok(!out[2].outbound, 'reject sets action, not outbound');
   assert.strictEqual(out[3].outbound, 'direct'); // explicit DIRECT untouched
+});
+
+test('available source policy targets survive unless explicitly overridden', () => {
+  const rules = ['DOMAIN-SUFFIX,netflix.com,Streaming', 'MATCH,Streaming'];
+  const available = new Set(['Streaming']);
+  const kept = clashRulesToSingbox(rules, true, null, null, null, available);
+  assert.strictEqual(kept.rules[0].outbound, 'Streaming');
+  assert.strictEqual(kept.finalTarget, 'Streaming');
+  const forced = clashRulesToSingbox(rules, true, { Streaming: 'proxy' }, null, null, available);
+  assert.strictEqual(forced.rules[0].outbound, '🚀 Proxy');
+  assert.strictEqual(forced.finalTarget, '🚀 Proxy');
+});
+
+test('policy-group normalization removes invalid and cyclic references', () => {
+  const groups = normalizePolicyGroups([
+    { name: 'A', type: 'select', members: ['B'] },
+    { name: 'B', type: 'fallback', members: ['A', 'node'] },
+    { name: 'Empty', type: 'select', members: ['missing'] },
+    { name: '🚀 Proxy', type: 'select', members: ['node'] },
+  ], ['node']);
+  assert.deepStrictEqual(groups.map((group) => group.name), ['A', 'B']);
+  assert.deepStrictEqual(groups[0].members, ['B']);
+  assert.deepStrictEqual(groups[1].members, ['node']);
+});
+
+test('deep policy-group graphs are bounded and normalized without recursion', () => {
+  const groups = Array.from({ length: 4096 }, (_, index) => ({
+    name: `Group ${index}`,
+    type: 'select',
+    members: [index === 4095 ? 'node' : `Group ${index + 1}`],
+  }));
+  const normalized = normalizePolicyGroups(groups, ['node']);
+  assert.strictEqual(normalized.length, groups.length);
+  assert.deepStrictEqual(normalized.at(-1).members, ['node']);
 });
 
 console.log('\nGEOSITE / GEOIP categories:');
@@ -853,20 +938,22 @@ const singboxParser = require('../src/main/parsers/singbox');
 test('parseSingboxConfig converts outbounds to nodes, skipping non-proxies', () => {
   const cfg = JSON.stringify({
     outbounds: [
-      { type: 'selector', tag: 'select', outbounds: ['a'] },
+      { type: 'selector', tag: 'select', outbounds: ['VL'] },
       { type: 'vless', tag: 'VL', server: '1.2.3.4', server_port: 443, uuid: 'u', flow: 'xtls-rprx-vision',
         tls: { enabled: true, server_name: 'e.com', reality: { enabled: true, public_key: 'PK', short_id: 'ab' } } },
       { type: 'shadowsocks', tag: 'SS', server: '5.6.7.8', server_port: 8388, method: 'aes-128-gcm', password: 'pw' },
       { type: 'direct', tag: 'direct' },
     ],
   });
-  const { nodes, isSingbox } = singboxParser.parseSingboxConfig(cfg);
+  const { nodes, groups, isSingbox } = singboxParser.parseSingboxConfig(cfg);
   assert.strictEqual(isSingbox, true);
   assert.strictEqual(nodes.length, 2); // selector + direct dropped
   const vl = nodes.find((n) => n.type === 'vless');
   assert.strictEqual(vl.uuid, 'u');
   assert.strictEqual(vl.flow, 'xtls-rprx-vision');
   assert.strictEqual(vl.reality.publicKey, 'PK');
+  assert.strictEqual(groups[0].name, 'select');
+  assert.deepStrictEqual(groups[0].members, ['VL']);
 });
 
 test('sing-box parser rejects malformed endpoints and out-of-range ports', () => {
@@ -915,6 +1002,55 @@ test('parseSubscriptionContent detects sing-box JSON (raw and base64)', () => {
   assert.strictEqual(parseSubscriptionContent(b64).format, 'singbox');
   const wrapped = b64.match(/.{1,76}/g).join('\n');
   assert.strictEqual(parseSubscriptionContent(wrapped).format, 'singbox');
+});
+
+test('native policy groups and final routing survive both core generators', () => {
+  const json = JSON.stringify({
+    outbounds: [
+      { type: 'selector', tag: 'Streaming', outbounds: ['A', 'B', 'direct'], default: 'B' },
+      { type: 'urltest', tag: 'Fast', outbounds: ['A', 'B'], url: 'https://example.com/ping', interval: '2m', tolerance: 25 },
+      { type: 'trojan', tag: 'A', server: 'a.example.com', server_port: 443, password: 'a' },
+      { type: 'trojan', tag: 'B', server: 'b.example.com', server_port: 443, password: 'b' },
+      { type: 'direct', tag: 'direct' },
+    ],
+    route: {
+      rules: [{ domain_suffix: ['netflix.com'], outbound: 'Streaming' }],
+      final: 'Fast',
+    },
+  });
+  const parsed = parseSubscriptionContent(json);
+  assert.deepStrictEqual(parsed.policyGroups.map((group) => group.name), ['Streaming', 'Fast']);
+  assert.ok(parsed.rules.includes('DOMAIN-SUFFIX,netflix.com,Streaming'));
+  assert.ok(parsed.rules.includes('MATCH,Fast'));
+
+  const singbox = buildSingboxConfig(parsed.nodes, {
+    policyGroups: parsed.policyGroups,
+    clashRules: parsed.rules,
+    ruleSetDir: null,
+  });
+  const streamingOutbound = singbox.outbounds.find((outbound) => outbound.tag === 'Streaming');
+  assert.strictEqual(streamingOutbound.type, 'selector');
+  assert.deepStrictEqual(streamingOutbound.outbounds, ['A', 'B', 'direct']);
+  assert.strictEqual(streamingOutbound.default, 'B');
+  assert.strictEqual(singbox.outbounds.find((outbound) => outbound.tag === 'Fast').interval, '120s');
+  assert.strictEqual(singbox.route.rules.find((rule) => rule.domain_suffix).outbound, 'Streaming');
+  assert.strictEqual(singbox.route.final, 'Fast');
+
+  const mihomo = buildMihomoConfig(parsed.nodes, {
+    policyGroups: parsed.policyGroups,
+    clashRules: parsed.rules,
+  });
+  assert.strictEqual(mihomo['proxy-groups'].find((group) => group.name === 'Streaming').type, 'select');
+  assert.strictEqual(mihomo['proxy-groups'].find((group) => group.name === 'Fast').type, 'url-test');
+  assert.ok(mihomo.rules.includes('DOMAIN-SUFFIX,netflix.com,Streaming'));
+  assert.strictEqual(mihomo.rules.at(-1), 'MATCH,Fast');
+});
+
+test('policy groups affect config fingerprints', () => {
+  const base = { nodes: [{ name: 'A' }], rules: ['MATCH,Group'] };
+  const first = configFingerprint({ ...base, policyGroups: [{ name: 'Group', type: 'select', members: ['A'] }] });
+  const second = configFingerprint({ ...base, policyGroups: [{ name: 'Group', type: 'url-test', members: ['A'] }] });
+  assert.notStrictEqual(first, second);
 });
 
 console.log('\nGeoData mirrors:');

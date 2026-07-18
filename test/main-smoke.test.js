@@ -145,15 +145,18 @@ require.cache[require.resolve(subscriptionPath)] = {
       subscriptionFetchCalls.push({ url, options });
       return {
         nodes: [{ name: 'node-of-' + new URL(url).pathname.slice(1), type: 'trojan', server: 's.example.com', port: 443, password: 'p' }],
+        policyGroups: [],
         format: 'links',
         rules: [],
         raw: 'stub',
         userInfo: null,
       };
     },
-    parseSubscriptionContent: () => ({ nodes: [], format: 'unknown', rules: [], raw: '' }),
+    parseSubscriptionContent: () => ({ nodes: [], policyGroups: [], format: 'unknown', rules: [], raw: '' }),
+    formatSubscriptionForEditing: (value, target) => `editable:${target}:${value}`,
     configFingerprint: (value) => JSON.stringify([
       value.nodes || [],
+      value.policyGroups || value.groups || [],
       value.clashRules || value.rules || [],
       value.clashRuleProviders || value.ruleProviders || {},
     ]),
@@ -363,12 +366,20 @@ async function main() {
   state.systemProxyOn = false;
   state.systemProxyServer = null;
 
-  const subA = await handlers['sub:add'](null, { name: 'A', url: 'https://example.com/a' });
+  const subA = await handlers['sub:add'](null, {
+    name: 'A', url: 'https://example.com/a', userAgentMode: 'sing-box',
+  });
   assert.strictEqual(state.store.get('activeSub'), subA.id, 'the first subscription becomes active');
   assert.strictEqual(
     subscriptionFetchCalls.at(-1).options.coreType,
     state.store.getSettings().coreType,
     'subscription fetch did not request the active core format'
+  );
+  assert.strictEqual(subscriptionFetchCalls.at(-1).options.userAgentMode, 'sing-box');
+  assert.strictEqual(state.store.getSubscription(subA.id).userAgentMode, 'sing-box');
+  assert.deepStrictEqual(
+    await handlers['sub:getRaw'](null, { id: subA.id }),
+    { raw: 'editable:sing-box:stub' }
   );
 
   state.store.set('activeSub', null); // simulate a legacy store
@@ -382,9 +393,33 @@ async function main() {
   assert.ok(!('nodes' in rendererSubA), 'global state must not hydrate active node details');
   assert.ok(!('nodes' in rendererSubB), 'inactive profile payload stays out of renderer IPC');
   assert.strictEqual(rendererSubB.nodeCount, 1, 'inactive profile still exposes its node count');
+  assert.strictEqual(rendererSubA.userAgentMode, 'sing-box');
   const rendererNodes = await handlers['nodes:get']();
   assert.strictEqual(rendererNodes.activeSub, subA.id);
   assert.deepStrictEqual(rendererNodes.nodes, [{ name: 'node-of-a', type: 'trojan', server: 's.example.com', port: 443 }]);
+
+  const fetchesBeforeUaEdit = subscriptionFetchCalls.length;
+  await handlers['sub:edit'](null, { id: subA.id, userAgentMode: 'clash' });
+  assert.strictEqual(subscriptionFetchCalls.length, fetchesBeforeUaEdit + 1, 'changing UA did not refetch the config');
+  assert.strictEqual(subscriptionFetchCalls.at(-1).options.userAgentMode, 'clash');
+  assert.strictEqual(state.store.getSubscription(subA.id).userAgentMode, 'clash');
+
+  const profileBeforePolicyTest = state.store.getSubscription(subA.id);
+  state.store.upsertSubscription({
+    ...profileBeforePolicyTest,
+    policyGroups: [{ name: 'Source Group', type: 'select', members: ['node-of-a'] }],
+    clashRules: ['DOMAIN-SUFFIX,source.example,Source Group', 'MATCH,Source Group'],
+  });
+  const singboxPolicyConfig = core.buildCurrentConfig('sing-box').config;
+  const mihomoPolicyConfig = core.buildCurrentConfig('mihomo').config;
+  assert.ok(singboxPolicyConfig.outbounds.some((outbound) => outbound.tag === 'Source Group'));
+  assert.strictEqual(singboxPolicyConfig.route.final, 'Source Group');
+  assert.ok(mihomoPolicyConfig['proxy-groups'].some((group) => group.name === 'Source Group'));
+  assert.strictEqual(mihomoPolicyConfig.rules.at(-1), 'MATCH,Source Group');
+  assert.ok(core.ruleGroupInfo().sourceTargets.includes('Source Group'));
+  assert.deepStrictEqual(state.store.getSubscription(subA.id).policyGroups[0].members, ['node-of-a']);
+  state.store.upsertSubscription(profileBeforePolicyTest);
+  console.log('✓ source policy groups persist and generate native routing for both cores');
 
   // Updating only rules/providers still changes the generated core config.
   const subscriptionStub = require(subscriptionPath);
@@ -436,14 +471,16 @@ async function main() {
   const originalClearInterval = global.clearInterval;
   let scheduledAutoUpdate = null;
   let autoUpdateAttempts = 0;
+  let autoUpdateOptions = null;
   global.setInterval = (callback, milliseconds) => {
     assert.strictEqual(milliseconds, 60000);
     scheduledAutoUpdate = callback;
     return { fakeTimer: true };
   };
   global.clearInterval = () => {};
-  subscriptionStub.fetchSubscription = async () => {
+  subscriptionStub.fetchSubscription = async (_url, _log, options) => {
     autoUpdateAttempts += 1;
+    autoUpdateOptions = options;
     throw new Error('offline');
   };
   try {
@@ -464,6 +501,7 @@ async function main() {
     await scheduledAutoUpdate();
     await scheduledAutoUpdate();
     assert.strictEqual(autoUpdateAttempts, 1, 'a failed auto-update retried on the next minute tick');
+    assert.strictEqual(autoUpdateOptions.userAgentMode, 'clash', 'auto-update ignored the config User-Agent mode');
 
     const autoRollbackSnapshot = state.store.getSubscription(subA.id, { includeRaw: true });
     const autoManager = state.singbox;
@@ -1029,6 +1067,10 @@ async function main() {
   await assert.rejects(
     handlers['sub:edit'](null, { id: subA.id, updateViaProxy: 'false' }),
     /invalid updateViaProxy/
+  );
+  await assert.rejects(
+    handlers['sub:edit'](null, { id: subA.id, userAgentMode: 'surge' }),
+    /invalid userAgentMode/
   );
   await assert.rejects(
     handlers['customrs:edit'](null, { id: 'missing', autoUpdateMinutes: 1.5 }),

@@ -1182,15 +1182,35 @@ function validateBackupDocument(document) {
   if (subscriptions.length > 500 || customRuleSets.length > 2000 || localRules.length > 10000) throw new Error('backup exceeds supported item limits');
   const ids = new Set();
   let nodeCount = 0;
+  let policyMemberCount = 0;
   for (const sub of subscriptions) {
     if (!isPlainObject(sub) || typeof sub.id !== 'string' || !sub.id || sub.id.length > 256 || ids.has(sub.id)) {
       throw new Error('backup contains an invalid or duplicate config id');
     }
     ids.add(sub.id);
+    if (sub.userAgentMode !== undefined && !['auto', 'sing-box', 'clash'].includes(sub.userAgentMode)) {
+      throw new Error('backup config User-Agent mode is invalid');
+    }
     if (sub.nodes !== undefined && !Array.isArray(sub.nodes)) throw new Error('backup config nodes are invalid');
     if (Array.isArray(sub.nodes)) {
       nodeCount += sub.nodes.length;
       if (nodeCount > 100000 || sub.nodes.some((node) => !isPlainObject(node))) throw new Error('backup config nodes are invalid');
+    }
+    if (sub.policyGroups !== undefined) {
+      if (!Array.isArray(sub.policyGroups) || sub.policyGroups.length > 10000) {
+        throw new Error('backup config policy groups are invalid');
+      }
+      for (const group of sub.policyGroups) {
+        if (
+          !isPlainObject(group) || typeof group.name !== 'string' ||
+          !['select', 'url-test', 'fallback', 'load-balance'].includes(group.type) ||
+          !Array.isArray(group.members) || group.members.some((member) => typeof member !== 'string')
+        ) {
+          throw new Error('backup config policy groups are invalid');
+        }
+        policyMemberCount += group.members.length;
+        if (policyMemberCount > 100000) throw new Error('backup config policy groups are invalid');
+      }
     }
   }
   const ruleIds = new Set();

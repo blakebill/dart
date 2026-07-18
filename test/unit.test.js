@@ -125,6 +125,7 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['settings.manageGeo'], '管理');
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
+  assert.strictEqual(zh['rulegroups.targetSource'], '配置原出站');
 });
 
 test('static HTML fallbacks keep config terminology', () => {
@@ -135,11 +136,14 @@ test('static HTML fallbacks keep config terminology', () => {
   for (const stale of ['静默启动（', '桌面通知（', '硬件加速（', '启用 IPv6（']) {
     assert.ok(!html.includes(stale), `settings fallback still has parenthetical hint: ${stale}`);
   }
+  assert.ok(html.includes('id="subUserAgent"'), 'add-config User-Agent selector is missing');
+  assert.ok(html.includes('id="editUserAgent"'), 'edit-config User-Agent selector is missing');
 });
 
 test('rule-set page is folded into rules and native geodata management', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
   const dialogs = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'dialog', 'system.js'), 'utf-8');
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rules.js'), 'utf-8');
   assert.ok(!html.includes('data-tab="ruleset"'), 'standalone rule-set nav is still present');
   assert.ok(!html.includes('id="tab-ruleset"'), 'standalone rule-set tab is still present');
   assert.ok(!html.includes('id="crsFormat"'), 'remote rules should auto-detect format when adding');
@@ -147,10 +151,12 @@ test('rule-set page is folded into rules and native geodata management', () => {
   assert.ok(!html.includes('QuantumultX'), 'unsupported remote rule format option is still present');
   assert.ok(!html.includes('Surge'), 'unsupported remote rule format option is still present');
   assert.ok(!html.includes('Loon'), 'unsupported remote rule format option is still present');
+  assert.ok(html.indexOf('id="ruleGroupList"') < html.indexOf('id="lrList"'), 'policy groups should be the first rules section');
   assert.ok(html.indexOf('id="crsList"') > html.indexOf('id="lrList"'), 'remote rules should follow local rules');
-  assert.ok(html.indexOf('id="crsList"') < html.indexOf('id="ruleGroupList"'), 'remote rules should be above policy groups');
   assert.ok(html.includes('id="geoManageBtn"'), 'GeoData management launcher is missing');
   assert.ok(dialogs.includes("Dialog.register('geodata'"), 'native GeoData dialog is missing');
+  assert.ok(rules.includes('const sourceTargets = new Set(info.sourceTargets || [])'));
+  assert.ok(rules.includes("if (sel.value === 'source') delete next[g]"));
 });
 
 console.log('\nRenderer modules:');
@@ -627,6 +633,7 @@ test('light theme uses quiet system surfaces and lightweight dashboard cards', (
 test('language changes refresh enhanced select labels immediately', () => {
   const select = fs.readFileSync(path.join(rendererDir, 'js', 'select.js'), 'utf-8');
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
   const css = readRendererCss();
   const languageFlow = main.slice(
     main.indexOf('function setLanguage(lang)'),
@@ -635,10 +642,14 @@ test('language changes refresh enhanced select labels immediately', () => {
   assert.ok(select.includes('function refreshSelects('));
   assert.ok(select.includes('selectSync.get(sel)'));
   assert.ok(languageFlow.includes('App.state.settings.language = lang'));
+  assert.ok(languageFlow.includes('App.refreshRuleGroupLabels()'));
+  assert.ok(rules.includes("source: t('rulegroups.targetSource')"));
+  assert.ok(rules.includes('App.refreshSelects(list)'));
   assert.ok(languageFlow.indexOf('App.state.settings.language = lang') < languageFlow.indexOf('App.renderSettings()'));
   assert.ok(languageFlow.indexOf('App.renderSettings()') < languageFlow.indexOf('App.refreshSelects()'));
   const selectElement = { value: 'zh' };
   let mirroredLanguage = null;
+  let refreshedRuleGroups = 0;
   const noop = () => {};
   const sandbox = {
     App: {
@@ -651,6 +662,7 @@ test('language changes refresh enhanced select labels immediately', () => {
       renderMode: noop,
       renderUsage: noop,
       renderCoreStatus: noop,
+      refreshRuleGroupLabels: () => { refreshedRuleGroups++; },
       refreshSelects: () => { mirroredLanguage = selectElement.value; },
     },
     setLang: noop,
@@ -661,6 +673,7 @@ test('language changes refresh enhanced select labels immediately', () => {
   vm.runInNewContext(`${languageFlow}\nsetLanguage('en');`, sandbox);
   assert.strictEqual(sandbox.App.state.settings.language, 'en');
   assert.strictEqual(mirroredLanguage, 'en');
+  assert.strictEqual(refreshedRuleGroups, 1);
   assert.ok(main.includes('{ ...previous, ...status }'), 'compact status events must preserve core version fields');
   assert.ok(css.includes('.btn.primary:hover:not(:disabled)'));
   assert.ok(css.includes('background: var(--accent-hover)'), 'primary hover must retain a contrast-safe blue background');
@@ -947,12 +960,20 @@ test('config validation errors expose common line, column and object paths', () 
 test('backup validation preserves supported data and rejects duplicate config ids', () => {
   const store = {
     getSettings: () => ({ coreType: 'mihomo', mixedPort: 7890 }),
-    getSubscriptions: () => [{ id: 'profile-a', name: 'A', nodes: [{ name: 'node-a' }] }],
+    getSubscriptions: () => [{
+      id: 'profile-a',
+      name: 'A',
+      userAgentMode: 'sing-box',
+      nodes: [{ name: 'node-a' }],
+      policyGroups: [{ name: 'Source', type: 'select', members: ['node-a'] }],
+    }],
     get: (key) => ({ activeSub: 'profile-a', selected: 'node-a', customRuleSets: [{ id: 'rule-a' }], localRules: [] }[key]),
   };
   const document = toolbox.buildBackup(store, '0.8.0');
   const normalized = toolbox.validateBackupDocument(document);
   assert.strictEqual(normalized.activeSub, 'profile-a');
+  assert.strictEqual(normalized.subscriptions[0].userAgentMode, 'sing-box');
+  assert.strictEqual(normalized.subscriptions[0].policyGroups[0].name, 'Source');
   assert.strictEqual(toolbox.backupSummary(document, normalized).nodes, 1);
   document.data.subscriptions.push({ id: 'profile-a' });
   assert.throws(() => toolbox.validateBackupDocument(document), /duplicate config id/);
@@ -962,6 +983,12 @@ test('backup validation preserves supported data and rejects duplicate config id
   document.data.customRuleSets.pop();
   document.data.localRules.push({ id: 'local-a', matchType: 'made-up', values: [] });
   assert.throws(() => toolbox.validateBackupDocument(document), /local rule type is invalid/);
+  document.data.localRules.pop();
+  document.data.subscriptions[0].userAgentMode = 'surge';
+  assert.throws(() => toolbox.validateBackupDocument(document), /User-Agent mode is invalid/);
+  document.data.subscriptions[0].userAgentMode = 'sing-box';
+  document.data.subscriptions[0].policyGroups[0].members = 'node-a';
+  assert.throws(() => toolbox.validateBackupDocument(document), /policy groups are invalid/);
 });
 
 console.log('\nVersioning:');
@@ -1233,6 +1260,7 @@ test('profile payloads load on demand with a bounded cache', () => {
       id: 'profile-' + i,
       name: 'Profile ' + i,
       nodes: [{ name: 'node-' + i }],
+      policyGroups: [{ name: 'Group ' + i, type: 'select', members: ['node-' + i] }],
       raw: 'x'.repeat(1024),
     });
   }
@@ -1240,6 +1268,7 @@ test('profile payloads load on demand with a bounded cache', () => {
   const summaries = reloaded.listSubscriptions();
   assert.strictEqual(reloaded._profileCache.size, 0, 'startup should not hydrate profile payloads');
   assert.ok(summaries.every((sub) => !('nodes' in sub) && sub.nodeCount === 1));
+  assert.strictEqual(reloaded.getSubscription('profile-0').policyGroups[0].name, 'Group 0');
   for (const sub of summaries) reloaded.getSubscription(sub.id);
   assert.ok(reloaded._profileCache.size <= 1, 'profile LRU cache retained more than the active payload');
 });

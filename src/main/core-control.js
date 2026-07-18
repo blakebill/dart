@@ -9,6 +9,7 @@ const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, sendStatus, ref
 const { isWindowsAdmin, isWindowsAdminSync, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
 const { buildSingboxConfig, buildMihomoConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
+const { normalizePolicyGroups } = require('./policy-groups');
 const { geoDataUrls } = require('./singbox');
 const crypto = require('crypto');
 const subscription = require('./subscription');
@@ -234,6 +235,7 @@ function restoreAutoUpdatedSubscription(snapshot, applied) {
   state.store.upsertSubscription({
     ...latest,
     nodes: snapshot.nodes || [],
+    policyGroups: snapshot.policyGroups || [],
     format: snapshot.format || 'unknown',
     clashRules: snapshot.clashRules || [],
     clashRuleProviders: snapshot.clashRuleProviders || {},
@@ -371,32 +373,58 @@ function persistLastRunning(value) {
   }
 }
 
-/** Load the active profile and migrate legacy duplicate/reserved node names. */
+/** Load the active profile and migrate legacy node names/policy groups. */
 function getActiveSubscription() {
   const id = getActiveSubId();
-  const sub = id ? state.store.getSubscription(id) : null;
+  let sub = id ? state.store.getSubscription(id) : null;
   if (!sub || !Array.isArray(sub.nodes)) return sub;
+  let profileMigrated = false;
+
+  // Profiles saved before policy groups were persisted can recover them once
+  // from the retained source body, without requiring a network refresh.
+  if (!Array.isArray(sub.policyGroups)) {
+    profileMigrated = true;
+    const source = state.store.getSubscription(id, { includeRaw: true });
+    const parsed = source && source.raw ? subscription.parseSubscriptionContent(source.raw) : null;
+    if (parsed && parsed.nodes.length) {
+      sub = {
+        ...sub,
+        nodes: parsed.nodes,
+        policyGroups: parsed.policyGroups || [],
+        clashRules: parsed.rules || [],
+        clashRuleProviders: parsed.ruleProviders || {},
+      };
+    } else {
+      sub.policyGroups = [];
+    }
+  }
   const nodes = subscription.uniqueNodeNames(sub.nodes);
-  if (nodes.length !== sub.nodes.length || nodes.some((node, index) => node.name !== (sub.nodes[index] && sub.nodes[index].name))) {
+  const policyGroups = normalizePolicyGroups(sub.policyGroups, nodes);
+  const nodesChanged = nodes.length !== sub.nodes.length ||
+    nodes.some((node, index) => node.name !== (sub.nodes[index] && sub.nodes[index].name));
+  const groupsChanged = JSON.stringify(policyGroups) !== JSON.stringify(sub.policyGroups);
+  if (profileMigrated || nodesChanged || groupsChanged || !sub.configHash) {
     sub.nodes = nodes;
+    sub.policyGroups = policyGroups;
     sub.configHash = subscription.configFingerprint(sub);
     try {
       state.store.upsertSubscription(sub);
     } catch (error) {
-      // Name normalization is enough to build a valid runtime config. A
+      // In-memory normalization is enough to build a valid runtime config. A
       // read-only disk should only postpone this legacy migration, not prevent
       // the otherwise usable profile from starting in the current session.
-      sendLog('[gui] failed to persist normalized node names: ' + error.message);
+      sendLog('[gui] failed to persist normalized profile routing: ' + error.message);
     }
   }
   return sub;
 }
 
-/** Nodes + Clash rules (+ rule-providers) of the active subscription only. */
+/** Nodes + policy groups + Clash rules/providers of the active subscription. */
 function activeSubData() {
   const sub = getActiveSubscription();
   return {
     nodes: (sub && sub.nodes) || [],
+    groups: (sub && sub.policyGroups) || [],
     rules: (sub && sub.clashRules) || [],
     providers: (sub && sub.clashRuleProviders) || {},
   };
@@ -514,7 +542,7 @@ function buildCurrentConfig(coreType = null) {
     ? { ...storedSettings, coreType: coreType === 'mihomo' ? 'mihomo' : 'sing-box' }
     : storedSettings;
   // Use only the active subscription's nodes (profiles are not merged).
-  const { nodes: allNodes, rules: allRules, providers } = activeSubData();
+  const { nodes: allNodes, groups: allGroups, rules: allRules, providers } = activeSubData();
   if (allNodes.length === 0) {
     throw new Error('No nodes available. Add a config first.');
   }
@@ -523,6 +551,7 @@ function buildCurrentConfig(coreType = null) {
   // default — CN/private direct, everything else proxied — so the user's local
   // rules and custom rule-sets are what actually steer routing.
   const clashRules = settings.useBuiltinRules ? [] : allRules;
+  const policyGroups = settings.useBuiltinRules ? [] : allGroups;
   const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
   const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.mihomoGeoDataReady(false) : false;
   const ui = panelUiInfo();
@@ -538,6 +567,7 @@ function buildCurrentConfig(coreType = null) {
     selected: state.store.get('selected'),
     clashMode: settings.clashMode,
     clashRules,
+    policyGroups,
     ruleProviders: providers,
     enableIpv6: settings.enableIpv6,
     dnsRemote: settings.dnsRemote,
@@ -567,11 +597,18 @@ function buildCurrentConfig(coreType = null) {
 
 /** Build the route info (rules + rule-sets) from the current config, without running. */
 function currentRouteInfo() {
-  const { rules, providers } = activeSubData();
+  const { nodes, groups, rules, providers } = activeSubData();
   // Mirror buildCurrentConfig: in built-in rules mode the subscription's own
   // rules are dropped so the Rules view shows what actually runs.
   const settings = state.store.getSettings();
   const clashRules = settings.useBuiltinRules ? [] : rules;
+  const policyGroups = settings.useBuiltinRules ? [] : normalizePolicyGroups(groups, nodes);
+  const availableTargets = new Set([
+    AUTO_PROXY_GROUP,
+    '🛟 Fallback',
+    ...nodes.map((node) => node && node.name).filter(Boolean),
+    ...policyGroups.map((group) => group.name),
+  ]);
   const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
   // Only the route is needed here, so skip converting every node to an outbound.
   const route = buildRoute({
@@ -582,6 +619,7 @@ function currentRouteInfo() {
     ruleOverrides: settings.ruleOverrides,
     geoAvailable: availableGeoSet(clashRules),
     ruleSetData: loadRuleSetData(clashRules, providers),
+    availableTargets,
   });
   return { rules: route.rules, ruleSets: route.rule_set };
 }
@@ -592,8 +630,22 @@ function currentRouteInfo() {
  */
 function ruleGroupInfo() {
   const settings = state.store.getSettings();
-  const groups = settings.useBuiltinRules ? [] : extractRuleGroups(activeSubData().rules);
-  return { groups, overrides: settings.ruleOverrides || {} };
+  if (settings.useBuiltinRules) return { groups: [], sourceTargets: [], overrides: settings.ruleOverrides || {} };
+  const data = activeSubData();
+  const groups = extractRuleGroups(data.rules);
+  const policyGroups = normalizePolicyGroups(data.groups, data.nodes);
+  const available = new Set([
+    APP_PROXY_GROUP,
+    AUTO_PROXY_GROUP,
+    '🛟 Fallback',
+    ...data.nodes.map((node) => node && node.name).filter(Boolean),
+    ...policyGroups.map((group) => group.name),
+  ]);
+  return {
+    groups,
+    sourceTargets: groups.filter((name) => available.has(name)),
+    overrides: settings.ruleOverrides || {},
+  };
 }
 
 async function startCoreNow() {
@@ -1422,6 +1474,9 @@ async function runAutoUpdateTick() {
         const r = await subscription.fetchSubscription(sourceUrl, sendLog, {
           proxyPort,
           coreType: state.store.getSettings().coreType,
+          userAgentMode: ['sing-box', 'clash'].includes(current.userAgentMode)
+            ? current.userAgentMode
+            : 'auto',
         });
         if (!r.nodes.length) throw new Error('no nodes parsed from the updated config');
         const applied = await queueConfigMutation(() => {
@@ -1435,6 +1490,7 @@ async function runAutoUpdateTick() {
           const next = {
             ...latest,
             nodes: r.nodes,
+            policyGroups: r.policyGroups || [],
             format: r.format,
             clashRules: r.rules || [],
             clashRuleProviders: r.ruleProviders || {},

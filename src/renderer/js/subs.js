@@ -33,15 +33,18 @@
       const auInfo = au > 0 ? t('subs.autoUpdateInfo', au) : t('subs.autoUpdateNone');
       const isActive = sub.id === App.state.activeSub;
       if (isActive) div.classList.add('active');
-      const fmt = escapeHtml({ clash: 'Clash', links: 'Links' }[sub.format] || sub.format || '-');
+      const fmt = escapeHtml({ clash: 'Clash', singbox: 'sing-box', links: 'Links' }[sub.format] || sub.format || '-');
       const id = escapeHtml(sub.id);
       const viaProxy = sub.updateViaProxy ? ' · ' + t('subs.viaProxyTag') : '';
+      const userAgentMode = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
+      const userAgentLabel = userAgentMode === 'clash' ? 'Clash' : userAgentMode;
+      const userAgentTag = userAgentMode === 'auto' ? '' : ' · ' + t('subs.userAgentTag', userAgentLabel);
       // Two meta lines: profile facts on top, traffic quota (when known) below.
       const trafficLine = traffic ? `<div class="sub-meta">${traffic}</div>` : '';
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(sub.name)}${isActive ? ' ✓' : ''}</div>
-          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${fmt} · ${auInfo}${viaProxy} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
+          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${fmt} · ${auInfo}${viaProxy}${userAgentTag} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
           ${trafficLine}
         </div>
         <div class="sub-actions">
@@ -96,6 +99,7 @@
     $('#editName').value = sub.name || '';
     $('#editUrl').value = sub.url || '';
     $('#editAutoUpdate').value = String(sub.autoUpdateMinutes || 0);
+    $('#editUserAgent').value = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
     $('#editViaProxy').checked = !!sub.updateViaProxy;
     $('#subEditPanel').classList.remove('hidden');
     $('#subEditPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -106,14 +110,16 @@
     const url = $('#subUrl').value.trim();
     if (!url) return toast(t('toast.needUrl'), true);
     const name = $('#subName').value.trim();
+    const userAgentMode = $('#subUserAgent').value;
     const btn = $('#subAddBtn');
     btn.disabled = true;
     btn.textContent = t('subs.fetching');
     try {
-      const sub = await call(api.addSubscription, { name, url });
+      const sub = await call(api.addSubscription, { name, url, userAgentMode });
       toast(t('toast.subAdded', sub.name, sub.nodeCount));
       $('#subUrl').value = '';
       $('#subName').value = '';
+      $('#subUserAgent').value = 'auto';
       await App.refresh();
     } catch (_) {
       /* call() already showed the error */
@@ -138,6 +144,7 @@
         name: $('#editName').value.trim(),
         url: $('#editUrl').value.trim(),
         autoUpdateMinutes: parseInt($('#editAutoUpdate').value, 10) || 0,
+        userAgentMode: $('#editUserAgent').value,
         updateViaProxy: $('#editViaProxy').checked,
       });
       toast(t('settings.saved'));

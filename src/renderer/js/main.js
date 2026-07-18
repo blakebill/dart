@@ -48,6 +48,9 @@
     if (App.renderSubs) App.renderSubs();
     if (App.renderNodes) App.renderNodes();
     if (App.renderSettings) App.renderSettings();
+    // Policy-group controls are generated dynamically and may remain mounted
+    // while another tab is active, so data-i18n cannot update their options.
+    if (App.refreshRuleGroupLabels) App.refreshRuleGroupLabels();
     App.renderMode();
     App.renderUsage();
     if (App.renderCoreStatus) App.renderCoreStatus(App.state.status);

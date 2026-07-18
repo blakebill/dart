@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
-const PROFILE_FIELDS = ['nodes', 'clashRules', 'clashRuleProviders'];
+const PROFILE_FIELDS = ['nodes', 'policyGroups', 'clashRules', 'clashRuleProviders'];
 const LEGACY_PROFILE_FIELDS = [...PROFILE_FIELDS, 'raw'];
 const RULESET_FIELDS = ['rule', 'rules'];
 const LEGACY_DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';

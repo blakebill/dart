@@ -185,6 +185,14 @@
           <h1 data-i18n="nav.rules">规则</h1>
           <div class="workspace-section">
             <div class="row">
+              <h2 data-i18n="rulegroups.section">策略组</h2>
+              <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
+            </div>
+            <p class="hint" data-i18n="rulegroups.hint"></p>
+            <div id="ruleGroupList" class="sub-list"></div>
+          </div>
+          <div class="workspace-section">
+            <div class="row">
               <h2 data-i18n="localrules.section">本地规则</h2>
               <button id="lrAdd" class="btn primary" data-i18n="localrules.add">添加本地规则</button>
             </div>
@@ -207,14 +215,6 @@
               <button id="crsAdd" class="btn primary" data-i18n="customrs.add">添加</button>
             </div>
             <div id="crsList" class="sub-list"></div>
-          </div>
-          <div class="workspace-section">
-            <div class="row">
-              <h2 data-i18n="rulegroups.section">策略组</h2>
-              <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
-            </div>
-            <p class="hint" data-i18n="rulegroups.hint"></p>
-            <div id="ruleGroupList" class="sub-list"></div>
           </div>
           <div class="workspace-section">
             <div class="row">
@@ -245,6 +245,11 @@
             <div class="form-row">
               <input id="subName" class="input" data-i18n-ph="subs.namePh" />
               <input id="subUrl" class="input grow" data-i18n-ph="subs.urlPh" />
+              <select id="subUserAgent" class="input small">
+                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
+                <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
+                <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
+              </select>
               <button id="subAddBtn" class="btn primary" data-i18n="subs.addBtn">添加</button>
             </div>
             <p class="hint" data-i18n="subs.hint"></p>
@@ -269,6 +274,14 @@
                 <option value="360">6 h</option>
                 <option value="720">12 h</option>
                 <option value="1440">24 h</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <label data-i18n="subs.userAgent">订阅格式</label>
+              <select id="editUserAgent" class="input small">
+                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
+                <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
+                <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
               </select>
             </div>
             <div class="setting-row">

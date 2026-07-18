@@ -119,6 +119,23 @@
   // The subscription's own rules keep their matching, but the user picks where
   // each policy group routes (proxy / direct / reject). Saved as a name->target
   // map in settings; the core restarts to apply.
+  function refreshRuleGroupLabels() {
+    const list = $('#ruleGroupList');
+    if (!list) return;
+    const labels = {
+      source: t('rulegroups.targetSource'),
+      proxy: t('customrs.targetProxy'),
+      direct: t('customrs.targetDirect'),
+      reject: t('customrs.targetReject'),
+    };
+    const empty = list.querySelector('.hint');
+    if (empty) empty.textContent = t('rulegroups.empty');
+    list.querySelectorAll('select[data-group] option').forEach((option) => {
+      if (labels[option.value]) option.textContent = labels[option.value];
+    });
+    if (App.refreshSelects) App.refreshSelects(list);
+  }
+
   async function loadRuleGroups(options = {}) {
     const list = $('#ruleGroupList');
     if (!list) return;
@@ -145,12 +162,17 @@
         ['direct', t('customrs.targetDirect')],
         ['reject', t('customrs.targetReject')],
       ];
+      const sourceTargets = new Set(info.sourceTargets || []);
       list.innerHTML = '';
       for (const g of groups) {
-        const cur = overrides[g] || 'proxy';
+        const hasSourceTarget = sourceTargets.has(g);
+        const groupOptions = hasSourceTarget
+          ? [['source', t('rulegroups.targetSource')], ...opts]
+          : opts;
+        const cur = overrides[g] || (hasSourceTarget ? 'source' : 'proxy');
         const div = document.createElement('div');
         div.className = 'sub-item';
-        const sel = opts
+        const sel = groupOptions
           .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
           .join('');
         div.innerHTML = `
@@ -166,7 +188,7 @@
         sel.addEventListener('change', async () => {
           const next = { ...(info.overrides || {}) };
           const g = sel.dataset.group;
-          if (sel.value === 'proxy') delete next[g]; // proxy is the default; keep the map small
+          if (sel.value === 'source') delete next[g];
           else next[g] = sel.value;
           sel.disabled = true;
           try {
@@ -302,6 +324,7 @@
   App.loadRules = loadRules;
   App.loadLocalRules = loadLocalRules;
   App.loadRuleGroups = loadRuleGroups;
+  App.refreshRuleGroupLabels = refreshRuleGroupLabels;
   App.ensureRulesLoaded = () => loadRules({ force: false });
   App.ensureLocalRulesLoaded = () => loadLocalRules({ force: false });
   App.ensureRuleGroupsLoaded = () => loadRuleGroups({ force: false });

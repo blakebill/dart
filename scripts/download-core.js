@@ -24,10 +24,13 @@ const https = require('https');
 const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 const { URL } = require('url');
+const { assetSha256, sha256File, verifyFileSha256 } = require('../src/main/integrity');
 
 const BIN_DIR = path.join(__dirname, '..', 'bin');
 const SINGBOX_DIR = path.join(BIN_DIR, 'singbox');
 const MIHOMO_DIR = path.join(BIN_DIR, 'mihomo');
+const DART_SINGBOX_REPO = 'blakebill/sing-box';
+const DART_MIHOMO_REPO = 'blakebill/mihomo';
 
 function requestHeaders(extra = {}) {
   const headers = { 'User-Agent': 'dart-build', ...extra };
@@ -101,7 +104,7 @@ async function downloadFirst(urls, dest, validate) {
     console.log('Downloading', url);
     try {
       await download(url, dest);
-      if (!validate || validate(dest)) return url;
+      if (!validate || await validate(dest)) return url;
       throw new Error('downloaded file failed validation');
     } catch (e) {
       lastErr = e;
@@ -126,8 +129,9 @@ function detectArch() {
   return process.arch === 'arm64' ? 'arm64' : 'amd64';
 }
 
-async function release(repo, versionEnv) {
-  const version = (process.env[versionEnv] || '').trim();
+async function release(repo, versionEnv, normalizeVersion = (value) => value) {
+  const requestedVersion = (process.env[versionEnv] || '').trim();
+  const version = requestedVersion ? normalizeVersion(requestedVersion.replace(/^v/, '')) : '';
   if (!version) {
     console.log(`Resolving latest ${repo} release...`);
     return getJson(`https://api.github.com/repos/${repo}/releases/latest`);
@@ -230,12 +234,12 @@ function validGeo(file) {
   }
 }
 
-function geoDataUrls(repo, file) {
+function geoDataUrls(repo, file, ref = 'rule-set') {
   return [
-    `https://raw.githubusercontent.com/SagerNet/${repo}/rule-set/${file}`,
-    `https://cdn.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
-    `https://fastly.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
-    `https://gcore.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
+    `https://raw.githubusercontent.com/SagerNet/${repo}/${ref}/${file}`,
+    `https://cdn.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
+    `https://fastly.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
+    `https://gcore.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
   ];
 }
 
@@ -288,17 +292,27 @@ function validateMihomoGeoData(dir, binName) {
 async function bundleSingBox(goos, arch) {
   cleanDir(SINGBOX_DIR);
   const binName = goos === 'windows' ? 'sing-box.exe' : 'sing-box';
-  const rel = await release('SagerNet/sing-box', 'SINGBOX_VERSION');
+  const rel = await release(DART_SINGBOX_REPO, 'SINGBOX_VERSION', (version) =>
+    /-dart\.\d+$/.test(version) ? version : `${version}-dart.1`
+  );
   const tag = rel.tag_name;
   if (!tag) throw new Error('could not resolve sing-box release tag');
   const ver = String(tag).replace(/^v/, '');
   const ext = goos === 'windows' ? 'zip' : 'tar.gz';
   const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
   const archivePath = path.join(SINGBOX_DIR, fileName);
-  const url = `https://github.com/SagerNet/sing-box/releases/download/v${ver}/${fileName}`;
+  const releaseAsset = (rel.assets || []).find((asset) => asset.name === fileName);
+  if (!releaseAsset || !releaseAsset.browser_download_url) {
+    throw new Error('sing-box release does not contain ' + fileName);
+  }
+  const url = releaseAsset.browser_download_url;
+  const digest = assetSha256(releaseAsset);
+  if (!digest) throw new Error('sing-box release asset has no SHA-256 digest: ' + fileName);
 
   console.log('Downloading sing-box core:', url);
   await download(url, archivePath);
+  await verifyFileSha256(archivePath, digest, fileName);
+  console.log('Verified sing-box SHA-256:', digest);
   console.log('Extracting sing-box...');
   if (goos === 'windows') extractZip(archivePath, SINGBOX_DIR);
   else extractTarGz(archivePath, SINGBOX_DIR);
@@ -323,21 +337,48 @@ async function bundleSingBox(goos, arch) {
     { file: 'geosite-cn.srs', repo: 'sing-geosite' },
   ];
   const meta = {};
+  const dataComponents = [];
   for (const rs of ruleSets) {
+    const commitInfo = await getJson(`https://api.github.com/repos/SagerNet/${rs.repo}/commits/rule-set`);
+    const commit = String(commitInfo.sha || '');
+    if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error('could not pin SagerNet/' + rs.repo + ' rule-set commit');
     const dest = path.join(SINGBOX_DIR, rs.file);
-    await downloadFirst(geoDataUrls(rs.repo, rs.file), dest, validSrs);
+    await downloadFirst(geoDataUrls(rs.repo, rs.file, commit), dest, validSrs);
+    const fileDigest = await sha256File(dest);
     meta[rs.file] = { updatedAt: Date.now() };
+    dataComponents.push({
+      type: 'data',
+      name: rs.repo,
+      version: commit,
+      repository: `https://github.com/SagerNet/${rs.repo}`,
+      license: 'GPL-3.0-or-later',
+      asset: rs.file,
+      assetSha256: fileDigest,
+      binaryPath: `singbox/${rs.file}`,
+    });
   }
   fs.writeFileSync(path.join(SINGBOX_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
   console.log('sing-box bundle ready in', SINGBOX_DIR);
+  return [{
+    type: 'application',
+    name: 'sing-box',
+    version: ver,
+    repository: `https://github.com/${DART_SINGBOX_REPO}`,
+    license: 'GPL-3.0-or-later',
+    asset: fileName,
+    assetSha256: digest,
+    binaryPath: `singbox/${binName}`,
+  }, ...dataComponents];
 }
 
 function mihomoAsset(rel, goos, arch) {
   const ext = goos === 'windows' ? 'zip' : 'gz';
   const assets = rel.assets || [];
   const candidates = assets
-    .map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }))
+    .map((a) => ({ name: a.name || '', url: a.browser_download_url || '', sha256: assetSha256(a) }))
     .filter((a) =>
+      path.basename(a.name) === a.name &&
+      !/[\\/]/.test(a.name) &&
       /mihomo/i.test(a.name) &&
       a.name.toLowerCase().includes(goos) &&
       a.name.toLowerCase().includes(arch) &&
@@ -348,19 +389,22 @@ function mihomoAsset(rel, goos, arch) {
   if (candidates[0]) return candidates[0];
   const tag = String(rel.tag_name || '').replace(/^v/, '');
   const name = `mihomo-${goos}-${arch}-v${tag}.${ext}`;
-  return { name, url: `https://github.com/MetaCubeX/mihomo/releases/download/v${tag}/${name}` };
+  return { name, url: `https://github.com/${DART_MIHOMO_REPO}/releases/download/v${tag}/${name}`, sha256: null };
 }
 
 async function bundleMihomo(goos, arch) {
   cleanDir(MIHOMO_DIR);
   const binName = goos === 'windows' ? 'mihomo.exe' : 'mihomo';
-  const rel = await release('MetaCubeX/mihomo', 'MIHOMO_VERSION');
+  const rel = await release(DART_MIHOMO_REPO, 'MIHOMO_VERSION');
   if (!rel.tag_name) throw new Error('could not resolve mihomo release tag');
   const asset = mihomoAsset(rel, goos, arch);
   const archivePath = path.join(MIHOMO_DIR, asset.name);
+  if (!asset.sha256) throw new Error('mihomo release asset has no SHA-256 digest: ' + asset.name);
 
   console.log('Downloading mihomo core:', asset.url);
   await download(asset.url, archivePath);
+  await verifyFileSha256(archivePath, asset.sha256, asset.name);
+  console.log('Verified mihomo SHA-256:', asset.sha256);
   console.log('Extracting mihomo...');
   if (/\.gz$/i.test(asset.name) && !/\.tar\.gz$/i.test(asset.name)) {
     const data = zlib.gunzipSync(fs.readFileSync(archivePath));
@@ -389,22 +433,75 @@ async function bundleMihomo(goos, arch) {
   }
   fs.unlinkSync(archivePath);
 
+  const geoRelease = await getJson('https://api.github.com/repos/MetaCubeX/meta-rules-dat/releases/latest');
+  if (!geoRelease.tag_name) throw new Error('could not resolve meta-rules-dat release tag');
   const meta = {};
+  const dataComponents = [];
   for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
-    await downloadFirst(mihomoGeoDataUrls(file), path.join(MIHOMO_DIR, file), validGeo);
+    const geoAsset = (geoRelease.assets || []).find((candidate) => candidate.name === file);
+    const geoDigest = assetSha256(geoAsset);
+    if (!geoAsset || !geoAsset.browser_download_url || !geoDigest) {
+      throw new Error('meta-rules-dat release has no verifiable asset: ' + file);
+    }
+    await downloadFirst(
+      [geoAsset.browser_download_url, ...mihomoGeoDataUrls(file).slice(1)],
+      path.join(MIHOMO_DIR, file),
+      async (downloaded) => {
+        if (!validGeo(downloaded)) return false;
+        await verifyFileSha256(downloaded, geoDigest, file);
+        return true;
+      }
+    );
     meta[file] = { updatedAt: Date.now() };
+    dataComponents.push({
+      type: 'data',
+      name: `meta-rules-dat-${path.parse(file).name}`,
+      version: String(geoRelease.tag_name).replace(/^v/, ''),
+      repository: 'https://github.com/MetaCubeX/meta-rules-dat',
+      license: 'GPL-3.0-only',
+      asset: file,
+      assetSha256: geoDigest,
+      binaryPath: `mihomo/${file}`,
+    });
   }
   validateMihomoGeoData(MIHOMO_DIR, binName);
   fs.writeFileSync(path.join(MIHOMO_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
   console.log('mihomo bundle ready in', MIHOMO_DIR);
+  return [{
+    type: 'application',
+    name: 'mihomo',
+    version: String(rel.tag_name).replace(/^v/, ''),
+    repository: `https://github.com/${DART_MIHOMO_REPO}`,
+    license: 'GPL-3.0-only',
+    asset: asset.name,
+    assetSha256: asset.sha256,
+    binaryPath: `mihomo/${binName}`,
+  }, ...dataComponents];
 }
 
 async function main() {
   const goos = detectOs();
   const arch = detectArch();
   fs.mkdirSync(BIN_DIR, { recursive: true });
-  await bundleSingBox(goos, arch);
-  await bundleMihomo(goos, arch);
+  const components = [
+    await bundleSingBox(goos, arch),
+    await bundleMihomo(goos, arch),
+  ].flat();
+  const files = [];
+  for (const folder of ['singbox', 'mihomo']) {
+    const dir = path.join(BIN_DIR, folder);
+    for (const name of fs.readdirSync(dir).sort()) {
+      const file = path.join(dir, name);
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) continue;
+      files.push({ path: `${folder}/${name}`, size: stat.size, sha256: await sha256File(file) });
+    }
+  }
+  fs.writeFileSync(
+    path.join(BIN_DIR, 'manifest.json'),
+    JSON.stringify({ schemaVersion: 1, components, files }, null, 2) + '\n',
+    'utf-8'
+  );
   console.log('Bundled cores and GeoData in', BIN_DIR);
 }
 

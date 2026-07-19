@@ -6,6 +6,7 @@ const { buildMihomoConfig, buildSingboxConfig } = require('./converter');
 const { assetSha256 } = require('./integrity');
 
 const DART_SINGBOX_REPO = 'blakebill/sing-box';
+const DART_MIHOMO_REPO = 'blakebill/mihomo';
 
 function cleanReleaseAsset(asset) {
   if (!asset) return null;
@@ -136,7 +137,7 @@ const adapters = {
     configFile: 'config.yaml',
     configExtension: '.yaml',
     configFormat: 'YAML',
-    repo: 'MetaCubeX/mihomo',
+    repo: DART_MIHOMO_REPO,
     supportsBinaryRuleSets: false,
     supportsDynamicRuleData: false,
     supportsLiveRuleInspection: true,
@@ -242,7 +243,7 @@ const adapters = {
       const fileName = `mihomo-${goos}-${arch}-v${version}.${ext}`;
       return {
         fileName,
-        url: `https://github.com/MetaCubeX/mihomo/releases/download/v${version}/${fileName}`,
+        url: `https://github.com/${DART_MIHOMO_REPO}/releases/download/v${version}/${fileName}`,
         sha256: null,
       };
     },

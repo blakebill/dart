@@ -19,12 +19,32 @@
     content.innerHTML = html;
     applyI18n();
     if (App.enhanceSelects) App.enhanceSelects(content);
+    content.querySelectorAll('.tool-result, [data-dialog-status]').forEach((region) => {
+      region.setAttribute('role', 'status');
+      region.setAttribute('aria-live', 'polite');
+      region.setAttribute('aria-atomic', 'false');
+    });
+    const dialogWindow = document.querySelector('.native-dialog-window');
+    if (dialogWindow) dialogWindow.setAttribute('aria-busy', 'false');
+    requestAnimationFrame(() => focusInitial(dialogWindow));
     if (api.dialogViewReady) {
       requestAnimationFrame(() => api.dialogViewReady().catch(() => {}));
     }
     content.querySelectorAll('[data-dialog-close]').forEach((button) => {
       button.addEventListener('click', close);
     });
+  }
+
+  function focusableElements(root = document) {
+    return Array.from(root.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+      'textarea:not([disabled]), [role="combobox"]:not([aria-disabled="true"]), ' +
+      'a[href], [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => !element.hidden && element.offsetParent !== null && !element.closest('[hidden]'));
+  }
+
+  function focusInitial(dialogWindow) {
+    if (dialogWindow) dialogWindow.focus({ preventScroll: true });
   }
 
   function footer(buttons = '') {
@@ -56,14 +76,19 @@
   async function runBusy(button, busyKey, operation) {
     const previous = button.textContent;
     button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    const dialogWindow = document.querySelector('.native-dialog-window');
+    if (dialogWindow) dialogWindow.setAttribute('aria-busy', 'true');
     if (busyKey) button.textContent = t(busyKey);
     try {
       return await operation();
     } finally {
       if (button.isConnected) {
         button.disabled = false;
+        button.removeAttribute('aria-busy');
         button.textContent = previous;
       }
+      if (dialogWindow) dialogWindow.setAttribute('aria-busy', 'false');
     }
   }
 
@@ -100,6 +125,7 @@
     resultRow,
     emptyResult,
     showFailure,
+    focusableElements,
     call,
   };
 })();

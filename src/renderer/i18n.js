@@ -15,6 +15,7 @@ const DICT = {
     'window.maximize': '最大化',
     'window.restore': '还原',
     'window.close': '关闭',
+    'nav.label': '主要页面',
     // nav
     'nav.dashboard': '📊 概览',
     'nav.subs': '📡 配置',
@@ -50,6 +51,7 @@ const DICT = {
     'dash.noDelay': '未测速',
     'dash.needRunning': '内核未运行',
     'dash.traffic': '实时流量',
+    'dash.trafficChartLabel': '最近 60 秒的流量趋势；当前上传和下载速度显示在图表上方。',
     'dash.sessionDown': '会话 ↓',
     'dash.sessionUp': '会话 ↑',
     'dash.up': '上传',
@@ -346,6 +348,7 @@ const DICT = {
     'settings.geoHint': '当前运行内核对应的 GeoData 文件状态、上次更新时间和大小。',
     'settings.updateGeo': '更新 GeoData',
     'settings.updatingGeo': '更新中...',
+    'settings.downloadProgress': '下载进度',
     'settings.geoUpdated': 'GeoData 已更新',
     'settings.general': '常规',
     'settings.language': '界面语言',
@@ -360,7 +363,7 @@ const DICT = {
     'settings.ipv6': '启用 IPv6',
     'settings.builtinRules': '使用内置规则（忽略订阅自带规则）',
     'settings.testUrl': '测速地址',
-    'settings.testUrlPh': '如 https://www.gstatic.com/generate_204',
+    'settings.testUrlPh': '如 http://www.gstatic.com/generate_204',
     'settings.testConcurrency': '测速并发数（全部测速，1–32）',
     'settings.save': '保存设置',
     'settings.check': '校验当前配置',
@@ -415,6 +418,7 @@ const DICT = {
     'uwp.rowHint': '让 Edge、商店应用等 UWP 程序也能走本地代理',
     'uwp.hint': 'UWP/商店应用默认被禁止访问 127.0.0.1，无法使用本地代理。勾选需要豁免的应用后点击应用；需要管理员权限时会自动请求。',
     'uwp.searchPh': '搜索应用...',
+    'uwp.scopeLabel': '应用范围',
     'uwp.scopeAll': '全部',
     'uwp.scopeUser': '用户应用',
     'uwp.scopeSystem': '系统应用',
@@ -451,6 +455,7 @@ const DICT = {
     'window.maximize': 'Maximize',
     'window.restore': 'Restore',
     'window.close': 'Close',
+    'nav.label': 'Primary pages',
     'nav.dashboard': '📊 Dashboard',
     'nav.subs': '📡 Configs',
     'nav.nodes': '🌐 Nodes',
@@ -483,6 +488,7 @@ const DICT = {
     'dash.noDelay': 'Not tested',
     'dash.needRunning': 'Core stopped',
     'dash.traffic': 'Live Traffic',
+    'dash.trafficChartLabel': 'Traffic history for the last 60 seconds; current upload and download rates are shown above.',
     'dash.sessionDown': 'Session ↓',
     'dash.sessionUp': 'Session ↑',
     'dash.up': 'Upload',
@@ -770,6 +776,7 @@ const DICT = {
     'settings.geoHint': 'Status, last update time and size of the GeoData files used by the current runtime core.',
     'settings.updateGeo': 'Update GeoData',
     'settings.updatingGeo': 'Updating...',
+    'settings.downloadProgress': 'Download progress',
     'settings.geoUpdated': 'GeoData updated',
     'settings.general': 'General',
     'settings.language': 'Language',
@@ -784,7 +791,7 @@ const DICT = {
     'settings.ipv6': 'Enable IPv6',
     'settings.builtinRules': "Use built-in rules (ignore the config's own rules)",
     'settings.testUrl': 'Latency test URL',
-    'settings.testUrlPh': 'e.g. https://www.gstatic.com/generate_204',
+    'settings.testUrlPh': 'e.g. http://www.gstatic.com/generate_204',
     'settings.testConcurrency': 'Test concurrency (Test All, 1–32)',
     'settings.save': 'Save Settings',
     'settings.check': 'Validate Current Config',
@@ -847,6 +854,7 @@ const DICT = {
     'uwp.rowHint': 'Let UWP apps (Edge, Store apps) use the local proxy',
     'uwp.hint': 'UWP / Store apps are blocked from reaching 127.0.0.1 by default and cannot use the local proxy. Check the apps to exempt, then Apply; administrator rights are requested automatically when needed.',
     'uwp.searchPh': 'Search apps...',
+    'uwp.scopeLabel': 'App scope',
     'uwp.scopeAll': 'All',
     'uwp.scopeUser': 'User apps',
     'uwp.scopeSystem': 'System apps',
@@ -869,6 +877,9 @@ let currentLang = 'zh';
 
 function setLang(lang) {
   currentLang = DICT[lang] ? lang : 'zh';
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
+  }
 }
 
 function getLang() {
@@ -889,9 +900,22 @@ function applyI18n() {
     el.textContent = t(el.getAttribute('data-i18n'));
   });
   document.querySelectorAll('[data-i18n-ph]').forEach((el) => {
-    el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph')));
+    const value = t(el.getAttribute('data-i18n-ph'));
+    el.setAttribute('placeholder', value);
+    const hasLabel = el.labels && el.labels.length > 0;
+    if (!hasLabel && !el.hasAttribute('aria-label') && !el.hasAttribute('aria-labelledby')) {
+      el.setAttribute('aria-label', value);
+    }
   });
+  document.querySelectorAll('[data-i18n-aria-label]').forEach((el) => {
+    el.setAttribute('aria-label', t(el.getAttribute('data-i18n-aria-label')));
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach((el) => {
+    el.setAttribute('title', t(el.getAttribute('data-i18n-title')));
+  });
+  document.documentElement.lang = currentLang === 'en' ? 'en' : 'zh-CN';
   document.title = t('appName');
+  window.dispatchEvent(new CustomEvent('dart-language-changed', { detail: { language: currentLang } }));
 }
 
 // DICT is exported for the i18n parity test (test/unit.test.js).

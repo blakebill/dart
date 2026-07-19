@@ -22,6 +22,10 @@ body.native-dialog-body {
   box-shadow: var(--shadow);
 }
 
+.native-dialog-window:focus {
+  outline: none;
+}
+
 :root[data-theme='light'] .native-dialog-window {
   background: rgba(255, 255, 255, 0.08);
 }
@@ -68,6 +72,11 @@ body.native-dialog-body {
 .native-dialog-close:hover {
   background: #c42b1c;
   color: #fff;
+}
+
+.native-dialog-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
 }
 
 .native-dialog-content {
@@ -220,5 +229,20 @@ body.native-dialog-body {
 @media (prefers-reduced-motion: reduce) {
   .native-dialog-close {
     transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .native-dialog-window,
+  .native-dialog-titlebar,
+  .dialog-footer {
+    border-color: ButtonBorder;
+    background: Canvas;
+    box-shadow: none;
+  }
+
+  .native-dialog-close:hover {
+    color: HighlightText;
+    background: Highlight;
   }
 }

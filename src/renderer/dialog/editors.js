@@ -14,11 +14,11 @@
     Dialog.setView(titleKey, `
       <div class="dialog-body">
         <div class="setting-row">
-          <label data-i18n="localrules.name">${escapeHtml(t('localrules.name'))}</label>
+          <label for="lrName" data-i18n="localrules.name">${escapeHtml(t('localrules.name'))}</label>
           <input id="lrName" class="input" />
         </div>
         <div class="setting-row">
-          <label data-i18n="localrules.type">${escapeHtml(t('localrules.type'))}</label>
+          <label for="lrType" data-i18n="localrules.type">${escapeHtml(t('localrules.type'))}</label>
           <select id="lrType" class="input small">
             <option value="domain">DOMAIN</option>
             <option value="domain_suffix">DOMAIN-SUFFIX</option>
@@ -28,14 +28,14 @@
           </select>
         </div>
         <div class="setting-row">
-          <label data-i18n="localrules.target">${escapeHtml(t('localrules.target'))}</label>
+          <label for="lrTarget" data-i18n="localrules.target">${escapeHtml(t('localrules.target'))}</label>
           <select id="lrTarget" class="input small">
             <option value="proxy" data-i18n="customrs.targetProxy">${escapeHtml(t('customrs.targetProxy'))}</option>
             <option value="direct" data-i18n="customrs.targetDirect">${escapeHtml(t('customrs.targetDirect'))}</option>
             <option value="reject" data-i18n="customrs.targetReject">${escapeHtml(t('customrs.targetReject'))}</option>
           </select>
         </div>
-        <label class="modal-label" data-i18n="localrules.values">${escapeHtml(t('localrules.values'))}</label>
+        <label class="modal-label" for="lrValues" data-i18n="localrules.values">${escapeHtml(t('localrules.values'))}</label>
         <textarea id="lrValues" class="textarea" data-i18n-ph="localrules.valuesPh"></textarea>
       </div>
       ${Dialog.footer(`<button id="lrSave" class="btn primary" data-i18n="localrules.save">${escapeHtml(t('localrules.save'))}</button>`)}
@@ -69,15 +69,15 @@
     Dialog.setView('customrs.editTitle', `
       <div class="dialog-body">
         <div class="setting-row">
-          <label data-i18n="customrs.namePh">${escapeHtml(t('customrs.namePh'))}</label>
+          <label for="crsEditName" data-i18n="customrs.namePh">${escapeHtml(t('customrs.namePh'))}</label>
           <input id="crsEditName" class="input" />
         </div>
         <div class="setting-row">
-          <label data-i18n="customrs.urlPh">${escapeHtml(t('customrs.urlPh'))}</label>
+          <label for="crsEditUrl" data-i18n="customrs.urlPh">${escapeHtml(t('customrs.urlPh'))}</label>
           <input id="crsEditUrl" class="input grow" />
         </div>
         <div class="setting-row">
-          <label data-i18n="localrules.target">${escapeHtml(t('localrules.target'))}</label>
+          <label for="crsEditTarget" data-i18n="localrules.target">${escapeHtml(t('localrules.target'))}</label>
           <select id="crsEditTarget" class="input small">
             <option value="proxy" data-i18n="customrs.targetProxy">${escapeHtml(t('customrs.targetProxy'))}</option>
             <option value="direct" data-i18n="customrs.targetDirect">${escapeHtml(t('customrs.targetDirect'))}</option>
@@ -85,7 +85,7 @@
           </select>
         </div>
         <div class="setting-row">
-          <label data-i18n="subs.autoUpdate">${escapeHtml(t('subs.autoUpdate'))}</label>
+          <label for="crsEditAutoUpdate" data-i18n="subs.autoUpdate">${escapeHtml(t('subs.autoUpdate'))}</label>
           <select id="crsEditAutoUpdate" class="input small">
             <option value="0" data-i18n="subs.autoUpdateOff">${escapeHtml(t('subs.autoUpdateOff'))}</option>
             <option value="60">1 h</option><option value="360">6 h</option>
@@ -94,7 +94,7 @@
           </select>
         </div>
         <div class="setting-row">
-          <label data-i18n="customrs.enabledLabel">${escapeHtml(t('customrs.enabledLabel'))}</label>
+          <label for="crsEditEnabled" data-i18n="customrs.enabledLabel">${escapeHtml(t('customrs.enabledLabel'))}</label>
           <input id="crsEditEnabled" type="checkbox" />
         </div>
       </div>
@@ -184,7 +184,7 @@
         <p class="hint" data-i18n="subs.rawHint">${escapeHtml(t('subs.rawHint'))}</p>
         <div id="rawEditorWrap" class="editor-wrap dialog-editor-wrap">
           <pre id="rawHighlight" class="editor-highlight" aria-hidden="true"></pre>
-          <textarea id="rawContent" class="textarea raw-editor" spellcheck="false"></textarea>
+          <textarea id="rawContent" class="textarea raw-editor" spellcheck="false" data-i18n-aria-label="subs.rawTitle"></textarea>
         </div>
       </div>
       ${Dialog.footer(`<button id="rawSave" class="btn primary" data-i18n="subs.editSave">${escapeHtml(t('subs.editSave'))}</button>`)}
@@ -244,8 +244,8 @@
       <div class="dialog-body dialog-flex">
         <p class="hint" data-i18n="convert.inputHint">${escapeHtml(t('convert.inputHint'))}</p>
         <div class="row convert-target-row">
-          <span class="modal-label" data-i18n="convert.targetLabel">${escapeHtml(t('convert.targetLabel'))}</span>
-          <div id="convertTarget" class="mode-switch convert-target" role="group">
+          <span id="convertTargetLabel" class="modal-label" data-i18n="convert.targetLabel">${escapeHtml(t('convert.targetLabel'))}</span>
+          <div id="convertTarget" class="mode-switch convert-target" role="group" aria-labelledby="convertTargetLabel">
             <button class="btn primary" data-convert-target="auto" data-i18n="convert.targetAuto">${escapeHtml(t('convert.targetAuto'))}</button>
             <button class="btn" data-convert-target="sing-box" data-i18n="convert.targetSingbox">${escapeHtml(t('convert.targetSingbox'))}</button>
             <button class="btn" data-convert-target="clash" data-i18n="convert.targetClash">${escapeHtml(t('convert.targetClash'))}</button>
@@ -261,7 +261,7 @@
         <div class="row convert-output-head">
           <span class="modal-label"><span id="convertOutputTitle">${escapeHtml(t('convert.outputTitle'))}</span> <span id="convertMeta" class="hint"></span></span>
         </div>
-        <pre id="convertOutput" class="code dialog-convert-output"></pre>
+        <pre id="convertOutput" class="code dialog-convert-output" role="status" aria-live="polite" aria-atomic="false"></pre>
       </div>
       ${Dialog.footer()}
     `);

@@ -71,6 +71,10 @@
       st.running ? 'var(--green)' : 'var(--text-dim)');
     setText($('#dashProxy'), st.systemProxy ? t('state.on') : t('state.off'),
       st.systemProxy ? 'var(--green)' : 'var(--text-dim)');
+    const coreCard = $('#dashCoreCard');
+    const proxyCard = $('#dashProxyCard');
+    if (coreCard) coreCard.setAttribute('aria-pressed', String(!!st.running));
+    if (proxyCard) proxyCard.setAttribute('aria-pressed', String(!!st.systemProxy));
     renderDashNodeCards();
 
     const coreHint = $('#coreHint');
@@ -101,8 +105,6 @@
   function renderStatus() {
     const st = App.state.status || {};
     $('#statusDot').className = 'status-dot ' + (st.running ? 'on' : 'off');
-    // Top-left logo dot "breathes" while the core runs: a slow glow swell, not
-    // a hard on/off blink.
     const dot = document.querySelector('.logo-dot');
     if (dot) dot.classList.toggle('running', !!st.running);
     $('#statusText').textContent = st.running ? t('status.running') : t('status.stopped');
@@ -114,7 +116,11 @@
 
   function renderMode() {
     const mode = (App.state.settings && App.state.settings.clashMode) || 'rule';
-    $$('.mode-btn').forEach((b) => b.classList.toggle('primary', b.dataset.mode === mode));
+    $$('.mode-btn').forEach((button) => {
+      const active = button.dataset.mode === mode;
+      button.classList.toggle('primary', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
   }
 
   function usageLevel(pct) {
@@ -177,7 +183,7 @@
           </div>
           <span class="usage-pct">${escapeHtml(pctLabel)}</span>
         </div>
-        <div class="usage-bar usage-bar-lg"><div class="usage-fill" style="width:${st.pct}%"></div></div>
+        <div class="usage-bar usage-bar-lg" role="progressbar" aria-label="${name}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct.toFixed(1)}" aria-valuetext="${escapeHtml(usedLabel)}"><div class="usage-fill" style="width:${st.pct}%"></div></div>
         <div class="usage-featured-meta">
           <span>${escapeHtml(usedLabel)}</span>
           <span>${escapeHtml(remainLabel)}</span>
@@ -201,7 +207,7 @@
             <span class="usage-name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
             <span class="sub-meta">${escapeHtml(meta)}</span>
           </div>
-          <div class="usage-bar"><div class="usage-fill" style="width:${o.pct}%"></div></div>
+          <div class="usage-bar" role="progressbar" aria-label="${escapeHtml(s.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${o.pct.toFixed(1)}" aria-valuetext="${escapeHtml(meta)}"><div class="usage-fill" style="width:${o.pct}%"></div></div>
         </div>`;
     }
     return html + '</div>';

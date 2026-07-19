@@ -19,16 +19,16 @@
     <link rel="stylesheet" href="dialog/dialog.css?v=2" />
   </head>
   <body class="native-dialog-body">
-    <main class="native-dialog-window">
+    <main class="native-dialog-window" role="dialog" aria-modal="true" aria-labelledby="dialogTitle" aria-busy="true" tabindex="-1">
       <header class="native-dialog-titlebar">
         <strong id="dialogTitle">Dart</strong>
         <button id="dialogCloseTop" class="native-dialog-close" type="button" aria-label="Close">×</button>
       </header>
       <section id="dialogContent" class="native-dialog-content">
-        <div class="dialog-loading">...</div>
+        <div class="dialog-loading" role="status">...</div>
       </section>
     </main>
-    <div id="toast" class="toast hidden"></div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
 
     <script src="i18n.js"></script>
     <script src="js/util.js"></script>

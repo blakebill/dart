@@ -8,8 +8,8 @@ const { uniqueSibling, replaceFileSync } = require('./file-utils');
 const PROFILE_FIELDS = ['nodes', 'policyGroups', 'clashRules', 'clashRuleProviders'];
 const LEGACY_PROFILE_FIELDS = [...PROFILE_FIELDS, 'raw'];
 const RULESET_FIELDS = ['rule', 'rules'];
-const LEGACY_DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
-const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
+const LEGACY_DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
+const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
 // Only the active/most recently inspected profile needs to remain hydrated.
 // Profiles can contain thousands of full node objects, so retaining a second
 // one has a much larger cost than re-reading it on the uncommon profile switch.
@@ -64,8 +64,21 @@ class Store {
     this._ruleStorageEnabled = true;
     this._preserveOrphanPayloads = fs.existsSync(this.recoveryMarker);
     this.data = this._load();
+    this._migrateSettingsDefaults();
     this._prepareSubscriptions();
     this._prepareCustomRuleSets();
+  }
+
+  _migrateSettingsDefaults() {
+    const settings = this.data.settings;
+    if (!settings || settings.testUrl !== LEGACY_DEFAULT_TEST_URL) return;
+    this.data = {
+      ...this.data,
+      settings: { ...settings, testUrl: DEFAULT_TEST_URL },
+    };
+    try { this._writeConfig(); } catch (_) {
+      // Keep the migrated value in memory if a read-only disk prevents repair.
+    }
   }
 
   _load() {
@@ -882,9 +895,7 @@ class Store {
   }
 
   getSettings() {
-    const settings = { ...DEFAULT_SETTINGS, ...(this.data.settings || {}) };
-    if (settings.testUrl === LEGACY_DEFAULT_TEST_URL) settings.testUrl = DEFAULT_TEST_URL;
-    return settings;
+    return { ...DEFAULT_SETTINGS, ...(this.data.settings || {}) };
   }
 
   updateSettings(patch) {

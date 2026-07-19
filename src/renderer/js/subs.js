@@ -39,6 +39,7 @@
       const userAgentMode = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
       const userAgentLabel = userAgentMode === 'clash' ? 'Clash' : userAgentMode;
       const userAgentTag = userAgentMode === 'auto' ? '' : ' · ' + t('subs.userAgentTag', userAgentLabel);
+      const actionLabel = (label) => escapeHtml(`${label}: ${sub.name}`);
       // Two meta lines: profile facts on top, traffic quota (when known) below.
       const trafficLine = traffic ? `<div class="sub-meta">${traffic}</div>` : '';
       div.innerHTML = `
@@ -48,11 +49,11 @@
           ${trafficLine}
         </div>
         <div class="sub-actions">
-          <button class="btn sub-activate-btn ${isActive ? 'success' : ''}" data-act="activate" data-id="${id}" ${isActive ? 'disabled' : ''}>${isActive ? t('subs.enabled') : t('subs.enable')}</button>
-          <button class="btn" data-act="update" data-id="${id}">${t('subs.update')}</button>
-          <button class="btn" data-act="edit" data-id="${id}">${t('subs.edit')}</button>
-          <button class="btn" data-act="editraw" data-id="${id}">${t('subs.editRaw')}</button>
-          <button class="btn danger" data-act="remove" data-id="${id}">${t('subs.remove')}</button>
+          <button type="button" class="btn sub-activate-btn ${isActive ? 'success' : ''}" data-act="activate" data-id="${id}" aria-label="${actionLabel(isActive ? t('subs.enabled') : t('subs.enable'))}" ${isActive ? 'disabled' : ''}>${isActive ? t('subs.enabled') : t('subs.enable')}</button>
+          <button type="button" class="btn" data-act="update" data-id="${id}" aria-label="${actionLabel(t('subs.update'))}">${t('subs.update')}</button>
+          <button type="button" class="btn" data-act="edit" data-id="${id}" aria-label="${actionLabel(t('subs.edit'))}">${t('subs.edit')}</button>
+          <button type="button" class="btn" data-act="editraw" data-id="${id}" aria-label="${actionLabel(t('subs.editRaw'))}">${t('subs.editRaw')}</button>
+          <button type="button" class="btn danger" data-act="remove" data-id="${id}" aria-label="${actionLabel(t('subs.remove'))}">${t('subs.remove')}</button>
         </div>`;
       list.appendChild(div);
     }
@@ -61,7 +62,10 @@
         const id = b.dataset.id;
         const originalText = b.textContent;
         const busy = b.dataset.act === 'activate' || b.dataset.act === 'update' || b.dataset.act === 'remove';
-        if (busy) b.disabled = true;
+        if (busy) {
+          b.disabled = true;
+          b.setAttribute('aria-busy', 'true');
+        }
         try {
           if (b.dataset.act === 'activate') {
             await call(api.setActiveSub, { id });
@@ -84,6 +88,7 @@
         } finally {
           if (b.isConnected) {
             b.disabled = false;
+            b.removeAttribute('aria-busy');
             b.textContent = originalText;
           }
         }

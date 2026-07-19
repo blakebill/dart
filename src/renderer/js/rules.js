@@ -133,6 +133,9 @@
     list.querySelectorAll('select[data-group] option').forEach((option) => {
       if (labels[option.value]) option.textContent = labels[option.value];
     });
+    list.querySelectorAll('select[data-group]').forEach((select) => {
+      select.setAttribute('aria-label', `${select.dataset.group}: ${t('localrules.target')}`);
+    });
     if (App.refreshSelects) App.refreshSelects(list);
   }
 
@@ -180,7 +183,7 @@
             <div class="sub-name">${escapeHtml(g)}</div>
           </div>
           <div class="sub-actions">
-            <select class="input small" data-group="${escapeHtml(g)}">${sel}</select>
+            <select class="input small" data-group="${escapeHtml(g)}" aria-label="${escapeHtml(g + ': ' + t('localrules.target'))}">${sel}</select>
           </div>`;
         list.appendChild(div);
       }
@@ -254,17 +257,19 @@
       const matchLabel = escapeHtml(MATCH_LABELS[it.matchType] || it.matchType || '');
       const targetLabel = escapeHtml(tgt[it.target] || it.target || '');
       const id = escapeHtml(it.id);
+      const itemName = it.name || MATCH_LABELS[it.matchType] || it.matchType || '';
+      const actionLabel = (label) => escapeHtml(`${label}: ${itemName}`);
       const div = document.createElement('div');
       div.className = 'sub-item';
       div.innerHTML = `
         <div class="sub-info">
-          <div class="sub-name">${escapeHtml(it.name || MATCH_LABELS[it.matchType] || it.matchType)}${it.enabled ? '' : ' · ⏸'}</div>
+          <div class="sub-name">${escapeHtml(itemName)}${it.enabled ? '' : ' · ⏸'}</div>
           <div class="sub-meta">${matchLabel} · ${targetLabel} · ${t('localrules.count', (it.values || []).length)}</div>
         </div>
         <div class="sub-actions">
-          <button class="btn" data-act="toggle" data-id="${id}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
-          <button class="btn" data-act="edit" data-id="${id}">${t('subs.edit')}</button>
-          <button class="btn danger" data-act="remove" data-id="${id}">${t('customrs.remove')}</button>
+          <button type="button" class="btn" data-act="toggle" data-id="${id}" aria-label="${actionLabel(it.enabled ? t('customrs.disable') : t('customrs.enable'))}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
+          <button type="button" class="btn" data-act="edit" data-id="${id}" aria-label="${actionLabel(t('subs.edit'))}">${t('subs.edit')}</button>
+          <button type="button" class="btn danger" data-act="remove" data-id="${id}" aria-label="${actionLabel(t('customrs.remove'))}">${t('customrs.remove')}</button>
         </div>`;
       list.appendChild(div);
     }
@@ -273,6 +278,7 @@
         const id = b.dataset.id;
         const act = b.dataset.act;
         b.disabled = true;
+        b.setAttribute('aria-busy', 'true');
         try {
           const items2 = await call(api.listLocalRules);
           const it = items2.find((x) => x.id === id);
@@ -288,6 +294,7 @@
           /* call() already showed the error */
         } finally {
           b.disabled = false;
+          b.removeAttribute('aria-busy');
         }
       });
     });

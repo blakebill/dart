@@ -28,12 +28,15 @@ function compareTags(a, b) {
 }
 
 /**
- * The newest stable tag from a list, or null. Prerelease tags (-alpha/-beta/
- * -rc/-pre) are skipped: jsDelivr lists every git tag, while the GitHub
- * "latest release" this stands in for never points at a prerelease.
+ * The newest stable tag from a list, or null. Dart's numbered downstream
+ * builds are stable; other prerelease tags are skipped because jsDelivr lists
+ * every git tag while the GitHub "latest release" endpoint does not.
  */
 function pickLatestTag(tags) {
-  const stable = (tags || []).filter((t) => t && !/[-+]/.test(String(t)));
+  const stable = (tags || []).filter((tag) => {
+    const value = String(tag || '');
+    return value && (!/[-+]/.test(value) || /-dart\.\d+$/.test(value));
+  });
   if (!stable.length) return null;
   return stable.reduce((best, t) => (compareTags(t, best) > 0 ? t : best));
 }
@@ -77,4 +80,15 @@ async function latestReleaseTag(repo, proxyPort = 0, log = () => {}, options = {
   return { tag, release: null, source: 'jsdelivr' };
 }
 
-module.exports = { compareTags, pickLatestTag, latestReleaseTag };
+/** Resolve one exact GitHub release. There is no tag-metadata CDN equivalent. */
+function releaseByTag(repo, tag, proxyPort = 0, log = () => {}, options = {}) {
+  return getJson(
+    `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`,
+    proxyPort,
+    log,
+    { Accept: 'application/vnd.github+json' },
+    options
+  );
+}
+
+module.exports = { compareTags, pickLatestTag, latestReleaseTag, releaseByTag };

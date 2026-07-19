@@ -51,13 +51,29 @@
 
   function toast(msg, isErr = false) {
     const t0 = App.$('#toast');
+    if (!t0) return;
     t0.textContent = msg;
     t0.classList.toggle('err', isErr);
+    t0.setAttribute('role', isErr ? 'alert' : 'status');
+    t0.setAttribute('aria-live', isErr ? 'assertive' : 'polite');
     t0.classList.remove('hidden');
     clearTimeout(toast._timer);
     toast._timer = setTimeout(() => t0.classList.add('hidden'), 3000);
   }
   App.toast = toast;
+
+  App.setProgress = function setProgress(element, ratio) {
+    if (!element) return 0;
+    const normalized = Math.max(0, Math.min(1, Number(ratio) || 0));
+    const percent = Math.round(normalized * 100);
+    const bar = element.querySelector('.bar');
+    if (bar) bar.style.width = percent + '%';
+    element.setAttribute('aria-valuemin', '0');
+    element.setAttribute('aria-valuemax', '100');
+    element.setAttribute('aria-valuenow', String(percent));
+    element.setAttribute('aria-valuetext', percent + '%');
+    return percent;
+  };
 
   App.call = async function call(fn, ...args) {
     try {

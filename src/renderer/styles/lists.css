@@ -132,6 +132,7 @@
 }
 
 .node-item {
+  position: relative;
   height: 68px;
   min-height: 68px;
   flex-direction: column;
@@ -144,6 +145,34 @@
   background: var(--surface-raised);
   cursor: pointer;
   transition: border-color var(--motion-standard), background-color var(--motion-standard), transform var(--motion-standard), box-shadow var(--motion-standard);
+}
+
+.node-select-btn {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: space-between;
+  padding: 8px 10px;
+  gap: 4px;
+  border: 0;
+  border-radius: inherit;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.node-select-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.node-item.has-test .node-bottom {
+  padding-right: 58px;
 }
 
 .node-item:first-child {
@@ -262,6 +291,10 @@
 }
 
 .node-test-btn {
+  position: absolute;
+  z-index: 2;
+  right: 10px;
+  bottom: 8px;
   min-height: 26px;
   padding-block: 2px;
 }
@@ -271,6 +304,12 @@
   color: var(--text);
   border-color: var(--border-strong);
   background: var(--surface-hover);
+}
+
+.node-test-btn:focus-visible,
+.conn-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .rule-item {

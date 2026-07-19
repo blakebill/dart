@@ -40,8 +40,9 @@ configureUserDataDir();
  *   traffic.js       Clash API /traffic stream -> renderer
  *   admin.js         Windows admin detection / elevated relaunch
  *   update.js        app release update check
- *   core-control.js  config build, core start/stop, proxy guard, Clash API
- *   ipc.js           every ipcMain handler
+ *   core-adapters.js per-core capabilities, commands, assets, and config build
+ *   core-control.js  config orchestration, core lifecycle, proxy guard, Clash API
+ *   ipc.js           domain ipcMain registration (validation lives separately)
  */
 
 // Windows keeps GPU on for Mica/DWM. Elsewhere disable hardware acceleration to
@@ -51,7 +52,7 @@ if (process.platform !== 'win32') {
 }
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
-const { SingBoxManager } = require('./singbox');
+const { CoreManager } = require('./singbox');
 const { createWindow, showMainWindow } = require('./window');
 const { createTray } = require('./tray');
 const { stopTrafficStream } = require('./traffic');
@@ -154,7 +155,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     state.store = new Store(app.getPath('userData'));
     const settings = state.store.getSettings();
-    state.singbox = new SingBoxManager({
+    state.singbox = new CoreManager({
       resourcesDir: resourcesBinDir,
       runtimeDir,
       coreType: settings.coreType,

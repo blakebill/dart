@@ -60,14 +60,16 @@
 
   $('#checkUpdateBtn').addEventListener('click', () => runUpdateCheck(false));
   if (api && api.onDownloadProgress) api.onDownloadProgress((progress) => {
-    $('#downloadProgress .bar').style.width = Math.round(progress * 100) + '%';
+    App.setProgress($('#downloadProgress'), progress);
   });
   $('#downloadUpdateBtn').addEventListener('click', async () => {
     const button = $('#downloadUpdateBtn');
     const progress = $('#downloadProgress');
     button.disabled = true;
     button.textContent = t('about.downloading');
+    button.setAttribute('aria-busy', 'true');
     progress.classList.remove('hidden');
+    App.setProgress(progress, 0);
     try {
       await api.downloadUpdate();
       toast(t('about.installing'));
@@ -76,6 +78,7 @@
       if (latestUpdateUrl) api.openExternal(latestUpdateUrl).catch(() => {});
     } finally {
       button.disabled = false;
+      button.removeAttribute('aria-busy');
       button.textContent = t('about.download');
       setTimeout(() => progress.classList.add('hidden'), 1500);
     }

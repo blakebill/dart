@@ -20,12 +20,14 @@
       return null;
     }
     button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
     try {
       App.commitSettings(await call(api.updateSettings, patch));
       toast(t('settings.saved'));
       return patch;
     } finally {
       button.disabled = false;
+      button.removeAttribute('aria-busy');
     }
   }
 

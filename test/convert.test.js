@@ -305,6 +305,8 @@ test('full Clash -> sing-box config', () => {
   assert.ok(types.includes('selector'));
   assert.ok(types.includes('urltest'));
   assert.ok(config.outbounds.some((o) => o.tag === '🛟 Fallback' && o.type === 'urltest'));
+  assert.ok(config.outbounds.some((o) => o.tag === '🧠 Smart' && o.type === 'selector'));
+  assert.ok(config.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('🧠 Smart'));
   assert.ok(config.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('🛟 Fallback'));
   assert.ok(types.includes('direct'));
   assert.ok(!types.includes('block'), 'block outbound removed in 1.12+');
@@ -369,7 +371,11 @@ test('full config for Mihomo keeps Clash semantics', () => {
   assert.strictEqual(cfg['geodata-mode'], true);
   assert.strictEqual(cfg['geodata-loader'], 'memconservative');
   assert.strictEqual(cfg.proxies.length, 3);
-  assert.deepStrictEqual(cfg['proxy-groups'][0].proxies.slice(0, 3), ['US-ss', '♻️ Auto', '🛟 Fallback']);
+  assert.deepStrictEqual(
+    cfg['proxy-groups'][0].proxies.slice(0, 4),
+    ['US-ss', '♻️ Auto', '🧠 Smart', '🛟 Fallback']
+  );
+  assert.ok(cfg['proxy-groups'].some((group) => group.name === '🧠 Smart' && group.type === 'select'));
   assert.ok(cfg['proxy-groups'].some((group) => group.name === '🛟 Fallback' && group.type === 'fallback'));
   assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
   assert.ok(cfg.rules.includes('DOMAIN,example.cn,DIRECT'));
@@ -428,8 +434,9 @@ test('subscription node names are unique and cannot shadow strategy groups', () 
     'trojan://p@a.com:443#dup',
     'trojan://p@b.com:443#dup',
     'trojan://p@c.com:443#%E2%99%BB%EF%B8%8F%20Auto',
+    'trojan://p@d.com:443#%F0%9F%A7%A0%20Smart',
   ].join('\n'));
-  assert.deepStrictEqual(res.nodes.map((node) => node.name), ['dup', 'dup 2', '♻️ Auto 2']);
+  assert.deepStrictEqual(res.nodes.map((node) => node.name), ['dup', 'dup 2', '♻️ Auto 2', '🧠 Smart 2']);
 });
 
 test('TUN inbound', () => {
@@ -489,6 +496,14 @@ test('custom latency URL is used by both cores health-check groups', () => {
   assert.ok(singbox.outbounds.filter((outbound) => outbound.type === 'urltest').every((outbound) => outbound.url === testUrl));
   const mihomo = buildMihomoConfig([node], { testUrl });
   assert.ok(mihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type)).every((group) => group.url === testUrl));
+
+  const defaultUrl = 'http://www.gstatic.com/generate_204';
+  const defaultSingbox = buildSingboxConfig([node]);
+  assert.ok(defaultSingbox.outbounds.filter((outbound) => outbound.type === 'urltest')
+    .every((outbound) => outbound.url === defaultUrl));
+  const defaultMihomo = buildMihomoConfig([node]);
+  assert.ok(defaultMihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type))
+    .every((group) => group.url === defaultUrl));
 });
 
 test('Auto groups actively track lower HTTP RTT without a wide sticky margin', () => {
@@ -515,6 +530,27 @@ test('Auto groups actively track lower HTTP RTT without a wide sticky margin', (
   assert.strictEqual(mihomoHeadlessAuto.lazy, true);
   assert.strictEqual(mihomoHeadlessAuto.timeout, 5000);
   assert.strictEqual(mihomoHeadlessAuto['max-failed-times'], 2);
+});
+
+test('Smart groups are app-managed selectors with a headless URL-test fallback', () => {
+  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
+  const singbox = buildSingboxConfig([node]);
+  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
+  assert.strictEqual(singboxSmart.type, 'selector');
+  assert.deepStrictEqual(singboxSmart.outbounds, ['n']);
+  const singboxHeadless = buildSingboxConfig([node], { enableClashApi: false })
+    .outbounds.find((outbound) => outbound.tag === '🧠 Smart');
+  assert.strictEqual(singboxHeadless.type, 'urltest');
+  assert.strictEqual(singboxHeadless.tolerance, 50);
+
+  const mihomo = buildMihomoConfig([node]);
+  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
+  assert.strictEqual(mihomoSmart.type, 'select');
+  assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
+  const mihomoHeadless = buildMihomoConfig([node], { enableClashApi: false })
+    ['proxy-groups'].find((group) => group.name === '🧠 Smart');
+  assert.strictEqual(mihomoHeadless.type, 'url-test');
+  assert.strictEqual(mihomoHeadless.tolerance, 50);
 });
 
 test('interface binding only in TUN mode (VPN/WireGuard coexistence)', () => {
@@ -1087,7 +1123,7 @@ test('large Mihomo proxy groups are deduplicated in linear time', () => {
   }));
   const started = Date.now();
   const config = buildMihomoConfig(nodes, { hasGeoData: false });
-  assert.strictEqual(config['proxy-groups'][0].proxies.length, nodes.length + 3);
+  assert.strictEqual(config['proxy-groups'][0].proxies.length, nodes.length + 4);
   assert.ok(Date.now() - started < 1500, 'Mihomo proxy-group construction regressed to quadratic time');
 });
 

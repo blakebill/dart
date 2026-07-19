@@ -39,7 +39,24 @@
 
   $('#dialogCloseTop').addEventListener('click', Dialog.close);
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') Dialog.close();
+    if (event.key === 'Escape' && !event.defaultPrevented) {
+      event.preventDefault();
+      Dialog.close();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const dialogWindow = document.querySelector('.native-dialog-window');
+    const focusable = Dialog.focusableElements(dialogWindow);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || !dialogWindow.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   });
 
   let initialization = null;

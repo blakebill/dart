@@ -13,7 +13,7 @@ const MAX_PROFILE_EDIT_FORMAT_BYTES = 4 * 1024 * 1024;
 const USER_INFO_FIELDS = new Set(['upload', 'download', 'total', 'expire']);
 
 const RESERVED_NODE_NAMES = new Set([
-  '🚀 Proxy', '♻️ Auto', '🛟 Fallback',
+  '🚀 Proxy', '♻️ Auto', '🧠 Smart', '🛟 Fallback',
   'direct', 'DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL',
 ]);
 

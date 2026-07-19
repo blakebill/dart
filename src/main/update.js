@@ -1,7 +1,9 @@
 'use strict';
 
 const fs = require('fs');
+const fetch = require('./fetch');
 const github = require('./github');
+const { assetSha256, parseSha256Sums, verifyFileSha256 } = require('./integrity');
 
 /** App release update check against the project's GitHub releases. */
 
@@ -54,8 +56,10 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}, options = {})
     const { tag, release, source } = await github.latestReleaseTag(UPDATE_REPO, proxyPort, log, options);
     const latest = tag.replace(/^v/, '');
     const expectedName = installerName(latest);
-    const assets = release ? (release.assets || []).filter((a) => /\.exe$/i.test(a.name || '')) : [];
+    const releaseAssets = release ? release.assets || [] : [];
+    const assets = releaseAssets.filter((a) => /\.exe$/i.test(a.name || ''));
     const asset = assets.find((a) => String(a.name).toLowerCase() === expectedName.toLowerCase()) || null;
+    const checksumAsset = releaseAssets.find((a) => /^SHA256SUMS(?:\.txt)?$/i.test(a.name || '')) || null;
     const assetName = asset ? asset.name : installerName(latest);
     const encodedTag = encodeURIComponent(tag);
     return {
@@ -66,6 +70,10 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}, options = {})
       assetUrl: asset ? asset.browser_download_url : `https://github.com/${UPDATE_REPO}/releases/download/${encodedTag}/${assetName}`,
       assetName,
       assetSize: asset ? asset.size : 0,
+      assetSha256: assetSha256(asset),
+      checksumUrl: checksumAsset
+        ? checksumAsset.browser_download_url
+        : `https://github.com/${UPDATE_REPO}/releases/download/${encodedTag}/SHA256SUMS.txt`,
       source, // 'github' | 'jsdelivr', for the logs
     };
   } catch (e) {
@@ -74,4 +82,24 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}, options = {})
   }
 }
 
-module.exports = { checkUpdate, installerName, validateInstaller };
+/** Verify an installer using its GitHub asset digest or the release checksum manifest. */
+async function verifyInstallerIntegrity(filePath, info, proxyPort = 0, log = () => {}, options = {}) {
+  let expected = info && info.assetSha256;
+  if (!expected && info && info.checksumUrl) {
+    const { body } = await fetch.getBufferWithFallback(info.checksumUrl, {
+      proxyPort,
+      log,
+      signal: options.signal,
+      maxBytes: 1024 * 1024,
+    });
+    expected = parseSha256Sums(body.toString('utf-8')).get(info.assetName);
+  }
+  if (!expected) {
+    throw new Error('release does not provide a SHA-256 digest for the installer');
+  }
+  const actual = await verifyFileSha256(filePath, expected, info.assetName || 'installer');
+  log('[gui] installer SHA-256 verified: ' + actual);
+  return actual;
+}
+
+module.exports = { checkUpdate, installerName, validateInstaller, verifyInstallerIntegrity };

@@ -3,7 +3,7 @@
 (function () {
   const App = window.App;
   const Dialog = App.Dialog;
-  const { $, toast, escapeHtml, fmtBytes, fmtDate } = App;
+  const { $, toast, escapeHtml, fmtBytes, fmtDate, setProgress } = App;
   const api = window.api;
   const { t } = window.i18n;
 
@@ -13,7 +13,7 @@
     Dialog.setView('settings.coreManageTitle', `
       <div class="dialog-body">
         <div class="setting-row">
-          <label data-i18n="settings.runningCore">${escapeHtml(t('settings.runningCore'))}</label>
+          <label for="dialogCoreType" data-i18n="settings.runningCore">${escapeHtml(t('settings.runningCore'))}</label>
           <select id="dialogCoreType" class="input small">
             <option value="sing-box">sing-box</option>
             <option value="mihomo">mihomo</option>
@@ -22,11 +22,11 @@
         <div class="setting-row">
           <div class="setting-label">
             <span data-i18n="settings.corePath">${escapeHtml(t('settings.corePath'))}</span>
-            <span id="dialogCoreStatus" class="hint"></span>
+            <span id="dialogCoreStatus" class="hint" data-dialog-status></span>
           </div>
           <button id="dialogCoreFolder" class="btn" data-i18n="settings.openCoreFolder">${escapeHtml(t('settings.openCoreFolder'))}</button>
         </div>
-        <div id="dialogProgress" class="progress dialog-progress hidden"><div class="bar"></div></div>
+        <div id="dialogProgress" class="progress dialog-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
       </div>
       ${Dialog.footer(`
         <button id="dialogCoreRestart" class="btn" data-i18n="dash.restartCore">${escapeHtml(t('dash.restartCore'))}</button>
@@ -64,8 +64,7 @@
     await refreshStatus();
 
     const removeProgress = api.onDownloadProgress((progress) => {
-      const bar = $('#dialogProgress .bar');
-      if (bar) bar.style.width = Math.round(progress * 100) + '%';
+      setProgress($('#dialogProgress'), progress);
     });
     window.addEventListener('beforeunload', removeProgress, { once: true });
 
@@ -89,7 +88,7 @@
     Dialog.bind('#dialogCoreUpdate', 'click', async () => {
       const progress = $('#dialogProgress');
       progress.classList.remove('hidden');
-      $('#dialogProgress .bar').style.width = '0%';
+      setProgress(progress, 0);
       try {
         await Dialog.runBusy($('#dialogCoreUpdate'), 'settings.updatingCore', async () => {
           const coreType = $('#dialogCoreType').value;
@@ -110,7 +109,7 @@
       <div class="dialog-body dialog-flex">
         <p class="hint" data-i18n="settings.geoHint">${escapeHtml(t('settings.geoHint'))}</p>
         <div id="dialogGeoList" class="rule-list dialog-result"></div>
-        <div id="dialogProgress" class="progress dialog-progress hidden"><div class="bar"></div></div>
+        <div id="dialogProgress" class="progress dialog-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
       </div>
       ${Dialog.footer(`<button id="dialogGeoUpdate" class="btn primary" data-i18n="settings.updateGeo">${escapeHtml(t('settings.updateGeo'))}</button>`)}
     `);
@@ -151,14 +150,13 @@
 
     await reload();
     const removeProgress = api.onDownloadProgress((progress) => {
-      const bar = $('#dialogProgress .bar');
-      if (bar) bar.style.width = Math.round(progress * 100) + '%';
+      setProgress($('#dialogProgress'), progress);
     });
     window.addEventListener('beforeunload', removeProgress, { once: true });
     Dialog.bind('#dialogGeoUpdate', 'click', async () => {
       const progress = $('#dialogProgress');
       progress.classList.remove('hidden');
-      $('#dialogProgress .bar').style.width = '0%';
+      setProgress(progress, 0);
       try {
         await Dialog.runBusy($('#dialogGeoUpdate'), 'settings.updatingGeo', async () => {
           await Dialog.call(api.updateGeoData);
@@ -179,18 +177,20 @@
       <div class="dialog-body dialog-flex">
         <p class="hint" data-i18n="uwp.hint">${escapeHtml(t('uwp.hint'))}</p>
         <div class="row uwp-toolbar dialog-commandbar">
+          <label class="sr-only" for="dialogUwpScope" data-i18n="uwp.scopeLabel">${escapeHtml(t('uwp.scopeLabel'))}</label>
           <select id="dialogUwpScope" class="input small">
             <option value="all" data-i18n="uwp.scopeAll">${escapeHtml(t('uwp.scopeAll'))}</option>
             <option value="user" data-i18n="uwp.scopeUser">${escapeHtml(t('uwp.scopeUser'))}</option>
             <option value="system" data-i18n="uwp.scopeSystem">${escapeHtml(t('uwp.scopeSystem'))}</option>
           </select>
+          <label class="sr-only" for="dialogUwpFilter" data-i18n="uwp.searchPh">${escapeHtml(t('uwp.searchPh'))}</label>
           <input id="dialogUwpFilter" class="input grow" data-i18n-ph="uwp.searchPh" />
           <button id="dialogUwpReload" class="btn" data-i18n="uwp.reload">${escapeHtml(t('uwp.reload'))}</button>
         </div>
         <div class="row uwp-selection-row">
           <button id="dialogUwpSelectAll" class="btn" data-i18n="uwp.selectAll">${escapeHtml(t('uwp.selectAll'))}</button>
           <button id="dialogUwpInvert" class="btn" data-i18n="uwp.invert">${escapeHtml(t('uwp.invert'))}</button>
-          <span id="dialogUwpStatus" class="hint grow"></span>
+          <span id="dialogUwpStatus" class="hint grow" data-dialog-status></span>
         </div>
         <div id="dialogUwpList" class="uwp-list dialog-uwp-list"></div>
       </div>

@@ -157,22 +157,45 @@
 
   function showTab(tab) {
     const btn = document.querySelector(`.nav-item[data-tab="${tab}"]`);
-    if (!btn) return;
-    if (!btn.classList.contains('active')) {
-      $$('.nav-item').forEach((b) => b.classList.remove('active'));
-      $$('.tab').forEach((el) => el.classList.remove('active'));
-      btn.classList.add('active');
-      syncTopbarTitle(btn);
-      const panel = $('#tab-' + tab);
-      if (panel) panel.classList.add('active');
-    }
+    const panel = $('#tab-' + tab);
+    if (!btn || !panel) return;
+    const previousPanel = document.querySelector('.tab.active');
+    const shouldMoveFocus = previousPanel && previousPanel !== panel && previousPanel.contains(document.activeElement);
+    $$('.nav-item').forEach((button) => {
+      const active = button === btn;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+      button.tabIndex = active ? 0 : -1;
+    });
+    $$('.tab').forEach((element) => {
+      const active = element === panel;
+      element.classList.toggle('active', active);
+      element.hidden = !active;
+    });
+    syncTopbarTitle(btn);
     syncNavIndicator(btn);
+    if (shouldMoveFocus) requestAnimationFrame(() => panel.focus({ preventScroll: true }));
     onTabShown(tab).catch((error) => App.toast(error.message || String(error), true));
   }
   App.showTab = showTab;
 
-  $$('.nav-item').forEach((btn) => {
+  const navButtons = $$('.nav-item');
+  navButtons.forEach((btn) => {
     btn.addEventListener('click', () => showTab(btn.dataset.tab));
+  });
+  nav.addEventListener('keydown', (event) => {
+    const current = event.target.closest('.nav-item');
+    if (!current) return;
+    const index = navButtons.indexOf(current);
+    let next = -1;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = (index + 1) % navButtons.length;
+    else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = (index - 1 + navButtons.length) % navButtons.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = navButtons.length - 1;
+    if (next < 0) return;
+    event.preventDefault();
+    navButtons[next].focus();
+    showTab(navButtons[next].dataset.tab);
   });
   syncNavIndicator(document.querySelector('.nav-item.active'), true);
   window.addEventListener('resize', () => {

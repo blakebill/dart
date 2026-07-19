@@ -42,12 +42,14 @@ select:hover,
   border-color: var(--border-strong);
 }
 
-.input:focus,
-.textarea:focus,
-select:focus,
-.ui-select:focus {
+.input:focus-visible,
+.textarea:focus-visible,
+select:focus-visible,
+.ui-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: 0 0 0 4px var(--focus-ring);
 }
 
 .input.small,
@@ -86,7 +88,11 @@ select[data-enhanced] {
   justify-content: space-between;
   gap: 8px;
   cursor: pointer;
+  font: inherit;
+  text-align: left;
   user-select: none;
+  appearance: none;
+  -webkit-appearance: none;
 }
 
 .ui-select-label {
@@ -116,6 +122,7 @@ select[data-enhanced] {
 .ui-select-menu {
   position: fixed;
   z-index: 1200;
+  max-width: calc(100vw - 16px);
   max-height: 280px;
   padding: 4px;
   overflow: auto;
@@ -136,13 +143,23 @@ select[data-enhanced] {
   white-space: nowrap;
 }
 
-.ui-select-opt:hover {
+.ui-select-opt:hover,
+.ui-select-opt.active {
   background: var(--surface-hover);
+}
+
+.ui-select-opt.active {
+  box-shadow: inset 2px 0 var(--accent);
 }
 
 .ui-select-opt.selected {
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+.ui-select-opt[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .btn {
@@ -230,7 +247,7 @@ button:disabled {
 .hint {
   margin-top: 8px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.6;
 }
 
@@ -282,4 +299,10 @@ input[type='checkbox']:checked {
 input[type='checkbox']:checked::after {
   background: var(--on-accent);
   transform: translateX(15px);
+}
+
+input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--focus-ring);
 }

@@ -10,6 +10,7 @@
   const VIRTUAL_NODE_ROW_HEIGHT = 78;
   const VIRTUAL_OVERSCAN = 5;
   const AUTO_GROUP = '♻️ Auto';
+  const SMART_GROUP = '🧠 Smart';
   const FALLBACK_GROUP = '🛟 Fallback';
   let nodeRows = [];
   let filteredNodeCount = 0;
@@ -20,7 +21,7 @@
   let testAllRun = null;
   const delayRequests = new Map();
 
-  let groupNow = { proxy: null, auto: null, fallback: null };
+  let groupNow = { proxy: null, auto: null, smart: null, fallback: null };
   let groupRefresh = null;
   let groupPollTimer = null;
   let currentNodeFrame = 0;
@@ -42,6 +43,7 @@
     if (!(App.state.status && App.state.status.running)) return '-';
     const selected = groupNow.proxy || App.state.selected || AUTO_GROUP;
     if (selected === AUTO_GROUP) return groupNow.auto || AUTO_GROUP;
+    if (selected === SMART_GROUP) return groupNow.smart || SMART_GROUP;
     if (selected === FALLBACK_GROUP) return groupNow.fallback || FALLBACK_GROUP;
     return selected === 'direct' ? 'DIRECT' : selected;
   }
@@ -69,7 +71,7 @@
   async function refreshGroupSelections() {
     if (groupRefresh) return groupRefresh;
     groupRefresh = (async () => {
-      let next = { proxy: null, auto: null, fallback: null };
+      let next = { proxy: null, auto: null, smart: null, fallback: null };
       if (App.state.status && App.state.status.running) {
         try { next = await api.getGroupSelections(App.currentTab === 'nodes'); } catch (_) {}
       }
@@ -77,9 +79,11 @@
       next = {
         proxy: next && next.proxy || null,
         auto: next && next.auto || null,
+        smart: next && next.smart || null,
         fallback: next && next.fallback || null,
       };
-      const changed = next.proxy !== groupNow.proxy || next.auto !== groupNow.auto || next.fallback !== groupNow.fallback;
+      const changed = next.proxy !== groupNow.proxy || next.auto !== groupNow.auto ||
+        next.smart !== groupNow.smart || next.fallback !== groupNow.fallback;
       groupNow = next;
       renderCurrentNode();
       if (changed && App.currentTab === 'nodes' && !document.hidden) renderNodes();
@@ -191,20 +195,31 @@
     // and as a marker on that node's own row.
     let tagHtml = type ? `<span class="node-tag">${escapeHtml(String(type))}</span>` : '';
     if (server && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
+    if (server && groupNow.smart && name === groupNow.smart) tagHtml += '<span class="node-tag">🧠</span>';
     if (server && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
     let metaHtml = server ? `<span class="sub-meta">${escapeHtml(String(server))}:${escapeHtml(String(port))}</span>` : '';
-    const selectedNow = name === AUTO_GROUP ? groupNow.auto : name === FALLBACK_GROUP ? groupNow.fallback : null;
+    const selectedNow = name === AUTO_GROUP
+      ? groupNow.auto
+      : name === SMART_GROUP
+        ? groupNow.smart
+        : name === FALLBACK_GROUP ? groupNow.fallback : null;
     if (!server && selectedNow) {
       metaHtml = `<span class="sub-meta">${t('nodes.autoNow', escapeHtml(selectedNow))}</span>`;
     }
-    const testHtml = server ? `<button class="node-test-btn" data-name="${escapeHtml(name)}">${t('nodes.test')}</button>` : '';
+    const safeName = escapeHtml(name);
+    const testHtml = server
+      ? `<button type="button" class="node-test-btn" data-name="${safeName}" aria-label="${escapeHtml(t('nodes.test') + ': ' + name)}">${t('nodes.test')}</button>`
+      : '';
     const activeHtml = active ? `<span class="node-active">✓ ${t('nodes.active')}</span>` : '';
-    return `<div class="node-item${active ? ' active' : ''}" data-name="${escapeHtml(name)}">
-      <div class="node-top">
-        <div class="node-identity"><span class="node-name">${escapeHtml(name)}</span>${tagHtml}</div>
+    return `<div class="node-item${active ? ' active' : ''}${server ? ' has-test' : ''}" role="listitem" data-name="${safeName}">
+      <button type="button" class="node-select-btn" data-select-name="${safeName}" aria-pressed="${String(active)}">
+      <span class="node-top">
+        <span class="node-identity"><span class="node-name">${safeName}</span>${tagHtml}</span>
         ${activeHtml}
-      </div>
-      <div class="node-bottom">${metaHtml}${delayHtml}${testHtml}</div>
+      </span>
+      <span class="node-bottom">${metaHtml}${delayHtml}</span>
+      </button>
+      ${testHtml}
     </div>`;
   }
 
@@ -262,7 +277,9 @@
     const filter = ($('#nodeFilter').value || '').toLowerCase();
     const nodes = activeNodes().filter((n) => String(n && n.name || '').toLowerCase().includes(filter));
     filteredNodeCount = nodes.length;
-    nodeRows = App.state.activeSub ? [{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes] : [];
+    nodeRows = App.state.activeSub
+      ? [{ name: AUTO_GROUP }, { name: SMART_GROUP }, { name: FALLBACK_GROUP }, ...nodes]
+      : [];
     $('#nodeCount').textContent = t('nodes.count', nodes.length);
     renderNodeWindow();
   }
@@ -273,17 +290,26 @@
       testOne(tb.dataset.name);
       return;
     }
-    const row = e.target.closest('.node-item');
-    if (row && row.dataset.name) selectNode(row.dataset.name);
+    const selectButton = e.target.closest('.node-select-btn');
+    if (selectButton && selectButton.dataset.selectName) {
+      selectNode(selectButton.dataset.selectName, document.activeElement === selectButton);
+    }
   });
 
-  async function selectNode(name) {
+  async function selectNode(name, restoreFocus = false) {
     try {
       await api.selectNode(name);
       App.state.selected = name;
       groupNow.proxy = name;
       renderNodes();
       renderCurrentNode();
+      if (restoreFocus) {
+        requestAnimationFrame(() => {
+          const button = Array.from(document.querySelectorAll('.node-select-btn'))
+            .find((candidate) => candidate.dataset.selectName === name);
+          if (button) button.focus({ preventScroll: true });
+        });
+      }
       toast(t('toast.nodeSelected', name));
     } catch (e) {
       toast(e.message || String(e), true);

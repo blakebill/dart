@@ -160,3 +160,76 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --surface: rgb(38, 38, 41);
+    --surface-raised: rgb(46, 46, 49);
+    --surface-hover: rgb(62, 62, 66);
+    --field: rgb(24, 24, 27);
+    --menu-surface: rgb(42, 42, 45);
+    --raised-filter: none;
+  }
+
+  :root[data-theme='light'] {
+    --surface: rgb(250, 250, 250);
+    --surface-raised: rgb(255, 255, 255);
+    --surface-hover: rgb(242, 242, 242);
+    --field: rgb(255, 255, 255);
+    --menu-surface: rgb(255, 255, 255);
+  }
+}
+
+@media (forced-colors: active) {
+  :root,
+  :root[data-theme='light'] {
+    --surface: Canvas;
+    --surface-raised: Canvas;
+    --surface-hover: Highlight;
+    --field: Field;
+    --menu-surface: Canvas;
+    --border: ButtonBorder;
+    --border-strong: CanvasText;
+    --text: CanvasText;
+    --text-dim: CanvasText;
+    --text-faint: GrayText;
+    --accent: Highlight;
+    --accent-hover: Highlight;
+    --accent-soft: transparent;
+    --focus-ring: transparent;
+    --green: CanvasText;
+    --red: CanvasText;
+    --yellow: CanvasText;
+    --on-accent: HighlightText;
+    --shadow: none;
+    --panel-shadow: none;
+    --raised-filter: none;
+  }
+
+  .panel,
+  .card,
+  .ui-select-menu,
+  .toast,
+  .native-dialog-window {
+    box-shadow: none;
+  }
+
+  .nav-item.active,
+  .ui-select-opt.active,
+  .ui-select-opt.selected,
+  .btn.primary {
+    color: HighlightText;
+    background: Highlight;
+  }
+
+  .nav-indicator,
+  .status-dot.on,
+  input[type='checkbox']:checked {
+    background: Highlight;
+  }
+
+  .traffic-stat .dot,
+  .usage-fill {
+    forced-color-adjust: none;
+  }
+}

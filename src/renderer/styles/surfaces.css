@@ -110,7 +110,7 @@ button.card:focus-visible {
   margin-top: auto;
   padding-top: 8px;
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .card-value.delay-good { color: var(--green); }
@@ -144,7 +144,7 @@ button.card:focus-visible {
   display: flex;
   gap: 16px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .traffic-stat {

@@ -14,6 +14,7 @@
  */
 
 const assert = require('assert');
+const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const fs = require('fs');
 const os = require('os');
@@ -277,6 +278,9 @@ async function main() {
   const stateModule = require(path.join(__dirname, '..', 'src', 'main', 'state'));
   const { state } = stateModule;
   const statusManager = state.singbox;
+  // This smoke test has no executable core. Treat generated configs as valid
+  // unless a case explicitly overrides the validator.
+  statusManager._checkConfigPath = async () => ({ output: '' });
   const statusSettings = state.store.getSettings();
   const statusCoreType = statusManager.getCoreType();
   const nextStatusCoreType = statusCoreType === 'mihomo' ? 'sing-box' : 'mihomo';
@@ -922,6 +926,7 @@ async function main() {
     isRunning: restartManager.isRunning,
     start: restartManager.start,
     stop: restartManager.stop,
+    checkConfigFor: restartManager.checkConfigFor,
     ensureSingBoxGeoData: restartManager.ensureSingBoxGeoData,
     updateGeoData: restartManager.updateGeoData,
   };
@@ -932,8 +937,10 @@ async function main() {
   const firstStartGate = new Promise((resolve) => { releaseFirstStart = resolve; });
   const firstStartSeen = new Promise((resolve) => { announceFirstStart = resolve; });
   const startedConfigs = [];
+  let restartStops = 0;
   restartManager.isRunning = () => fakeRunning;
-  restartManager.stop = async () => { fakeRunning = false; };
+  restartManager.stop = async () => { restartStops++; fakeRunning = false; };
+  restartManager.checkConfigFor = async () => true;
   restartManager.start = async (config) => {
     startedConfigs.push(config);
     if (startedConfigs.length === 1) {
@@ -960,11 +967,19 @@ async function main() {
     fakeRunning = true;
     restartManager.start = async () => { throw new Error('simulated start failure'); };
     await assert.rejects(core.restartIfRunning(), /simulated start failure/);
+
+    fakeRunning = true;
+    const stopsBeforeInvalidConfig = restartStops;
+    restartManager.checkConfigFor = async () => { throw new Error('simulated config validation failure'); };
+    await assert.rejects(core.restartIfRunning(), /simulated config validation failure/);
+    assert.strictEqual(fakeRunning, true, 'validation failure stopped the working core');
+    assert.strictEqual(restartStops, stopsBeforeInvalidConfig, 'validation happened after stopping the core');
   } finally {
     fakeRunning = false;
     restartManager.isRunning = restartOriginals.isRunning;
     restartManager.start = restartOriginals.start;
     restartManager.stop = restartOriginals.stop;
+    restartManager.checkConfigFor = restartOriginals.checkConfigFor;
     restartManager.ensureSingBoxGeoData = restartOriginals.ensureSingBoxGeoData;
     restartManager.updateGeoData = restartOriginals.updateGeoData;
     state.store.updateSettings({
@@ -1036,11 +1051,11 @@ async function main() {
   const toClash = handlers['convert:preview'](null, { content: 'singbox-source', target: 'auto' });
   assert.strictEqual(toClash.target, 'clash');
   assert.ok(toClash.text.includes('name: Dart Proxy'));
-  assert.ok(!/[🚀♻️]/u.test(toClash.text), 'converted Clash output still contains decorative emoji');
+  assert.ok(!/[🚀♻️🧠🛟]/u.test(toClash.text), 'converted Clash output still contains decorative emoji');
   const toSingbox = handlers['convert:preview'](null, { content: 'clash-source', target: 'auto' });
   assert.strictEqual(toSingbox.target, 'sing-box');
   assert.ok(toSingbox.config.outbounds.some((outbound) => outbound.tag === 'Dart Proxy'));
-  assert.ok(!/[🚀♻️]/u.test(JSON.stringify(toSingbox.config)), 'converted sing-box output still contains decorative emoji');
+  assert.ok(!/[🚀♻️🧠🛟]/u.test(JSON.stringify(toSingbox.config)), 'converted sing-box output still contains decorative emoji');
   await assert.rejects(
     Promise.resolve().then(() => handlers['convert:preview'](null, { content: 'clash-source', target: 'invalid' })),
     /invalid conversion target/
@@ -1521,7 +1536,9 @@ async function main() {
   }
   console.log('✓ failed Mihomo block-mode rebuilds restore the previous running config');
 
+  let interruptedRequests = 0;
   http.request = (_options, callback) => {
+    interruptedRequests++;
     const request = new EventEmitter();
     request.write = () => {};
     request.end = () => {
@@ -1538,11 +1555,29 @@ async function main() {
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error('response did not settle')), 250)),
   ]);
+  const interruptedRunning = state.singbox.isRunning;
   try {
     await assert.rejects(deadline(core.clashApi('GET', '/partial')), /response aborted/);
-    await assert.rejects(deadline(core.testNodeDelay('partial')), /response aborted/);
+    const beforeDuplicateDelays = interruptedRequests;
+    const duplicateDelays = await Promise.allSettled([
+      deadline(core.testNodeDelay('coalesced-partial')),
+      deadline(core.testNodeDelay('coalesced-partial')),
+    ]);
+    assert.ok(duplicateDelays.every((result) => result.status === 'rejected'));
+    assert.ok(duplicateDelays.every((result) => /response aborted/.test(result.reason.message)));
+    assert.strictEqual(
+      interruptedRequests - beforeDuplicateDelays,
+      1,
+      'identical in-flight delay tests were not shared'
+    );
+    state.singbox.isRunning = () => true;
+    assert.deepStrictEqual(
+      await handlers['node:delay'](null, { name: 'ipc-partial' }),
+      { ok: false, error: 'delay response aborted' }
+    );
   } finally {
     http.request = originalHttpRequest;
+    state.singbox.isRunning = interruptedRunning;
   }
   console.log('✓ interrupted Clash API responses reject promptly without an unhandled stream error');
 
@@ -1620,7 +1655,13 @@ async function main() {
       html_url: 'https://example.com/release',
       assets: [
         { name: 'Unrelated.Tool.exe', browser_download_url: 'https://example.com/wrong.exe', size: 1 },
-        { name: 'Dart.Setup.0.7.8.exe', browser_download_url: 'https://example.com/right.exe', size: 2 },
+        {
+          name: 'Dart.Setup.0.7.8.exe',
+          browser_download_url: 'https://example.com/right.exe',
+          size: 2,
+          digest: 'sha256:' + 'a'.repeat(64),
+        },
+        { name: 'SHA256SUMS.txt', browser_download_url: 'https://example.com/SHA256SUMS.txt' },
       ],
     },
   });
@@ -1628,6 +1669,25 @@ async function main() {
   github.latestReleaseTag = originalLatestReleaseTag;
   assert.strictEqual(updateInfo.assetName, 'Dart.Setup.0.7.8.exe');
   assert.strictEqual(updateInfo.assetUrl, 'https://example.com/right.exe');
+  assert.strictEqual(updateInfo.assetSha256, 'a'.repeat(64));
+  assert.strictEqual(updateInfo.checksumUrl, 'https://example.com/SHA256SUMS.txt');
+  const updatePayload = path.join(tmpDir, 'verified-update.exe');
+  fs.writeFileSync(updatePayload, 'verified installer payload');
+  const updateDigest = crypto.createHash('sha256').update('verified installer payload').digest('hex');
+  assert.strictEqual(
+    await appUpdate.verifyInstallerIntegrity(updatePayload, {
+      assetName: 'verified-update.exe',
+      assetSha256: updateDigest,
+    }),
+    updateDigest
+  );
+  await assert.rejects(
+    appUpdate.verifyInstallerIntegrity(updatePayload, {
+      assetName: 'verified-update.exe',
+      assetSha256: 'f'.repeat(64),
+    }),
+    /SHA-256 mismatch/
+  );
 
   github.latestReleaseTag = async () => ({ tag: '0.7.9', source: 'jsdelivr', release: null });
   const unprefixedUpdate = await appUpdate.checkUpdate('0.7.8');
@@ -1638,18 +1698,23 @@ async function main() {
   github.latestReleaseTag = originalLatestReleaseTag;
   console.log('✓ app updates select the matching Dart installer asset');
 
-  const { SingBoxManager } = require(path.join(__dirname, '..', 'src', 'main', 'singbox'));
+  const { CoreManager } = require(path.join(__dirname, '..', 'src', 'main', 'singbox'));
   const coreRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-install-'));
-  const manager = new SingBoxManager({ runtimeDir: coreRuntime, coreType: 'mihomo' });
+  const manager = new CoreManager({ runtimeDir: coreRuntime, coreType: 'mihomo' });
   const coreDir = manager.ensureCoreDir('mihomo');
   const binaryName = manager.binNameFor('mihomo');
   const selectedAsset = manager._coreAsset('1.2.3', 'linux', 'amd64', {
     assets: [
       { name: '../mihomo-linux-amd64.gz', browser_download_url: 'https://example.com/escape.gz' },
-      { name: 'mihomo-linux-amd64-v1.2.3.gz', browser_download_url: 'https://example.com/safe.gz' },
+      {
+        name: 'mihomo-linux-amd64-v1.2.3.gz',
+        browser_download_url: 'https://example.com/safe.gz',
+        digest: 'sha256:' + 'b'.repeat(64),
+      },
     ],
   }, 'mihomo');
   assert.strictEqual(selectedAsset.fileName, 'mihomo-linux-amd64-v1.2.3.gz');
+  assert.strictEqual(selectedAsset.sha256, 'b'.repeat(64));
   const staleDir = path.join(coreDir, 'mihomo-old-release');
   fs.mkdirSync(staleDir, { recursive: true });
   fs.writeFileSync(path.join(staleDir, binaryName), 'stale-binary');

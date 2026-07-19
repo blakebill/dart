@@ -7,8 +7,8 @@ const net = require('net');
 const os = require('os');
 const tls = require('tls');
 const { execFile } = require('child_process');
-const yaml = require('js-yaml');
 
+const { getCoreAdapter, listCoreAdapters } = require('./core-adapters');
 const fetch = require('./fetch');
 
 const MAX_ERROR_TEXT = 16 * 1024;
@@ -16,6 +16,7 @@ const MAX_CONFIG_PREVIEW = 180 * 1024;
 const DNS_TIMEOUT = 7000;
 const APP_PROXY_GROUP = '🚀 Proxy';
 const AUTO_PROXY_GROUP = '♻️ Auto';
+const SMART_PROXY_GROUP = '🧠 Smart';
 const FALLBACK_PROXY_GROUP = '🛟 Fallback';
 let diagnosticModeQueue = Promise.resolve();
 
@@ -180,7 +181,7 @@ async function withTemporarySelector(context, path, previous, target, operation)
 
 function usableProxySelection(group, preferred) {
   const all = Array.isArray(group && group.all) ? group.all : [];
-  const candidates = [preferred, AUTO_PROXY_GROUP, FALLBACK_PROXY_GROUP, ...all];
+  const candidates = [preferred, AUTO_PROXY_GROUP, SMART_PROXY_GROUP, FALLBACK_PROXY_GROUP, ...all];
   return candidates.find((name) =>
     typeof name === 'string' &&
     !/^direct$/i.test(name) &&
@@ -455,24 +456,7 @@ function dnsPathFor(config, settings, policy, target) {
     return { resolver: 'none', server: null, detour: null, skipped: true, confidence: 'exact' };
   }
   const direct = /^DIRECT$/i.test(policy || '') || settings.clashMode === 'direct';
-  if (settings.coreType === 'mihomo') {
-    if (!settings.enableTun || !config.dns) {
-      return { resolver: 'system', server: 'System DNS', detour: 'system', confidence: 'exact' };
-    }
-    const servers = direct ? config.dns['direct-nameserver'] : config.dns.nameserver;
-    return {
-      resolver: direct ? 'direct-nameserver' : 'nameserver',
-      server: arrayValue(servers)[0] || (direct ? settings.dnsLocal : settings.dnsRemote),
-      detour: direct ? 'DIRECT' : '🚀 Proxy',
-      confidence: 'estimated',
-    };
-  }
-  return {
-    resolver: direct ? 'local-dns' : 'proxy-dns',
-    server: direct ? settings.dnsLocal : settings.dnsRemote,
-    detour: direct ? 'direct' : '🚀 Proxy',
-    confidence: settings.clashMode === 'rule' ? 'estimated' : 'exact',
-  };
+  return getCoreAdapter(settings.coreType).dnsPath(config, settings, direct);
 }
 
 async function inspectRoute(value, context) {
@@ -498,7 +482,8 @@ async function inspectRoute(value, context) {
   // Mihomo exposes structured Clash rules. sing-box flattens route rules into
   // `DEFAULT: field=value` entries, which cannot be matched reliably; its
   // generated config below retains the original structured matcher fields.
-  if (!forcedPolicy && settings.coreType === 'mihomo' && context.state.singbox.isRunning() && settings.enableClashApi) {
+  const adapter = getCoreAdapter(settings.coreType);
+  if (!forcedPolicy && adapter.supportsLiveRuleInspection && context.state.singbox.isRunning() && settings.enableClashApi) {
     try {
       const live = await context.core.clashApi('GET', '/rules');
       if (Array.isArray(live.rules) && live.rules.length) {
@@ -510,9 +495,7 @@ async function inspectRoute(value, context) {
     }
   }
   if (!entries.length && !forcedPolicy) {
-    entries = settings.coreType === 'mihomo'
-      ? (config.rules || []).map((rule) => ({ kind: 'clash', rule }))
-      : (((config.route || {}).rules) || []).map((rule) => ({ kind: 'sing-box', rule }));
+    entries = adapter.routeEntries(config);
   }
 
   const unresolved = [];
@@ -1065,24 +1048,20 @@ function stateStatus(actual, expected) {
 }
 
 function configText(coreType, config) {
-  return coreType === 'mihomo'
-    ? yaml.dump(config, { lineWidth: -1, noRefs: true })
-    : JSON.stringify(config, null, 2);
+  return getCoreAdapter(coreType).serializeConfig(config);
 }
 
 function configSummary(coreType, config, sourceNodes, sourceRules, text) {
-  const generatedNodes = coreType === 'mihomo'
-    ? (config.proxies || []).length
-    : (config.outbounds || []).filter((item) => !['selector', 'urltest', 'direct'].includes(item.type)).length;
-  const rules = coreType === 'mihomo' ? (config.rules || []).length : (((config.route || {}).rules) || []).length;
+  const adapter = getCoreAdapter(coreType);
+  const summary = adapter.summarizeConfig(config);
   return {
-    format: coreType === 'mihomo' ? 'YAML' : 'JSON',
+    format: adapter.configFormat,
     sourceNodes,
-    generatedNodes,
-    droppedNodes: Math.max(0, sourceNodes - generatedNodes),
+    generatedNodes: summary.generatedNodes,
+    droppedNodes: Math.max(0, sourceNodes - summary.generatedNodes),
     sourceRules,
-    generatedRules: rules,
-    tun: coreType === 'mihomo' ? !!(config.tun && config.tun.enable) : (config.inbounds || []).some((item) => item.type === 'tun'),
+    generatedRules: summary.generatedRules,
+    tun: summary.tun,
     dns: !!config.dns,
     bytes: Buffer.byteLength(text),
     lines: text.split('\n').length,
@@ -1106,9 +1085,10 @@ async function checkAllConfigs(context) {
   const sourceRules = active && Array.isArray(active.clashRules) ? active.clashRules.length : 0;
   const sourceText = active && typeof active.raw === 'string' ? active.raw : '';
   const results = [];
-  for (const coreType of ['sing-box', 'mihomo']) {
+  for (const adapter of listCoreAdapters()) {
+    const coreType = adapter.id;
     try {
-      if (coreType === 'mihomo') await context.state.singbox.validateMihomoGeoData();
+      await adapter.prepareStart(context.state.singbox);
       const { config } = context.core.buildCurrentConfig(coreType);
       const text = configText(coreType, config);
       const installed = context.state.singbox.isCoreInstalled(coreType);

@@ -3,14 +3,18 @@
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
-const { app } = require('electron');
 
 const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, isWindowsAdminSync, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
-const { buildSingboxConfig, buildMihomoConfig, buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
+const { buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
 const { normalizePolicyGroups } = require('./policy-groups');
 const { geoDataUrls } = require('./singbox');
+const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
+const { ManagedAutoSelection } = require('./managed-auto-selection');
+const { SmartSelectionModel } = require('./smart-selection');
+const { OperationCoordinator } = require('./operation-coordinator');
+const { createAutoLaunchService } = require('./auto-launch');
 const crypto = require('crypto');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
@@ -20,7 +24,7 @@ const { buildDelayApiPath, selectAutoTestBatch } = require('./delay');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 /**
- * Core control: everything that drives the sing-box core — building the
+ * Core control: everything that drives the selected proxy core — building the
  * config from the active profile + settings, start/stop/restart, the system
  * proxy guard, the Clash API client, proxy-mode switching, and the
  * subscription auto-update timer.
@@ -32,82 +36,47 @@ const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16, maxFreeSock
 const MAX_CLASH_RESPONSE_BYTES = 32 * 1024 * 1024;
 const APP_PROXY_GROUP = '🚀 Proxy';
 const AUTO_PROXY_GROUP = '♻️ Auto';
+const SMART_PROXY_GROUP = '🧠 Smart';
 const MANAGED_AUTO_INTERVAL_MS = 60_000;
+const delayRequestCache = new Map();
 let tunWasActive = false;
 let tunAdaptersClean = false;
-const remoteUpdateTokens = new Map();
-let remoteUpdateEpoch = 0;
-let lifecycleClosing = false;
+const operations = new OperationCoordinator();
 let staleProxyHealPromise = null;
-let configMutationTail = Promise.resolve();
-let customRuleMutationTail = Promise.resolve();
-let managedAutoTimer = null;
-let managedAutoRun = null;
-let managedAutoGeneration = 0;
-let managedAutoCursor = 0;
-let autoSelectionRevision = 0;
-let autoSelectorTail = Promise.resolve();
 
 function assertLifecycleOpen() {
-  if (!lifecycleClosing) return;
-  const error = new Error('app is shutting down');
-  error.code = 'DART_SHUTDOWN';
-  throw error;
+  operations.assertOpen();
 }
 
 /** Serialize persisted config changes through their restart/rollback phase. */
 function queueConfigMutation(operation) {
-  const apply = () => {
-    assertLifecycleOpen();
-    return operation();
-  };
-  const task = configMutationTail.then(apply, apply);
-  configMutationTail = task.catch(() => {});
-  return task;
+  return operations.queue('config', operation);
 }
 
 /** Keep binary rule-set file snapshots ordered without blocking other downloads. */
 function queueCustomRuleMutation(operation) {
-  const apply = () => {
-    assertLifecycleOpen();
-    return operation();
-  };
-  const task = customRuleMutationTail.then(apply, apply);
-  customRuleMutationTail = task.catch(() => {});
-  return task;
-}
-
-function remoteUpdateKey(scope, id) {
-  return `${scope}:${id}`;
+  return operations.queue('custom-rules', operation);
 }
 
 /** Last-started manual update wins; background updates yield to active work. */
 function beginRemoteUpdate(scope, id, { background = false } = {}) {
-  const key = remoteUpdateKey(scope, id);
-  if (background && remoteUpdateTokens.has(key)) return null;
-  const token = Symbol(key);
-  remoteUpdateTokens.set(key, token);
-  return token;
+  return operations.beginRemote(scope, id, { background });
 }
 
 function assertRemoteUpdate(scope, id, token) {
-  if (!token || remoteUpdateTokens.get(remoteUpdateKey(scope, id)) !== token) {
-    throw new Error('a newer update superseded this request');
-  }
+  operations.assertRemote(scope, id, token);
 }
 
 function finishRemoteUpdate(scope, id, token) {
-  const key = remoteUpdateKey(scope, id);
-  if (remoteUpdateTokens.get(key) === token) remoteUpdateTokens.delete(key);
+  operations.finishRemote(scope, id, token);
 }
 
 function cancelRemoteUpdate(scope, id) {
-  remoteUpdateTokens.delete(remoteUpdateKey(scope, id));
+  operations.cancelRemote(scope, id);
 }
 
 function cancelAllRemoteUpdates() {
-  remoteUpdateEpoch += 1;
-  remoteUpdateTokens.clear();
+  operations.cancelAllRemote();
 }
 
 function responseLatch(resolve, reject) {
@@ -474,6 +443,7 @@ function customRuleSetFileName(id) {
  * custom rule-sets. Local rules come first (most specific user intent).
  */
 function collectCustomRules(coreType = 'sing-box') {
+  const adapter = getCoreAdapter(coreType);
   const extraRules = [];
   const extraRuleSets = [];
   for (const lr of state.store.get('localRules') || []) {
@@ -491,7 +461,7 @@ function collectCustomRules(coreType = 'sing-box') {
       } else if (c.rule) {
         for (const rule of splitInlineRule(c.rule)) extraRules.push(rule);
       }
-    } else if (c.kind === 'ruleset' && coreType !== 'mihomo') {
+    } else if (c.kind === 'ruleset' && adapter.supportsBinaryRuleSets) {
       // Mihomo cannot consume sing-box .srs binaries. Emitting a RULE-SET
       // matcher without a Mihomo rule-provider makes the whole config invalid.
       const p = path.join(state.singbox.coreDir('sing-box'), customRuleSetFileName(c.id));
@@ -539,7 +509,7 @@ async function processCustomRuleSet(c, { beforeCommit } = {}) {
 function buildCurrentConfig(coreType = null) {
   const storedSettings = state.store.getSettings();
   const settings = coreType
-    ? { ...storedSettings, coreType: coreType === 'mihomo' ? 'mihomo' : 'sing-box' }
+    ? { ...storedSettings, coreType: normalizeCoreType(coreType) }
     : storedSettings;
   // Use only the active subscription's nodes (profiles are not merged).
   const { nodes: allNodes, groups: allGroups, rules: allRules, providers } = activeSubData();
@@ -553,7 +523,7 @@ function buildCurrentConfig(coreType = null) {
   const clashRules = settings.useBuiltinRules ? [] : allRules;
   const policyGroups = settings.useBuiltinRules ? [] : allGroups;
   const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
-  const mihomoGeoReady = settings.coreType === 'mihomo' ? state.singbox.mihomoGeoDataReady(false) : false;
+  const adapter = getCoreAdapter(settings.coreType);
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
   const commonOpts = {
@@ -577,21 +547,14 @@ function buildCurrentConfig(coreType = null) {
     extraRules,
     extraRuleSets,
   };
-  const config = settings.coreType === 'mihomo'
-    ? buildMihomoConfig(allNodes, {
-        ...commonOpts,
-        hasGeoData: mihomoGeoReady,
-        externalUiDir: ui.dir.replace(/\\/g, '/'),
-        externalUiDownloadUrl: ui.downloadUrl,
-      })
-    : buildSingboxConfig(allNodes, {
-        ...commonOpts,
-        externalUiDir: ui.dir.replace(/\\/g, '/'),
-        externalUiDownloadUrl: ui.downloadUrl,
-        ruleSetDir: state.singbox.resolveRuleSetDir(),
-        geoAvailable: availableGeoSet(clashRules),
-        ruleSetData: loadRuleSetData(clashRules, providers),
-      });
+  const config = adapter.buildConfig(allNodes, commonOpts, {
+    manager: state.singbox,
+    ui,
+    clashRules,
+    providers,
+    availableGeoSet,
+    loadRuleSetData,
+  });
   return { config, settings };
 }
 
@@ -605,6 +568,7 @@ function currentRouteInfo() {
   const policyGroups = settings.useBuiltinRules ? [] : normalizePolicyGroups(groups, nodes);
   const availableTargets = new Set([
     AUTO_PROXY_GROUP,
+    SMART_PROXY_GROUP,
     '🛟 Fallback',
     ...nodes.map((node) => node && node.name).filter(Boolean),
     ...policyGroups.map((group) => group.name),
@@ -637,6 +601,7 @@ function ruleGroupInfo() {
   const available = new Set([
     APP_PROXY_GROUP,
     AUTO_PROXY_GROUP,
+    SMART_PROXY_GROUP,
     '🛟 Fallback',
     ...data.nodes.map((node) => node && node.name).filter(Boolean),
     ...policyGroups.map((group) => group.name),
@@ -654,9 +619,8 @@ async function startCoreNow() {
   // the cleanup may observe and disable the freshly enabled local proxy.
   if (staleProxyHealPromise) await staleProxyHealPromise;
   assertLifecycleOpen();
-  if (state.singbox.getCoreType() === 'mihomo') {
-    await state.singbox.validateMihomoGeoData();
-  }
+  await state.singbox.ensureBundledSingBoxPatch();
+  await getCoreAdapter(state.singbox.getCoreType()).prepareStart(state.singbox);
   const { config, settings } = buildCurrentConfig();
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
@@ -689,7 +653,7 @@ async function startCoreNow() {
     maybeFetchGeodata();
     // Pull anything the subscription's rules reference but that isn't on disk
     // yet. This housekeeping is non-fatal and applies on the next start.
-    if (settings.coreType === 'sing-box') {
+    if (getCoreAdapter(settings.coreType).supportsDynamicRuleData) {
       const { rules, providers } = effectiveSub();
       maybeFetchGeoCategories(rules);
       maybeFetchRuleProviders(rules, providers);
@@ -722,8 +686,7 @@ function maybeFetchGeodata() {
 }
 
 function geoDataReady() {
-  if (state.singbox.getCoreType() !== 'mihomo') return state.singbox.ensureSingBoxGeoData();
-  return state.singbox.mihomoGeoDataReady();
+  return getCoreAdapter(state.singbox.getCoreType()).geoDataReady(state.singbox);
 }
 
 /** Writable dir holding all geo rule-sets (base + downloaded categories). */
@@ -926,6 +889,7 @@ async function stopCoreNow(remember) {
   // Mark the stop as intentional so the exit handler doesn't fire a "core
   // crashed" notification for a stop/restart we initiated.
   state.coreStopping = true;
+  delayRequestCache.clear();
   stopManagedAutoSelection();
   stopTrafficStream();
   stopProxyGuard();
@@ -1071,9 +1035,8 @@ function setSystemProxyEnabled(enable) {
 }
 
 async function cleanup() {
-  lifecycleClosing = true;
+  operations.close();
   stopManagedAutoSelection();
-  cancelAllRemoteUpdates();
   if (typeof state.cancelPendingUpdates === 'function') {
     await state.cancelPendingUpdates();
   }
@@ -1108,6 +1071,10 @@ async function restartIfRunning() {
       while (appliedGeneration !== restartGeneration) {
         appliedGeneration = restartGeneration;
         if (!state.singbox.isRunning()) return false;
+        const coreType = state.singbox.getCoreType();
+        await getCoreAdapter(coreType).prepareStart(state.singbox);
+        const { config } = buildCurrentConfig(coreType);
+        await state.singbox.checkConfigFor(coreType, config);
         await stopCoreNow();
         await startCoreNow();
         restarts += 1;
@@ -1131,12 +1098,17 @@ async function restartIfRunning() {
  * @returns {Promise<number>} delay in ms
  */
 function testNodeDelay(name) {
-  return new Promise((resolve, reject) => {
+  const settings = state.store.getSettings();
+  const testUrl = String(settings.testUrl || '').trim();
+  const requestKey = JSON.stringify([state.singbox.getCoreType(), settings.clashApiPort, name, testUrl]);
+  const pending = delayRequestCache.get(requestKey);
+  if (pending) return pending;
+
+  const request = new Promise((resolve, reject) => {
     const done = responseLatch(resolve, reject);
-    const settings = state.store.getSettings();
     // Keep `url` first: this is the documented Clash API shape and avoids older
     // compatibility layers silently falling back to their built-in test URL.
-    const reqPath = buildDelayApiPath(name, settings.testUrl);
+    const reqPath = buildDelayApiPath(name, testUrl);
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -1179,6 +1151,11 @@ function testNodeDelay(name) {
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.end();
   });
+  const shared = request.finally(() => {
+    if (delayRequestCache.get(requestKey) === shared) delayRequestCache.delete(requestKey);
+  });
+  delayRequestCache.set(requestKey, shared);
+  return shared;
 }
 
 /** Generic Clash API request (sing-box external controller). Resolves parsed JSON. */
@@ -1245,137 +1222,63 @@ function clashApi(method, apiPath, body) {
   });
 }
 
-function usesManagedAutoSelection() {
+const managedAutoSelection = new ManagedAutoSelection({
+  appGroup: APP_PROXY_GROUP,
+  autoGroup: AUTO_PROXY_GROUP,
+  clashApi,
+  getSettings: () => state.store.getSettings(),
+  intervalMs: MANAGED_AUTO_INTERVAL_MS,
+  isRunning: () => state.singbox.isRunning(),
+  selectBatch: selectAutoTestBatch,
+  testDelay: testNodeDelay,
+});
+const smartSelectionModel = new SmartSelectionModel();
+
+function smartSelectionContextKey() {
+  const id = getActiveSubId() || '';
+  const profile = id ? state.store.getSubscription(id) : null;
+  const fingerprint = profile && (profile.configHash || profile.updatedAt) || '';
   const settings = state.store.getSettings();
-  return settings.enableClashApi;
+  return `${state.singbox.getCoreType()}:${id}:${fingerprint}:${settings.testUrl || ''}`;
 }
 
-function queueAutoCandidate(name, revision) {
-  const apply = () => {
-    if (
-      revision !== autoSelectionRevision ||
-      !state.singbox.isRunning() ||
-      !usesManagedAutoSelection()
-    ) return null;
-    return clashApi('PUT', '/proxies/' + encodeURIComponent(AUTO_PROXY_GROUP), { name }).then(() => name);
-  };
-  const operation = autoSelectorTail.then(apply, apply);
-  autoSelectorTail = operation.catch(() => {});
-  return operation;
-}
+const managedSmartSelection = new ManagedAutoSelection({
+  appGroup: APP_PROXY_GROUP,
+  autoGroup: SMART_PROXY_GROUP,
+  clashApi,
+  getSettings: () => state.store.getSettings(),
+  intervalMs: MANAGED_AUTO_INTERVAL_MS,
+  isRunning: () => state.singbox.isRunning(),
+  selectBatch: selectAutoTestBatch,
+  selectCandidate: ({ names, current, measurements }) => smartSelectionModel.choose({
+    contextKey: smartSelectionContextKey(),
+    names,
+    current,
+    measurements,
+  }),
+  testDelay: testNodeDelay,
+});
 
 /** Apply the fastest result from the visible node sweep without testing twice. */
 function applyMeasuredAutoCandidate(name) {
-  if (!state.singbox.isRunning()) throw new Error('core not running');
-  if (usesManagedAutoSelection()) {
-    return queueAutoCandidate(name, ++autoSelectionRevision);
-  }
-  return null;
-}
-
-/** Refresh Dart's core-independent Auto selector from a full or rotating sweep. */
-function refreshManagedAutoSelection({ force = false, generation = managedAutoGeneration } = {}) {
-  if (!state.singbox.isRunning() || !usesManagedAutoSelection()) return Promise.resolve(null);
-  if (managedAutoRun && managedAutoRun.generation === generation) {
-    if (force && !managedAutoRun.force) {
-      return managedAutoRun.promise
-        .catch(() => null)
-        .then(() => refreshManagedAutoSelection({ force: true, generation }));
-    }
-    return managedAutoRun.promise;
-  }
-
-  const token = {};
-  const promise = (async () => {
-    if (!force) {
-      const outer = await clashApi('GET', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP));
-      if (!outer || outer.now !== AUTO_PROXY_GROUP) return null;
-    }
-    const group = await clashApi('GET', '/proxies/' + encodeURIComponent(AUTO_PROXY_GROUP));
-    const names = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
-    if (!names.length) return null;
-    const batch = selectAutoTestBatch(names, group && group.now, managedAutoCursor, force);
-    if (!force) managedAutoCursor = batch.nextCursor;
-    const candidates = batch.candidates;
-
-    const revision = autoSelectionRevision;
-    const concurrency = Math.max(1, Math.min(
-      16,
-      Number(state.store.getSettings().testConcurrency) || 8,
-      candidates.length
-    ));
-    let cursor = 0;
-    let bestName = null;
-    let bestDelay = Infinity;
-    async function worker() {
-      while (cursor < candidates.length && generation === managedAutoGeneration) {
-        const name = candidates[cursor++];
-        try {
-          const delay = await testNodeDelay(name);
-          if (delay < bestDelay) {
-            bestDelay = delay;
-            bestName = name;
-          }
-        } catch (_) {
-          /* Unreachable nodes do not participate in this election. */
-        }
-      }
-    }
-    await Promise.all(Array.from({ length: concurrency }, worker));
-    if (
-      !bestName ||
-      generation !== managedAutoGeneration ||
-      revision !== autoSelectionRevision
-    ) return null;
-    return queueAutoCandidate(bestName, revision);
-  })().finally(() => {
-    if (managedAutoRun && managedAutoRun.token === token) managedAutoRun = null;
-  });
-  managedAutoRun = { token, generation, force, promise };
-  return promise;
+  return managedAutoSelection.applyMeasuredCandidate(name);
 }
 
 function stopManagedAutoSelection() {
-  managedAutoGeneration++;
-  managedAutoCursor = 0;
-  autoSelectionRevision++;
-  if (managedAutoTimer) clearTimeout(managedAutoTimer);
-  managedAutoTimer = null;
-  managedAutoRun = null;
+  managedAutoSelection.stop();
+  managedSmartSelection.stop();
 }
 
 function startManagedAutoSelection() {
-  stopManagedAutoSelection();
-  if (!usesManagedAutoSelection()) return;
-  const generation = managedAutoGeneration;
-  const tick = async () => {
-    managedAutoTimer = null;
-    try { await refreshManagedAutoSelection({ generation }); } catch (_) {}
-    if (
-      generation !== managedAutoGeneration ||
-      !state.singbox.isRunning() ||
-      !usesManagedAutoSelection()
-    ) return;
-    managedAutoTimer = setTimeout(tick, MANAGED_AUTO_INTERVAL_MS);
-    if (managedAutoTimer.unref) managedAutoTimer.unref();
-  };
-  managedAutoTimer = setTimeout(tick, 250);
-  if (managedAutoTimer.unref) managedAutoTimer.unref();
+  managedAutoSelection.start();
+  managedSmartSelection.start();
 }
 
 /** Switch the outer proxy selector live via the Clash API. */
-let selectorTail = Promise.resolve();
-function setClashSelector(name) {
-  const select = async () => {
-    const result = await clashApi('PUT', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP), { name });
-    if (name === AUTO_PROXY_GROUP && usesManagedAutoSelection()) {
-      refreshManagedAutoSelection({ force: true }).catch(() => null);
-    }
-    return result;
-  };
-  const operation = selectorTail.then(select, select);
-  selectorTail = operation.catch(() => {});
-  return operation;
+async function setClashSelector(name) {
+  const result = await managedAutoSelection.setOuterSelector(name);
+  if (name === SMART_PROXY_GROUP) managedSmartSelection.refresh().catch(() => null);
+  return result;
 }
 
 /**
@@ -1384,8 +1287,7 @@ function setClashSelector(name) {
  */
 let modeRevision = 0;
 function modeChangeNeedsRestart(coreType, currentMode, nextMode) {
-  return coreType === 'mihomo' && currentMode !== nextMode &&
-    (currentMode === 'block' || nextMode === 'block');
+  return getCoreAdapter(coreType).modeChangeNeedsRestart(currentMode, nextMode);
 }
 
 function setProxyMode(mode) {
@@ -1440,7 +1342,7 @@ function autoUpdateDue(item, minutes, now = Date.now()) {
 
 let autoUpdateRunning = false;
 async function autoUpdateTick() {
-  if (lifecycleClosing || autoUpdateRunning) return;
+  if (operations.closing || autoUpdateRunning) return;
   autoUpdateRunning = true;
   try {
     await runAutoUpdateTick();
@@ -1454,13 +1356,13 @@ async function autoUpdateTick() {
 }
 
 async function runAutoUpdateTick() {
-  const epoch = remoteUpdateEpoch;
+  const epoch = operations.remoteEpoch;
   const subs = state.store.listSubscriptions();
   let changed = false;
   let activeConfigChanged = false;
   let activeConfigRollback = null;
   for (const sub of subs) {
-    if (epoch !== remoteUpdateEpoch) return;
+    if (epoch !== operations.remoteEpoch) return;
     const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
     if (sub.url && autoUpdateDue(sub, mins)) {
       const token = beginRemoteUpdate('subscription', sub.id, { background: true });
@@ -1583,7 +1485,7 @@ async function runAutoUpdateTick() {
   let crsChanged = false;
   const crsRollbacks = [];
   for (const c of crs) {
-    if (epoch !== remoteUpdateEpoch) return;
+    if (epoch !== operations.remoteEpoch) return;
     const mins = parseInt(c.autoUpdateMinutes || 0, 10);
     if (c.enabled !== false && c.url && autoUpdateDue(c, mins)) {
       await queueCustomRuleMutation(async () => {
@@ -1690,7 +1592,7 @@ function rescheduleAutoUpdate() {
   const need =
     hasDue(state.store.listSubscriptions()) ||
     hasDue(state.store.listCustomRuleSets().filter((item) => item.enabled !== false));
-  if (!lifecycleClosing && need && !autoUpdateTimer) {
+  if (!operations.closing && need && !autoUpdateTimer) {
     autoUpdateTimer = setInterval(autoUpdateTick, 60000);
   } else if (!need && autoUpdateTimer) {
     clearInterval(autoUpdateTimer);
@@ -1702,16 +1604,6 @@ function rescheduleAutoUpdate() {
 // but stay fresh on their own: once a week re-download geoip-cn/geosite-cn.
 const GEO_UPDATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const GEO_RETRY_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const GEO_RUNTIME_FILES = Object.freeze({
-  'sing-box': ['geoip-cn.srs', 'geosite-cn.srs', 'geodata-meta.json'],
-  mihomo: [
-    'geoip.dat',
-    'geosite.dat',
-    'country.mmdb',
-    'geodata-meta.json',
-    '.mihomo-geodata-validation.json',
-  ],
-});
 let geoTimer = null;
 let geoInitialTimer = null;
 
@@ -1729,7 +1621,7 @@ function snapshotGeoData(coreType) {
   const dir = state.singbox.ensureCoreDir(coreType);
   const snapshots = [];
   try {
-    for (const file of GEO_RUNTIME_FILES[coreType] || []) {
+    for (const file of getCoreAdapter(coreType).geoDataFiles) {
       snapshots.push(snapshotFile(path.join(dir, file), 'geo-update-backup'));
     }
     return snapshots;
@@ -1764,7 +1656,7 @@ async function refreshGeoData(onProgress = () => {}) {
     const dir = await state.singbox.updateGeoData(onProgress, currentProxyPort());
     markGeoDataApplied(snapshots);
     if (
-      !lifecycleClosing &&
+      !operations.closing &&
       state.singbox.getCoreType() === coreType &&
       state.singbox.isRunning()
     ) {
@@ -1779,7 +1671,7 @@ async function refreshGeoData(onProgress = () => {}) {
           recoveryError = restoreError;
         }
         if (
-          !lifecycleClosing &&
+          !operations.closing &&
           !state.singbox.isRunning() &&
           state.singbox.getCoreType() === coreType
         ) {
@@ -1804,7 +1696,7 @@ async function refreshGeoData(onProgress = () => {}) {
 }
 
 async function checkGeoUpdate() {
-  if (lifecycleClosing) return;
+  if (operations.closing) return;
   const coreType = state.singbox.getCoreType();
   const suffix = coreType.replace(/[^a-z0-9]/gi, '');
   const successKey = 'geoUpdatedAt_' + suffix;
@@ -1832,7 +1724,7 @@ async function checkGeoUpdate() {
 
 /** Start the weekly geodata refresh: a check shortly after boot, then every 6h. */
 function startGeoAutoUpdate() {
-  if (lifecycleClosing || geoTimer) return;
+  if (operations.closing || geoTimer) return;
   geoInitialTimer = setTimeout(() => {
     geoInitialTimer = null;
     checkGeoUpdate().catch(() => {});
@@ -1840,173 +1732,15 @@ function startGeoAutoUpdate() {
   geoTimer = setInterval(() => checkGeoUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
 }
 
-// Name of the Windows logon task used for elevated auto-start (see below).
-const AUTOSTART_TASK = 'Dart-AutoStart';
+const autoLaunch = createAutoLaunchService({
+  app: require('electron').app,
+  getSettings: () => state.store.getSettings(),
+  isAdmin: isWindowsAdminSync,
+  log: sendLog,
+});
 
-/** Set (or clear) the plain HKCU "Run" login item via Electron. */
-function setRunItem(enable, silent) {
-  app.setLoginItemSettings({
-    openAtLogin: !!enable,
-    openAsHidden: !!silent,
-    path: process.execPath,
-    args: silent ? ['--hidden'] : [],
-  });
-}
-
-/** True if our scheduled logon task exists (read-only query; no elevation). */
-function autostartTaskExists() {
-  try {
-    const { spawnSync } = require('child_process');
-    const r = spawnSync('schtasks.exe', ['/query', '/tn', AUTOSTART_TASK], {
-      windowsHide: true,
-      encoding: 'utf-8',
-    });
-    return r.status === 0;
-  } catch (_) {
-    return false;
-  }
-}
-
-/**
- * Run a schtasks command, elevating via UAC only when we are not already admin.
- * Returns true on success (exit 0). When `elevate` is true and the user declines
- * UAC, Start-Process throws and PowerShell exits non-zero, so we return false.
- */
-function runSchtasks(args, elevate) {
-  const { spawnSync } = require('child_process');
-  if (!elevate) {
-    const r = spawnSync('schtasks.exe', args, { windowsHide: true, encoding: 'utf-8' });
-    return !r.error && r.status === 0;
-  }
-  const argList = args.map((a) => `'${String(a).replace(/'/g, "''")}'`).join(',');
-  const ps = `$p = Start-Process -FilePath 'schtasks.exe' -ArgumentList @(${argList}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode`;
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
-    windowsHide: true,
-    encoding: 'utf-8',
-  });
-  return !r.error && r.status === 0;
-}
-
-/**
- * Task Scheduler XML for a logon task that runs Dart with highest privileges.
- * The command is just the exe path (no --hidden): silent start is driven by the
- * persisted `silentStart` setting at startup, so toggling it never needs the
- * task to be rebuilt. ExecutionTimeLimit is disabled (PT0S) so the long-running
- * GUI is never killed by the default 72h task limit.
- */
-function buildAutostartTaskXml() {
-  const esc = (s) =>
-    String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const user = `${process.env.USERDOMAIN || process.env.COMPUTERNAME || ''}\\${process.env.USERNAME || ''}`;
-  return `<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Dart Network Control auto-start (elevated for TUN mode)</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${esc(user)}</UserId></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><UserId>${esc(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>false</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>${esc(process.execPath)}</Command></Exec></Actions>
-</Task>`;
-}
-
-/** (Re)create the elevated logon task. Returns true on success. */
-function createAutostartTask() {
-  const os = require('os');
-  const tmp = path.join(os.tmpdir(), `dart-autostart-${process.pid}.xml`);
-  try {
-    // UTF-16LE + BOM (﻿) to match the XML declaration schtasks expects.
-    fs.writeFileSync(tmp, '﻿' + buildAutostartTaskXml(), { encoding: 'utf16le' });
-    const ok = runSchtasks(['/create', '/tn', AUTOSTART_TASK, '/xml', tmp, '/f'], !isWindowsAdminSync());
-    sendLog('[gui] autostart task ' + (ok ? '(re)created' : 'create failed'));
-    return ok;
-  } catch (e) {
-    sendLog('[gui] autostart task error: ' + e.message);
-    return false;
-  } finally {
-    try { fs.unlinkSync(tmp); } catch (_) {}
-  }
-}
-
-/** Delete the elevated logon task if present. */
-function deleteAutostartTask() {
-  const removed = runSchtasks(['/delete', '/tn', AUTOSTART_TASK, '/f'], !isWindowsAdminSync());
-  if (removed) {
-    sendLog('[gui] autostart task removed');
-  } else {
-    sendLog('[gui] autostart task remove failed');
-  }
-  return removed;
-}
-
-/**
- * Windows: pick the auto-launch mechanism. TUN needs administrator rights, and a
- * plain HKCU "Run" entry can never start elevated (by UAC design), so when both
- * auto-launch and TUN are on we register a Task Scheduler logon task with
- * highest privileges instead — it starts Dart elevated at login with no UAC
- * prompt. Creating/removing such a task itself needs admin: when we are already
- * elevated it happens silently; otherwise it costs a single UAC prompt, which we
- * only pay on an explicit user action (`interactive`), never at startup.
- */
-function applyAutoLaunchWindows(enable, silent, interactive) {
-  const wantTask = !!enable && !!state.store.getSettings().enableTun;
-  if (wantTask) {
-    const admin = isWindowsAdminSync();
-    if (admin) {
-      // (Re)create silently to keep the stored exe path current (e.g. post-update).
-      if (createAutostartTask()) setRunItem(false);
-      else setRunItem(enable, silent);
-      return;
-    }
-    if (interactive && createAutostartTask()) {
-      setRunItem(false);
-      return;
-    }
-    if (autostartTaskExists()) {
-      setRunItem(false);
-      return;
-    }
-    // Not elevated and no task yet (e.g. a background startup sync): fall back to
-    // a plain Run item so the app still auto-launches; TUN then prompts as before.
-    setRunItem(enable, silent);
-    return;
-  }
-  // No elevated task wanted: drop any we created, use the plain Run item.
-  if (autostartTaskExists() && (isWindowsAdminSync() || interactive)) {
-    const removed = deleteAutostartTask();
-    if (!removed && interactive) throw new Error('failed to remove the elevated auto-start task');
-  }
-  setRunItem(enable, silent);
-}
-
-/**
- * Apply the auto-launch (login item) setting on supported platforms. When
- * `silent` is set, the login launch starts hidden in the tray: pass `--hidden`
- * (read at startup) and openAsHidden (the macOS equivalent). On Windows, an
- * elevated logon task is used instead when TUN is on (see applyAutoLaunchWindows).
- * `interactive` is set for explicit user actions, gating the one-time UAC prompt.
- */
-function applyAutoLaunch(enable, silent, { interactive = false } = {}) {
-  if (process.platform === 'linux' && !process.env.APPIMAGE) {
-    // setLoginItemSettings has limited support on plain Linux; best-effort only.
-    return;
-  }
-  if (process.platform === 'win32') {
-    applyAutoLaunchWindows(enable, silent, interactive);
-    return;
-  }
-  setRunItem(enable, silent);
+function applyAutoLaunch(enable, silent, options) {
+  return autoLaunch.apply(enable, silent, options);
 }
 
 /**

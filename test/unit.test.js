@@ -11,6 +11,7 @@ const os = require('os');
 const path = require('path');
 const vm = require('vm');
 const { buildDelayApiPath, selectAutoTestBatch } = require('../src/main/delay');
+const { SmartSelectionModel } = require('../src/main/smart-selection');
 
 let passed = 0;
 function test(name, fn) {
@@ -33,6 +34,9 @@ test('manual latency request carries the configured URL in Clash API order', () 
   assert.strictEqual(parsed.searchParams.get('url'), 'https://example.com/ping?q=a&x=1');
   assert.strictEqual(parsed.searchParams.get('timeout'), '5000');
   assert.ok(parsed.search.startsWith('?url='));
+
+  const defaultRequest = new URL(buildDelayApiPath('Hong Kong / 01'), 'http://127.0.0.1');
+  assert.strictEqual(defaultRequest.searchParams.get('url'), 'http://www.gstatic.com/generate_204');
 });
 
 test('background Auto checks rotate bounded batches while retaining the winner', () => {
@@ -63,6 +67,52 @@ test('background Auto batches scale gradually and normalize duplicate names', ()
   );
 });
 
+test('Smart selection smooths RTT and ignores insignificant improvements', () => {
+  const model = new SmartSelectionModel({ minDwellMs: 0, switchThresholdMs: 20, switchThresholdRatio: 0 });
+  const choose = (measurements, now) => model.choose({
+    contextKey: 'sing-box:profile-a', names: ['a', 'b'], current: 'a', measurements, now,
+  });
+  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 90 }], 1000), 'a');
+  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 61_000), 'a');
+  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 121_000), 'b');
+});
+
+test('Smart selection fails over, cools repeated failures, and bounds memory', () => {
+  const model = new SmartSelectionModel({ minDwellMs: 600_000, maxNodes: 2 });
+  assert.strictEqual(model.choose({
+    contextKey: 'mihomo:profile-a', names: ['a', 'b'], current: 'a', now: 1000,
+    measurements: [{ name: 'a', delay: 50 }, { name: 'b', delay: 100 }],
+  }), 'a');
+  assert.strictEqual(model.choose({
+    contextKey: 'mihomo:profile-a', names: ['a', 'b'], current: 'a', now: 2000,
+    measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 100 }],
+  }), 'b');
+  model.choose({
+    contextKey: 'mihomo:profile-a', names: ['a', 'b', 'c'], current: 'b', now: 3000,
+    measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 100 }, { name: 'c', delay: 120 }],
+  });
+  const snapshot = model.snapshot();
+  assert.ok(snapshot.nodes.size <= 2);
+  const failed = snapshot.nodes.get('a');
+  assert.ok(!failed || failed.cooldownUntil > 3000);
+});
+
+test('Smart selection isolates history by core and active profile', () => {
+  const model = new SmartSelectionModel();
+  model.choose({
+    contextKey: 'sing-box:a', names: ['a'], current: 'a', now: 1000,
+    measurements: [{ name: 'a', delay: 50 }],
+  });
+  assert.strictEqual(model.snapshot().nodes.size, 1);
+  model.choose({
+    contextKey: 'mihomo:a', names: ['b'], current: 'b', now: 2000,
+    measurements: [{ name: 'b', delay: 60 }],
+  });
+  const snapshot = model.snapshot();
+  assert.strictEqual(snapshot.contextKey, 'mihomo:a');
+  assert.deepStrictEqual([...snapshot.nodes.keys()], ['b']);
+});
+
 // i18n.js is a browser IIFE; evaluate it with a stub window to get the DICT.
 function loadDict() {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'i18n.js'), 'utf-8');
@@ -84,7 +134,7 @@ test('zh and en dictionaries declare exactly the same keys', () => {
 test('every data-i18n key used in index.html exists in the dictionary', () => {
   const DICT = loadDict();
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
-  const used = [...html.matchAll(/data-i18n(?:-ph)?="([^"]+)"/g)].map((m) => m[1]);
+  const used = [...html.matchAll(/data-i18n(?:-(?:ph|aria-label|title))?="([^"]+)"/g)].map((m) => m[1]);
   const missing = used.filter((k) => !(k in DICT.zh));
   assert.deepStrictEqual([...new Set(missing)], [], 'HTML references undefined i18n keys');
 });
@@ -276,6 +326,70 @@ test('frameless window exposes Mica-safe custom desktop controls', () => {
   assert.ok(css.includes('--motion-standard: 200ms cubic-bezier(0.4, 0, 0.2, 1)'));
 });
 
+test('primary navigation follows the vertical tabs keyboard pattern', () => {
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  assert.ok(indexHtml.includes('role="tablist"'));
+  assert.ok(indexHtml.includes('aria-orientation="vertical"'));
+  for (const tab of ['dashboard', 'subs', 'nodes', 'rules', 'conns', 'tools', 'logs', 'settings']) {
+    assert.ok(indexHtml.includes(`id="nav-${tab}"`), `missing tab id: ${tab}`);
+    assert.ok(indexHtml.includes(`aria-controls="tab-${tab}"`), `missing tab target: ${tab}`);
+    assert.ok(indexHtml.includes(`aria-labelledby="nav-${tab}"`), `missing panel label: ${tab}`);
+  }
+  assert.ok(main.includes("button.setAttribute('aria-selected', String(active))"));
+  assert.ok(main.includes('button.tabIndex = active ? 0 : -1'));
+  assert.ok(main.includes('element.hidden = !active'));
+  for (const key of ['ArrowDown', 'ArrowUp', 'Home', 'End']) assert.ok(main.includes(`'${key}'`));
+});
+
+test('enhanced selects expose a complete combobox keyboard model', () => {
+  const select = fs.readFileSync(path.join(rendererDir, 'js', 'select.js'), 'utf-8');
+  assert.ok(select.includes("document.createElement('button')"));
+  assert.ok(select.includes("setAttribute('role', 'combobox')"));
+  assert.ok(select.includes("setAttribute('aria-expanded', 'false')"));
+  assert.ok(select.includes("setAttribute('aria-controls', menuId)"));
+  assert.ok(select.includes("menu.setAttribute('role', 'listbox')"));
+  assert.ok(select.includes("item.setAttribute('role', 'option')"));
+  assert.ok(select.includes("root.setAttribute('aria-activedescendant'"));
+  for (const key of ['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', 'Escape']) {
+    assert.ok(select.includes(`'${key}'`), `missing select keyboard action: ${key}`);
+  }
+  assert.ok(select.includes('event.stopImmediatePropagation()'));
+});
+
+test('static form controls expose labels instead of relying on placeholders alone', () => {
+  const controls = [...indexHtml.matchAll(/<(input|select|textarea)\b[^>]*>/g)].map((match) => match[0]);
+  for (const control of controls) {
+    const id = (control.match(/id="([^"]+)"/) || [])[1];
+    const position = indexHtml.indexOf(control);
+    const wrapped = position >= 0 && indexHtml.lastIndexOf('<label', position) > indexHtml.lastIndexOf('</label>', position);
+    const named = /aria-label|aria-labelledby|data-i18n-ph/.test(control) ||
+      (id && indexHtml.includes(`for="${id}"`)) || wrapped;
+    assert.ok(named, `form control lacks an accessible name: ${control}`);
+  }
+});
+
+test('dialogs trap focus and announce dynamic operations without losing Mica', () => {
+  const common = fs.readFileSync(path.join(rendererDir, 'dialog', 'common.js'), 'utf-8');
+  const dialogMain = fs.readFileSync(path.join(rendererDir, 'dialog', 'main.js'), 'utf-8');
+  const util = fs.readFileSync(path.join(rendererDir, 'js', 'util.js'), 'utf-8');
+  const css = readRendererCss();
+  assert.ok(dialogHtml.includes('role="dialog"'));
+  assert.ok(dialogHtml.includes('aria-modal="true"'));
+  assert.ok(dialogHtml.includes('aria-labelledby="dialogTitle"'));
+  assert.ok(common.includes('function focusableElements('));
+  assert.ok(dialogHtml.includes('class="native-dialog-window" role="dialog" aria-modal="true" aria-labelledby="dialogTitle" aria-busy="true" tabindex="-1"'));
+  assert.ok(common.includes('focusInitial(dialogWindow)'));
+  assert.ok(dialogMain.includes("event.key !== 'Tab'"));
+  assert.ok(dialogMain.includes('document.activeElement === last'));
+  assert.ok(common.includes("setAttribute('aria-busy', 'true')"));
+  assert.ok(util.includes('App.setProgress = function setProgress'));
+  assert.ok(indexHtml.includes('role="progressbar"'));
+  assert.ok(indexHtml.includes('aria-live="polite"'));
+  assert.ok(css.includes('@media (forced-colors: active)'));
+  assert.ok(css.includes('@media (prefers-reduced-transparency: reduce)'));
+  assert.ok(css.includes('animation: statusPulse 2.4s ease-in-out infinite'));
+});
+
 test('all secondary workflows are registered in the native dialog host', () => {
   const host = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
   const renderers = ['editors.js', 'system.js', 'toolbox.js']
@@ -392,7 +506,7 @@ test('external-input fields stay HTML-escaped in the renderer templates', () => 
     ['js/conns.js', 'escapeHtml(chains)'],
     ['js/rules.js', 'escapeHtml(it.payload)'],
     ['js/rules.js', 'escapeHtml(it.id)'],
-    ['js/rulesets.js', 'escapeHtml(it.name)'],
+    ['js/rulesets.js', 'escapeHtml(itemName)'],
     ['js/rulesets.js', 'escapeHtml(it.id)'],
     ['js/logs.js', 'escapeHtml(rest)'],
     ['dialog/system.js', 'escapeHtml(entry.name)'],
@@ -457,8 +571,8 @@ test('background renderer work is bounded to visible and useful content', () => 
   const editors = fs.readFileSync(path.join(rendererDir, 'dialog', 'editors.js'), 'utf-8');
   const logs = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
   const settings = fs.readFileSync(path.join(rendererDir, 'js', 'settings.js'), 'utf-8');
-  const ipc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf-8');
-  assert.ok(ipc.includes('MAX_IPC_CONNECTIONS = 300'));
+  const ipcValidation = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc-validation.js'), 'utf-8');
+  assert.ok(ipcValidation.includes('MAX_IPC_CONNECTIONS = 300'));
   assert.ok(main.includes('function connectionPollDelay(data)'));
   assert.ok(main.includes('data.totalConnections > shown ? 5000 : 3000'));
   assert.ok(charts.includes('function isCanvasVisible()'));
@@ -484,7 +598,7 @@ test('node, connection and log workspaces use a direct full-height canvas', () =
   assert.ok(css.includes('#tab-logs .log-box'));
   assert.ok(css.includes('max-height: none'));
   for (const id of ['tab-nodes', 'tab-conns', 'tab-logs']) {
-    const start = indexHtml.indexOf(`<section class="tab live-workspace" id="${id}">`);
+    const start = indexHtml.indexOf(`<section class="tab live-workspace" id="${id}"`);
     assert.ok(start >= 0, `${id} must use the live workspace layout`);
     const section = indexHtml.slice(start, indexHtml.indexOf('</section>', start));
     assert.ok(section.includes('workspace-commandbar'), `${id} must expose a direct command bar`);
@@ -495,7 +609,7 @@ test('node, connection and log workspaces use a direct full-height canvas', () =
 test('config, rule and tool pages use unframed canvas sections', () => {
   const css = readRendererCss();
   for (const id of ['tab-subs', 'tab-rules', 'tab-tools']) {
-    const start = indexHtml.indexOf(`<section class="tab canvas-page" id="${id}">`);
+    const start = indexHtml.indexOf(`<section class="tab canvas-page" id="${id}"`);
     assert.ok(start >= 0, `${id} must use the canvas page layout`);
     const section = indexHtml.slice(start, indexHtml.indexOf('</section>', start));
     assert.ok(!section.includes('class="panel'), `${id} must not have an outer panel`);
@@ -566,10 +680,23 @@ test('node strategies keep profile order and expose a stable sidebar readout', (
   const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
   const css = readRendererCss();
   assert.ok(indexHtml.includes('id="miniCurrentNode"'));
-  assert.ok(nodes.includes("{ name: AUTO_GROUP }, { name: FALLBACK_GROUP }, ...nodes"));
+  assert.ok(nodes.includes("{ name: AUTO_GROUP }, { name: SMART_GROUP }, { name: FALLBACK_GROUP }, ...nodes"));
   assert.ok(!nodes.includes('const pinned = []'));
   assert.ok(css.includes('.mini-current-node'));
   assert.ok(css.includes('--node-offset'));
+});
+
+test('virtualized node cards remain keyboard-selectable with named row actions', () => {
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const css = readRendererCss();
+  assert.ok(nodes.includes('class="node-select-btn"'));
+  assert.ok(nodes.includes('aria-pressed="${String(active)}"'));
+  assert.ok(nodes.includes('data-select-name'));
+  assert.ok(nodes.includes("t('nodes.test') + ': ' + name"));
+  assert.ok(conns.includes("t('conns.close') + ': ' + target"));
+  assert.ok(css.includes('.node-select-btn:focus-visible'));
+  assert.ok(indexHtml.includes('id="nodeList" class="node-list" role="list"'));
 });
 
 test('dashboard status cards expose current node latency and click actions', () => {
@@ -642,7 +769,7 @@ test('language changes refresh enhanced select labels immediately', () => {
     main.indexOf('// ---------- Tab switching ----------')
   );
   assert.ok(select.includes('function refreshSelects('));
-  assert.ok(select.includes('selectSync.get(sel)'));
+  assert.ok(select.includes('selectSync.get(select)'));
   assert.ok(languageFlow.includes('App.state.settings.language = lang'));
   assert.ok(languageFlow.includes('App.refreshRuleGroupLabels()'));
   assert.ok(rules.includes("source: t('rulegroups.targetSource')"));
@@ -788,6 +915,109 @@ test('pickLatestTag skips prereleases and picks the newest stable', () => {
   assert.strictEqual(github.pickLatestTag(['v0.5.5', 'v0.6.0', 'v0.2.8-pre']), 'v0.6.0');
   assert.strictEqual(github.pickLatestTag([]), null);
   assert.strictEqual(github.pickLatestTag(['1.0.0-rc.1']), null); // nothing stable
+  assert.strictEqual(
+    github.pickLatestTag(['v1.13.14', 'v1.13.14-dart.1', 'v1.14.0-alpha.1']),
+    'v1.13.14-dart.1'
+  );
+});
+
+console.log('\nCore adapters and integrity:');
+
+const { getCoreAdapter, listCoreAdapters, normalizeCoreType } = require('../src/main/core-adapters');
+const { normalizeSha256, parseSha256Sums } = require('../src/main/integrity');
+const { OperationCoordinator } = require('../src/main/operation-coordinator');
+const { addBundledComponents } = require('../scripts/release-metadata');
+
+test('core adapters own paths, commands, formats and release assets', () => {
+  assert.deepStrictEqual(listCoreAdapters().map((adapter) => adapter.id), ['sing-box', 'mihomo']);
+  assert.strictEqual(normalizeCoreType('unknown'), 'sing-box');
+  const singBox = getCoreAdapter('sing-box');
+  const mihomo = getCoreAdapter('mihomo');
+  assert.deepStrictEqual(singBox.checkArgs('config.json'), ['check', '-c', 'config.json']);
+  assert.deepStrictEqual(mihomo.checkArgs('config.yaml', '/work'), ['-t', '-f', 'config.yaml', '-d', '/work']);
+  assert.ok(singBox.serializeConfig({ log: { level: 'info' } }).includes('\n'));
+  assert.ok(mihomo.serializeConfig({ mode: 'rule' }).includes('mode: rule'));
+  assert.strictEqual(singBox.configFormat, 'JSON');
+  assert.strictEqual(singBox.repo, 'blakebill/sing-box');
+  assert.strictEqual(singBox.releaseTag('1.13.14'), 'v1.13.14-dart.1');
+  assert.strictEqual(singBox.releaseTag('v1.13.14-dart.2'), 'v1.13.14-dart.2');
+  assert.strictEqual(mihomo.configFormat, 'YAML');
+  assert.strictEqual(singBox.routeEntries({ route: { rules: [{}] } })[0].kind, 'sing-box');
+  assert.strictEqual(mihomo.routeEntries({ rules: ['MATCH,DIRECT'] })[0].kind, 'clash');
+  assert.deepStrictEqual(
+    singBox.summarizeConfig({ outbounds: [{ type: 'trojan' }, { type: 'direct' }], route: { rules: [{}] } }),
+    { generatedNodes: 1, generatedRules: 1, tun: false }
+  );
+  assert.strictEqual(
+    mihomo.dnsPath({ dns: { nameserver: ['https://dns.example/dns-query'] } }, { enableTun: true }, false).server,
+    'https://dns.example/dns-query'
+  );
+  const digest = 'a'.repeat(64);
+  const asset = mihomo.releaseAsset('1.2.3', 'windows', 'amd64', {
+    assets: [{
+      name: 'mihomo-windows-amd64-v1.2.3.zip',
+      browser_download_url: 'https://example.com/mihomo.zip',
+      digest: 'sha256:' + digest,
+    }],
+  });
+  assert.strictEqual(asset.sha256, digest);
+  assert.strictEqual(mihomo.modeChangeNeedsRestart('rule', 'block'), true);
+  assert.strictEqual(singBox.modeChangeNeedsRestart('rule', 'block'), false);
+});
+
+test('SHA-256 metadata accepts GitHub digests and standard manifests', () => {
+  const a = 'a'.repeat(64);
+  const b = 'b'.repeat(64);
+  assert.strictEqual(normalizeSha256('sha256:' + a.toUpperCase()), a);
+  assert.strictEqual(normalizeSha256('sha512:' + a), null);
+  const sums = parseSha256Sums(`${a}  Dart.Setup.exe\nSHA256 (core.zip) = ${b}\n`);
+  assert.strictEqual(sums.get('Dart.Setup.exe'), a);
+  assert.strictEqual(sums.get('core.zip'), b);
+});
+
+test('operation coordinator supersedes stale work and closes atomically', () => {
+  const coordinator = new OperationCoordinator();
+  const first = coordinator.beginRemote('config', 'a');
+  assert.doesNotThrow(() => coordinator.assertRemote('config', 'a', first));
+  const second = coordinator.beginRemote('config', 'a');
+  assert.throws(() => coordinator.assertRemote('config', 'a', first), /superseded/);
+  assert.doesNotThrow(() => coordinator.assertRemote('config', 'a', second));
+  assert.strictEqual(coordinator.beginRemote('config', 'a', { background: true }), null);
+  coordinator.close();
+  assert.throws(() => coordinator.assertOpen(), /shutting down/);
+});
+
+test('release SBOM includes bundled cores and immutable file hashes', () => {
+  const digest = 'c'.repeat(64);
+  const sbom = addBundledComponents({ components: [] }, {
+    components: [{
+      type: 'application',
+      name: 'sing-box',
+      version: '1.2.3',
+      repository: 'https://github.com/blakebill/sing-box',
+      license: 'GPL-3.0-or-later',
+      asset: 'sing-box.zip',
+      assetSha256: 'd'.repeat(64),
+      binaryPath: 'singbox/sing-box.exe',
+    }],
+    files: [{ path: 'singbox/sing-box.exe', sha256: digest }],
+  });
+  assert.strictEqual(sbom.components[0].hashes[0].content, digest);
+  assert.match(sbom.components[0]['bom-ref'], /^pkg:github\/blakebill\/sing-box@1\.2\.3#/);
+});
+
+test('release workflow pins actions and isolates write permission to publishing', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'release.yml'), 'utf-8');
+  const actionRefs = [...workflow.matchAll(/uses:\s*[^@\s]+@([^\s#]+)/g)].map((match) => match[1]);
+  assert.ok(actionRefs.length >= 6);
+  assert.ok(actionRefs.every((ref) => /^[a-f0-9]{40}$/.test(ref)), 'every release action must use a full commit SHA');
+  assert.match(workflow, /permissions:\s*\{\}/);
+  assert.match(workflow, /build-windows:[\s\S]*?permissions:\s*\n\s+contents: read/);
+  assert.match(workflow, /publish:[\s\S]*?permissions:\s*\n\s+contents: write/);
+  const coreDownloadStep = workflow.match(/- name: Download bundled cores and GeoData([\s\S]*?)\n\s+- name:/);
+  assert.ok(coreDownloadStep && !coreDownloadStep[1].includes('GITHUB_TOKEN'));
+  assert.ok(workflow.includes('release/SHA256SUMS.txt'));
+  assert.ok(workflow.includes('release/sbom.cdx.json'));
 });
 
 console.log('\nUWP AppContainer:');
@@ -1216,12 +1446,14 @@ test('settings merge defaults with stored values', () => {
   const store = new Store(dir);
   store.updateSettings({
     mixedPort: 1234,
-    testUrl: 'http://www.gstatic.com/generate_204',
+    testUrl: 'https://www.gstatic.com/generate_204',
   });
   const s = new Store(dir).getSettings();
   assert.strictEqual(s.mixedPort, 1234);
   assert.strictEqual(s.clashApiPort, 9090); // default still present
-  assert.strictEqual(s.testUrl, 'https://www.gstatic.com/generate_204');
+  assert.strictEqual(s.testUrl, 'http://www.gstatic.com/generate_204');
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
+  assert.strictEqual(persisted.settings.testUrl, 'http://www.gstatic.com/generate_204');
 });
 
 test('large subscription payloads migrate to independent profile files', () => {
@@ -1501,7 +1733,7 @@ test('system DNS diagnostics use the OS resolver path', () => {
 
 test('selected cores use independent runtime folders', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const { SingBoxManager } = require('../src/main/singbox');
+  const { CoreManager } = require('../src/main/singbox');
   const ext = process.platform === 'win32' ? '.exe' : '';
   const fakeDat = Buffer.alloc(2048);
   for (let i = 0; i < fakeDat.length; i++) fakeDat[i] = (i * 31) & 0xff;
@@ -1509,7 +1741,7 @@ test('selected cores use independent runtime folders', () => {
   fs.writeFileSync(path.join(dir, 'bin', 'sing-box' + ext), 'legacy-singbox');
   fs.writeFileSync(path.join(dir, 'bin', 'mihomo' + ext), 'legacy-mihomo');
   fs.writeFileSync(path.join(dir, 'geoip.dat'), fakeDat);
-  const mgr = new SingBoxManager({ runtimeDir: dir });
+  const mgr = new CoreManager({ runtimeDir: dir });
 
   assert.strictEqual(mgr.coreDir('sing-box'), path.join(dir, 'singbox'));
   assert.strictEqual(mgr.coreDir('mihomo'), path.join(dir, 'mihomo'));
@@ -1526,6 +1758,50 @@ test('selected cores use independent runtime folders', () => {
   assert.ok(mgr._coreEnv().SAFE_PATHS.split(path.delimiter).includes(path.join(dir, 'ui')));
 });
 
+test('bundled Dart sing-box replaces a compatible official runtime override once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
+  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
+  const { CoreManager } = require('../src/main/singbox');
+  const binName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+  const runtimeBin = path.join(dir, 'singbox', binName);
+  const bundledBin = path.join(resources, 'singbox', binName);
+  fs.mkdirSync(path.dirname(runtimeBin), { recursive: true });
+  fs.mkdirSync(path.dirname(bundledBin), { recursive: true });
+  fs.writeFileSync(runtimeBin, 'official');
+  fs.writeFileSync(bundledBin, 'dart');
+
+  const logs = [];
+  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources, onLog: (line) => logs.push(line) });
+  let probes = 0;
+  mgr._probeCoreVersion = async (bin) => {
+    probes++;
+    return bin === bundledBin ? '1.13.14-dart.1' : '1.13.14';
+  };
+  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), true);
+  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), false);
+  assert.strictEqual(fs.readFileSync(runtimeBin, 'utf-8'), 'dart');
+  assert.strictEqual(probes, 2);
+  assert.ok(logs.some((line) => line.includes('1.13.14-dart.1')));
+});
+
+test('bundled Dart sing-box never downgrades a newer runtime core', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
+  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
+  const { CoreManager } = require('../src/main/singbox');
+  const binName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+  const runtimeBin = path.join(dir, 'singbox', binName);
+  const bundledBin = path.join(resources, 'singbox', binName);
+  fs.mkdirSync(path.dirname(runtimeBin), { recursive: true });
+  fs.mkdirSync(path.dirname(bundledBin), { recursive: true });
+  fs.writeFileSync(runtimeBin, 'newer-official');
+  fs.writeFileSync(bundledBin, 'older-dart');
+
+  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources });
+  mgr._probeCoreVersion = async (bin) => bin === bundledBin ? '1.13.14-dart.1' : '1.14.0';
+  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), false);
+  assert.strictEqual(fs.readFileSync(runtimeBin, 'utf-8'), 'newer-official');
+});
+
 test('sing-box geodata self-heals invalid writable rule-sets from bundled files', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
   const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
@@ -1539,8 +1815,8 @@ test('sing-box geodata self-heals invalid writable rule-sets from bundled files'
   fs.writeFileSync(path.join(writable, 'geoip-cn.srs'), Buffer.from('<html>blocked</html>'));
   fs.writeFileSync(path.join(writable, 'geosite-cn.srs'), Buffer.alloc(1));
 
-  const { SingBoxManager } = require('../src/main/singbox');
-  const mgr = new SingBoxManager({ runtimeDir: dir, resourcesDir: resources });
+  const { CoreManager } = require('../src/main/singbox');
+  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources });
 
   assert.strictEqual(mgr.ensureSingBoxGeoData(), true);
   assert.strictEqual(mgr.resolveRuleSetDir(), writable);
@@ -1550,8 +1826,8 @@ test('sing-box geodata self-heals invalid writable rule-sets from bundled files'
 
 test('mihomo geodata validation cache survives restarts and follows core changes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const { SingBoxManager } = require('../src/main/singbox');
-  const mgr = new SingBoxManager({ runtimeDir: dir, coreType: 'mihomo' });
+  const { CoreManager } = require('../src/main/singbox');
+  const mgr = new CoreManager({ runtimeDir: dir, coreType: 'mihomo' });
   const coreDir = mgr.ensureCoreDir('mihomo');
   const bin = path.join(coreDir, process.platform === 'win32' ? 'mihomo.exe' : 'mihomo');
   fs.writeFileSync(bin, 'fake-core');

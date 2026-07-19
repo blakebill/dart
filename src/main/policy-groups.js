@@ -1,7 +1,7 @@
 'use strict';
 
 const RESERVED_NAMES = new Set([
-  '🚀 Proxy', '♻️ Auto', '🛟 Fallback',
+  '🚀 Proxy', '♻️ Auto', '🧠 Smart', '🛟 Fallback',
   'direct', 'DIRECT', 'REJECT', 'REJECT-DROP', 'GLOBAL',
 ]);
 const RESERVED_NAMES_LOWER = new Set([...RESERVED_NAMES].map((name) => name.toLowerCase()));

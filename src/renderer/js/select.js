@@ -1,159 +1,284 @@
 'use strict';
-// Custom dropdown: the native <select> popup can't be styled (the OS draws it),
-// so we progressively enhance every <select> with a div-based menu that matches
-// the app's rounded theme. The native <select> stays in the DOM (hidden) and
-// keeps owning the value + 'change' event, so all existing logic is untouched —
-// option clicks just set the native value and dispatch 'change'.
+// Progressively enhance native selects with a themed combobox while keeping
+// the original select as the single source of truth for values and events.
 (function () {
   const App = window.App || (window.App = {});
 
-  let openMenuCtl = null; // controller {root, menu, close} of the open dropdown
+  let openMenuCtl = null;
+  let selectId = 0;
   const selectSync = new WeakMap();
 
-  function closeOpen() {
-    if (openMenuCtl) openMenuCtl.close();
+  function closeOpen(options) {
+    if (openMenuCtl) openMenuCtl.close(options);
   }
 
-  // Close the open menu on a click outside it, Esc, an outer scroll, or resize
-  // (the menu is position:fixed, so it must not linger when things move). The
-  // trigger and option clicks stopPropagation, so this only sees outside clicks.
-  document.addEventListener('click', (e) => {
-    if (openMenuCtl && !openMenuCtl.root.contains(e.target) && !openMenuCtl.menu.contains(e.target)) closeOpen();
+  document.addEventListener('click', (event) => {
+    if (!openMenuCtl) return;
+    if (!openMenuCtl.root.contains(event.target) && !openMenuCtl.menu.contains(event.target)) closeOpen();
   });
-  document.addEventListener('keydown', (e) => {
-    if (openMenuCtl && e.key === 'Escape') closeOpen();
-  });
-  window.addEventListener('scroll', (e) => {
-    if (openMenuCtl && openMenuCtl.menu.contains(e.target)) return; // scrolling inside the menu
+  // Capture Escape before a parent dialog interprets it as a request to close.
+  document.addEventListener('keydown', (event) => {
+    if (!openMenuCtl || event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeOpen({ focus: true });
+  }, true);
+  window.addEventListener('scroll', (event) => {
+    if (openMenuCtl && openMenuCtl.menu.contains(event.target)) return;
     closeOpen();
   }, true);
-  window.addEventListener('resize', closeOpen);
+  window.addEventListener('resize', () => closeOpen());
 
-  function enhance(sel) {
-    if (!(sel instanceof HTMLSelectElement) || sel.dataset.enhanced) return;
-    sel.dataset.enhanced = '1';
-    let root = null;
-    try {
-      buildEnhanced(sel, (el) => { root = el; });
-    } catch (e) {
-      // Never leave a select hidden-but-inert: restore the native control.
-      delete sel.dataset.enhanced;
-      if (root && root.parentNode) root.remove();
+  function explicitLabel(select) {
+    if (!select.id) return null;
+    return Array.from(document.querySelectorAll('label[for]')).find((label) => label.htmlFor === select.id) || null;
+  }
+
+  function copyAccessibleName(select, root) {
+    const labelledBy = select.getAttribute('aria-labelledby');
+    const ariaLabel = select.getAttribute('aria-label');
+    const label = explicitLabel(select);
+    if (label) {
+      if (!label.id) label.id = `ui-select-label-${++selectId}`;
+      root.setAttribute('aria-labelledby', label.id);
+      label.htmlFor = root.id;
+    } else if (labelledBy) {
+      root.setAttribute('aria-labelledby', labelledBy);
+    } else if (ariaLabel) {
+      root.setAttribute('aria-label', ariaLabel);
+    } else if (select.title) {
+      root.setAttribute('aria-label', select.title);
     }
   }
 
-  function buildEnhanced(sel, setRoot) {
-    const root = document.createElement('div');
-    setRoot(root);
-    // Reuse the native select's look (.input/.small give border, radius, size).
-    root.className = 'ui-select ' + sel.className;
-    root.tabIndex = 0;
-    root.setAttribute('role', 'listbox');
+  function enhance(select) {
+    if (!(select instanceof HTMLSelectElement) || select.dataset.enhanced) return;
+    select.dataset.enhanced = '1';
+    let root = null;
+    try {
+      root = buildEnhanced(select);
+    } catch (error) {
+      delete select.dataset.enhanced;
+      select.removeAttribute('aria-hidden');
+      select.removeAttribute('tabindex');
+      if (root) {
+        const label = Array.from(document.querySelectorAll('label[for]'))
+          .find((candidate) => candidate.htmlFor === root.id);
+        if (label && select.id) label.htmlFor = select.id;
+        if (root.parentNode) root.remove();
+      }
+    }
+  }
 
-    const label = document.createElement('span');
-    label.className = 'ui-select-label';
+  function buildEnhanced(select) {
+    const id = ++selectId;
+    const root = document.createElement('button');
+    root.type = 'button';
+    root.className = `ui-select ${select.className}`;
+    root.id = `ui-select-${id}`;
+    root.setAttribute('role', 'combobox');
+    root.setAttribute('aria-haspopup', 'listbox');
+    root.setAttribute('aria-autocomplete', 'none');
+    root.setAttribute('aria-expanded', 'false');
 
+    const menuId = `ui-select-menu-${id}`;
+    root.setAttribute('aria-controls', menuId);
+    copyAccessibleName(select, root);
+
+    const valueLabel = document.createElement('span');
+    valueLabel.className = 'ui-select-label';
     const chevron = document.createElement('span');
     chevron.className = 'ui-select-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
     chevron.innerHTML =
       "<svg width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='currentColor'" +
       " stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'>" +
       "<polyline points='6 9 12 15 18 9'/></svg>";
+    root.append(valueLabel, chevron);
+    select.insertAdjacentElement('afterend', root);
+    select.setAttribute('aria-hidden', 'true');
+    select.tabIndex = -1;
 
-    root.append(label, chevron);
-    sel.insertAdjacentElement('afterend', root);
-
-    // The menu is transient and lives on <body> while open. body-level keeps its
-    // position:fixed relative to the viewport — inside the wrapper, a transformed
-    // ancestor (the animated content area) would become its containing block and
-    // push it off-screen. Created on open, removed on close (so it never leaks).
     let menu = null;
+    let activeIndex = -1;
+    let typeahead = '';
+    let typeaheadTimer = null;
 
-    const syncLabel = () => {
-      const o = sel.options[sel.selectedIndex];
-      label.textContent = o ? o.textContent : '';
-    };
-    selectSync.set(sel, syncLabel);
+    const enabledIndexes = () => Array.from(select.options)
+      .map((option, index) => (!option.disabled ? index : -1))
+      .filter((index) => index >= 0);
 
-    const closeMenu = () => {
-      if (menu) { menu.remove(); menu = null; }
+    function syncControl() {
+      const option = select.options[select.selectedIndex];
+      valueLabel.textContent = option ? option.textContent : '';
+      root.disabled = !!select.disabled;
+      root.setAttribute('aria-disabled', String(!!select.disabled));
+      if (select.getAttribute('aria-label') && !root.hasAttribute('aria-labelledby')) {
+        root.setAttribute('aria-label', select.getAttribute('aria-label'));
+      }
+    }
+    selectSync.set(select, syncControl);
+
+    function setActive(index) {
+      if (!menu || index < 0 || index >= select.options.length || select.options[index].disabled) return;
+      activeIndex = index;
+      menu.querySelectorAll('[role="option"]').forEach((item, itemIndex) => {
+        item.classList.toggle('active', itemIndex === index);
+      });
+      const active = menu.children[index];
+      root.setAttribute('aria-activedescendant', active.id);
+      active.scrollIntoView({ block: 'nearest' });
+    }
+
+    function closeMenu({ focus = false } = {}) {
+      clearTimeout(typeaheadTimer);
+      typeahead = '';
+      if (menu) {
+        menu.remove();
+        menu = null;
+      }
+      activeIndex = -1;
       root.classList.remove('open');
+      root.setAttribute('aria-expanded', 'false');
+      root.removeAttribute('aria-activedescendant');
       if (openMenuCtl && openMenuCtl.root === root) openMenuCtl = null;
-    };
+      if (focus) root.focus();
+    }
 
-    const openMenu = () => {
-      if (sel.disabled) return;
-      closeOpen(); // close any other open dropdown first
+    function choose(index) {
+      const option = select.options[index];
+      if (!option || option.disabled) return;
+      if (select.value !== option.value) {
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      syncControl();
+      closeMenu({ focus: true });
+    }
 
+    function openMenu(preferredIndex) {
+      if (select.disabled || menu) return;
+      closeOpen();
       menu = document.createElement('div');
+      menu.id = menuId;
       menu.className = 'ui-select-menu';
-      for (const o of sel.options) {
+      menu.setAttribute('role', 'listbox');
+      menu.setAttribute('aria-labelledby', root.getAttribute('aria-labelledby') || root.id);
+
+      Array.from(select.options).forEach((option, index) => {
         const item = document.createElement('div');
-        item.className = 'ui-select-opt' + (o.selected ? ' selected' : '');
-        item.textContent = o.textContent;
-        item.addEventListener('click', (e) => {
-          e.stopPropagation(); // don't bubble to the trigger (would re-open)
-          if (sel.value !== o.value) {
-            sel.value = o.value;
-            sel.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-          closeMenu();
+        item.id = `${menuId}-option-${index}`;
+        item.className = 'ui-select-opt' + (option.selected ? ' selected' : '');
+        item.textContent = option.textContent;
+        item.setAttribute('role', 'option');
+        item.setAttribute('aria-selected', String(option.selected));
+        item.setAttribute('aria-disabled', String(!!option.disabled));
+        item.addEventListener('pointermove', () => setActive(index));
+        item.addEventListener('click', (event) => {
+          event.stopPropagation();
+          choose(index);
         });
         menu.appendChild(item);
-      }
+      });
       document.body.appendChild(menu);
 
-      // Position under the trigger (flip up when short on room), clamped to the
-      // viewport. getBoundingClientRect + a body-level fixed menu share the same
-      // viewport coordinate system.
-      const r = root.getBoundingClientRect();
-      const mw = menu.offsetWidth;
-      const mh = menu.offsetHeight;
-      menu.style.minWidth = r.width + 'px';
-      let left = Math.min(r.left, window.innerWidth - mw - 8);
+      const rect = root.getBoundingClientRect();
+      menu.style.minWidth = rect.width + 'px';
+      const menuWidth = Math.max(rect.width, menu.offsetWidth);
+      const menuHeight = menu.offsetHeight;
+      const left = Math.min(rect.left, window.innerWidth - menuWidth - 8);
       menu.style.left = Math.max(8, left) + 'px';
-      const below = window.innerHeight - r.bottom;
-      menu.style.top = (below < mh && r.top > below ? r.top - mh - 4 : r.bottom + 4) + 'px';
+      const below = window.innerHeight - rect.bottom;
+      menu.style.top = (below < menuHeight && rect.top > below ? rect.top - menuHeight - 4 : rect.bottom + 4) + 'px';
 
       root.classList.add('open');
+      root.setAttribute('aria-expanded', 'true');
       openMenuCtl = { root, menu, close: closeMenu };
-    };
+      const indexes = enabledIndexes();
+      const initial = indexes.includes(preferredIndex)
+        ? preferredIndex
+        : (indexes.includes(select.selectedIndex) ? select.selectedIndex : indexes[0]);
+      if (initial !== undefined) setActive(initial);
+    }
 
-    root.addEventListener('click', (e) => {
-      e.stopPropagation(); // keep the document close-handler from seeing our own click
-      if (root.classList.contains('open')) closeMenu();
-      else openMenu();
+    function moveActive(delta) {
+      const indexes = enabledIndexes();
+      if (!indexes.length) return;
+      const current = indexes.indexOf(activeIndex);
+      const next = current < 0
+        ? (delta > 0 ? 0 : indexes.length - 1)
+        : (current + delta + indexes.length) % indexes.length;
+      setActive(indexes[next]);
+    }
+
+    function runTypeahead(key) {
+      clearTimeout(typeaheadTimer);
+      typeahead += key.toLocaleLowerCase();
+      typeaheadTimer = setTimeout(() => { typeahead = ''; }, 700);
+      const options = Array.from(select.options);
+      const match = options.findIndex((option) =>
+        !option.disabled && option.textContent.trim().toLocaleLowerCase().startsWith(typeahead)
+      );
+      if (match >= 0) {
+        if (!menu) openMenu(match);
+        else setActive(match);
+      }
+    }
+
+    root.addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (menu) closeMenu();
+      else openMenu(select.selectedIndex);
     });
-    root.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') { e.preventDefault(); openMenu(); }
+    root.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (!menu) openMenu(select.selectedIndex);
+        else moveActive(event.key === 'ArrowDown' ? 1 : -1);
+      } else if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        if (!menu) openMenu(select.selectedIndex);
+        const indexes = enabledIndexes();
+        if (indexes.length) setActive(event.key === 'Home' ? indexes[0] : indexes[indexes.length - 1]);
+      } else if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        if (!menu) openMenu(select.selectedIndex);
+        else choose(activeIndex);
+      } else if (event.key === 'Tab') {
+        closeMenu();
+      } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        runTypeahead(event.key);
+      }
     });
 
-    // Reflect programmatic `select.value = ...` (e.g. settings load) in the label
-    // by wrapping the instance's value setter — change events aren't fired then.
-    const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
-    Object.defineProperty(sel, 'value', {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value');
+    Object.defineProperty(select, 'value', {
       configurable: true,
-      get() { return desc.get.call(this); },
-      set(v) { desc.set.call(this, v); syncLabel(); },
+      get() { return descriptor.get.call(this); },
+      set(value) {
+        descriptor.set.call(this, value);
+        syncControl();
+      },
     });
-    sel.addEventListener('change', syncLabel);
+    select.addEventListener('change', syncControl);
+    new MutationObserver(() => {
+      closeMenu();
+      syncControl();
+    }).observe(select, { attributes: true, childList: true, characterData: true, subtree: true });
 
-    syncLabel();
+    syncControl();
+    return root;
   }
 
-  /** Enhance every <select> within root (default: whole document). Idempotent. */
   function enhanceSelects(root) {
     (root || document).querySelectorAll('select').forEach(enhance);
   }
 
-  // Translation updates mutate the native <option> text in place. Refresh the
-  // mirrored label as well, otherwise the enhanced control keeps displaying
-  // the previous language until its value changes.
   function refreshSelects(root) {
     closeOpen();
     enhanceSelects(root);
-    (root || document).querySelectorAll('select').forEach((sel) => {
-      const sync = selectSync.get(sel);
+    (root || document).querySelectorAll('select').forEach((select) => {
+      const sync = selectSync.get(select);
       if (sync) sync();
     });
   }

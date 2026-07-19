@@ -26,6 +26,7 @@
     let result = null;
     toolView('toolbox.routeTitle', 'toolbox.routeHint', `
       <div class="form-row dialog-commandbar">
+        <label class="sr-only" for="routeInput" data-i18n="toolbox.routePlaceholder">${escapeHtml(t('toolbox.routePlaceholder'))}</label>
         <input id="routeInput" class="input grow" value="www.google.com" data-i18n-ph="toolbox.routePlaceholder" />
         <button id="routeRun" class="btn primary" data-i18n="toolbox.inspect">${escapeHtml(t('toolbox.inspect'))}</button>
       </div>
@@ -176,6 +177,7 @@
     let result = null;
     toolView('toolbox.portTitle', 'toolbox.portHint', `
       <div class="form-row dialog-commandbar">
+        <label class="sr-only" for="portInput" data-i18n="toolbox.portPlaceholder">${escapeHtml(t('toolbox.portPlaceholder'))}</label>
         <input id="portInput" class="input grow" value="7890, 9090" data-i18n-ph="toolbox.portPlaceholder" />
         <button id="portRun" class="btn primary" data-i18n="toolbox.inspect">${escapeHtml(t('toolbox.inspect'))}</button>
       </div>
@@ -267,6 +269,7 @@
     let result = null;
     toolView('toolbox.dnsTitle', 'toolbox.dnsHint', `
       <div class="form-row dialog-commandbar">
+        <label class="sr-only" for="dnsInput" data-i18n="toolbox.dnsPlaceholder">${escapeHtml(t('toolbox.dnsPlaceholder'))}</label>
         <input id="dnsInput" class="input grow" value="www.google.com" data-i18n-ph="toolbox.dnsPlaceholder" />
         <button id="dnsRun" class="btn primary" data-i18n="toolbox.compare">${escapeHtml(t('toolbox.compare'))}</button>
       </div>

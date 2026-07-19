@@ -33,7 +33,7 @@
     const netCls = net === 'TCP' ? ' tcp' : net === 'UDP' ? ' udp' : '';
     const netHtml = net ? `<span class="conn-net${netCls}">${escapeHtml(net)}</span>` : '';
     const closeHtml = c.id
-      ? `<button class="conn-close" data-id="${escapeHtml(c.id)}" title="${t('conns.close')}">✕</button>`
+      ? `<button type="button" class="conn-close" data-id="${escapeHtml(c.id)}" aria-label="${escapeHtml(t('conns.close') + ': ' + target)}" title="${escapeHtml(t('conns.close'))}">✕</button>`
       : '';
     return (
       `<div class="conn-main">` +
@@ -53,7 +53,7 @@
     let html = start ? `<div class="virtual-spacer" style="height:${start * VIRTUAL_CONNECTION_ROW_HEIGHT}px"></div>` : '';
     for (let i = start; i < end; i++) {
       const c = connectionItems[i];
-      html += `<div class="conn-item" data-connection-id="${escapeHtml(c.id || '')}">${connRowInner(c)}</div>`;
+      html += `<div class="conn-item" role="listitem" data-connection-id="${escapeHtml(c.id || '')}">${connRowInner(c)}</div>`;
     }
     const after = connectionItems.length - end;
     if (after) html += `<div class="virtual-spacer" style="height:${after * VIRTUAL_CONNECTION_ROW_HEIGHT}px"></div>`;
@@ -93,12 +93,18 @@
     const btn = e.target.closest('.conn-close');
     if (!btn || !btn.dataset.id) return;
     btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
     try {
       await call(api.closeConnection, btn.dataset.id);
       toast(t('conns.closedOne'));
       loadConnections();
     } catch (_) {
       /* toast already shown by call() */
+    } finally {
+      if (btn.isConnected) {
+        btn.disabled = false;
+        btn.removeAttribute('aria-busy');
+      }
     }
   });
 

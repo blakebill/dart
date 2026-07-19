@@ -9,188 +9,39 @@ const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, getRecentLogs, clearRecentLogs, sendStatus, coreStatusInfo } = require('./state');
 const core = require('./core-control');
 const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
-const update = require('./update');
-const { buildMihomoConfig, buildSingboxConfig, dnsServerFromAddress } = require('./converter');
+const { AppUpdateController } = require('./app-update-controller');
+const { getCoreAdapter } = require('./core-adapters');
+const { buildMihomoConfig, buildSingboxConfig } = require('./converter');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
-const fetch = require('./fetch');
 const { notify } = require('./notify');
 const toolbox = require('./toolbox');
 const dialogWindows = require('./dialog-window');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
-
-/** Validate an IPC payload field: must be a non-empty string. */
-function reqStr(v, name) {
-  if (typeof v !== 'string' || !v.trim()) throw new Error('invalid ' + name);
-  return v;
-}
-
-/** Validate an IPC payload field: must be an http(s) URL. */
-function reqUrl(v, name) {
-  reqStr(v, name);
-  let u;
-  try {
-    u = new URL(v);
-  } catch (_) {
-    throw new Error('invalid ' + name);
-  }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new Error(name + ' must be an http(s) URL');
-  }
-  return v;
-}
-
-/** Validate an IPC payload field against an allowlist of values. */
-function reqEnum(v, allowed, name) {
-  if (!allowed.includes(v)) throw new Error('invalid ' + name);
-  return v;
-}
-
-function reqBoolean(v, name) {
-  if (typeof v !== 'boolean') throw new Error('invalid ' + name);
-  return v;
-}
+const validation = require('./ipc-validation');
+const {
+  CORE_CONFIG_SETTINGS,
+  MAX_IPC_CONNECTIONS,
+  SETTING_KEYS,
+  VALID_CRS_FORMATS,
+  VALID_MODES,
+  VALID_SUBSCRIPTION_UA_MODES,
+  VALID_TARGETS,
+  recentConnections,
+  reqAutoUpdateMinutes,
+  reqBoolean,
+  reqConfigText,
+  reqEnum,
+  reqStr,
+  reqUrl,
+  validateSettingsPatch,
+} = validation;
 
 function senderWindow(event) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win || win !== state.mainWindow || win.isDestroyed()) throw new Error('invalid window');
   return win;
-}
-
-// Where converted rules may route to.
-const VALID_TARGETS = ['proxy', 'direct', 'reject'];
-const VALID_CRS_FORMATS = ['clash', 'sing-box'];
-const VALID_SUBSCRIPTION_UA_MODES = ['auto', 'sing-box', 'clash'];
-
-// Settings keys the renderer may write; anything else in a patch is dropped so
-// a malformed payload cannot pollute the persisted store.
-const SETTING_KEYS = new Set([
-  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel',
-  'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
-  'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
-  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'coreType',
-]);
-
-const VALID_MODES = ['rule', 'global', 'direct', 'block'];
-const MAX_IPC_CONNECTIONS = 300;
-const MAX_CONFIG_INPUT_BYTES = 32 * 1024 * 1024;
-const MAX_AUTO_UPDATE_MINUTES = 365 * 24 * 60;
-
-function reqAutoUpdateMinutes(value) {
-  if (!Number.isInteger(value) || value < 0 || value > MAX_AUTO_UPDATE_MINUTES) {
-    throw new Error('invalid autoUpdateMinutes');
-  }
-  return value;
-}
-
-function reqConfigText(value) {
-  reqStr(value, 'content');
-  if (Buffer.byteLength(value, 'utf-8') > MAX_CONFIG_INPUT_BYTES) {
-    throw new Error('config content exceeds 32 MB');
-  }
-  return value;
-}
-
-function recentConnections(items, limit) {
-  const keyEntry = (item) => ({
-    item,
-    key: String(item.start || '') + '\0' + String(item.id || ''),
-  });
-  if (items.length <= limit) {
-    return items.map(keyEntry).sort((a, b) => b.key.localeCompare(a.key)).map((entry) => entry.item);
-  }
-  const heap = [];
-  const swap = (a, b) => { [heap[a], heap[b]] = [heap[b], heap[a]]; };
-  const siftUp = (index) => {
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (heap[parent].key.localeCompare(heap[index].key) <= 0) break;
-      swap(parent, index);
-      index = parent;
-    }
-  };
-  const siftDown = (index) => {
-    while (true) {
-      const left = index * 2 + 1;
-      const right = left + 1;
-      let smallest = index;
-      if (left < heap.length && heap[left].key.localeCompare(heap[smallest].key) < 0) smallest = left;
-      if (right < heap.length && heap[right].key.localeCompare(heap[smallest].key) < 0) smallest = right;
-      if (smallest === index) return;
-      swap(index, smallest);
-      index = smallest;
-    }
-  };
-  for (const item of items) {
-    const entry = keyEntry(item);
-    if (heap.length < limit) {
-      heap.push(entry);
-      siftUp(heap.length - 1);
-    } else if (entry.key.localeCompare(heap[0].key) > 0) {
-      heap[0] = entry;
-      siftDown(0);
-    }
-  }
-  return heap.sort((a, b) => b.key.localeCompare(a.key)).map((entry) => entry.item);
-}
-const CORE_CONFIG_SETTINGS = new Set([
-  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
-  'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
-  'ruleOverrides', 'coreType', 'testUrl',
-]);
-
-function validateSettingsPatch(patch, current) {
-  for (const key of ['mixedPort', 'clashApiPort']) {
-    if (!(key in patch)) continue;
-    if (!Number.isInteger(patch[key]) || patch[key] < 1 || patch[key] > 65535) {
-      throw new Error(`invalid ${key}`);
-    }
-  }
-  for (const key of [
-    'enableClashApi', 'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
-    'notifications', 'enableIpv6', 'useBuiltinRules',
-  ]) {
-    if (key in patch && typeof patch[key] !== 'boolean') throw new Error(`invalid ${key}`);
-  }
-  if ('coreType' in patch) reqEnum(patch.coreType, ['sing-box', 'mihomo'], 'coreType');
-  if ('logLevel' in patch) reqEnum(patch.logLevel, ['trace', 'debug', 'info', 'warn', 'error'], 'logLevel');
-  if ('dnsStrategy' in patch) {
-    reqEnum(patch.dnsStrategy, ['prefer_ipv4', 'prefer_ipv6', 'ipv4_only', 'ipv6_only'], 'dnsStrategy');
-  }
-  if ('language' in patch) reqEnum(patch.language, ['zh', 'en'], 'language');
-  if ('theme' in patch) reqEnum(patch.theme, ['dark', 'light', 'system'], 'theme');
-  if ('clashMode' in patch) reqEnum(patch.clashMode, VALID_MODES, 'clashMode');
-  for (const key of ['dnsRemote', 'dnsLocal']) {
-    if (!(key in patch)) continue;
-    const value = reqStr(patch[key], key).trim();
-    const allowedScheme = /^(?:https|tls|quic|h3|http3|tcp|udp):\/\//i.test(value);
-    if (
-      /\s/.test(value) ||
-      (value.includes('://') && !allowedScheme) ||
-      !/^(?:(?:https|tls|quic|h3|http3|tcp|udp):\/\/)?[^/]+(?:\/\S*)?$/i.test(value)
-    ) {
-      throw new Error('invalid ' + key);
-    }
-    patch[key] = value;
-    dnsServerFromAddress(value, 'validate');
-  }
-  if ('testUrl' in patch && patch.testUrl) reqUrl(patch.testUrl, 'testUrl');
-  if ('testConcurrency' in patch) {
-    if (!Number.isInteger(patch.testConcurrency) || patch.testConcurrency < 1 || patch.testConcurrency > 32) {
-      throw new Error('invalid testConcurrency');
-    }
-  }
-  if ('ruleOverrides' in patch) {
-    if (!patch.ruleOverrides || typeof patch.ruleOverrides !== 'object' || Array.isArray(patch.ruleOverrides)) {
-      throw new Error('invalid ruleOverrides');
-    }
-    for (const value of Object.values(patch.ruleOverrides)) reqEnum(value, VALID_TARGETS, 'ruleOverrides');
-  }
-  const next = { ...current, ...patch };
-  if (next.enableClashApi && next.mixedPort === next.clashApiPort) {
-    throw new Error('mixedPort and clashApiPort must be different');
-  }
 }
 
 async function rollbackSettingsAfterFailure(previous, wasRunning, originalError) {
@@ -284,18 +135,15 @@ function purgeCustomRuleBinaries() {
 }
 
 let pendingBackup = null;
-let updateDownloadRunning = false;
-let updateQuitPending = false;
-let updateDownloadController = null;
-let appUpdateTask = null;
+let appUpdateController = null;
 let coreUpdateTask = null;
 
 async function cancelPendingUpdates() {
-  if (updateDownloadController) updateDownloadController.abort();
+  if (appUpdateController) appUpdateController.cancel();
   if (state.singbox && typeof state.singbox.cancelCoreDownload === 'function') {
     state.singbox.cancelCoreDownload();
   }
-  const pending = [appUpdateTask, coreUpdateTask].filter(Boolean);
+  const pending = [appUpdateController && appUpdateController.task, coreUpdateTask].filter(Boolean);
   if (pending.length) await Promise.allSettled(pending);
 }
 
@@ -327,6 +175,7 @@ function plainConversionLabels(value) {
     return value
       .replace(/🚀 Proxy/g, 'Dart Proxy')
       .replace(/♻️ Auto/g, 'Dart Auto')
+      .replace(/🧠 Smart/g, 'Dart Smart')
       .replace(/🛟 Fallback/g, 'Dart Fallback');
   }
   if (Array.isArray(value)) return value.map(plainConversionLabels);
@@ -779,26 +628,21 @@ function registerIpc() {
     return { config, nodeCount: result.nodes.length, format: result.format, target: 'sing-box' };
   });
 
-  // Export the current sing-box config to a file.
+  // Export the active core's generated config to a file.
   ipcMain.handle('convert:export', async (event) => {
-    if (state.singbox.getCoreType() === 'mihomo') await state.singbox.validateMihomoGeoData();
-    const { config, settings } = core.buildCurrentConfig();
+    const adapter = getCoreAdapter(state.singbox.getCoreType());
+    await adapter.prepareStart(state.singbox);
+    const { config } = core.buildCurrentConfig();
     // The per-run API secret is runtime-only; keep it out of shared exports.
     if (config.experimental && config.experimental.clash_api) {
       delete config.experimental.clash_api.secret;
     }
-    if (settings.coreType === 'mihomo' && config.secret) delete config.secret;
-    const isMihomo = settings.coreType === 'mihomo';
+    if (adapter.sanitizeExport) adapter.sanitizeExport(config);
     const { canceled, filePath } = await dialog.showSaveDialog(dialogWindows.ownerWindow(event), {
-      title: isMihomo ? 'Export mihomo config' : 'Export sing-box config',
-      defaultPath: isMihomo ? 'config.yaml' : 'config.json',
-      filters: isMihomo ? [{ name: 'YAML', extensions: ['yaml', 'yml'] }] : [{ name: 'JSON', extensions: ['json'] }],
+      ...adapter.exportDialog,
     });
     if (canceled || !filePath) return null;
-    await writeAtomicText(
-      filePath,
-      isMihomo ? yaml.dump(config, { lineWidth: -1, noRefs: true }) : JSON.stringify(config, null, 2)
-    );
+    await writeAtomicText(filePath, adapter.serializeConfig(config));
     return filePath;
   });
 
@@ -873,7 +717,11 @@ function registerIpc() {
   ipcMain.handle('node:delay', async (_e, { name }) => {
     reqStr(name, 'name');
     if (!state.singbox.isRunning()) throw new Error('core not running');
-    return core.testNodeDelay(name);
+    try {
+      return { ok: true, delay: await core.testNodeDelay(name) };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'timeout' };
+    }
   });
 
   ipcMain.handle('node:autoCandidate', async (_e, { name }) => {
@@ -890,7 +738,7 @@ function registerIpc() {
   // Resolve the live outer selector plus the health-check groups. Outside the
   // Nodes tab only the active automatic group is queried, keeping polling tiny.
   ipcMain.handle('node:groupSelections', async (_e, { all = false } = {}) => {
-    if (!state.singbox.isRunning()) return { proxy: null, auto: null, fallback: null };
+    if (!state.singbox.isRunning()) return { proxy: null, auto: null, smart: null, fallback: null };
     const current = async (name) => {
       try {
         const group = await core.clashApi('GET', '/proxies/' + encodeURIComponent(name));
@@ -901,11 +749,12 @@ function registerIpc() {
     };
     const proxy = await current('🚀 Proxy');
     const selected = proxy || state.store.get('selected') || '♻️ Auto';
-    const [auto, fallback] = await Promise.all([
+    const [auto, smart, fallback] = await Promise.all([
       all || selected === '♻️ Auto' ? current('♻️ Auto') : null,
+      all || selected === '🧠 Smart' ? current('🧠 Smart') : null,
       all || selected === '🛟 Fallback' ? current('🛟 Fallback') : null,
     ]);
-    return { proxy, auto, fallback };
+    return { proxy, auto, smart, fallback };
   });
 
   // Select an outbound and persist it as the default for the next start.
@@ -915,6 +764,7 @@ function registerIpc() {
     const active = core.getActiveSubscription();
     const validNames = new Set([
       '♻️ Auto',
+      '🧠 Smart',
       '🛟 Fallback',
       ...((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean),
     ]);
@@ -1012,24 +862,13 @@ function registerIpc() {
 
   // Rule-set management: report status of each routing rule-set.
   ipcMain.handle('ruleset:list', async () => {
-    const isMihomo = state.singbox.getCoreType() === 'mihomo';
-    const items = isMihomo
-      ? [
-          { tag: 'geoip', file: 'geoip.dat' },
-          { tag: 'geosite', file: 'geosite.dat' },
-          { tag: 'country-mmdb', file: 'country.mmdb' },
-        ]
-      : [
-          { tag: 'geoip-cn', file: 'geoip-cn.srs' },
-          { tag: 'geosite-cn', file: 'geosite-cn.srs' },
-        ];
+    const adapter = getCoreAdapter(state.singbox.getCoreType());
+    const items = adapter.ruleSetItems;
     const dirs = [
-      { loc: 'updated', dir: state.singbox.coreDir(isMihomo ? 'mihomo' : 'sing-box') },
-      ...state.singbox.resourceDirs(isMihomo ? 'mihomo' : 'sing-box').map((dir) => ({ loc: 'bundled', dir })),
+      { loc: 'updated', dir: state.singbox.coreDir(adapter.id) },
+      ...state.singbox.resourceDirs(adapter.id).map((dir) => ({ loc: 'bundled', dir })),
       // Legacy fallback for users upgrading from the shared runtime layout.
-      ...(isMihomo
-        ? [{ loc: 'updated', dir: runtimeDir }, { loc: 'bundled', dir: resourcesBinDir }]
-        : [{ loc: 'updated', dir: path.join(runtimeDir, 'bin') }, { loc: 'bundled', dir: resourcesBinDir }]),
+      ...adapter.legacyGeoDirs(runtimeDir, resourcesBinDir),
     ].filter((d, i, arr) => d.dir && arr.findIndex((x) => x.dir === d.dir) === i);
     const readUpdatedAt = (dir, file) => {
       try {
@@ -1050,7 +889,7 @@ function registerIpc() {
             found = {
               location: d.loc,
               size: st.size,
-              valid: isMihomo ? state.singbox._validGeoFile(p) : state.singbox._validSrs(p),
+              valid: adapter.validateGeoFile(state.singbox, p),
               mtime: st.mtimeMs,
               dir: d.dir,
             };
@@ -1120,80 +959,16 @@ function registerIpc() {
     await shell.openExternal(u.toString());
     return true;
   });
-  ipcMain.handle('app:checkUpdate', () => update.checkUpdate(app.getVersion(), core.currentProxyPort(), sendLog));
-
-  // Download the new installer (proxy-first with direct fallback), launch it,
-  // then quit so it can replace our files.
-  ipcMain.handle('update:download', () => {
-    if (updateDownloadRunning || updateQuitPending || app.isQuitting) return Promise.reject(new Error('app update download already in progress'));
-    updateDownloadRunning = true;
-    const controller = new AbortController();
-    updateDownloadController = controller;
-    let task;
-    task = (async () => {
-      try {
-      const proxyPort = core.currentProxyPort();
-      const info = await update.checkUpdate(app.getVersion(), proxyPort, sendLog, { signal: controller.signal });
-      if (controller.signal.aborted || app.isQuitting) throw Object.assign(new Error('app is shutting down'), { code: 'ABORT_ERR' });
-      if (info.error) throw new Error(info.error);
-      if (!info.hasUpdate) throw new Error('already up to date');
-      if (!info.assetUrl || !info.assetName) throw new Error('no installer asset on the latest release');
-      const assetName = path.basename(info.assetName);
-      if (assetName !== info.assetName || /[\\/]/.test(info.assetName)) {
-        throw new Error('invalid installer asset name');
-      }
-      const dest = path.join(app.getPath('temp'), assetName);
-      sendLog('[gui] downloading update: ' + info.assetUrl + (proxyPort ? ' (via proxy)' : ' (direct — start the core to download via proxy)'));
-      try {
-        await fetch.downloadWithFallback(info.assetUrl, dest, {
-          proxyPort,
-          signal: controller.signal,
-          log: sendLog,
-          onProgress: (p) => sendToMain('core:downloadProgress', p),
-        });
-      } catch (e) {
-        if (e && e.code === 'ABORT_ERR') throw e;
-        throw new Error(
-          e.message + (proxyPort ? '' : ' — start the core first so the download can go through the proxy')
-        );
-      }
-      if (controller.signal.aborted || app.isQuitting) {
-        try { fs.unlinkSync(dest); } catch (_) {}
-        throw Object.assign(new Error('app is shutting down'), { code: 'ABORT_ERR' });
-      }
-      try {
-        update.validateInstaller(dest, Number(info.assetSize) || 0);
-      } catch (error) {
-        try { fs.unlinkSync(dest); } catch (_) {}
-        throw error;
-      }
-      const err = await shell.openPath(dest);
-      if (err) {
-        try { fs.unlinkSync(dest); } catch (_) {}
-        throw new Error('failed to launch installer: ' + err);
-      }
-      sendLog('[gui] installer launched; quitting for the update');
-      updateQuitPending = true;
-      // Keep normal before-quit cleanup active while the installer starts. If
-      // another quit arrives during this delay, its cleanup owns the shutdown.
-      setTimeout(async () => {
-        if (app.isQuitting) return;
-        app.isQuitting = true;
-        try { await core.cleanup(); } catch (_) { /* best-effort */ }
-        app.quit();
-      }, 1200);
-      return true;
-      } finally {
-        updateDownloadRunning = false;
-        if (updateDownloadController === controller) updateDownloadController = null;
-      }
-    })();
-    appUpdateTask = task;
-    task.finally(() => {
-      if (appUpdateTask === task) appUpdateTask = null;
-    }).catch(() => {});
-    return task;
+  appUpdateController = new AppUpdateController({
+    app,
+    core,
+    fetch: require('./fetch'),
+    sendLog,
+    sendToMain,
+    shell,
+    update: require('./update'),
   });
+  appUpdateController.register(ipcMain);
 
   // Custom rule-sets (remote, multi-format -> converted & applied).
   const sanitizeCrs = (c) => ({
@@ -1732,7 +1507,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('core:check', () => core.queueConfigMutation(async () => {
-    if (state.singbox.getCoreType() === 'mihomo') await state.singbox.validateMihomoGeoData();
+    await getCoreAdapter(state.singbox.getCoreType()).prepareStart(state.singbox);
     const { config } = core.buildCurrentConfig();
     await state.singbox.checkConfigFor(state.singbox.getCoreType(), config);
     return true;

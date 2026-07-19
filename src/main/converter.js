@@ -7,8 +7,9 @@ const {
 } = require('./policy-groups');
 
 const AUTO_GROUP = '♻️ Auto';
+const SMART_GROUP = '🧠 Smart';
 const FALLBACK_GROUP = '🛟 Fallback';
-const DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
+const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
 const AUTO_TEST_TOLERANCE_MS = 1;
 const AUTO_TEST_INTERVAL_SECONDS = 60;
 const AUTO_TEST_TIMEOUT_MS = 5000;
@@ -825,7 +826,7 @@ function dedupeNames(items, key, reserved = []) {
 
 /** Deduplicate tags and keep generated strategy outbounds unambiguous. */
 function dedupeTags(outbounds) {
-  return dedupeNames(outbounds, 'tag', ['🚀 Proxy', AUTO_GROUP, FALLBACK_GROUP, 'direct']);
+  return dedupeNames(outbounds, 'tag', ['🚀 Proxy', AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct']);
 }
 
 /**
@@ -945,12 +946,12 @@ function buildSingboxConfig(nodes, opts = {}) {
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const sourceGroups = normalizePolicyGroups(policyGroups, nodeTags);
   const sourceGroupNames = sourceGroups.map((group) => group.name);
-  const availableTargets = new Set([AUTO_GROUP, FALLBACK_GROUP, ...nodeTags, ...sourceGroupNames]);
+  const availableTargets = new Set([AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...nodeTags, ...sourceGroupNames]);
 
   // Default selection: a specific node tag if it still exists, else auto.
   const defaultOutbound =
     selected && (
-      [AUTO_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) ||
+      [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) ||
       availableTargets.has(selected)
     )
       ? selected
@@ -962,7 +963,7 @@ function buildSingboxConfig(nodes, opts = {}) {
   const proxyGroup = {
     type: 'selector',
     tag: '🚀 Proxy',
-    outbounds: [AUTO_GROUP, FALLBACK_GROUP, ...sourceGroupNames, ...nodeTags, 'direct'],
+    outbounds: [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...sourceGroupNames, ...nodeTags, 'direct'],
     default: defaultOutbound,
   };
   // Sing-Box's Clash API updates per-node delay history without asking a
@@ -978,6 +979,18 @@ function buildSingboxConfig(nodes, opts = {}) {
         url: latencyUrl,
         interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
         tolerance: AUTO_TEST_TOLERANCE_MS,
+        idle_timeout: '30m',
+        interrupt_exist_connections: false,
+      };
+  const smartGroup = enableClashApi
+    ? { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] }
+    : {
+        type: 'urltest',
+        tag: SMART_GROUP,
+        outbounds: nodeTags,
+        url: latencyUrl,
+        interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
+        tolerance: 50,
         idle_timeout: '30m',
         interrupt_exist_connections: false,
       };
@@ -997,6 +1010,7 @@ function buildSingboxConfig(nodes, opts = {}) {
   const outbounds = [
     proxyGroup,
     autoGroup,
+    smartGroup,
     fallbackGroup,
     ...sourceGroupOutbounds,
     ...nodeOutbounds,
@@ -1104,7 +1118,7 @@ function buildSingboxConfig(nodes, opts = {}) {
 }
 
 function dedupeProxyNames(proxies) {
-  return dedupeNames(proxies, 'name', ['🚀 Proxy', AUTO_GROUP, FALLBACK_GROUP, 'direct', 'DIRECT', 'REJECT', 'GLOBAL']);
+  return dedupeNames(proxies, 'name', ['🚀 Proxy', AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct', 'DIRECT', 'REJECT', 'GLOBAL']);
 }
 
 function clashTargetName(target) {
@@ -1230,13 +1244,13 @@ function buildMihomoConfig(nodes, opts = {}) {
   if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
   const sourceGroups = normalizePolicyGroups(policyGroups, proxyNames);
   const sourceGroupNames = sourceGroups.map((group) => group.name);
-  const availableTargets = new Set([AUTO_GROUP, FALLBACK_GROUP, ...proxyNames, ...sourceGroupNames]);
+  const availableTargets = new Set([AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...proxyNames, ...sourceGroupNames]);
   const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
   const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const defaultProxy =
     selected && (
-      [AUTO_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) ||
+      [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) ||
       availableTargets.has(selected)
     )
       ? selected === 'direct' ? 'DIRECT' : selected
@@ -1251,6 +1265,7 @@ function buildMihomoConfig(nodes, opts = {}) {
   };
   addManual(defaultProxy);
   addManual(AUTO_GROUP);
+  addManual(SMART_GROUP);
   addManual(FALLBACK_GROUP);
   for (const name of sourceGroupNames) addManual(name);
   for (const name of proxyNames) addManual(name);
@@ -1265,6 +1280,19 @@ function buildMihomoConfig(nodes, opts = {}) {
         url: latencyUrl,
         interval: AUTO_TEST_INTERVAL_SECONDS,
         tolerance: AUTO_TEST_TOLERANCE_MS,
+        timeout: AUTO_TEST_TIMEOUT_MS,
+        'max-failed-times': 2,
+        lazy: true,
+      };
+  const smartGroup = enableClashApi
+    ? { name: SMART_GROUP, type: 'select', proxies: proxyNames }
+    : {
+        name: SMART_GROUP,
+        type: 'url-test',
+        proxies: proxyNames,
+        url: latencyUrl,
+        interval: AUTO_TEST_INTERVAL_SECONDS,
+        tolerance: 50,
         timeout: AUTO_TEST_TIMEOUT_MS,
         'max-failed-times': 2,
         lazy: true,
@@ -1314,6 +1342,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     'proxy-groups': [
       { name: '🚀 Proxy', type: 'select', proxies: manualProxies },
       autoGroup,
+      smartGroup,
       {
         name: FALLBACK_GROUP,
         type: 'fallback',

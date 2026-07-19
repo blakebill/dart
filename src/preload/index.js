@@ -52,7 +52,11 @@ contextBridge.exposeInMainWorld('api', {
   notify: (title, body) => ipcRenderer.invoke('app:notify', { title, body }),
 
   // Node latency test
-  testNodeDelay: (name) => ipcRenderer.invoke('node:delay', { name }),
+  testNodeDelay: async (name) => {
+    const result = await ipcRenderer.invoke('node:delay', { name });
+    if (result && result.ok === false) throw new Error(result.error || 'timeout');
+    return result && result.ok === true ? result.delay : result;
+  },
   applyAutoCandidate: (name) => ipcRenderer.invoke('node:autoCandidate', { name }),
 
   // Node selection (+ current picks for the automatic groups)

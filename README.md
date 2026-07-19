@@ -1,7 +1,7 @@
 # Dart Network Control
 
 Dart Network Control is a native-feeling Windows desktop workspace for operating both the
-[sing-box](https://github.com/SagerNet/sing-box) and
+[Dart's maintained sing-box fork](https://github.com/blakebill/sing-box) and
 [mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) network cores. It brings profiles, routing, traffic, connections, logs, TUN, system proxy controls, and core maintenance into one operational interface. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
 
 This is an independent project and is not affiliated with or endorsed by sing-box, mihomo, or Zashboard.
@@ -11,7 +11,7 @@ This is an independent project and is not affiliated with or endorsed by sing-bo
 - Run and manage sing-box and mihomo independently, including in-app switching, downloads, and updates.
 - Import Clash, sing-box, Base64, and share-link configs, with automatic bidirectional conversion between Clash and sing-box.
 - Use system proxy or TUN alongside launch-at-login, silent startup, notifications, and UWP loopback exemptions.
-- Manage local and remote rules, policy groups, GeoData, and manual, Auto, or Fallback routing.
+- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing.
 - Monitor nodes, traffic, connections, logs, and latency, or open the locally hosted [Zashboard](https://github.com/Zephyruso/zashboard).
 - Inspect routes, validate configs, diagnose networking and DNS, inspect ports, and back up or restore user data.
 
@@ -70,9 +70,13 @@ flowchart LR
     SUB --> MODEL["Normalized nodes and rules"]
     MODEL --> CONVERT["Config builders"]
 
-    CONVERT --> MANAGER["Core manager"]
+    CONVERT --> ADAPTER["Core adapter registry"]
+    ADAPTER --> MANAGER["Core process manager"]
     MANAGER --> SB["sing-box process"]
     MANAGER --> MH["mihomo process"]
+
+    MAIN --> SMART["Session Smart selector\nRTT, jitter, failures, cooldown"]
+    SMART -->|"Clash API selection"| MANAGER
 
     SB -->|"Clash API"| MAIN
     MH -->|"Clash API"| MAIN
@@ -90,8 +94,8 @@ Configuration flow:
 
 1. Format detection dispatches an imported profile to the Clash, sing-box, or share-link parser.
 2. Parsed data is normalized into an internal node, rule, and policy-group model.
-3. `converter.js` generates sing-box JSON or mihomo YAML for the selected core.
-4. `SingBoxManager` writes the configuration into the matching core directory, validates it, and starts the independent child process.
+3. The selected core adapter generates sing-box JSON or mihomo YAML and supplies its paths, commands, GeoData capabilities, release assets, and export behavior.
+4. `CoreManager` uses that adapter to write and validate the configuration, verify downloaded core archives, and start the independent child process.
 5. The main process reads runtime state through a local Clash API protected by a per-session random secret and sends only the required data to the renderer.
 
 ### Data Directories
@@ -130,14 +134,18 @@ singbox-gui/
 ├── bin/                         # Downloaded cores and GeoData; ignored by Git
 ├── build/                       # Icons and NSIS installer configuration
 ├── scripts/
-│   ├── download-core.js         # Downloads and validates both cores and GeoData
+│   ├── download-core.js         # Pins, verifies, and inventories cores and GeoData
+│   ├── release-metadata.js      # CycloneDX SBOM and SHA-256 release manifest
 │   └── make-icon.js
 ├── src/
 │   ├── main/
 │   │   ├── index.js             # Electron lifecycle
 │   │   ├── window.js            # Frameless window, Mica, and background throttling
-│   │   ├── ipc.js               # IPC registration and input validation
+│   │   ├── ipc.js               # Domain IPC registration
+│   │   ├── ipc-validation.js    # Shared payload limits and validation
 │   │   ├── core-control.js      # Core, proxy, rule, and update orchestration
+│   │   ├── core-adapters.js     # sing-box and mihomo capabilities
+│   │   ├── operation-coordinator.js # Serialized mutations and stale-work guards
 │   │   ├── singbox.js           # Core processes, downloads, paths, and GeoData
 │   │   ├── tun-adapter.js       # Windows Dart TUN cleanup and display naming
 │   │   ├── toolbox.js           # Diagnostics, route/DNS checks, and backups
@@ -186,13 +194,22 @@ npm run dist
 
 Build output is written to `release/`. For a local patch release, `npm version patch --no-git-tag-version` updates both `package.json` and `package-lock.json`; an explicit target version can be used instead of `patch`. GitHub Actions runs the same test, core-download, and packaging flow and synchronizes the package version from the release tag. Manual runs may pin either core version; empty version inputs bundle the latest stable releases.
 
+### Release Security
+
+- `npm ci` installs exactly the versions and integrity hashes in `package-lock.json`; Dependabot monitors npm and GitHub Actions updates.
+- Release workflow actions are pinned to immutable commit SHAs, build and publish permissions are isolated, runtime dependencies are audited, and downloaded core/GeoData release assets must match upstream SHA-256 digests. SagerNet rule sets are fetched from resolved immutable commit IDs.
+- Every Dart release publishes `SHA256SUMS.txt` and a CycloneDX `sbom.cdx.json`. In-app installer updates refuse to execute when no matching SHA-256 digest is available.
+- Windows Authenticode signing is optional. Configure the repository secrets `WINDOWS_CERTIFICATE` and `WINDOWS_CERTIFICATE_PASSWORD`; the workflow verifies every generated executable before publishing when signing is enabled.
+
+Generate the same release metadata after a local build with `npm run release:metadata`. Keep signing certificates and passwords only in GitHub Actions secrets, never in the repository.
+
 ### Third-Party Components and Licenses
 
 The Dart Network Control Electron UI, configuration management, and process orchestration code is declared as MIT in `package.json`. The installer and runtime also use the independent third-party components below. Each component remains subject to its upstream license and is not relicensed under Dart's license.
 
 | Component | Purpose and distribution | Upstream license |
 | --- | --- | --- |
-| [sing-box](https://github.com/SagerNet/sing-box) | Independent core process bundled with the installer | [GPL v3 or later with the upstream additional notice](https://github.com/SagerNet/sing-box/blob/dev/LICENSE) |
+| [Dart sing-box fork](https://github.com/blakebill/sing-box) | Independent core process bundled with the installer; patched from [SagerNet/sing-box](https://github.com/SagerNet/sing-box) | [GPL v3 or later with the upstream additional notice](https://github.com/SagerNet/sing-box/blob/dev/LICENSE) |
 | [mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) | Independent core process bundled with the installer | [GPL v3](https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE) |
 | [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip) | Bundled and updateable sing-box GeoIP rules | [GPL v3 or later](https://github.com/SagerNet/sing-geoip/blob/main/LICENSE) |
 | [SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) | Bundled and updateable sing-box Geosite rules | [GPL v3 or later](https://github.com/SagerNet/sing-geosite/blob/main/LICENSE) |

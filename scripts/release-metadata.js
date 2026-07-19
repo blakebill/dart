@@ -2,7 +2,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
 const { sha256File } = require('../src/main/integrity');
 
 const releaseDir = path.resolve(process.argv[2] || path.join(__dirname, '..', 'release'));
@@ -30,16 +29,51 @@ function addBundledComponents(sbom, manifest) {
   return sbom;
 }
 
+function packagePurl(name, version) {
+  const encodedName = String(name || '').split('/').map(encodeURIComponent).join('/');
+  return `pkg:npm/${encodedName}@${encodeURIComponent(version)}`;
+}
+
 function generateSbom() {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const result = spawnSync(npm, ['sbom', '--sbom-format', 'cyclonedx'], {
-    cwd: path.join(__dirname, '..'),
-    encoding: 'utf-8',
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-  });
-  if (result.status !== 0) throw new Error((result.stderr || result.stdout || 'npm sbom failed').trim());
-  const sbom = JSON.parse(result.stdout);
+  const root = path.join(__dirname, '..');
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf-8'));
+  const components = [];
+  const seen = new Set();
+  for (const [packagePath, pkg] of Object.entries(lock.packages || {})) {
+    if (!packagePath || !pkg || !pkg.version) continue;
+    const name = pkg.name || packagePath.replace(/^.*node_modules\//, '');
+    const ref = packagePurl(name, pkg.version);
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    const component = {
+      type: 'library',
+      'bom-ref': ref,
+      name,
+      version: pkg.version,
+      purl: ref,
+    };
+    if (typeof pkg.license === 'string') component.licenses = [{ license: { name: pkg.license } }];
+    components.push(component);
+  }
+  const rootRef = packagePurl(manifest.name, manifest.version);
+  const sbom = {
+    bomFormat: 'CycloneDX',
+    specVersion: '1.5',
+    serialNumber: `urn:uuid:${require('crypto').randomUUID()}`,
+    version: 1,
+    metadata: {
+      timestamp: new Date().toISOString(),
+      component: {
+        type: 'application',
+        'bom-ref': rootRef,
+        name: manifest.name,
+        version: manifest.version,
+        purl: rootRef,
+      },
+    },
+    components,
+  };
   const manifestPath = path.join(__dirname, '..', 'bin', 'manifest.json');
   if (fs.existsSync(manifestPath)) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
@@ -69,4 +103,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { addBundledComponents };
+module.exports = { addBundledComponents, generateSbom };

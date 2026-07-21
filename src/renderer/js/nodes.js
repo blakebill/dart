@@ -20,6 +20,9 @@
   let nodeLoadGeneration = 0;
   let testAllRun = null;
   const delayRequests = new Map();
+  /** @type {Map<string, {grade:string,level:string,label?:string,score?:number|null}>} */
+  const qualities = new Map();
+  let qualityRefresh = null;
 
   let groupNow = { proxy: null, auto: null, smart: null, fallback: null };
   let groupRefresh = null;
@@ -87,6 +90,11 @@
       groupNow = next;
       renderCurrentNode();
       if (changed && App.currentTab === 'nodes' && !document.hidden) renderNodes();
+      // Pull Smart history often enough that background probes paint delay + labels
+      // without requiring a manual "test" click.
+      if (App.currentTab === 'nodes' && App.state.status && App.state.status.running) {
+        refreshQualities();
+      }
     })().finally(() => {
       groupRefresh = null;
       scheduleGroupPoll();
@@ -111,6 +119,7 @@
   }
 
   function releaseNodes({ cancelTests = true } = {}) {
+    qualities.clear();
     if (cancelTests) {
       for (const name of delayRequests.keys()) {
         if (delays.get(name) === 'testing') delays.delete(name);
@@ -137,6 +146,7 @@
     const activeSub = App.state.activeSub || null;
     if (!options.force && loadedNodeSub === activeSub) {
       renderNodes();
+      refreshQualities();
       return nodeItems;
     }
     if (!activeSub) {
@@ -154,6 +164,7 @@
       nodeItems = Array.isArray(result.nodes) ? result.nodes : [];
       loadedNodeSub = result.activeSub || null;
       renderNodes();
+      refreshQualities();
       return nodeItems;
     })().catch(() => {
       if (generation === nodeLoadGeneration) releaseNodes();
@@ -178,6 +189,154 @@
     if (v === 'timeout') return t('nodes.timeout');
     if (typeof v === 'number') return v + ' ms';
     return '';
+  }
+
+  /**
+   * Stability from Smart history only — never derived from the latest delay,
+   * so the label does not just mirror the latency color.
+   * Returns null when there is nothing useful to show (hide the label).
+   *
+   * kind: probing | good | mid | bad | unavailable
+   */
+  function qualityDisplay(name) {
+    const smart = qualities.get(name);
+    if (!smart || !smart.level || smart.level === 'unknown') return null;
+    const samples = Math.max(0, Number(smart.samples) || 0);
+    const level = smart.level;
+    if (level === 'unavailable' || smart.failed) {
+      return {
+        kind: 'unavailable',
+        label: t('nodes.quality.unavailable'),
+        title: t('nodes.quality.hint.unavailable'),
+        samples,
+        showSamples: false,
+      };
+    }
+    if (level === 'probing' || (samples > 0 && samples < 5 && level !== 'good' && level !== 'mid' && level !== 'bad')) {
+      return {
+        kind: 'probing',
+        label: t('nodes.quality.probing'),
+        title: t('nodes.quality.hint.probing', samples),
+        samples,
+        showSamples: samples > 0,
+      };
+    }
+    if (level === 'good' || level === 'mid' || level === 'bad') {
+      const label = level === 'good'
+        ? t('nodes.quality.good')
+        : level === 'mid'
+          ? t('nodes.quality.ok')
+          : t('nodes.quality.weak');
+      const title = level === 'good'
+        ? t('nodes.quality.hint.good', samples)
+        : level === 'mid'
+          ? t('nodes.quality.hint.ok', samples)
+          : t('nodes.quality.hint.weak', samples);
+      return { kind: level, label, title, samples, showSamples: samples > 0 };
+    }
+    return null;
+  }
+
+  function qualityHtmlFor(name) {
+    const info = qualityDisplay(name);
+    if (!info) return '';
+    const meta = info.showSamples
+      ? `<span class="node-quality-n">·${escapeHtml(String(info.samples))}</span>`
+      : '';
+    return `<span class="node-quality ${escapeHtml(info.kind)}" title="${escapeHtml(info.title)}" aria-label="${escapeHtml(info.title)}">${escapeHtml(info.label)}${meta}</span>`;
+  }
+
+  /** Apply background Smart EWMA into the delay map so UI is not "label without ms". */
+  function syncDelayFromQuality(name, value) {
+    if (!name || !value || delays.get(name) === 'testing') return false;
+    if (Number.isFinite(value.ewma)) {
+      const ms = Math.round(Number(value.ewma));
+      if (delays.get(name) !== ms) {
+        delays.set(name, ms);
+        return true;
+      }
+      return false;
+    }
+    // Never succeeded and currently failing — same as a timed-out probe.
+    if ((value.level === 'unavailable' || value.failed) && delays.get(name) === undefined) {
+      delays.set(name, 'timeout');
+      return true;
+    }
+    return false;
+  }
+
+  function patchNodeQuality(row, name) {
+    const info = qualityDisplay(name);
+    let qEl = row.querySelector('.node-quality');
+    if (!info) {
+      if (qEl) qEl.remove();
+      return;
+    }
+    if (!qEl) {
+      qEl = document.createElement('span');
+      const delayEl = row.querySelector('.node-delay');
+      const bottom = row.querySelector('.node-bottom');
+      if (delayEl) delayEl.before(qEl);
+      else if (bottom) bottom.appendChild(qEl);
+      else return;
+    }
+    qEl.className = 'node-quality ' + info.kind;
+    qEl.title = info.title;
+    qEl.setAttribute('aria-label', info.title);
+    qEl.textContent = '';
+    qEl.appendChild(document.createTextNode(info.label));
+    if (info.showSamples) {
+      const n = document.createElement('span');
+      n.className = 'node-quality-n';
+      n.textContent = '·' + String(info.samples);
+      qEl.appendChild(n);
+    }
+  }
+
+  async function refreshQualities() {
+    if (!api || !api.getNodeQualities) return;
+    const profileId = App.state.activeSub || null;
+    if (qualityRefresh && qualityRefresh.profileId === profileId) return qualityRefresh.promise;
+    const token = {};
+    const promise = (async () => {
+      try {
+        const map = await api.getNodeQualities();
+        if (App.state.activeSub !== profileId) return;
+        let qualityChanged = false;
+        let delayChanged = false;
+        const next = new Map();
+        if (map && typeof map === 'object') {
+          for (const [name, value] of Object.entries(map)) {
+            if (!name || !value) continue;
+            next.set(name, value);
+            const prev = qualities.get(name);
+            if (!prev
+              || prev.level !== value.level
+              || prev.samples !== value.samples
+              || prev.failed !== value.failed
+              || prev.ewma !== value.ewma) {
+              qualityChanged = true;
+            }
+            if (syncDelayFromQuality(name, value)) delayChanged = true;
+          }
+        }
+        if (next.size !== qualities.size) qualityChanged = true;
+        qualities.clear();
+        for (const [name, value] of next) qualities.set(name, value);
+        if (delayChanged && typeof App.renderDashNodeCards === 'function' && !document.hidden) {
+          App.renderDashNodeCards();
+        }
+        if ((qualityChanged || delayChanged) && App.currentTab === 'nodes' && !document.hidden) {
+          renderNodeWindow();
+        }
+      } catch (_) {
+        /* quality is advisory */
+      } finally {
+        if (qualityRefresh && qualityRefresh.token === token) qualityRefresh = null;
+      }
+    })();
+    qualityRefresh = { token, profileId, promise };
+    return promise;
   }
 
   function isActiveNode(name) {
@@ -207,6 +366,8 @@
       metaHtml = `<span class="sub-meta">${t('nodes.autoNow', escapeHtml(selectedNow))}</span>`;
     }
     const safeName = escapeHtml(name);
+    // Stability short label + sample count (not a second latency traffic light).
+    const qualityHtml = server ? qualityHtmlFor(name) : '';
     const testHtml = server
       ? `<button type="button" class="node-test-btn" data-name="${safeName}" aria-label="${escapeHtml(t('nodes.test') + ': ' + name)}">${t('nodes.test')}</button>`
       : '';
@@ -217,7 +378,7 @@
         <span class="node-identity"><span class="node-name">${safeName}</span>${tagHtml}</span>
         ${activeHtml}
       </span>
-      <span class="node-bottom">${metaHtml}${delayHtml}</span>
+      <span class="node-bottom">${metaHtml}${qualityHtml}${delayHtml}</span>
       </button>
       ${testHtml}
     </div>`;
@@ -340,11 +501,14 @@
       const list = $('#nodeList');
       for (const n of dirtyDelays) {
         const row = list.querySelector(`.node-item[data-name="${CSS.escape(n)}"]`);
-        const el = row && row.querySelector('.node-delay');
-        if (!el) continue;
-        const d = delays.get(n);
-        el.className = 'node-delay ' + delayClass(d);
-        el.textContent = delayText(d);
+        if (!row) continue;
+        const el = row.querySelector('.node-delay');
+        if (el) {
+          const d = delays.get(n);
+          el.className = 'node-delay' + (d !== undefined ? ' ' + delayClass(d) : '');
+          el.textContent = delayText(d);
+        }
+        patchNodeQuality(row, n);
       }
       dirtyDelays.clear();
     });
@@ -364,7 +528,8 @@
     delays.set(name, 'testing');
     scheduleDelayUpdate(name);
     try {
-      const ms = await api.testNodeDelay(name);
+      // Manual clicks always force a real probe (background Auto/Smart still cache).
+      const ms = await api.testNodeDelay(name, { force: true });
       if (delayRequests.get(name) === token) delays.set(name, ms);
     } catch (e) {
       if (delayRequests.get(name) === token) delays.set(name, 'timeout');
@@ -372,6 +537,7 @@
     if (delayRequests.get(name) === token) {
       delayRequests.delete(name);
       scheduleDelayUpdate(name);
+      refreshQualities();
       refreshGroupSelections(); // a fresh delay result may make a group re-pick
     }
   }
@@ -410,7 +576,7 @@
         delays.set(name, 'testing');
         scheduleDelayUpdate(name);
         try {
-          const result = await api.testNodeDelay(name);
+          const result = await api.testNodeDelay(name, { force: true });
           if (!run.cancelled && delayRequests.get(name) === token) {
             delays.set(name, result);
             if (result < bestDelay) {
@@ -436,7 +602,10 @@
           toast(e.message || String(e), true);
         }
       }
-      if (!run.cancelled) await refreshGroupSelections();
+      if (!run.cancelled) {
+        await refreshQualities();
+        await refreshGroupSelections();
+      }
     } finally {
       if (testAllRun === run) {
         testAllRun = null;

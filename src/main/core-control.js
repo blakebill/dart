@@ -7,7 +7,19 @@ const http = require('http');
 const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, isWindowsAdminSync, ensureAdminForTun } = require('./admin');
 const { startTrafficStream, stopTrafficStream } = require('./traffic');
-const { buildRoute, ruleListToSingboxRule, extractRuleGroups, extractGeoCategories, extractRuleSetRefs, parseRuleList } = require('./converter');
+const {
+  buildRoute,
+  ruleListToSingboxRule,
+  extractRuleGroups,
+  extractGeoCategories,
+  extractRuleSetRefs,
+  parseRuleList,
+  coreSupportsKernelSmart,
+  prepareSourcePolicyGroups,
+  applySourceGroupSelections,
+  sourceGroupPickOptions,
+  sourcePicksForWiredGroup,
+} = require('./converter');
 const { normalizePolicyGroups } = require('./policy-groups');
 const { geoDataUrls } = require('./singbox');
 const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
@@ -20,7 +32,8 @@ const subscription = require('./subscription');
 const proxy = require('./proxy');
 const fetch = require('./fetch');
 const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
-const { buildDelayApiPath, selectAutoTestBatch } = require('./delay');
+const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('./delay');
+const os = require('os');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 /**
@@ -38,11 +51,24 @@ const APP_PROXY_GROUP = '🚀 Proxy';
 const AUTO_PROXY_GROUP = '♻️ Auto';
 const SMART_PROXY_GROUP = '🧠 Smart';
 const MANAGED_AUTO_INTERVAL_MS = 60_000;
+// Non-selected Auto/Smart groups still pre-warm winners, but much less often.
+const MANAGED_IDLE_INTERVAL_MS = 4 * 60_000;
+const DELAY_RESULT_TTL_MS = 45_000;
+const DELAY_FAILURE_TTL_MS = 8_000;
 const delayRequestCache = new Map();
+// Successful (and briefly failed) delay results shared by Auto + Smart sweeps.
+const delayResultCache = new Map();
+// Last successful version probe → whether config emits type: smart.
+// Used only for diagnostics / optional UI; config path always re-resolves.
+let lastKernelSmartMeta = { coreType: null, version: null, kernelSmart: false };
 let tunWasActive = false;
 let tunAdaptersClean = false;
 const operations = new OperationCoordinator();
 let staleProxyHealPromise = null;
+// When a restart (not an explicit user Stop) tears down the core, remember that
+// the system proxy was owned so startCoreNow can re-assert it even if the user
+// turned off autoSetSystemProxy and only enabled the proxy manually.
+let pendingSystemProxyResume = false;
 
 function assertLifecycleOpen() {
   operations.assertOpen();
@@ -102,6 +128,7 @@ function responseLatch(resolve, reject) {
 // Both core configs use Zashboard's latest-release URL for the first download.
 const PANEL_UI_URL = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip';
 const SYSTEM_PROXY_OWNER_KEY = 'ownedSystemProxyServer';
+const SYSTEM_PROXY_RESTORE_KEY = 'ownedSystemProxyRestore';
 
 /** The control panel served at /ui: { dir, downloadUrl }. */
 function panelUiInfo() {
@@ -121,24 +148,73 @@ function persistedSystemProxyOwnership() {
   return state.store ? state.store.get(SYSTEM_PROXY_OWNER_KEY) || null : null;
 }
 
+function persistedSystemProxyRestore(expectedServer = null) {
+  if (!state.store) return null;
+  const restore = state.store.get(SYSTEM_PROXY_RESTORE_KEY);
+  if (!restore || typeof restore !== 'object') return null;
+  if (expectedServer && restore.ownedServer && restore.ownedServer !== expectedServer) return null;
+  if (!restore.enable || !restore.server || !restore.override) return null;
+  return {
+    enable: restore.enable,
+    server: restore.server,
+    override: restore.override,
+  };
+}
+
 function forgetSystemProxyOwnership(expectedServer = null) {
   if (!state.store) return false;
   const current = persistedSystemProxyOwnership();
   if (expectedServer && current && current !== expectedServer) return false;
   state.store.set(SYSTEM_PROXY_OWNER_KEY, null);
+  try {
+    const restore = state.store.get(SYSTEM_PROXY_RESTORE_KEY);
+    if (!expectedServer || !restore || !restore.ownedServer || restore.ownedServer === expectedServer) {
+      state.store.set(SYSTEM_PROXY_RESTORE_KEY, null);
+    }
+  } catch (_) {}
   return true;
+}
+
+/** Disable our system proxy and restore the user's previous ProxyOverride when known. */
+async function disableOwnedSystemProxy(server) {
+  if (!server) return false;
+  const restore = persistedSystemProxyRestore(server);
+  return proxy.disableSystemProxyIfOurs(server, restore ? { restore } : {});
 }
 
 /** Persist ownership first, so a crash after the registry write is recoverable. */
 async function enableOwnedSystemProxy(port) {
   if (process.platform !== 'win32') return false;
   const server = `127.0.0.1:${port}`;
+  const alreadyOwned = persistedSystemProxyOwnership() === server;
+  const existingRestore = alreadyOwned ? state.store.get(SYSTEM_PROXY_RESTORE_KEY) : null;
   state.store.set(SYSTEM_PROXY_OWNER_KEY, server);
   try {
     const enabled = await proxy.enableSystemProxy('127.0.0.1', port);
-    if (!enabled) {
+    if (!enabled || enabled.ok === false) {
       forgetSystemProxyOwnership(server);
       return false;
+    }
+    // Keep the pre-Dart registry snapshot so disable can restore ProxyOverride.
+    // Re-asserting an endpoint we already own must not overwrite that snapshot
+    // with Dart's own ProxyOverride as if it were the user's original bypass list.
+    if (enabled.restore && !(
+      existingRestore &&
+      existingRestore.ownedServer === server &&
+      existingRestore.enable &&
+      existingRestore.server &&
+      existingRestore.override
+    )) {
+      try {
+        state.store.set(SYSTEM_PROXY_RESTORE_KEY, {
+          ownedServer: server,
+          enable: enabled.restore.enable,
+          server: enabled.restore.server,
+          override: enabled.restore.override,
+        });
+      } catch (error) {
+        sendLog('[gui] failed to persist system proxy restore snapshot: ' + error.message);
+      }
     }
     state.systemProxyOn = true;
     state.systemProxyServer = server;
@@ -342,11 +418,44 @@ function persistLastRunning(value) {
   }
 }
 
+// Hot paths (nodes:get, delay checks, config builds) call getActiveSubscription
+// frequently. Re-running uniqueNodeNames + normalizePolicyGroups on multi-hundred
+// node profiles dominated main-process time; cache by a cheap store fingerprint.
+let activeSubscriptionCache = null;
+
+function activeSubscriptionFingerprint(sub) {
+  if (!sub) return '';
+  return [
+    sub.id || '',
+    sub.updatedAt || 0,
+    sub.configHash || '',
+    Array.isArray(sub.nodes) ? sub.nodes.length : -1,
+    Array.isArray(sub.policyGroups) ? sub.policyGroups.length : -1,
+    Array.isArray(sub.clashRules) ? sub.clashRules.length : -1,
+  ].join('\0');
+}
+
 /** Load the active profile and migrate legacy node names/policy groups. */
 function getActiveSubscription() {
   const id = getActiveSubId();
-  let sub = id ? state.store.getSubscription(id) : null;
-  if (!sub || !Array.isArray(sub.nodes)) return sub;
+  if (!id) {
+    activeSubscriptionCache = null;
+    return null;
+  }
+  let sub = state.store.getSubscription(id);
+  if (!sub || !Array.isArray(sub.nodes)) {
+    activeSubscriptionCache = null;
+    return sub;
+  }
+  const fingerprint = activeSubscriptionFingerprint(sub);
+  if (
+    activeSubscriptionCache &&
+    activeSubscriptionCache.fingerprint === fingerprint &&
+    activeSubscriptionCache.sub
+  ) {
+    return activeSubscriptionCache.sub;
+  }
+
   let profileMigrated = false;
 
   // Profiles saved before policy groups were persisted can recover them once
@@ -385,6 +494,10 @@ function getActiveSubscription() {
       sendLog('[gui] failed to persist normalized profile routing: ' + error.message);
     }
   }
+  activeSubscriptionCache = {
+    fingerprint: activeSubscriptionFingerprint(sub),
+    sub,
+  };
   return sub;
 }
 
@@ -506,7 +619,26 @@ async function processCustomRuleSet(c, { beforeCommit } = {}) {
   return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
 }
 
-function buildCurrentConfig(coreType = null) {
+/**
+ * Resolve whether the installed core can emit type: smart.
+ * Always probes when cache is cold so we do not silently fall back to selector.
+ */
+async function resolveKernelSmart(coreType = null) {
+  const resolvedCoreType = normalizeCoreType(coreType || state.singbox.getCoreType());
+  let coreVersion = state.singbox.peekCoreVersion(resolvedCoreType);
+  if (coreVersion == null && state.singbox.isCoreInstalled(resolvedCoreType)) {
+    try {
+      coreVersion = await state.singbox.getCoreVersion(resolvedCoreType);
+    } catch (_) {
+      coreVersion = null;
+    }
+  }
+  const kernelSmart = coreSupportsKernelSmart(resolvedCoreType, coreVersion);
+  lastKernelSmartMeta = { coreType: resolvedCoreType, version: coreVersion, kernelSmart };
+  return lastKernelSmartMeta;
+}
+
+function buildCurrentConfig(coreType = null, options = {}) {
   const storedSettings = state.store.getSettings();
   const settings = coreType
     ? { ...storedSettings, coreType: normalizeCoreType(coreType) }
@@ -526,8 +658,18 @@ function buildCurrentConfig(coreType = null) {
   const adapter = getCoreAdapter(settings.coreType);
   const ui = panelUiInfo();
   try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
+  const resolvedCoreType = normalizeCoreType(settings.coreType);
+  // Prefer explicit meta from resolveKernelSmart(); else peek cache.
+  const coreVersion = options.coreVersion !== undefined
+    ? options.coreVersion
+    : state.singbox.peekCoreVersion(resolvedCoreType);
+  const kernelSmart = options.kernelSmart !== undefined
+    ? !!options.kernelSmart
+    : coreSupportsKernelSmart(resolvedCoreType, coreVersion);
+  lastKernelSmartMeta = { coreType: resolvedCoreType, version: coreVersion, kernelSmart };
   const commonOpts = {
     ruleOverrides: settings.ruleOverrides,
+    ruleGroupSelections: settings.ruleGroupSelections,
     mixedPort: settings.mixedPort,
     clashApiPort: settings.clashApiPort,
     clashApiSecret: state.clashApiSecret,
@@ -546,6 +688,8 @@ function buildCurrentConfig(coreType = null) {
     testUrl: settings.testUrl,
     extraRules,
     extraRuleSets,
+    kernelSmart,
+    coreVersion,
   };
   const config = adapter.buildConfig(allNodes, commonOpts, {
     manager: state.singbox,
@@ -555,7 +699,16 @@ function buildCurrentConfig(coreType = null) {
     availableGeoSet,
     loadRuleSetData,
   });
-  return { config, settings };
+  return { config, settings, kernelSmart, coreVersion };
+}
+
+/** Always probe core version before building (start/export/validate paths). */
+async function buildCurrentConfigAsync(coreType = null) {
+  const resolved = normalizeCoreType(
+    coreType || state.store.getSettings().coreType || state.singbox.getCoreType()
+  );
+  const meta = await resolveKernelSmart(resolved);
+  return buildCurrentConfig(resolved, meta);
 }
 
 /** Build the route info (rules + rule-sets) from the current config, without running. */
@@ -565,11 +718,14 @@ function currentRouteInfo() {
   // rules are dropped so the Rules view shows what actually runs.
   const settings = state.store.getSettings();
   const clashRules = settings.useBuiltinRules ? [] : rules;
-  const policyGroups = settings.useBuiltinRules ? [] : normalizePolicyGroups(groups, nodes);
+  // Same folding as runtime config: main-proxy aliases (e.g. "Proxy") are not
+  // freestanding source targets and must not appear as available outbounds.
+  const policyGroups = settings.useBuiltinRules ? [] : prepareSourcePolicyGroups(groups, nodes);
   const availableTargets = new Set([
     AUTO_PROXY_GROUP,
     SMART_PROXY_GROUP,
     '🛟 Fallback',
+    APP_PROXY_GROUP,
     ...nodes.map((node) => node && node.name).filter(Boolean),
     ...policyGroups.map((group) => group.name),
   ]);
@@ -594,10 +750,27 @@ function currentRouteInfo() {
  */
 function ruleGroupInfo() {
   const settings = state.store.getSettings();
-  if (settings.useBuiltinRules) return { groups: [], sourceTargets: [], overrides: settings.ruleOverrides || {} };
+  if (settings.useBuiltinRules) {
+    return {
+      groups: [],
+      sourceTargets: [],
+      selectableTargets: [],
+      overrides: settings.ruleOverrides || {},
+      selections: settings.ruleGroupSelections || {},
+      pickOptions: [],
+      picksByGroup: {},
+      defaults: {},
+    };
+  }
   const data = activeSubData();
   const groups = extractRuleGroups(data.rules);
-  const policyGroups = normalizePolicyGroups(data.groups, data.nodes);
+  const policyGroups = prepareSourcePolicyGroups(data.groups, data.nodes);
+  const wired = applySourceGroupSelections(
+    policyGroups,
+    data.nodes,
+    settings.ruleGroupSelections
+  );
+  const byName = new Map(wired.map((group) => [group.name, group]));
   const available = new Set([
     APP_PROXY_GROUP,
     AUTO_PROXY_GROUP,
@@ -606,11 +779,72 @@ function ruleGroupInfo() {
     ...data.nodes.map((node) => node && node.name).filter(Boolean),
     ...policyGroups.map((group) => group.name),
   ]);
+  const sourceTargets = groups.filter((name) => available.has(name));
+  // Only plain select groups expose a node picker; url-test/fallback keep force modes only.
+  const selectableTargets = sourceTargets.filter((name) => {
+    const group = byName.get(name);
+    return group && (group.type === 'select' || group.type === 'selector');
+  });
+  const defaults = {};
+  const picksByGroup = {};
+  for (const name of selectableTargets) {
+    const group = byName.get(name);
+    if (group && group.default) defaults[name] = group.default;
+    picksByGroup[name] = sourcePicksForWiredGroup(group);
+  }
   return {
     groups,
-    sourceTargets: groups.filter((name) => available.has(name)),
+    sourceTargets,
+    selectableTargets,
     overrides: settings.ruleOverrides || {},
+    selections: settings.ruleGroupSelections || {},
+    pickOptions: sourceGroupPickOptions(data.nodes, policyGroups),
+    picksByGroup,
+    defaults,
   };
+}
+
+/** Persist a source-group outbound pick and apply it live via the Clash API when possible. */
+async function setRuleGroupSelection(groupName, outbound) {
+  const name = String(groupName || '').trim();
+  const target = String(outbound || '').trim();
+  if (!name || name.length > 256 || /[\r\n,]/.test(name)) throw new Error('invalid group');
+  if (!target || target.length > 256 || /[\r\n,]/.test(target)) throw new Error('invalid outbound');
+  const info = ruleGroupInfo();
+  if (!info.selectableTargets.includes(name)) throw new Error('group is not selectable');
+  const allowed = new Set([
+    ...((info.picksByGroup && info.picksByGroup[name]) || info.pickOptions || []),
+  ]);
+  const normalized = target === 'DIRECT' ? 'direct'
+    : (target === 'REJECT' || target === 'REJECT-DROP') ? 'reject'
+      : target;
+  if (!allowed.has(normalized) && !allowed.has(target)) {
+    throw new Error('outbound is not available');
+  }
+  const previous = state.store.getSettings();
+  const nextSelections = { ...(previous.ruleGroupSelections || {}) };
+  // Store empty omission when equal to computed default without explicit user... always store explicit picks.
+  nextSelections[name] = normalized === 'direct' ? 'direct' : normalized;
+  const settings = state.store.updateSettings({ ruleGroupSelections: nextSelections });
+  if (!state.singbox.isRunning()) return { settings, applied: true, live: false };
+  try {
+    const candidates = normalized === 'direct' ? ['direct', 'DIRECT']
+      : normalized === 'reject' ? ['reject', 'REJECT']
+        : [normalized];
+    let lastError = null;
+    for (const liveName of candidates) {
+      try {
+        await clashApi('PUT', '/proxies/' + encodeURIComponent(name), { name: liveName });
+        return { settings, applied: true, live: true };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error('failed to apply group selection');
+  } catch (error) {
+    // Config may predate enriched members — caller can restart. Selection is still persisted.
+    return { settings, applied: false, live: false, error: error.message || String(error) };
+  }
 }
 
 async function startCoreNow() {
@@ -620,8 +854,9 @@ async function startCoreNow() {
   if (staleProxyHealPromise) await staleProxyHealPromise;
   assertLifecycleOpen();
   await state.singbox.ensureBundledSingBoxPatch();
-  await getCoreAdapter(state.singbox.getCoreType()).prepareStart(state.singbox);
-  const { config, settings } = buildCurrentConfig();
+  const coreType = state.singbox.getCoreType();
+  await getCoreAdapter(coreType).prepareStart(state.singbox);
+  const { config, settings } = await buildCurrentConfigAsync(coreType);
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
   }
@@ -637,7 +872,9 @@ async function startCoreNow() {
     // is ready. Keep it off the user-visible TUN startup path.
     void syncTunDisplayName(sendLog);
   }
-  if (settings.autoSetSystemProxy && !settings.enableTun) {
+  const resumeSystemProxy = pendingSystemProxyResume;
+  pendingSystemProxyResume = false;
+  if (!settings.enableTun && (settings.autoSetSystemProxy || resumeSystemProxy)) {
     try {
       const enabled = await enableOwnedSystemProxy(settings.mixedPort);
       if (enabled) startProxyGuard(settings.mixedPort);
@@ -885,19 +1122,24 @@ function maybeFetchRuleProviders(clashRules, providers) {
  * Stop the core. When `remember` is true (an explicit user stop) we also clear
  * the auto-resume flag, so the app does not start itself on the next launch.
  */
-async function stopCoreNow(remember) {
+async function stopCoreNow(remember, { preserveSystemProxyIntent = false } = {}) {
   // Mark the stop as intentional so the exit handler doesn't fire a "core
   // crashed" notification for a stop/restart we initiated.
   state.coreStopping = true;
   delayRequestCache.clear();
+  delayResultCache.clear();
   stopManagedAutoSelection();
   stopTrafficStream();
   stopProxyGuard();
+  const hadOwnedProxy = state.systemProxyOn || !!persistedSystemProxyOwnership();
+  // Restarts must re-assert a manually enabled system proxy; explicit Stop must
+  // not leave a resume intent that would surprise the user on the next Start.
+  pendingSystemProxyResume = !!(preserveSystemProxyIntent && hadOwnedProxy);
   if (state.systemProxyOn) {
     const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
     let released = true;
     try {
-      if (ownedServer) await proxy.disableSystemProxyIfOurs(ownedServer);
+      if (ownedServer) await disableOwnedSystemProxy(ownedServer);
       else sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
     } catch (e) {
       sendLog('[gui] failed to disable system proxy: ' + e.message);
@@ -943,11 +1185,11 @@ function startProxyGuard(port) {
       if (generation !== proxyGuardGeneration || !state.systemProxyOn) return;
       if (!active) {
         const restored = await proxy.enableSystemProxy('127.0.0.1', port);
-        if (!restored) return;
+        if (!restored || restored.ok === false) return;
         // Stop may have landed while reg.exe was still writing. Clear the
         // just-written value again instead of leaving a dead local proxy.
         if (!state.systemProxyOn) {
-          await proxy.disableSystemProxyIfOurs(server);
+          await disableOwnedSystemProxy(server);
           return;
         }
         sendLog('[gui] system proxy was changed by another app; restored');
@@ -1003,7 +1245,7 @@ function restartCore() {
   return queueLifecycle(async () => {
     assertLifecycleOpen();
     if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
-    if (state.singbox.isRunning()) await stopCoreNow();
+    if (state.singbox.isRunning()) await stopCoreNow(undefined, { preserveSystemProxyIntent: true });
     return startCoreNow();
   });
 }
@@ -1019,7 +1261,8 @@ function setSystemProxyEnabled(enable) {
     } else {
       stopProxyGuard();
       const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
-      if (ownedServer) await proxy.disableSystemProxyIfOurs(ownedServer);
+      pendingSystemProxyResume = false;
+      if (ownedServer) await disableOwnedSystemProxy(ownedServer);
       else if (state.systemProxyOn) {
         sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
       }
@@ -1073,9 +1316,9 @@ async function restartIfRunning() {
         if (!state.singbox.isRunning()) return false;
         const coreType = state.singbox.getCoreType();
         await getCoreAdapter(coreType).prepareStart(state.singbox);
-        const { config } = buildCurrentConfig(coreType);
+        const { config } = await buildCurrentConfigAsync(coreType);
         await state.singbox.checkConfigFor(coreType, config);
-        await stopCoreNow();
+        await stopCoreNow(undefined, { preserveSystemProxyIntent: true });
         await startCoreNow();
         restarts += 1;
       }
@@ -1092,15 +1335,102 @@ async function restartIfRunning() {
   return restartPromise;
 }
 
+function delayResultKey(name) {
+  const settings = state.store.getSettings();
+  return JSON.stringify([
+    smartSelectionContextKey(),
+    String(settings.testUrl || '').trim(),
+    name,
+  ]);
+}
+
+function readDelayResultCache(name) {
+  const key = delayResultKey(name);
+  const hit = delayResultCache.get(key);
+  if (!hit) return null;
+  if (hit.expires <= Date.now()) {
+    delayResultCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function writeDelayResultCache(name, delay) {
+  if (delayResultCache.size >= 2048) {
+    let drop = 256;
+    for (const key of delayResultCache.keys()) {
+      delayResultCache.delete(key);
+      if (--drop <= 0) break;
+    }
+  }
+  const ok = Number.isFinite(delay);
+  delayResultCache.set(delayResultKey(name), {
+    delay: ok ? Number(delay) : null,
+    expires: Date.now() + (ok ? DELAY_RESULT_TTL_MS : DELAY_FAILURE_TTL_MS),
+  });
+}
+
+function networkFingerprint() {
+  const now = Date.now();
+  if (networkFingerprint.cached && networkFingerprint.expires > now) {
+    return networkFingerprint.cached;
+  }
+  try {
+    const nics = os.networkInterfaces() || {};
+    const parts = [];
+    for (const [name, addrs] of Object.entries(nics)) {
+      for (const addr of addrs || []) {
+        if (!addr || addr.internal) continue;
+        parts.push(`${name}|${addr.family}|${addr.address}`);
+      }
+    }
+    networkFingerprint.cached = parts.sort().join(';') || 'none';
+  } catch (_) {
+    networkFingerprint.cached = 'unknown';
+  }
+  networkFingerprint.expires = now + 5_000;
+  return networkFingerprint.cached;
+}
+networkFingerprint.cached = null;
+networkFingerprint.expires = 0;
+
+function ensureSmartModelContext() {
+  const key = smartSelectionContextKey();
+  if (smartSelectionModel.contextKey !== key) smartSelectionModel.clear(key);
+  smartSelectionModel.setNetworkKey(networkFingerprint());
+}
+
 /**
  * Query the latency of a node via the sing-box Clash API.
+ * Results are shared across Auto/Smart sweeps for a short TTL, and every
+ * observation is fed into the Smart history model.
  * @param {string} name outbound tag (node name)
+ * @param {{ force?: boolean }} [options] `force: true` skips the result cache
+ *   (used by explicit UI tests so a click always re-probes).
  * @returns {Promise<number>} delay in ms
  */
-function testNodeDelay(name) {
+function testNodeDelay(name, options = {}) {
+  const force = !!(options && options.force);
+  if (!force) {
+    const cached = readDelayResultCache(name);
+    if (cached && cached.delay != null) {
+      return Promise.resolve(cached.delay);
+    }
+  } else {
+    // Drop any stale success/failure so concurrent background readers also refresh.
+    try { delayResultCache.delete(delayResultKey(name)); } catch (_) {}
+  }
+
   const settings = state.store.getSettings();
   const testUrl = String(settings.testUrl || '').trim();
-  const requestKey = JSON.stringify([state.singbox.getCoreType(), settings.clashApiPort, name, testUrl]);
+  // Coalesce concurrent probes of the same node (force or not); only the
+  // result-cache short-circuit is skipped when force is set.
+  const requestKey = JSON.stringify([
+    smartSelectionContextKey(),
+    settings.clashApiPort,
+    name,
+    testUrl,
+  ]);
   const pending = delayRequestCache.get(requestKey);
   if (pending) return pending;
 
@@ -1151,11 +1481,30 @@ function testNodeDelay(name) {
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.end();
   });
-  const shared = request.finally(() => {
+  const shared = request.then(
+    (delay) => {
+      writeDelayResultCache(name, delay);
+      try { ensureSmartModelContext(); smartSelectionModel.observe({ name, delay }); } catch (_) {}
+      return delay;
+    },
+    (error) => {
+      writeDelayResultCache(name, null);
+      try { ensureSmartModelContext(); smartSelectionModel.observe({ name, delay: null }); } catch (_) {}
+      throw error;
+    }
+  ).finally(() => {
     if (delayRequestCache.get(requestKey) === shared) delayRequestCache.delete(requestKey);
   });
   delayRequestCache.set(requestKey, shared);
   return shared;
+}
+
+/** Smart quality grades for the active profile's nodes (UI badge). */
+function smartNodeQualities() {
+  ensureSmartModelContext();
+  const sub = getActiveSubscription();
+  const names = ((sub && sub.nodes) || []).map((node) => node && node.name).filter(Boolean);
+  return smartSelectionModel.qualities(names);
 }
 
 /** Generic Clash API request (sing-box external controller). Resolves parsed JSON. */
@@ -1222,16 +1571,6 @@ function clashApi(method, apiPath, body) {
   });
 }
 
-const managedAutoSelection = new ManagedAutoSelection({
-  appGroup: APP_PROXY_GROUP,
-  autoGroup: AUTO_PROXY_GROUP,
-  clashApi,
-  getSettings: () => state.store.getSettings(),
-  intervalMs: MANAGED_AUTO_INTERVAL_MS,
-  isRunning: () => state.singbox.isRunning(),
-  selectBatch: selectAutoTestBatch,
-  testDelay: testNodeDelay,
-});
 const smartSelectionModel = new SmartSelectionModel();
 
 function smartSelectionContextKey() {
@@ -1242,21 +1581,43 @@ function smartSelectionContextKey() {
   return `${state.singbox.getCoreType()}:${id}:${fingerprint}:${settings.testUrl || ''}`;
 }
 
-const managedSmartSelection = new ManagedAutoSelection({
+const managedSelectionOptions = {
   appGroup: APP_PROXY_GROUP,
-  autoGroup: SMART_PROXY_GROUP,
   clashApi,
   getSettings: () => state.store.getSettings(),
-  intervalMs: MANAGED_AUTO_INTERVAL_MS,
+  activeIntervalMs: MANAGED_AUTO_INTERVAL_MS,
+  idleIntervalMs: MANAGED_IDLE_INTERVAL_MS,
   isRunning: () => state.singbox.isRunning(),
+  testDelay: testNodeDelay,
+};
+
+const managedAutoSelection = new ManagedAutoSelection({
+  ...managedSelectionOptions,
+  autoGroup: AUTO_PROXY_GROUP,
   selectBatch: selectAutoTestBatch,
-  selectCandidate: ({ names, current, measurements }) => smartSelectionModel.choose({
-    contextKey: smartSelectionContextKey(),
+});
+
+const managedSmartSelection = new ManagedAutoSelection({
+  ...managedSelectionOptions,
+  autoGroup: SMART_PROXY_GROUP,
+  selectionModel: smartSelectionModel,
+  selectBatch: (names, current, cursor, force, opts) => selectSmartTestBatch(
     names,
     current,
-    measurements,
-  }),
-  testDelay: testNodeDelay,
+    cursor,
+    force,
+    { ...(opts || {}), model: smartSelectionModel }
+  ),
+  selectCandidate: ({ names, current, measurements }) => {
+    ensureSmartModelContext();
+    const pick = smartSelectionModel.choose({
+      contextKey: smartSelectionContextKey(),
+      names,
+      current,
+      measurements,
+    });
+    return pick;
+  },
 });
 
 /** Apply the fastest result from the visible node sweep without testing twice. */
@@ -1269,15 +1630,51 @@ function stopManagedAutoSelection() {
   managedSmartSelection.stop();
 }
 
+/**
+ * Keep Auto and Smart probing while the core runs:
+ * - the outer-selected group uses the fast interval (~60s)
+ * - the other group idles at ~4 minutes so a switch is already warm
+ * - a plain node selection leaves both on the idle cadence
+ * - with kernel type: smart, JS still measures and PUTs preferred; kernel failovers on dial
+ */
+async function syncManagedSelectionSchedulers({ forceRefresh = null } = {}) {
+  if (!state.singbox.isRunning() || !state.store.getSettings().enableClashApi) {
+    stopManagedAutoSelection();
+    return null;
+  }
+  let outer = state.store.get('selected') || AUTO_PROXY_GROUP;
+  try {
+    const group = await clashApi('GET', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP));
+    if (group && group.now) outer = group.now;
+  } catch (_) {
+    /* fall back to the persisted selection */
+  }
+  managedAutoSelection.setActive(outer === AUTO_PROXY_GROUP);
+  managedSmartSelection.setActive(outer === SMART_PROXY_GROUP);
+  if (!managedAutoSelection.isScheduled()) {
+    managedAutoSelection.start({ active: outer === AUTO_PROXY_GROUP });
+  }
+  if (!managedSmartSelection.isScheduled()) {
+    managedSmartSelection.start({ active: outer === SMART_PROXY_GROUP });
+  }
+  if (forceRefresh === AUTO_PROXY_GROUP) {
+    managedAutoSelection.refresh({ force: true }).catch(() => null);
+  } else if (forceRefresh === SMART_PROXY_GROUP) {
+    managedSmartSelection.refresh({ force: true }).catch(() => null);
+  }
+  return outer;
+}
+
 function startManagedAutoSelection() {
-  managedAutoSelection.start();
-  managedSmartSelection.start();
+  stopManagedAutoSelection();
+  void syncManagedSelectionSchedulers().catch(() => null);
 }
 
 /** Switch the outer proxy selector live via the Clash API. */
 async function setClashSelector(name) {
   const result = await managedAutoSelection.setOuterSelector(name);
-  if (name === SMART_PROXY_GROUP) managedSmartSelection.refresh().catch(() => null);
+  const forceRefresh = (name === AUTO_PROXY_GROUP || name === SMART_PROXY_GROUP) ? name : null;
+  await syncManagedSelectionSchedulers({ forceRefresh });
   return result;
 }
 
@@ -1766,7 +2163,7 @@ function healStaleSystemProxy() {
       return;
     }
     try {
-      const disabled = await proxy.disableSystemProxyIfOurs(server);
+      const disabled = await disableOwnedSystemProxy(server);
       forgetSystemProxyOwnership(server);
       state.systemProxyOn = false;
       state.systemProxyServer = null;
@@ -1795,6 +2192,7 @@ function healStaleSystemProxy() {
 module.exports = {
   currentProxyPort,
   enableOwnedSystemProxy,
+  disableOwnedSystemProxy,
   persistedSystemProxyOwnership,
   forgetSystemProxyOwnership,
   beginRemoteUpdate,
@@ -1817,8 +2215,12 @@ module.exports = {
   customRuleSetSourceKey,
   mergeProcessedCustomRuleSet,
   buildCurrentConfig,
+  buildCurrentConfigAsync,
+  resolveKernelSmart,
+  getKernelSmartMeta: () => ({ ...lastKernelSmartMeta }),
   currentRouteInfo,
   ruleGroupInfo,
+  setRuleGroupSelection,
   startCore,
   stopCore,
   restartCore,
@@ -1828,6 +2230,7 @@ module.exports = {
   startProxyGuard,
   stopProxyGuard,
   testNodeDelay,
+  smartNodeQualities,
   applyMeasuredAutoCandidate,
   clashApi,
   setClashSelector,

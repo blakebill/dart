@@ -149,10 +149,20 @@
     else navIndicatorFrame = requestAnimationFrame(update);
   }
 
+  /** Page title in the topbar: plain label only (no nav emoji). */
+  function pageTitleFromNav(button) {
+    const raw = (button && button.textContent || '').trim();
+    // Drop leading pictographs / emoji presentation selectors used on nav items.
+    return raw
+      .replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '')
+      .replace(/\s+/g, ' ')
+      .trim() || raw;
+  }
+
   function syncTopbarTitle(button) {
     const active = button || document.querySelector('.nav-item.active');
     const title = $('#topbarTitle');
-    if (active && title) title.textContent = active.textContent.trim();
+    if (active && title) title.textContent = pageTitleFromNav(active);
   }
 
   function showTab(tab) {
@@ -338,12 +348,44 @@
   let prevActiveSub;
   let prevActiveRevision;
   let prevRuleConfigRevision;
+  let prevSettingsSignature = '';
+  let prevSubsSignature = '';
+  let prevStatusSignature = '';
+  let prevSelected = undefined;
   let refreshSequence = 0;
   let statusEventRevision = 0;
+
+  function settingsSignature(settings) {
+    // Settings objects are small; a stable JSON form is cheaper than rebuilding
+    // the whole settings form on every refresh when nothing changed.
+    try { return JSON.stringify(settings || null); } catch (_) { return String(Date.now()); }
+  }
+
+  function subsSignature(subs, activeSub) {
+    const rows = (subs || []).map((sub) =>
+      [sub.id, sub.updatedAt || 0, sub.nodeCount || 0, sub.name || '', sub.userInfo && sub.userInfo.expire || ''].join('\0')
+    );
+    return `${activeSub || ''}|${rows.join('|')}`;
+  }
+
+  function statusSignature(status) {
+    const st = status || {};
+    return [
+      st.running ? 1 : 0,
+      st.systemProxy ? 1 : 0,
+      st.coreInstalled ? 1 : 0,
+      st.coreType || '',
+      st.coreName || '',
+      st.coreVersion === undefined ? '?' : (st.coreVersion || ''),
+      st.corePath || '',
+    ].join('\0');
+  }
+
   async function refresh() {
     const sequence = ++refreshSequence;
     const statusRevisionAtStart = statusEventRevision;
     const settingsRevisionAtStart = localSettingsRevision;
+    const previousTheme = App.state.settings && App.state.settings.theme;
     const nextState = await api.getState();
     if (sequence !== refreshSequence) return;
     // A compact status event can overtake this slower full snapshot. Preserve
@@ -370,6 +412,13 @@
       !!(App.state.settings && App.state.settings.useBuiltinRules),
       (App.state.settings && App.state.settings.ruleOverrides) || {},
     ]);
+    const nextSettingsSignature = settingsSignature(App.state.settings);
+    const nextSubsSignature = subsSignature(App.state.subscriptions, App.state.activeSub);
+    const nextStatusSignature = statusSignature(App.state.status);
+    const settingsChanged = nextSettingsSignature !== prevSettingsSignature;
+    const subsChanged = nextSubsSignature !== prevSubsSignature;
+    const statusChanged = nextStatusSignature !== prevStatusSignature;
+    const selectedChanged = App.state.selected !== prevSelected;
     const activeChanged = App.state.activeSub !== prevActiveSub || activeRevision !== prevActiveRevision;
     // A same-id refresh may still replace every node/rule in the profile.
     // Drop data tied to its old contents as well as on explicit profile switches.
@@ -383,29 +432,41 @@
       if (App.invalidateRuleCaches) App.invalidateRuleCaches();
     }
     prevRuleConfigRevision = ruleConfigRevision;
+    prevSettingsSignature = nextSettingsSignature;
+    prevSubsSignature = nextSubsSignature;
+    prevStatusSignature = nextStatusSignature;
+    prevSelected = App.state.selected;
     // setLanguage re-renders everything below; only invoke it on an actual change.
     const lang = App.state.settings && App.state.settings.language;
-    if (lang && lang !== getLang()) setLanguage(lang);
-    App.applyTheme(App.state.settings && App.state.settings.theme);
-    App.renderStatus();
-    if (App.renderSubs) App.renderSubs();
-    if (App.currentTab === 'nodes' && App.loadNodes) App.loadNodes();
-    if (App.renderSettings) App.renderSettings();
-    App.renderMode();
-    App.renderUsage();
+    const languageChanged = !!(lang && lang !== getLang());
+    if (languageChanged) setLanguage(lang);
+    const theme = App.state.settings && App.state.settings.theme;
+    if (theme !== previousTheme || languageChanged) App.applyTheme(theme);
+    // Cheap status chrome always tracks runtime truth; heavier panels only repaint
+    // when their backing snapshot actually changed (or language rebuilt the UI).
+    if (statusChanged || languageChanged) App.renderStatus();
+    if ((subsChanged || languageChanged) && App.renderSubs) App.renderSubs();
+    if (App.currentTab === 'nodes' && App.loadNodes && (activeChanged || languageChanged || selectedChanged)) {
+      App.loadNodes();
+    }
+    if ((settingsChanged || languageChanged) && App.renderSettings) App.renderSettings();
+    if (settingsChanged || languageChanged || statusChanged) App.renderMode();
+    if (subsChanged || languageChanged) App.renderUsage();
     // getState already carries the core path/version, so no extra IPC is needed.
-    if (App.renderCoreStatus) App.renderCoreStatus(App.state.status);
-    if (App.refreshGroupSelections) {
-      App.refreshGroupSelections();
-    } else if (App.state.status && App.state.status.running) {
-      // The current-node readout is visible outside the Nodes page. Load its
-      // controller after first paint only when a running core makes it useful.
-      afterPaint(() => {
-        if (document.hidden || !(App.state.status && App.state.status.running)) return;
-        ensureTabModules('nodes')
-          .then(() => App.refreshGroupSelections())
-          .catch(() => {});
-      });
+    if ((statusChanged || languageChanged) && App.renderCoreStatus) App.renderCoreStatus(App.state.status);
+    if (selectedChanged || statusChanged || languageChanged || activeChanged) {
+      if (App.refreshGroupSelections) {
+        App.refreshGroupSelections();
+      } else if (App.state.status && App.state.status.running) {
+        // The current-node readout is visible outside the Nodes page. Load its
+        // controller after first paint only when a running core makes it useful.
+        afterPaint(() => {
+          if (document.hidden || !(App.state.status && App.state.status.running)) return;
+          ensureTabModules('nodes')
+            .then(() => App.refreshGroupSelections())
+            .catch(() => {});
+        });
+      }
     }
   }
 
@@ -482,6 +543,7 @@
 
   // ---------- Startup ----------
   applyI18n();
+  syncTopbarTitle();
   App.refreshPalette();
   if (!api) {
     if (App.renderThemeLabel) App.renderThemeLabel();

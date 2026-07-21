@@ -9,10 +9,257 @@ const {
 const AUTO_GROUP = '♻️ Auto';
 const SMART_GROUP = '🧠 Smart';
 const FALLBACK_GROUP = '🛟 Fallback';
+const APP_PROXY_GROUP = '🚀 Proxy';
 const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
 const AUTO_TEST_TOLERANCE_MS = 1;
 const AUTO_TEST_INTERVAL_SECONDS = 60;
 const AUTO_TEST_TIMEOUT_MS = 5000;
+
+const APP_SELECTOR_ANCHORS = [APP_PROXY_GROUP, AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP];
+
+function cleanOutboundName(value) {
+  const name = typeof value === 'string' ? value.trim() : '';
+  return name && name.length <= 256 && !/[\r\n,]/.test(name) ? name : '';
+}
+
+function uniqueOutboundNames(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const name = cleanOutboundName(value);
+    if (!name || seen.has(name)) continue;
+    // Normalize built-ins to the tags used in generated configs.
+    let key = name;
+    if (name === 'DIRECT' || /^direct$/i.test(name)) key = 'direct';
+    else if (name === 'REJECT' || name === 'REJECT-DROP' || /^reject(-drop)?$/i.test(name)) key = 'reject';
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+function isBareDirectOutbound(name) {
+  const n = cleanOutboundName(name);
+  return !!(n && (n === 'direct' || n === 'DIRECT' || /^direct$/i.test(n)));
+}
+
+function isBareRejectOutbound(name) {
+  const n = cleanOutboundName(name);
+  return !!(n && (n === 'reject' || n === 'REJECT' || n === 'REJECT-DROP' || /^reject(-drop)?$/i.test(n)));
+}
+
+function isPreferDirectOrRejectMember(name) {
+  const n = cleanOutboundName(name);
+  if (!n) return false;
+  if (isBareDirectOutbound(n)) return true;
+  if (isBareRejectOutbound(n)) return true;
+  return n.includes('直连') || n.includes('拦截') || n.includes('拒绝') || n.includes('广告')
+    || n.toLowerCase().includes('direct');
+}
+
+/** Options that must not appear in the "选择出站" picker (bare direct / 全球直连-style). */
+function isExcludedSourcePick(name) {
+  const n = cleanOutboundName(name);
+  if (!n) return true;
+  if (isBareDirectOutbound(n)) return true;
+  // Subscription "global direct" style labels — not the same as app 🚀 Proxy picks.
+  if (n.includes('直连')) return true;
+  return false;
+}
+
+/**
+ * Normalize subscription policy groups for runtime generation. Source select
+ * groups stay as real selectors so the UI can pick an outbound from the app
+ * node list.
+ */
+function prepareSourcePolicyGroups(policyGroups, nodeNames = []) {
+  return normalizePolicyGroups(policyGroups, nodeNames);
+}
+
+/**
+ * Expand each select-type source group so the Clash API / UI picker can choose
+ * the app main selector, strategy groups, every node, or residual original
+ * members (nested groups, direct, …). Applies persisted `ruleGroupSelections`.
+ *
+ * Proxy-first groups default to 🚀 Proxy (follow the Nodes tab pick) when the
+ * user has not chosen yet; prefer-direct groups keep their original first
+ * member.
+ */
+function applySourceGroupSelections(groups, nodeNames = [], selections = null) {
+  const nodes = (Array.isArray(nodeNames) ? nodeNames : [])
+    .map((value) => (typeof value === 'string' ? value : value && value.name))
+    .map(cleanOutboundName)
+    .filter(Boolean);
+  const picks = selections && typeof selections === 'object' && !Array.isArray(selections)
+    ? selections
+    : {};
+  return (Array.isArray(groups) ? groups : []).map((group) => {
+    if (!group || (group.type !== 'select' && group.type !== 'selector')) return group;
+    const original = uniqueOutboundNames(group.members);
+    const firstOriginal = original[0] || '';
+    const preferDirect = !!(firstOriginal && isPreferDirectOrRejectMember(firstOriginal));
+    const hasReject = original.some((member) => isBareRejectOutbound(member));
+    // Drop bare direct / 全球直连-style entries from the selectable list, except
+    // keep bare `direct` when this group itself is prefer-direct (needs a default).
+    // Keep bare `reject` only when the subscription group already offered it.
+    const originalKept = original.filter((member) => {
+      if (isBareRejectOutbound(member)) return hasReject;
+      if (isBareDirectOutbound(member)) return preferDirect;
+      if (isExcludedSourcePick(member)) return false;
+      return true;
+    });
+    const members = uniqueOutboundNames([
+      ...APP_SELECTOR_ANCHORS,
+      ...originalKept,
+      ...nodes,
+      ...(preferDirect ? ['direct'] : []),
+      ...(hasReject ? ['reject'] : []),
+    ]);
+    if (!members.length) return group;
+
+    const saved = cleanOutboundName(picks[group.name]);
+    const norm = (name) => {
+      if (name === 'DIRECT') return 'direct';
+      if (name === 'REJECT' || name === 'REJECT-DROP') return 'reject';
+      return name;
+    };
+    let chosen = saved && members.includes(norm(saved)) ? norm(saved) : '';
+    if (!chosen) {
+      const preferred = norm(cleanOutboundName(group.default) || original[0] || '');
+      if (preferred && isPreferDirectOrRejectMember(preferred) && members.includes(preferred)) {
+        chosen = preferred;
+      } else if (members.includes(APP_PROXY_GROUP)) {
+        chosen = APP_PROXY_GROUP;
+      } else if (preferred && members.includes(preferred)) {
+        chosen = preferred;
+      } else {
+        chosen = members[0];
+      }
+    }
+    // Put the active pick first so Mihomo (no selector default field) starts on it.
+    const ordered = [chosen, ...members.filter((name) => name !== chosen)];
+    return { ...group, type: 'select', members: ordered, default: chosen };
+  });
+}
+
+/**
+ * UI picker list for one wired source group. Hides bare direct / 全球直连-style
+ * labels; includes reject only when that group actually has a reject strategy.
+ */
+function sourcePicksForWiredGroup(group) {
+  return uniqueOutboundNames(group && group.members || []).filter((name) => {
+    if (isBareDirectOutbound(name)) return false;
+    if (isExcludedSourcePick(name)) return false;
+    return true;
+  });
+}
+
+/** Flat picker options (anchors + nodes + non-direct extras). Used as a fallback. */
+function sourceGroupPickOptions(nodes = [], groups = []) {
+  const nodeNames = (Array.isArray(nodes) ? nodes : [])
+    .map((value) => (typeof value === 'string' ? value : value && value.name))
+    .map(cleanOutboundName)
+    .filter(Boolean);
+  const extras = [];
+  for (const group of Array.isArray(groups) ? groups : []) {
+    for (const member of group && group.members || []) {
+      const name = cleanOutboundName(member);
+      if (!name || isExcludedSourcePick(name)) continue;
+      if (isBareRejectOutbound(name)) continue; // reject is per-group only
+      extras.push(name);
+    }
+  }
+  return uniqueOutboundNames([
+    ...APP_SELECTOR_ANCHORS,
+    ...nodeNames,
+    ...extras,
+  ]).filter((name) => !isExcludedSourcePick(name) && !isBareRejectOutbound(name));
+}
+
+/**
+ * Whether the installed Dart core binary includes in-kernel Smart groups.
+ * Stock upstream builds never do. Dart forks report versions like
+ * `1.13.14-dart.3` / `1.19.29-dart.4`.
+ *
+ * First builds that shipped kernel Smart:
+ * - sing-box: `-dart.3`+
+ * - mihomo:   `-dart.4`+
+ */
+function coreSupportsKernelSmart(coreType, version) {
+  const text = String(version || '');
+  const match = text.match(/-dart\.(\d+)/i);
+  if (!match) return false;
+  const rev = Number(match[1]);
+  if (!Number.isFinite(rev)) return false;
+  if (coreType === 'mihomo') return rev >= 4;
+  if (coreType === 'sing-box') return rev >= 3;
+  return false;
+}
+
+/** Build the 🧠 Smart group for sing-box (kernel smart or app-managed fallback). */
+function buildSingboxSmartGroup(nodeTags, opts = {}) {
+  const {
+    kernelSmart = false,
+    enableClashApi = true,
+    latencyUrl = DEFAULT_TEST_URL,
+  } = opts;
+  if (kernelSmart) {
+    return {
+      type: 'smart',
+      tag: SMART_GROUP,
+      outbounds: nodeTags,
+      interrupt_exist_connections: false,
+    };
+  }
+  if (enableClashApi) {
+    return { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] };
+  }
+  return {
+    type: 'urltest',
+    tag: SMART_GROUP,
+    outbounds: nodeTags,
+    url: latencyUrl,
+    interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
+    tolerance: 50,
+    idle_timeout: '30m',
+    interrupt_exist_connections: false,
+  };
+}
+
+/** Build the 🧠 Smart proxy-group for mihomo (kernel smart or app-managed fallback). */
+function buildMihomoSmartGroup(proxyNames, opts = {}) {
+  const {
+    kernelSmart = false,
+    enableClashApi = true,
+    latencyUrl = DEFAULT_TEST_URL,
+  } = opts;
+  if (kernelSmart) {
+    return {
+      name: SMART_GROUP,
+      type: 'smart',
+      proxies: proxyNames,
+      url: latencyUrl,
+      interval: AUTO_TEST_INTERVAL_SECONDS,
+      timeout: AUTO_TEST_TIMEOUT_MS,
+      lazy: true,
+    };
+  }
+  if (enableClashApi) {
+    return { name: SMART_GROUP, type: 'select', proxies: proxyNames };
+  }
+  return {
+    name: SMART_GROUP,
+    type: 'url-test',
+    proxies: proxyNames,
+    url: latencyUrl,
+    interval: AUTO_TEST_INTERVAL_SECONDS,
+    tolerance: 50,
+    timeout: AUTO_TEST_TIMEOUT_MS,
+    'max-failed-times': 2,
+    lazy: true,
+  };
+}
 
 /**
  * Core converter
@@ -548,13 +795,163 @@ function parseClashRule(raw) {
 }
 
 /**
+ * Expand one-level Clash logical rules (AND/OR/NOT) into plain rule lines or a
+ * single AND descriptor. Deeper nesting and unsupported matchers are skipped
+ * rather than mis-routed.
+ * @returns {null|Array<string|object>} null when `raw` is not a logical rule
+ */
+function expandLogicalClashRule(raw) {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  const head = text.match(/^(AND|OR|NOT)\s*,/i);
+  if (!head) return null;
+  const kind = head[1].toUpperCase();
+  const rest = text.slice(head[0].length).trim();
+  if (!rest.startsWith('(')) return [];
+  let depth = 0;
+  let end = -1;
+  for (let i = 0; i < rest.length; i++) {
+    const ch = rest[i];
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return [];
+  const payload = rest.slice(0, end + 1);
+  const after = rest.slice(end + 1).replace(/^\s*,\s*/, '').trim();
+  const target = after.split(',')[0].trim();
+  if (!target || /[\r\n]/.test(target)) return [];
+
+  const inner = payload.slice(1, -1);
+  const children = [];
+  let i = 0;
+  while (i < inner.length) {
+    while (i < inner.length && (inner[i] === ',' || /\s/.test(inner[i]))) i += 1;
+    if (i >= inner.length) break;
+    if (inner[i] !== '(') return [];
+    let d = 0;
+    let j = i;
+    for (; j < inner.length; j++) {
+      if (inner[j] === '(') d += 1;
+      else if (inner[j] === ')') {
+        d -= 1;
+        if (d === 0) {
+          j += 1;
+          break;
+        }
+      }
+    }
+    if (d !== 0) return [];
+    const child = inner.slice(i + 1, j - 1).trim();
+    if (!child) return [];
+    children.push(child);
+    i = j;
+  }
+  if (!children.length) return [];
+
+  if (kind === 'OR') {
+    return children.map((child) => `${child},${target}`);
+  }
+  if (kind === 'AND') {
+    return [{ logical: 'AND', parts: children, target }];
+  }
+  // NOT cannot be expressed losslessly with the matchers we emit; drop it.
+  return [];
+}
+
+/** Flatten logical Clash rules so converters always see plain lines or AND descriptors. */
+function flattenClashRules(clashRules) {
+  const out = [];
+  for (const raw of clashRules || []) {
+    const expanded = expandLogicalClashRule(raw);
+    if (expanded === null) {
+      out.push(raw);
+      continue;
+    }
+    for (const item of expanded) out.push(item);
+  }
+  return out;
+}
+
+const AND_FIELD_BY_TYPE = {
+  DOMAIN: 'domain',
+  HOST: 'domain',
+  'DOMAIN-SUFFIX': 'domain_suffix',
+  'HOST-SUFFIX': 'domain_suffix',
+  'DOMAIN-KEYWORD': 'domain_keyword',
+  'HOST-KEYWORD': 'domain_keyword',
+  'DOMAIN-REGEX': 'domain_regex',
+  'IP-CIDR': 'ip_cidr',
+  'IP-CIDR6': 'ip_cidr',
+  'IP6-CIDR': 'ip_cidr',
+  'IP-ADDR': 'ip_cidr',
+  'DST-PORT': 'port',
+  'SRC-PORT': 'source_port',
+  'PROCESS-NAME': 'process_name',
+};
+
+/** Build one sing-box rule from a flattened AND descriptor, or null when unsupported. */
+function andDescriptorToSingboxRule(descriptor, overrides, availableTargets) {
+  if (!descriptor || descriptor.logical !== 'AND' || !Array.isArray(descriptor.parts)) return null;
+  const target = mapClashTarget(descriptor.target, overrides, availableTargets);
+  const rule = {};
+  const usedFields = new Set();
+  for (const part of descriptor.parts) {
+    const segs = String(part || '').split(',').map((s) => s.trim());
+    const type = (segs[0] || '').toUpperCase().replace(/\s+/g, '');
+    const value = segs[1];
+    if (!type || value === undefined || value === '') return null;
+    if (type === 'GEOIP' || type === 'GEOSITE' || type === 'RULE-SET' || type === 'NETWORK') {
+      // These need side-channel rule-set plumbing or are not expressible as AND
+      // fields alongside the rest of our converter path.
+      return null;
+    }
+    const field = AND_FIELD_BY_TYPE[type];
+    if (!field) return null;
+    // Same matcher field twice would be OR inside sing-box; that is not AND.
+    if (usedFields.has(field)) return null;
+    usedFields.add(field);
+    if (field === 'port' || field === 'source_port') {
+      const port = parseInt(value, 10);
+      if (Number.isNaN(port)) return null;
+      rule[field] = [port];
+    } else {
+      rule[field] = [value];
+    }
+  }
+  if (!usedFields.size) return null;
+  if (target === 'reject') rule.action = 'reject';
+  else rule.outbound = target;
+  return rule;
+}
+
+/** Preserve Clash/Mihomo AND semantics while applying the selected target override. */
+function andDescriptorToMihomoRule(descriptor, overrides, availableTargets) {
+  if (!descriptor || descriptor.logical !== 'AND' || !Array.isArray(descriptor.parts)) return null;
+  if (!descriptor.parts.length || descriptor.parts.some((part) => !String(part || '').trim())) return null;
+  const target = clashTargetName(mapClashTarget(descriptor.target, overrides, availableTargets));
+  const children = descriptor.parts.map((part) => `(${String(part).trim()})`).join(',');
+  return `AND,(${children}),${target}`;
+}
+
+/**
  * Distinct subscription policy-group names referenced by proxy-bound rules
  * (including MATCH/FINAL targets, excluding DIRECT/REJECT). These are the groups the user
  * can remap via `overrides`. Returned sorted for a stable UI.
  */
 function extractRuleGroups(clashRules) {
   const groups = new Set();
-  for (const raw of clashRules || []) {
+  for (const raw of flattenClashRules(clashRules)) {
+    if (raw && typeof raw === 'object' && raw.logical === 'AND') {
+      const n = String(raw.target || '').trim();
+      if (n && !/^DIRECT$/i.test(n) && !/^REJECT/i.test(n)) groups.add(n);
+      continue;
+    }
     const r = parseClashRule(raw);
     if (!r) continue;
     const n = String(r.target || '').trim();
@@ -567,7 +964,8 @@ function extractRuleGroups(clashRules) {
 /** Distinct rule-provider names referenced by `RULE-SET,<name>,...` rules. */
 function extractRuleSetRefs(clashRules) {
   const names = new Set();
-  for (const raw of clashRules || []) {
+  for (const raw of flattenClashRules(clashRules)) {
+    if (raw && typeof raw === 'object') continue;
     const r = parseClashRule(raw);
     if (r && r.type === 'RULE-SET' && r.value) names.add(r.value);
   }
@@ -604,7 +1002,8 @@ function resolveGeoAvailable(geoAvailable, hasGeo) {
  */
 function extractGeoCategories(clashRules) {
   const seen = new Map();
-  for (const raw of clashRules || []) {
+  for (const raw of flattenClashRules(clashRules)) {
+    if (raw && typeof raw === 'object') continue;
     const r = parseClashRule(raw);
     if (!r) continue;
     let kind = null;
@@ -646,7 +1045,12 @@ function clashRulesToSingbox(
   const out = [];
   const usedGeoTags = new Set();
   let finalTarget = null;
-  for (const raw of clashRules || []) {
+  for (const raw of flattenClashRules(clashRules)) {
+    if (raw && typeof raw === 'object' && raw.logical === 'AND') {
+      const combined = andDescriptorToSingboxRule(raw, overrides, availableTargets);
+      if (combined) out.push(combined);
+      continue;
+    }
     const parsed = parseClashRule(raw);
     if (!parsed) continue;
     const { type, value } = parsed;
@@ -926,6 +1330,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     clashRules = [],
     policyGroups = [],
     ruleOverrides = null, // { [policyGroupName]: 'direct'|'proxy'|'reject' }
+    ruleGroupSelections = null, // { [policyGroupName]: outboundTag } for source selectors
     geoAvailable = null, // Set of geo rule-set tags backed by a local .srs
     ruleSetData = null, // RULE-SET provider name -> parsed matcher arrays
     enableIpv6 = true,
@@ -944,17 +1349,20 @@ function buildSingboxConfig(nodes, opts = {}) {
   const nodeTags = nodeOutbounds.map((o) => o.tag);
   if (!nodeTags.length) throw new Error('No supported proxy nodes are available.');
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
-  const sourceGroups = normalizePolicyGroups(policyGroups, nodeTags);
+  const sourceGroups = applySourceGroupSelections(
+    prepareSourcePolicyGroups(policyGroups, nodeTags),
+    nodeTags,
+    ruleGroupSelections
+  );
   const sourceGroupNames = sourceGroups.map((group) => group.name);
   const availableTargets = new Set([AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...nodeTags, ...sourceGroupNames]);
 
-  // Default selection: a specific node tag if it still exists, else auto.
+  // Members of 🚀 Proxy only — never source policy groups (they may point back
+  // at 🚀 Proxy for "follow main selection").
+  const proxyMembers = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...nodeTags, 'direct'];
   const defaultOutbound =
-    selected && (
-      [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct'].includes(selected) ||
-      availableTargets.has(selected)
-    )
-      ? selected
+    selected && (proxyMembers.includes(selected) || selected === 'DIRECT')
+      ? (selected === 'DIRECT' ? 'direct' : selected)
       : AUTO_GROUP;
 
   // sing-box has no distinct ordered-fallback outbound. A sticky URLTest group
@@ -962,8 +1370,8 @@ function buildSingboxConfig(nodes, opts = {}) {
   // moves when that route fails.
   const proxyGroup = {
     type: 'selector',
-    tag: '🚀 Proxy',
-    outbounds: [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...sourceGroupNames, ...nodeTags, 'direct'],
+    tag: APP_PROXY_GROUP,
+    outbounds: proxyMembers,
     default: defaultOutbound,
   };
   // Sing-Box's Clash API updates per-node delay history without asking a
@@ -982,18 +1390,11 @@ function buildSingboxConfig(nodes, opts = {}) {
         idle_timeout: '30m',
         interrupt_exist_connections: false,
       };
-  const smartGroup = enableClashApi
-    ? { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] }
-    : {
-        type: 'urltest',
-        tag: SMART_GROUP,
-        outbounds: nodeTags,
-        url: latencyUrl,
-        interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
-        tolerance: 50,
-        idle_timeout: '30m',
-        interrupt_exist_connections: false,
-      };
+  const smartGroup = buildSingboxSmartGroup(nodeTags, {
+    kernelSmart: !!opts.kernelSmart,
+    enableClashApi,
+    latencyUrl,
+  });
   const fallbackGroup = {
     type: 'urltest',
     tag: FALLBACK_GROUP,
@@ -1004,9 +1405,12 @@ function buildSingboxConfig(nodes, opts = {}) {
     idle_timeout: '1m',
   };
 
-  // Only "direct" remains a special outbound; block / dns are handled via route
-  // rule actions (reject / hijack-dns) in sing-box 1.12+.
+  // direct is a real outbound; reject uses type block so selectors can offer it
+  // when a subscription group includes REJECT. Route actions still use reject.
   const sourceGroupOutbounds = singboxPolicyOutbounds(sourceGroups, latencyUrl, AUTO_TEST_INTERVAL_SECONDS);
+  const needsRejectOutbound = sourceGroups.some((group) => (
+    Array.isArray(group.members) && group.members.includes('reject')
+  ));
   const outbounds = [
     proxyGroup,
     autoGroup,
@@ -1015,6 +1419,7 @@ function buildSingboxConfig(nodes, opts = {}) {
     ...sourceGroupOutbounds,
     ...nodeOutbounds,
     { type: 'direct', tag: 'direct' },
+    ...(needsRejectOutbound ? [{ type: 'block', tag: 'reject' }] : []),
   ];
 
   // Inbounds (sing-box 1.12+: sniffing is a route rule action, not an inbound field)
@@ -1226,6 +1631,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     clashRules = [],
     policyGroups = [],
     ruleOverrides = null,
+    ruleGroupSelections = null,
     ruleProviders = {},
     enableIpv6 = true,
     enableTun = false,
@@ -1242,18 +1648,23 @@ function buildMihomoConfig(nodes, opts = {}) {
   const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
   const proxyNames = proxies.map((p) => p.name);
   if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
-  const sourceGroups = normalizePolicyGroups(policyGroups, proxyNames);
+  const sourceGroups = applySourceGroupSelections(
+    prepareSourcePolicyGroups(policyGroups, proxyNames),
+    proxyNames,
+    ruleGroupSelections
+  );
   const sourceGroupNames = sourceGroups.map((group) => group.name);
   const availableTargets = new Set([AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...proxyNames, ...sourceGroupNames]);
   const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
   const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
+  // Same as sing-box: 🚀 Proxy must not list source policy groups. Those groups
+  // already include 🚀 Proxy for "follow main selection"; nesting both ways is a
+  // cycle (Mihomo may accept it, but selection/routing becomes undefined).
+  const proxyMembers = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...proxyNames, 'DIRECT'];
   const defaultProxy =
-    selected && (
-      [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'DIRECT', 'direct'].includes(selected) ||
-      availableTargets.has(selected)
-    )
-      ? selected === 'direct' ? 'DIRECT' : selected
+    selected && (proxyMembers.includes(selected) || selected === 'direct')
+      ? (selected === 'direct' ? 'DIRECT' : selected)
       : AUTO_GROUP;
   const manualProxies = [];
   const manualSeen = new Set();
@@ -1264,12 +1675,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     }
   };
   addManual(defaultProxy);
-  addManual(AUTO_GROUP);
-  addManual(SMART_GROUP);
-  addManual(FALLBACK_GROUP);
-  for (const name of sourceGroupNames) addManual(name);
-  for (const name of proxyNames) addManual(name);
-  addManual('DIRECT');
+  for (const name of proxyMembers) addManual(name);
 
   const autoGroup = enableClashApi
     ? { name: AUTO_GROUP, type: 'select', proxies: proxyNames }
@@ -1284,43 +1690,47 @@ function buildMihomoConfig(nodes, opts = {}) {
         'max-failed-times': 2,
         lazy: true,
       };
-  const smartGroup = enableClashApi
-    ? { name: SMART_GROUP, type: 'select', proxies: proxyNames }
-    : {
-        name: SMART_GROUP,
-        type: 'url-test',
-        proxies: proxyNames,
-        url: latencyUrl,
-        interval: AUTO_TEST_INTERVAL_SECONDS,
-        tolerance: 50,
-        timeout: AUTO_TEST_TIMEOUT_MS,
-        'max-failed-times': 2,
-        lazy: true,
-      };
+  const smartGroup = buildMihomoSmartGroup(proxyNames, {
+    kernelSmart: !!opts.kernelSmart,
+    enableClashApi,
+    latencyUrl,
+  });
 
   const rules = [];
   let finalRule = 'MATCH,🚀 Proxy';
   if (clashMode === 'block') {
     rules.push('MATCH,REJECT');
   } else {
+    // Always prepend private-LAN direct, matching sing-box's early
+    // ip_is_private rule — even when the subscription ships its own rules.
+    const privateDirect = [
+      'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
+      'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
+      'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
+      'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+      'IP-CIDR,169.254.0.0/16,DIRECT,no-resolve',
+      'IP-CIDR6,fc00::/7,DIRECT,no-resolve',
+      'IP-CIDR6,fe80::/10,DIRECT,no-resolve',
+      'IP-CIDR6,::1/128,DIRECT,no-resolve',
+    ];
+    for (const rule of privateDirect) rules.push(rule);
     for (const r of extraRules) {
       for (const converted of singboxRuleToClashRules(r)) rules.push(converted);
     }
-    for (const raw of clashRules || []) {
+    for (const raw of flattenClashRules(clashRules)) {
+      if (raw && typeof raw === 'object' && raw.logical === 'AND') {
+        const combined = andDescriptorToMihomoRule(raw, ruleOverrides, availableTargets);
+        if (combined) rules.push(combined);
+        continue;
+      }
       const rule = clashRuleToMihomo(raw, ruleOverrides, availableRuleProviders, availableTargets);
       if (!hasGeoData && /^(GEOIP|GEOSITE),/i.test(rule || '')) continue;
       if (/^MATCH,/i.test(rule || '')) finalRule = rule;
       else if (rule) rules.push(rule);
     }
-    if (!rules.length) {
-      rules.push(
-        'IP-CIDR,127.0.0.0/8,DIRECT',
-        'IP-CIDR,10.0.0.0/8,DIRECT',
-        'IP-CIDR,172.16.0.0/12,DIRECT',
-        'IP-CIDR,192.168.0.0/16,DIRECT',
-        ...(hasGeoData ? ['GEOIP,CN,DIRECT'] : [])
-      );
-    }
+    // CN direct fallback, after subscription rules and before MATCH — same
+    // relative order as sing-box's geoip-cn/geosite-cn rule.
+    if (hasGeoData) rules.push('GEOIP,CN,DIRECT');
     rules.push(finalRule);
   }
 
@@ -1398,6 +1808,15 @@ function buildMihomoConfig(nodes, opts = {}) {
 
 module.exports = {
   DEFAULT_TEST_URL,
+  SMART_GROUP,
+  APP_PROXY_GROUP,
+  coreSupportsKernelSmart,
+  buildSingboxSmartGroup,
+  buildMihomoSmartGroup,
+  prepareSourcePolicyGroups,
+  applySourceGroupSelections,
+  sourceGroupPickOptions,
+  sourcePicksForWiredGroup,
   nodeToOutbound,
   nodeToClashProxy,
   buildSingboxConfig,

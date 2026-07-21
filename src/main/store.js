@@ -41,6 +41,7 @@ const DEFAULT_SETTINGS = {
   coreType: 'sing-box',
   useBuiltinRules: false,
   ruleOverrides: {},
+  ruleGroupSelections: {},
   testUrl: DEFAULT_TEST_URL,
   testConcurrency: 8,
 };
@@ -129,6 +130,7 @@ class Store {
       localRules: [],
       lastRunning: false,
       ownedSystemProxyServer: null,
+      ownedSystemProxyRestore: null,
       pendingUwpLoopbackSids: null,
     };
   }

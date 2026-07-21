@@ -162,9 +162,12 @@ function parseVless(uri) {
     flow: params.flow || '',
   };
   const security = params.security || 'none';
+  const host = params.host || '';
   if (security === 'tls' || security === 'xtls' || security === 'reality') {
     node.tls = true;
-    node.servername = params.sni || params.peer || '';
+    // WS/HTTP CDN links often set only `host` and omit `sni`. Fall back so
+    // the TLS handshake uses the same name as the transport Host header.
+    node.servername = params.sni || params.peer || host || '';
     if (params.alpn) node.alpn = splitAlpn(params.alpn);
     if (params.fp) node.clientFingerprint = params.fp;
     if (security === 'reality') {
@@ -174,7 +177,6 @@ function parseVless(uri) {
       };
     }
   }
-  const host = params.host || '';
   const path = params.path || '';
   if (node.network === 'ws') {
     node.wsOpts = { path: path || '/', headers: host ? { Host: host } : {} };

@@ -54,29 +54,33 @@ function normalizeClashProxy(p) {
         udp: p.udp,
       };
 
-    case 'vless':
+    case 'vless': {
+      // Reality always implies TLS. Some subscription YAML omit `tls: true` and
+      // only set reality-opts; Clash Meta still treats those as TLS nodes.
+      const reality = p['reality-opts']
+        ? {
+            publicKey: p['reality-opts']['public-key'],
+            shortId: p['reality-opts']['short-id'],
+          }
+        : undefined;
       return {
         ...base,
         type: 'vless',
         uuid: p.uuid,
         flow: p.flow || '',
         network: p.network || 'tcp',
-        tls: !!p.tls,
+        tls: !!p.tls || !!(reality && reality.publicKey),
         servername: p.servername || p.sni || '',
         alpn: p.alpn,
         clientFingerprint: p['client-fingerprint'],
         skipCertVerify: p['skip-cert-verify'],
-        reality: p['reality-opts']
-          ? {
-              publicKey: p['reality-opts']['public-key'],
-              shortId: p['reality-opts']['short-id'],
-            }
-          : undefined,
+        reality,
         wsOpts: p['ws-opts'],
         grpcOpts: p['grpc-opts'],
         h2Opts: p['h2-opts'],
         udp: p.udp,
       };
+    }
 
     case 'trojan':
       return {

@@ -147,6 +147,21 @@ body.native-dialog-body {
   margin-top: 14px;
 }
 
+/*
+ * Main-window toasts sit bottom-right. In dialogs that would cover the footer
+ * action row (Update / Apply / Close), anchor just above .dialog-footer's
+ * top border so the message sits with the action the user just took.
+ * Footer min-height is 66px; keep an 8px gap above the divider.
+ */
+body.native-dialog-body .toast {
+  top: auto;
+  right: 20px;
+  bottom: 74px;
+  left: auto;
+  max-width: min(360px, calc(100vw - 40px));
+  pointer-events: none;
+}
+
 #dialogCoreStatus {
   display: block;
   max-width: min(520px, 62vw);
@@ -154,6 +169,13 @@ body.native-dialog-body {
   text-overflow: ellipsis;
   white-space: nowrap;
   user-select: text;
+}
+
+.dialog-core-hint {
+  margin-top: auto;
+  padding-top: 8px;
+  line-height: 1.55;
+  white-space: normal;
 }
 
 .dialog-result {

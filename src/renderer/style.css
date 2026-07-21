@@ -381,8 +381,7 @@ textarea,
   line-height: 1.2;
 }
 
-.brand-caption,
-.topbar-kicker {
+.brand-caption {
   margin-top: 2px;
   color: var(--text-faint);
   font-size: 9px;
@@ -650,8 +649,8 @@ textarea,
 
 .topbar {
   display: flex;
-  height: 56px;
-  min-height: 56px;
+  height: 60px;
+  min-height: 60px;
   align-items: center;
   justify-content: space-between;
   padding: 0 24px;
@@ -663,13 +662,16 @@ textarea,
 .topbar-title {
   display: flex;
   min-width: 0;
-  flex-direction: column;
+  align-items: center;
 }
 
 .topbar-title strong {
   overflow: hidden;
-  font-size: 16px;
+  font-size: 22px;
   font-weight: 700;
+  line-height: 1.15;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

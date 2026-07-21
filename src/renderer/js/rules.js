@@ -116,9 +116,15 @@
   $('#ruleRefresh').addEventListener('click', () => loadRules({ force: true }));
 
   // ---------- Subscription policy-group outbound overrides ----------
-  // The subscription's own rules keep their matching, but the user picks where
-  // each policy group routes (proxy / direct / reject). Saved as a name->target
-  // map in settings; the core restarts to apply.
+  // Mode: select-outbound (source selector) | proxy | direct | reject.
+  // Source mode shows a second dropdown reusing the node list + app groups.
+  function pickOptionLabel(value) {
+    if (value === '🚀 Proxy') return t('rulegroups.followProxy');
+    if (value === 'direct' || value === 'DIRECT') return 'DIRECT';
+    if (value === 'reject' || value === 'REJECT') return 'REJECT';
+    return value;
+  }
+
   function refreshRuleGroupLabels() {
     const list = $('#ruleGroupList');
     if (!list) return;
@@ -130,13 +136,28 @@
     };
     const empty = list.querySelector('.hint');
     if (empty) empty.textContent = t('rulegroups.empty');
-    list.querySelectorAll('select[data-group] option').forEach((option) => {
+    list.querySelectorAll('select[data-role="mode"] option').forEach((option) => {
       if (labels[option.value]) option.textContent = labels[option.value];
     });
-    list.querySelectorAll('select[data-group]').forEach((select) => {
+    list.querySelectorAll('select[data-role="mode"]').forEach((select) => {
       select.setAttribute('aria-label', `${select.dataset.group}: ${t('localrules.target')}`);
     });
+    list.querySelectorAll('select[data-role="pick"]').forEach((select) => {
+      select.setAttribute('aria-label', `${select.dataset.group}: ${t('rulegroups.pickOutbound')}`);
+      const proxyOpt = select.querySelector('option[value="🚀 Proxy"]');
+      if (proxyOpt) proxyOpt.textContent = t('rulegroups.followProxy');
+    });
     if (App.refreshSelects) App.refreshSelects(list);
+  }
+
+  function syncPickVisibility(row, mode, selectable) {
+    const pick = row.querySelector('select[data-role="pick"]');
+    if (!pick) return;
+    const show = mode === 'source' && selectable;
+    pick.hidden = !show;
+    pick.disabled = !show;
+    const wrap = pick.closest('.rule-group-pick');
+    if (wrap) wrap.hidden = !show;
   }
 
   async function loadRuleGroups(options = {}) {
@@ -155,6 +176,10 @@
       if (generation !== ruleLoadGeneration) return;
       const groups = info.groups || [];
       const overrides = info.overrides || {};
+      const selections = info.selections || {};
+      const defaults = info.defaults || {};
+      const pickOptions = info.pickOptions || [];
+      const picksByGroup = info.picksByGroup || {};
       if (!groups.length) {
         list.innerHTML = `<p class="hint">${t('rulegroups.empty')}</p>`;
         ruleGroupsReady = true;
@@ -166,28 +191,53 @@
         ['reject', t('customrs.targetReject')],
       ];
       const sourceTargets = new Set(info.sourceTargets || []);
+      const selectableTargets = new Set(info.selectableTargets || []);
       list.innerHTML = '';
       for (const g of groups) {
         const hasSourceTarget = sourceTargets.has(g);
+        const selectable = selectableTargets.has(g);
         const groupOptions = hasSourceTarget
           ? [['source', t('rulegroups.targetSource')], ...opts]
           : opts;
         const cur = overrides[g] || (hasSourceTarget ? 'source' : 'proxy');
+        const pickValue = selections[g] || defaults[g] || '🚀 Proxy';
         const div = document.createElement('div');
-        div.className = 'sub-item';
-        const sel = groupOptions
+        div.className = 'sub-item rule-group-item';
+        const modeSel = groupOptions
           .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
           .join('');
+        let pickHtml = '';
+        if (selectable) {
+          // Per-group list (reject only when that group ships a reject strategy).
+          const groupPicks = picksByGroup[g] || pickOptions;
+          const options = groupPicks.includes(pickValue) ? groupPicks : [pickValue, ...groupPicks];
+          const pickOpts = options.map((value) => {
+            const selected = value === pickValue
+              || (pickValue === 'direct' && value === 'direct')
+              || (pickValue === 'reject' && value === 'reject')
+              ? ' selected' : '';
+            return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(pickOptionLabel(value))}</option>`;
+          }).join('');
+          pickHtml = `
+            <div class="rule-group-pick">
+              <select class="input small rule-group-pick-select" data-role="pick" data-group="${escapeHtml(g)}"
+                aria-label="${escapeHtml(g + ': ' + t('rulegroups.pickOutbound'))}">${pickOpts}</select>
+            </div>`;
+        }
         div.innerHTML = `
           <div class="sub-info">
             <div class="sub-name">${escapeHtml(g)}</div>
           </div>
-          <div class="sub-actions">
-            <select class="input small" data-group="${escapeHtml(g)}" aria-label="${escapeHtml(g + ': ' + t('localrules.target'))}">${sel}</select>
+          <div class="sub-actions rule-group-actions">
+            <select class="input small" data-role="mode" data-group="${escapeHtml(g)}"
+              aria-label="${escapeHtml(g + ': ' + t('localrules.target'))}">${modeSel}</select>
+            ${pickHtml}
           </div>`;
         list.appendChild(div);
+        syncPickVisibility(div, cur, selectable);
       }
-      list.querySelectorAll('select[data-group]').forEach((sel) => {
+
+      list.querySelectorAll('select[data-role="mode"]').forEach((sel) => {
         sel.addEventListener('change', async () => {
           const next = { ...(info.overrides || {}) };
           const g = sel.dataset.group;
@@ -197,6 +247,9 @@
           try {
             App.commitSettings(await call(api.updateSettings, { ruleOverrides: next }));
             info.overrides = next;
+            const row = sel.closest('.rule-group-item');
+            syncPickVisibility(row, sel.value, selectableTargets.has(g));
+            if (App.refreshSelects) App.refreshSelects(row);
             toast(t('settings.saved'));
             rulesReady = false;
             await loadRules({ force: true });
@@ -207,7 +260,34 @@
           }
         });
       });
-      if (App.enhanceSelects) App.enhanceSelects(list); // style these freshly-built selects
+
+      list.querySelectorAll('select[data-role="pick"]').forEach((sel) => {
+        sel.addEventListener('change', async () => {
+          const g = sel.dataset.group;
+          sel.disabled = true;
+          try {
+            const result = await call(api.setRuleGroupOutbound, g, sel.value);
+            if (result && result.settings) App.commitSettings(result.settings);
+            info.selections = {
+              ...(info.selections || {}),
+              [g]: sel.value,
+            };
+            // Running core may predate enriched selector members — rebuild once.
+            if (result && result.applied === false && App.state.status && App.state.status.running) {
+              try {
+                if (api.restartCore) await call(api.restartCore);
+              } catch (_) { /* call() already toasted */ }
+            }
+            toast(t('settings.saved'));
+          } catch (_) {
+            /* call() already showed the error */
+          } finally {
+            sel.disabled = false;
+          }
+        });
+      });
+
+      if (App.enhanceSelects) App.enhanceSelects(list);
       ruleGroupsReady = true;
     })().finally(() => {
       if (ruleGroupsLoading === request) ruleGroupsLoading = null;

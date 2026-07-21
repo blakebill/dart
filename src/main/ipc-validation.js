@@ -3,6 +3,7 @@
 const { dnsServerFromAddress } = require('./converter');
 
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
+const MAX_RULE_GROUP_SELECTION_ENTRIES = 512;
 const VALID_CRS_FORMATS = ['clash', 'sing-box'];
 const VALID_SUBSCRIPTION_UA_MODES = ['auto', 'sing-box', 'clash'];
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
@@ -14,12 +15,14 @@ const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
-  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'coreType',
+  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
 ]);
 
 const CORE_CONFIG_SETTINGS = new Set([
   'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
   'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
+  // ruleGroupSelections is NOT core-config: picks apply live via Clash API and
+  // only become config defaults on the next start/rebuild.
   'ruleOverrides', 'coreType', 'testUrl',
 ]);
 
@@ -149,6 +152,24 @@ function validateSettingsPatch(patch, current) {
       throw new Error('invalid ruleOverrides');
     }
     for (const value of Object.values(patch.ruleOverrides)) reqEnum(value, VALID_TARGETS, 'ruleOverrides');
+  }
+  if ('ruleGroupSelections' in patch) {
+    const selections = patch.ruleGroupSelections;
+    if (!selections || typeof selections !== 'object' || Array.isArray(selections)) {
+      throw new Error('invalid ruleGroupSelections');
+    }
+    const entries = Object.entries(selections);
+    if (entries.length > MAX_RULE_GROUP_SELECTION_ENTRIES) {
+      throw new Error('invalid ruleGroupSelections');
+    }
+    for (const [key, value] of entries) {
+      if (typeof key !== 'string' || !key.trim() || key.length > 256 || /[\r\n,]/.test(key)) {
+        throw new Error('invalid ruleGroupSelections');
+      }
+      if (typeof value !== 'string' || !value.trim() || value.length > 256 || /[\r\n,]/.test(value)) {
+        throw new Error('invalid ruleGroupSelections');
+      }
+    }
   }
   const next = { ...current, ...patch };
   if (next.enableClashApi && next.mixedPort === next.clashApiPort) {

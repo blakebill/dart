@@ -52,12 +52,17 @@ contextBridge.exposeInMainWorld('api', {
   notify: (title, body) => ipcRenderer.invoke('app:notify', { title, body }),
 
   // Node latency test
-  testNodeDelay: async (name) => {
-    const result = await ipcRenderer.invoke('node:delay', { name });
+  // options.force=true skips the short-lived result cache (manual re-test).
+  testNodeDelay: async (name, options = {}) => {
+    const result = await ipcRenderer.invoke('node:delay', {
+      name,
+      force: !!(options && options.force),
+    });
     if (result && result.ok === false) throw new Error(result.error || 'timeout');
     return result && result.ok === true ? result.delay : result;
   },
   applyAutoCandidate: (name) => ipcRenderer.invoke('node:autoCandidate', { name }),
+  getNodeQualities: () => ipcRenderer.invoke('node:qualities'),
 
   // Node selection (+ current picks for the automatic groups)
   selectNode: (name) => ipcRenderer.invoke('node:select', { name }),
@@ -66,6 +71,7 @@ contextBridge.exposeInMainWorld('api', {
   // Rules / connections / proxy mode
   getRules: () => ipcRenderer.invoke('rules:get'),
   getRuleGroups: () => ipcRenderer.invoke('rules:groups'),
+  setRuleGroupOutbound: (group, outbound) => ipcRenderer.invoke('rules:setGroupOutbound', { group, outbound }),
   getConnections: () => ipcRenderer.invoke('connections:get'),
   closeAllConnections: () => ipcRenderer.invoke('connections:closeAll'),
   closeConnection: (id) => ipcRenderer.invoke('connections:close', { id }),

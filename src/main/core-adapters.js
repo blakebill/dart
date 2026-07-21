@@ -54,8 +54,10 @@ const adapters = {
     binaryName(platform = process.platform) {
       return platform === 'win32' ? 'sing-box.exe' : 'sing-box';
     },
-    serializeConfig(config) {
-      return JSON.stringify(config, null, 2);
+    // Runtime configs are written often on start/restart; pretty-print only when
+    // exporting for humans (see serializeConfig options.pretty).
+    serializeConfig(config, options = {}) {
+      return options.pretty ? JSON.stringify(config, null, 2) : JSON.stringify(config);
     },
     routeEntries(config) {
       return (((config.route || {}).rules) || []).map((rule) => ({ kind: 'sing-box', rule }));
@@ -63,7 +65,7 @@ const adapters = {
     summarizeConfig(config) {
       return {
         generatedNodes: (config.outbounds || [])
-          .filter((item) => !['selector', 'urltest', 'direct'].includes(item.type)).length,
+          .filter((item) => !['selector', 'urltest', 'smart', 'direct'].includes(item.type)).length,
         generatedRules: (((config.route || {}).rules) || []).length,
         tun: (config.inbounds || []).some((item) => item.type === 'tun'),
       };

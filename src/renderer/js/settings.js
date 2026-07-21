@@ -31,25 +31,42 @@
     }
   }
 
+  function setFieldValue(el, value, isCheckbox) {
+    if (!el) return false;
+    if (isCheckbox) {
+      const next = !!value;
+      if (el.checked === next) return false;
+      el.checked = next;
+      return true;
+    }
+    const next = value === undefined || value === null ? '' : String(value);
+    if (el.value === next) return false;
+    el.value = next;
+    return true;
+  }
+
   function renderSettings() {
-    const s = App.state.settings;
-    $('#setMixedPort').value = s.mixedPort;
-    $('#setClashPort').value = s.clashApiPort;
-    $('#setLogLevel').value = s.logLevel;
-    $('#setAutoProxy').checked = !!s.autoSetSystemProxy;
-    $('#setClashApi').checked = !!s.enableClashApi;
-    $('#setAutoLaunch').checked = !!s.autoLaunch;
-    $('#setSilentStart').checked = !!s.silentStart;
-    $('#setNotifications').checked = s.notifications !== false;
-    $('#setIpv6').checked = !!s.enableIpv6;
-    $('#setBuiltinRules').checked = !!s.useBuiltinRules;
-    $('#setTestUrl').value = s.testUrl || '';
-    $('#setTestConcurrency').value = s.testConcurrency || 8;
-    $('#setLanguage').value = s.language || 'zh';
-    $('#setDnsRemote').value = s.dnsRemote || '';
-    $('#setDnsLocal').value = s.dnsLocal || '';
-    $('#setDnsStrategy').value = s.dnsStrategy || 'prefer_ipv4';
-    if ($('#setCoreType')) $('#setCoreType').value = s.coreType || 'sing-box';
+    const s = App.state.settings || {};
+    let changed = false;
+    changed = setFieldValue($('#setMixedPort'), s.mixedPort) || changed;
+    changed = setFieldValue($('#setClashPort'), s.clashApiPort) || changed;
+    changed = setFieldValue($('#setLogLevel'), s.logLevel) || changed;
+    changed = setFieldValue($('#setAutoProxy'), !!s.autoSetSystemProxy, true) || changed;
+    changed = setFieldValue($('#setClashApi'), !!s.enableClashApi, true) || changed;
+    changed = setFieldValue($('#setAutoLaunch'), !!s.autoLaunch, true) || changed;
+    changed = setFieldValue($('#setSilentStart'), !!s.silentStart, true) || changed;
+    changed = setFieldValue($('#setNotifications'), s.notifications !== false, true) || changed;
+    changed = setFieldValue($('#setIpv6'), !!s.enableIpv6, true) || changed;
+    changed = setFieldValue($('#setBuiltinRules'), !!s.useBuiltinRules, true) || changed;
+    changed = setFieldValue($('#setTestUrl'), s.testUrl || '') || changed;
+    changed = setFieldValue($('#setTestConcurrency'), s.testConcurrency || 8) || changed;
+    changed = setFieldValue($('#setLanguage'), s.language || 'zh') || changed;
+    changed = setFieldValue($('#setDnsRemote'), s.dnsRemote || '') || changed;
+    changed = setFieldValue($('#setDnsLocal'), s.dnsLocal || '') || changed;
+    changed = setFieldValue($('#setDnsStrategy'), s.dnsStrategy || 'prefer_ipv4') || changed;
+    changed = setFieldValue($('#setCoreType'), s.coreType || 'sing-box') || changed;
+    // Enhanced selects only need a refresh when an underlying value actually moved.
+    if (changed && App.refreshSelects && App.currentTab === 'settings') App.refreshSelects();
   }
 
   // Pure render of the core-status label from a status object.

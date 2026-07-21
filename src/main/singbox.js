@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { spawn, spawnSync } = require('child_process');
 const { pipeline } = require('stream/promises');
 const { StringDecoder } = require('string_decoder');
@@ -13,6 +14,43 @@ const github = require('./github');
 const { getCoreAdapter, hasCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { verifyFileSha256 } = require('./integrity');
 const { uniqueSibling, replaceFileSync, replaceFileBatchSync, writeJsonAtomicSync } = require('./file-utils');
+
+const CORE_START_MIN_ALIVE_MS = 600;
+const CORE_START_MAX_WAIT_MS = 8000;
+const CORE_START_POLL_MS = 100;
+
+/** TCP probe for 127.0.0.1:port — used to confirm the mixed inbound is accepting. */
+function probeLocalPort(port, timeoutMs = 250) {
+  return new Promise((resolve) => {
+    const numeric = Number(port);
+    if (!Number.isInteger(numeric) || numeric < 1 || numeric > 65535) {
+      resolve(false);
+      return;
+    }
+    const socket = net.connect({ host: '127.0.0.1', port: numeric }, () => {
+      socket.destroy();
+      resolve(true);
+    });
+    const finish = (ok) => {
+      try { socket.destroy(); } catch (_) {}
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
+/** Mixed inbound port from a generated sing-box or mihomo config, if present. */
+function listenPortFromConfig(config) {
+  if (!config || typeof config !== 'object') return null;
+  const mixed = Number(config['mixed-port']);
+  if (Number.isInteger(mixed) && mixed > 0 && mixed <= 65535) return mixed;
+  const inbound = Array.isArray(config.inbounds)
+    ? config.inbounds.find((item) => item && item.type === 'mixed')
+    : null;
+  const port = inbound && Number(inbound.listen_port);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+}
 
 // Matches ANSI CSI escape sequences (e.g. color codes like "\x1b[38;5;74m").
 const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -375,6 +413,23 @@ class CoreManager {
    * Return the installed core version (e.g. "1.9.3"), or null if not available.
    * The result is cached per binary path and refreshed after a download.
    */
+  /**
+   * Synchronous version of the last successful probe for this binary, or null.
+   * Used by sync config builders; call getCoreVersion() first on start paths.
+   */
+  peekCoreVersion(type = this.getCoreType()) {
+    const bin = this.resolveBinaryPath(type);
+    if (!bin || !this._versionCache) return null;
+    if (this._versionCache.bin !== bin || this._versionCache.coreType !== type) return null;
+    try {
+      const fingerprint = statFingerprint(fs.statSync(bin));
+      if (this._versionCache.fingerprint !== fingerprint) return null;
+    } catch (_) {
+      return null;
+    }
+    return this._versionCache.version;
+  }
+
   async getCoreVersion(type = this.getCoreType()) {
     const bin = this.resolveBinaryPath(type);
     if (!bin) return null;
@@ -925,8 +980,33 @@ class CoreManager {
       finalizeStreams(code, signal);
     });
 
-    // Wait briefly to confirm the process didn't crash immediately.
-    await new Promise((r) => setTimeout(r, 600));
+    // Wait until the process has stayed alive long enough to catch fast
+    // crashes, and (when known) until the mixed inbound accepts TCP. A fixed
+    // 600ms sleep alone misses slower bind/TUN failures that exit later.
+    const probePort = listenPortFromConfig(config);
+    const startedAt = Date.now();
+    let portReady = !probePort;
+    while (true) {
+      if (this.proc !== proc) {
+        const detail = startupLines.slice(-4).join(' | ');
+        throw new Error('core exited immediately after start' + (detail ? ': ' + detail : '; check the logs and config'));
+      }
+      const elapsed = Date.now() - startedAt;
+      if (probePort && !portReady) {
+        portReady = await probeLocalPort(probePort);
+      }
+      if (elapsed >= CORE_START_MIN_ALIVE_MS && portReady) break;
+      if (elapsed >= CORE_START_MAX_WAIT_MS) {
+        if (probePort && !portReady) {
+          try { await this.stop(); } catch (_) {}
+          throw new Error(
+            `core process stayed up but proxy port ${probePort} did not open; check the logs and config`
+          );
+        }
+        break;
+      }
+      await new Promise((r) => setTimeout(r, CORE_START_POLL_MS));
+    }
     if (this.proc !== proc) {
       const detail = startupLines.slice(-4).join(' | ');
       throw new Error('core exited immediately after start' + (detail ? ': ' + detail : '; check the logs and config'));

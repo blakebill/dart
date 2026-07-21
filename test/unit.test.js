@@ -10,8 +10,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const vm = require('vm');
-const { buildDelayApiPath, selectAutoTestBatch } = require('../src/main/delay');
+const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('../src/main/delay');
 const { SmartSelectionModel } = require('../src/main/smart-selection');
+const { ManagedAutoSelection } = require('../src/main/managed-auto-selection');
 
 let passed = 0;
 function test(name, fn) {
@@ -67,6 +68,34 @@ test('background Auto batches scale gradually and normalize duplicate names', ()
   );
 });
 
+test('Smart batches prioritize winner and unseen nodes and force-quick only a subset', () => {
+  const model = new SmartSelectionModel();
+  model.choose({
+    contextKey: 'k',
+    names: ['keep', 'fresh', 'stale'],
+    current: 'keep',
+    now: 1000,
+    measurements: [
+      { name: 'keep', delay: 80 },
+      { name: 'stale', delay: 90 },
+    ],
+  });
+  // Make "stale" old so explore wants it; "fresh" never measured.
+  const snap = model.snapshot();
+  snap.nodes.get('stale').lastSuccess = 1000;
+  model.restore(snap, 'k');
+  const names = Array.from({ length: 40 }, (_, i) => `n${i}`).concat(['keep', 'fresh', 'stale']);
+  const batch = selectSmartTestBatch(names, 'keep', 0, false, { model, now: 400_000 });
+  assert.ok(batch.candidates.includes('keep'));
+  assert.ok(batch.candidates.length <= 20);
+  assert.ok(batch.candidates.length >= 16);
+
+  const forced = selectSmartTestBatch(names, 'keep', 0, true, { model, now: 400_000 });
+  assert.ok(forced.refine);
+  assert.ok(forced.candidates.length < names.length);
+  assert.ok(forced.candidates.includes('keep'));
+});
+
 test('Smart selection smooths RTT and ignores insignificant improvements', () => {
   const model = new SmartSelectionModel({ minDwellMs: 0, switchThresholdMs: 20, switchThresholdRatio: 0 });
   const choose = (measurements, now) => model.choose({
@@ -77,24 +106,158 @@ test('Smart selection smooths RTT and ignores insignificant improvements', () =>
   assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 121_000), 'b');
 });
 
+test('Smart adaptive acceptable delay follows p75 of healthy samples', () => {
+  const { computeAdaptiveAcceptableDelayMs, DEFAULT_OPTIONS } = require('../src/main/smart-selection');
+  const opts = { ...DEFAULT_OPTIONS };
+  // Sparse → default
+  assert.strictEqual(computeAdaptiveAcceptableDelayMs([], opts, 1000), 500);
+  // Cluster around 100ms → p75*1.5 stays near floor band
+  const fast = Array.from({ length: 8 }, () => ({ ewma: 100, consecutiveFailures: 0, cooldownUntil: 0 }));
+  const fastLine = computeAdaptiveAcceptableDelayMs(fast, opts, 1000);
+  assert.ok(fastLine >= 400 && fastLine <= 500, String(fastLine));
+  // Cluster around 400ms → raises ceiling for international paths
+  const slow = Array.from({ length: 8 }, (_, i) => ({ ewma: 300 + i * 20, consecutiveFailures: 0, cooldownUntil: 0 }));
+  const slowLine = computeAdaptiveAcceptableDelayMs(slow, opts, 1000);
+  assert.ok(slowLine > 500, String(slowLine));
+  assert.ok(slowLine <= 2000, String(slowLine));
+});
+
+test('Smart selection never prefers UI-red high delay when a healthy node exists', () => {
+  const model = new SmartSelectionModel({ minDwellMs: 0, switchThresholdMs: 0, switchThresholdRatio: 0 });
+  const pick = model.choose({
+    contextKey: 'red-avoid',
+    names: ['good', 'red', 'dead'],
+    current: 'red',
+    now: 1000,
+    measurements: [
+      { name: 'good', delay: 80 },
+      { name: 'red', delay: 1200 },
+      { name: 'dead', delay: null },
+    ],
+  });
+  assert.strictEqual(pick, 'good');
+  // Stale Clash "now" on the red node must not re-stick after we already left.
+  const again = model.choose({
+    contextKey: 'red-avoid',
+    names: ['good', 'red', 'dead'],
+    current: 'red',
+    now: 2000,
+    measurements: [
+      { name: 'good', delay: 85 },
+      { name: 'red', delay: 1500 },
+    ],
+  });
+  assert.strictEqual(again, 'good');
+});
+
 test('Smart selection fails over, cools repeated failures, and bounds memory', () => {
-  const model = new SmartSelectionModel({ minDwellMs: 600_000, maxNodes: 2 });
+  const model = new SmartSelectionModel({ minDwellMs: 600_000, failedDwellMs: 5_000, maxNodes: 2 });
   assert.strictEqual(model.choose({
     contextKey: 'mihomo:profile-a', names: ['a', 'b'], current: 'a', now: 1000,
     measurements: [{ name: 'a', delay: 50 }, { name: 'b', delay: 100 }],
   }), 'a');
+  // First failure stays briefly; after failedDwellMs it can leave quickly.
   assert.strictEqual(model.choose({
     contextKey: 'mihomo:profile-a', names: ['a', 'b'], current: 'a', now: 2000,
     measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 100 }],
+  }), 'a');
+  assert.strictEqual(model.choose({
+    contextKey: 'mihomo:profile-a', names: ['a', 'b'], current: 'a', now: 7000,
+    measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 100 }],
   }), 'b');
   model.choose({
-    contextKey: 'mihomo:profile-a', names: ['a', 'b', 'c'], current: 'b', now: 3000,
+    contextKey: 'mihomo:profile-a', names: ['a', 'b', 'c'], current: 'b', now: 8000,
     measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 100 }, { name: 'c', delay: 120 }],
   });
   const snapshot = model.snapshot();
   assert.ok(snapshot.nodes.size <= 2);
   const failed = snapshot.nodes.get('a');
-  assert.ok(!failed || failed.cooldownUntil > 3000);
+  assert.ok(!failed || failed.cooldownUntil > 8000 || failed.consecutiveFailures > 0);
+  const grades = model.qualities(['b', 'missing']);
+  // Few successes are "probing" — UI must not traffic-light cold samples.
+  assert.strictEqual(grades.b.level, 'probing');
+  assert.ok(Number.isFinite(grades.b.ewma));
+  assert.strictEqual(grades.missing.level, 'unknown');
+  // Under the sample floor, jittery nodes stay probing (not mid/bad).
+  const flaky = new SmartSelectionModel();
+  flaky.choose({
+    contextKey: 'stab', names: ['x'], current: 'x', now: 1000,
+    measurements: [{ name: 'x', delay: 40 }, { name: 'x', delay: 200 }, { name: 'x', delay: 50 }],
+  });
+  assert.strictEqual(flaky.qualities(['x'], 2000).x.level, 'probing');
+  // Fast average RTT with wild swings is not "stable" once enough samples land.
+  const flakyConfirmed = new SmartSelectionModel();
+  flakyConfirmed.choose({
+    contextKey: 'stab2', names: ['x'], current: 'x', now: 1000,
+    measurements: [
+      { name: 'x', delay: 40 }, { name: 'x', delay: 200 }, { name: 'x', delay: 50 },
+      { name: 'x', delay: 180 }, { name: 'x', delay: 45 },
+    ],
+  });
+  assert.ok(['mid', 'bad'].includes(flakyConfirmed.qualities(['x'], 2000).x.level));
+  // Steady moderate RTT can still be "stable" once enough samples land.
+  const steady = new SmartSelectionModel();
+  steady.choose({
+    contextKey: 'steady', names: ['y'], current: 'y', now: 1000,
+    measurements: [
+      { name: 'y', delay: 280 }, { name: 'y', delay: 290 }, { name: 'y', delay: 275 },
+      { name: 'y', delay: 285 }, { name: 'y', delay: 282 },
+    ],
+  });
+  assert.strictEqual(steady.qualities(['y'], 2000).y.level, 'good');
+  // A failed node is "unavailable"; a few lucky re-tests must not go green.
+  const recovering = new SmartSelectionModel();
+  recovering.choose({
+    contextKey: 'rec', names: ['z'], current: 'z', now: 1000,
+    measurements: [{ name: 'z', delay: 100 }, { name: 'z', delay: null }, { name: 'z', delay: null }],
+  });
+  assert.strictEqual(recovering.qualities(['z'], 1500).z.level, 'unavailable');
+  recovering.choose({
+    contextKey: 'rec', names: ['z'], current: 'z', now: 2000,
+    measurements: [{ name: 'z', delay: 90 }, { name: 'z', delay: 95 }, { name: 'z', delay: 88 }],
+  });
+  const recoveringLevel = recovering.qualities(['z'], 2500).z.level;
+  assert.ok(['probing', 'bad', 'mid', 'unavailable'].includes(recoveringLevel));
+  assert.notStrictEqual(recoveringLevel, 'good');
+});
+
+test('managed Auto scheduler uses fast interval when active and idle when standby', async () => {
+  let putName = null;
+  const delays = [];
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '♻️ Auto',
+    clashApi: async (method, apiPath, body) => {
+      if (method === 'PUT') {
+        putName = body && body.name;
+        return {};
+      }
+      return { now: 'n1', all: ['n1', 'n2'] };
+    },
+    getSettings: () => ({ enableClashApi: true, testConcurrency: 2 }),
+    activeIntervalMs: 60_000,
+    idleIntervalMs: 240_000,
+    isRunning: () => true,
+    selectBatch: selectAutoTestBatch,
+    testDelay: async (name) => {
+      delays.push(name);
+      return name === 'n2' ? 10 : 100;
+    },
+  });
+  assert.strictEqual(managed.isScheduled(), false);
+  managed.start({ active: false });
+  assert.strictEqual(managed.isScheduled(), true);
+  assert.strictEqual(managed.isActive(), false);
+  assert.strictEqual(managed.intervalMs(), 240_000);
+  // Standby groups still pre-warm winners so a later switch is warm.
+  await managed.refresh({ force: false });
+  assert.ok(delays.length >= 1);
+  assert.strictEqual(putName, 'n2');
+  managed.setActive(true);
+  assert.strictEqual(managed.isActive(), true);
+  assert.strictEqual(managed.intervalMs(), 60_000);
+  managed.stop();
+  assert.strictEqual(managed.isScheduled(), false);
 });
 
 test('Smart selection isolates history by core and active profile', () => {
@@ -175,7 +338,7 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['settings.manageGeo'], '管理');
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
-  assert.strictEqual(zh['rulegroups.targetSource'], '配置原出站');
+  assert.strictEqual(zh['rulegroups.targetSource'], '选择出站');
 });
 
 test('static HTML fallbacks keep config terminology', () => {
@@ -889,11 +1052,15 @@ test('controls and canvas command bars share a stable size rhythm', () => {
 
 test('node test actions fit inside the fixed virtualized card height', () => {
   const css = readRendererCss();
-  const card = css.slice(css.indexOf('.node-item {'), css.indexOf('.node-item:first-child'));
+  const card = css.slice(css.indexOf('.node-item {'), css.indexOf('.node-item.has-test'));
   const action = css.slice(css.indexOf('.node-test-btn {'), css.indexOf('.node-test-btn:hover'));
   assert.ok(card.includes('height: 68px'));
   assert.ok(card.includes('padding: 8px 10px'));
   assert.ok(card.includes('gap: 4px'));
+  assert.ok(css.includes('.node-quality'));
+  assert.ok(css.includes('.node-quality.probing'));
+  assert.ok(css.includes('.node-quality.unavailable'));
+  assert.ok(css.includes('border-radius: 999px'));
   assert.ok(action.includes('min-height: 26px'));
   assert.ok(action.includes('padding-block: 2px'));
 });
@@ -935,7 +1102,9 @@ test('core adapters own paths, commands, formats and release assets', () => {
   const mihomo = getCoreAdapter('mihomo');
   assert.deepStrictEqual(singBox.checkArgs('config.json'), ['check', '-c', 'config.json']);
   assert.deepStrictEqual(mihomo.checkArgs('config.yaml', '/work'), ['-t', '-f', 'config.yaml', '-d', '/work']);
-  assert.ok(singBox.serializeConfig({ log: { level: 'info' } }).includes('\n'));
+  // Runtime writes stay compact; pretty-print is opt-in for human exports.
+  assert.strictEqual(singBox.serializeConfig({ log: { level: 'info' } }), '{"log":{"level":"info"}}');
+  assert.ok(singBox.serializeConfig({ log: { level: 'info' } }, { pretty: true }).includes('\n'));
   assert.ok(mihomo.serializeConfig({ mode: 'rule' }).includes('mode: rule'));
   assert.strictEqual(singBox.configFormat, 'JSON');
   assert.strictEqual(singBox.repo, 'blakebill/sing-box');
@@ -1348,10 +1517,10 @@ const { Store } = require('../src/main/store');
 test('store writes are atomic: tmp files never survive and data round-trips', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
   const store = new Store(dir);
-  store.set('subscriptions', [{ id: 'a', name: '测试' }]);
+  store.set('subscriptions', [{ id: 'a', name: 'profile-a' }]);
   assert.ok(!fs.existsSync(path.join(dir, 'config.json.tmp')), 'tmp file left behind');
   const reloaded = new Store(dir);
-  assert.deepStrictEqual(reloaded.get('subscriptions'), [{ id: 'a', name: '测试' }]);
+  assert.deepStrictEqual(reloaded.get('subscriptions'), [{ id: 'a', name: 'profile-a' }]);
 });
 
 test('store recovers a corrupt index and never deletes payloads without one', () => {

@@ -1333,9 +1333,12 @@ async function main() {
     );
     assert.strictEqual(state.store.getSettings().testUrl, testUrl, 'failed settings restart was persisted');
 
-    const previousTun = state.store.getSettings().enableTun;
+    // Disable path (no UAC): enabling TUN on non-admin Windows returns a soft
+    // cancel instead of restarting, which would hide restart-rollback failures.
+    const previousTun = true;
+    state.store.updateSettings({ enableTun: true });
     await assert.rejects(
-      handlers['tun:set'](null, { enable: !previousTun }),
+      handlers['tun:set'](null, { enable: false }),
       /new config failed to start/
     );
     assert.strictEqual(state.store.getSettings().enableTun, previousTun, 'failed TUN restart was persisted');

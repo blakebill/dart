@@ -67,6 +67,27 @@
   justify-content: flex-end;
 }
 
+.rule-group-item .rule-group-actions {
+  align-items: center;
+  max-width: min(100%, 420px);
+}
+
+.rule-group-item .rule-group-actions > .ui-select,
+.rule-group-item .rule-group-actions > select {
+  min-width: 7.5rem;
+}
+
+.rule-group-pick {
+  min-width: 0;
+  max-width: 220px;
+}
+
+.rule-group-pick .ui-select,
+.rule-group-pick-select {
+  min-width: 9rem;
+  max-width: 220px;
+}
+
 .sub-activate-btn {
   width: 72px;
 }
@@ -173,6 +194,66 @@
 
 .node-item.has-test .node-bottom {
   padding-right: 58px;
+}
+
+/* Stability label (not a speed grade). Sits left of the latency badge. */
+.node-quality {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 7.5em;
+  min-height: 19px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--text-faint) 10%, var(--field));
+}
+
+.node-quality-n {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.72;
+}
+
+/* Cold-start / sparse samples: readable, intentionally uncolored. */
+.node-quality.probing {
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text-faint) 12%, var(--field));
+  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+}
+
+.node-quality.good {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+
+.node-quality.mid {
+  color: var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--yellow) 35%, var(--border));
+}
+
+.node-quality.bad {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 11%, var(--surface));
+  border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+}
+
+.node-quality.unavailable {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, var(--surface));
+  border-color: color-mix(in srgb, var(--red) 42%, var(--border));
+}
+
+.node-quality.unknown {
+  opacity: 0.7;
 }
 
 .node-item:first-child {

@@ -462,7 +462,7 @@ function dnsPathFor(config, settings, policy, target) {
 async function inspectRoute(value, context) {
   const target = normalizeTarget(value);
   const resolved = await resolveHost(target);
-  const built = context.core.buildCurrentConfig();
+  const built = await context.core.buildCurrentConfigAsync();
   const { config } = built;
   let settings = built.settings;
   if (context.state.singbox.isRunning() && settings.enableClashApi) {
@@ -1089,7 +1089,7 @@ async function checkAllConfigs(context) {
     const coreType = adapter.id;
     try {
       await adapter.prepareStart(context.state.singbox);
-      const { config } = context.core.buildCurrentConfig(coreType);
+      const { config } = await context.core.buildCurrentConfigAsync(coreType);
       const text = configText(coreType, config);
       const installed = context.state.singbox.isCoreInstalled(coreType);
       let validation = { status: 'missing', message: coreType + ' core not installed', location: null };

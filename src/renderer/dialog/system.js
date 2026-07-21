@@ -11,7 +11,7 @@
     let state = await Dialog.call(api.getState);
     let status = state.status || {};
     Dialog.setView('settings.coreManageTitle', `
-      <div class="dialog-body">
+      <div class="dialog-body dialog-flex">
         <div class="setting-row">
           <label for="dialogCoreType" data-i18n="settings.runningCore">${escapeHtml(t('settings.runningCore'))}</label>
           <select id="dialogCoreType" class="input small">
@@ -27,6 +27,7 @@
           <button id="dialogCoreFolder" class="btn" data-i18n="settings.openCoreFolder">${escapeHtml(t('settings.openCoreFolder'))}</button>
         </div>
         <div id="dialogProgress" class="progress dialog-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
+        <p class="hint dialog-core-hint" data-i18n="settings.coreHint">${escapeHtml(t('settings.coreHint'))}</p>
       </div>
       ${Dialog.footer(`
         <button id="dialogCoreRestart" class="btn" data-i18n="dash.restartCore">${escapeHtml(t('dash.restartCore'))}</button>

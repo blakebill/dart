@@ -124,10 +124,12 @@ function pruneInvalidGroups(groups, nodeNames) {
     const members = [];
     const seen = new Set();
     for (const value of group.members) {
-      const member = /^direct$/i.test(value) ? 'direct' : value;
+      let member = value;
+      if (/^direct$/i.test(value)) member = 'direct';
+      else if (/^reject(-drop)?$/i.test(value) || value === 'REJECT' || value === 'REJECT-DROP') member = 'reject';
       if (
         !seen.has(member) && member !== group.name &&
-        (member === 'direct' || nodeNames.has(member) || names.has(member))
+        (member === 'direct' || member === 'reject' || nodeNames.has(member) || names.has(member))
       ) {
         seen.add(member);
         members.push(member);
@@ -138,7 +140,7 @@ function pruneInvalidGroups(groups, nodeNames) {
 
   for (const group of prepared) {
     for (const member of group.members) {
-      if (member === 'direct' || nodeNames.has(member)) {
+      if (member === 'direct' || member === 'reject' || nodeNames.has(member)) {
         if (!valid.has(group.name)) {
           valid.add(group.name);
           queue.push(group.name);
@@ -161,7 +163,7 @@ function pruneInvalidGroups(groups, nodeNames) {
     .map((group) => ({
       ...group,
       members: group.members.filter((member) => (
-        member === 'direct' || nodeNames.has(member) || valid.has(member)
+        member === 'direct' || member === 'reject' || nodeNames.has(member) || valid.has(member)
       )),
     }));
 }
@@ -283,16 +285,23 @@ function singboxPolicyOutbounds(groups, defaultUrl, defaultInterval) {
         ...(group.interrupt !== undefined ? { interrupt_exist_connections: group.interrupt } : {}),
       };
     }
+    // Clash intervals are often large (e.g. 3600). sing-box requires
+    // interval <= idle_timeout; a fixed 30m idle would FATAL on start.
+    const intervalSec = Math.max(1, Number(group.interval) || Number(defaultInterval) || 60);
+    const idleSec = Math.max(
+      Math.max(1, Number(group.idleTimeout) || 30 * 60),
+      intervalSec
+    );
     return {
       type: 'urltest',
       tag: group.name,
       outbounds: group.members,
       url: group.url || defaultUrl,
-      interval: `${group.interval || defaultInterval}s`,
+      interval: `${intervalSec}s`,
       tolerance: group.tolerance !== undefined
         ? group.tolerance
         : group.type === 'fallback' ? 10000 : 50,
-      idle_timeout: group.idleTimeout ? `${group.idleTimeout}s` : '30m',
+      idle_timeout: `${idleSec}s`,
       interrupt_exist_connections: group.interrupt === true,
     };
   });
@@ -301,7 +310,11 @@ function singboxPolicyOutbounds(groups, defaultUrl, defaultInterval) {
 function mihomoPolicyGroups(groups, defaultUrl, defaults = {}) {
   return (groups || []).map((group) => {
     const type = group.type === 'url-test' ? 'url-test' : group.type;
-    const members = group.members.map((member) => member === 'direct' ? 'DIRECT' : member);
+    const members = group.members.map((member) => {
+      if (member === 'direct') return 'DIRECT';
+      if (member === 'reject') return 'REJECT';
+      return member;
+    });
     const output = { name: group.name, type, proxies: members };
     if (type !== 'select') {
       output.url = group.url || defaultUrl;

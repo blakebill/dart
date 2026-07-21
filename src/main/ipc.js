@@ -632,7 +632,7 @@ function registerIpc() {
   ipcMain.handle('convert:export', async (event) => {
     const adapter = getCoreAdapter(state.singbox.getCoreType());
     await adapter.prepareStart(state.singbox);
-    const { config } = core.buildCurrentConfig();
+    const { config } = await core.buildCurrentConfigAsync();
     // The per-run API secret is runtime-only; keep it out of shared exports.
     if (config.experimental && config.experimental.clash_api) {
       delete config.experimental.clash_api.secret;
@@ -642,7 +642,7 @@ function registerIpc() {
       ...adapter.exportDialog,
     });
     if (canceled || !filePath) return null;
-    await writeAtomicText(filePath, adapter.serializeConfig(config));
+    await writeAtomicText(filePath, adapter.serializeConfig(config, { pretty: true }));
     return filePath;
   });
 
@@ -714,11 +714,13 @@ function registerIpc() {
   });
 
   // Test a single node's latency via the Clash API.
-  ipcMain.handle('node:delay', async (_e, { name }) => {
+  ipcMain.handle('node:delay', async (_e, input) => {
+    const { name, force = false } = input && typeof input === 'object' ? input : {};
     reqStr(name, 'name');
     if (!state.singbox.isRunning()) throw new Error('core not running');
     try {
-      return { ok: true, delay: await core.testNodeDelay(name) };
+      // Explicit UI tests pass force so a click always re-probes; Auto/Smart keep the cache.
+      return { ok: true, delay: await core.testNodeDelay(name, { force: !!force }) };
     } catch (error) {
       return { ok: false, error: error && error.message ? error.message : 'timeout' };
     }
@@ -734,6 +736,9 @@ function registerIpc() {
     if (!validNames.has(name)) throw new Error('node is not part of the active config');
     return core.applyMeasuredAutoCandidate(name);
   });
+
+  // Smart stability labels for node cards (probing/good/mid/bad/unavailable + ewma).
+  ipcMain.handle('node:qualities', () => core.smartNodeQualities());
 
   // Resolve the live outer selector plus the health-check groups. Outside the
   // Nodes tab only the active automatic group is queried, keeping polling tiny.
@@ -802,6 +807,13 @@ function registerIpc() {
 
   // The active subscription's policy groups + the user's outbound overrides.
   ipcMain.handle('rules:groups', () => core.ruleGroupInfo());
+
+  // Pick the outbound for a source policy group.
+  ipcMain.handle('rules:setGroupOutbound', async (_e, { group, outbound } = {}) => {
+    reqStr(group, 'group');
+    reqStr(outbound, 'outbound');
+    return core.setRuleGroupSelection(group, outbound);
+  });
 
   // Live connections from the Clash API.
   ipcMain.handle('connections:get', async () => {
@@ -1507,9 +1519,10 @@ function registerIpc() {
   });
 
   ipcMain.handle('core:check', () => core.queueConfigMutation(async () => {
-    await getCoreAdapter(state.singbox.getCoreType()).prepareStart(state.singbox);
-    const { config } = core.buildCurrentConfig();
-    await state.singbox.checkConfigFor(state.singbox.getCoreType(), config);
+    const coreType = state.singbox.getCoreType();
+    await getCoreAdapter(coreType).prepareStart(state.singbox);
+    const { config } = await core.buildCurrentConfigAsync(coreType);
+    await state.singbox.checkConfigFor(coreType, config);
     return true;
   }));
 

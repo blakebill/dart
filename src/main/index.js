@@ -166,7 +166,11 @@ if (!gotLock) {
         if (state.systemProxyOn) {
           const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
           if (ownedServer) {
-            proxy.disableSystemProxyIfOurs(ownedServer)
+            // Prefer the owned restore path so ProxyOverride is put back after a crash.
+            const release = typeof core.disableOwnedSystemProxy === 'function'
+              ? core.disableOwnedSystemProxy(ownedServer)
+              : proxy.disableSystemProxyIfOurs(ownedServer);
+            release
               .then(() => {
                 try { core.forgetSystemProxyOwnership(ownedServer); } catch (error) {
                   sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);

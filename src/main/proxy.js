@@ -114,7 +114,12 @@ function queueProxyOperation(operation) {
   return task;
 }
 
-/** Enable the system proxy, pointing at local host:port. */
+/**
+ * Enable the system proxy, pointing at local host:port.
+ * On success returns `{ ok: true, restore }` where `restore` is the prior
+ * registry snapshot (ProxyEnable / ProxyServer / ProxyOverride) so callers can
+ * put the user's bypass list back when Dart releases ownership.
+ */
 async function enableSystemProxy(host, port) {
   if (process.platform !== 'win32' || shuttingDown) return false;
   return queueProxyOperation(async () => {
@@ -145,7 +150,7 @@ async function enableSystemProxy(host, port) {
       await writeRegistrySetting('ProxyEnable', 'REG_DWORD', 1);
       if (shuttingDown) throw Object.assign(new Error('app is shutting down'), { code: 'DART_SHUTDOWN' });
       await refreshSettings();
-      return true;
+      return { ok: true, restore: snapshot };
     } catch (error) {
       if (changed) {
         try { await restoreProxySettings(snapshot); } catch (restoreError) { error.restoreError = restoreError; }
@@ -160,14 +165,28 @@ function beginShutdown() {
   shuttingDown = true;
 }
 
-/** Disable the proxy only while the registry still points at our exact endpoint. */
-async function disableSystemProxyIfOurs(server) {
+/**
+ * Disable (or fully restore) the proxy only while the registry still points at
+ * our exact endpoint. When `options.restore` is the snapshot taken before Dart
+ * overwrote ProxyOverride / ProxyServer, the user's prior bypass list and
+ * enable state are put back instead of only flipping ProxyEnable to 0.
+ */
+async function disableSystemProxyIfOurs(server, options = {}) {
   if (process.platform !== 'win32' || !server) return false;
   return queueProxyOperation(async () => {
+    let current;
+    try {
+      current = await runReg(['query', REG_PATH, '/v', 'ProxyServer']);
+    } catch (_) {
+      return false;
+    }
+    if (!proxyServerMatches(current, server)) return false;
+    if (options.restore) {
+      await restoreProxySettings(options.restore);
+      return true;
+    }
     const enabled = await runReg(['query', REG_PATH, '/v', 'ProxyEnable']);
     if (!registryDwordEnabled(enabled)) return false;
-    const current = await runReg(['query', REG_PATH, '/v', 'ProxyServer']);
-    if (!proxyServerMatches(current, server)) return false;
     await writeRegistrySetting('ProxyEnable', 'REG_DWORD', 0);
     await refreshSettings();
     return true;
@@ -263,6 +282,7 @@ async function refreshSettings() {
 module.exports = {
   enableSystemProxy,
   disableSystemProxyIfOurs,
+  restoreProxySettings,
   beginShutdown,
   disableSystemProxySyncIfOurs,
   isSystemProxyActive,

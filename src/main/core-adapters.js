@@ -7,6 +7,12 @@ const { assetSha256 } = require('./integrity');
 
 const DART_SINGBOX_REPO = 'blakebill/sing-box';
 const DART_MIHOMO_REPO = 'blakebill/mihomo';
+const OFFICIAL_SINGBOX_REPO = 'SagerNet/sing-box';
+const OFFICIAL_MIHOMO_REPO = 'MetaCubeX/mihomo';
+
+function releaseRepo(customRepo, officialRepo, source) {
+  return source === 'official' ? officialRepo : customRepo;
+}
 
 function cleanReleaseAsset(asset) {
   if (!asset) return null;
@@ -32,6 +38,10 @@ const adapters = {
     configExtension: '.json',
     configFormat: 'JSON',
     repo: DART_SINGBOX_REPO,
+    officialRepo: OFFICIAL_SINGBOX_REPO,
+    repoFor(source) {
+      return releaseRepo(DART_SINGBOX_REPO, OFFICIAL_SINGBOX_REPO, source);
+    },
     supportsBinaryRuleSets: true,
     supportsDynamicRuleData: true,
     supportsLiveRuleInspection: false,
@@ -113,18 +123,19 @@ const adapters = {
         ruleSetData: context.loadRuleSetData(context.clashRules, context.providers),
       });
     },
-    releaseAsset(version, goos, arch, release) {
+    releaseAsset(version, goos, arch, release, source = 'custom') {
       const ext = goos === 'windows' ? 'zip' : 'tar.gz';
       const fileName = `sing-box-${version}-${goos}-${arch}.${ext}`;
       const exact = findReleaseAsset(release, (asset) => asset.fileName === fileName)[0];
       return exact || {
         fileName,
-        url: `https://github.com/${DART_SINGBOX_REPO}/releases/download/v${version}/${fileName}`,
+        url: `https://github.com/${this.repoFor(source)}/releases/download/v${version}/${fileName}`,
         sha256: null,
       };
     },
-    releaseTag(version) {
+    releaseTag(version, source = 'custom') {
       const clean = String(version || '').replace(/^v/, '');
+      if (source === 'official') return `v${clean.replace(/-dart\.\d+$/, '')}`;
       return `v${/-dart\.\d+$/.test(clean) ? clean : `${clean}-dart.1`}`;
     },
     modeChangeNeedsRestart() {
@@ -140,6 +151,10 @@ const adapters = {
     configExtension: '.yaml',
     configFormat: 'YAML',
     repo: DART_MIHOMO_REPO,
+    officialRepo: OFFICIAL_MIHOMO_REPO,
+    repoFor(source) {
+      return releaseRepo(DART_MIHOMO_REPO, OFFICIAL_MIHOMO_REPO, source);
+    },
     supportsBinaryRuleSets: false,
     supportsDynamicRuleData: false,
     supportsLiveRuleInspection: true,
@@ -230,7 +245,7 @@ const adapters = {
         externalUiDownloadUrl: context.ui.downloadUrl,
       });
     },
-    releaseAsset(version, goos, arch, release) {
+    releaseAsset(version, goos, arch, release, source = 'custom') {
       const ext = goos === 'windows' ? 'zip' : 'gz';
       const candidates = findReleaseAsset(release, (asset) => {
         const lower = asset.fileName.toLowerCase();
@@ -245,7 +260,7 @@ const adapters = {
       const fileName = `mihomo-${goos}-${arch}-v${version}.${ext}`;
       return {
         fileName,
-        url: `https://github.com/${DART_MIHOMO_REPO}/releases/download/v${version}/${fileName}`,
+        url: `https://github.com/${this.repoFor(source)}/releases/download/v${version}/${fileName}`,
         sha256: null,
       };
     },

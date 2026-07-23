@@ -1071,6 +1071,7 @@ class CoreManager {
    * @param {(p:number)=>void} onProgress progress callback 0~1
    * @param {object} [opts]
    *   - proxyPort: tunnel the download through the local proxy (falls back to direct)
+   *   - source: custom (Dart fork) or official upstream release
    *   - beforeInstall: async hook run after the download, before extraction —
    *     used to stop a running core so the .exe is not locked during overwrite
    */
@@ -1092,6 +1093,7 @@ class CoreManager {
 
   async _downloadCore(version, onProgress, opts) {
     const { proxyPort = 0, beforeInstall = null, signal = null } = opts;
+    const source = opts.source === 'official' ? 'official' : 'custom';
     throwIfAborted(signal);
     const coreType = opts.coreType === undefined
       ? this.getCoreType()
@@ -1111,17 +1113,17 @@ class CoreManager {
     }
     let release = null;
     if (!tag) {
-      const latest = await this._latestVersion(proxyPort, coreType, signal);
+      const latest = await this._latestVersion(proxyPort, coreType, signal, source);
       tag = latest.tag;
       release = latest.release;
     } else {
       const releaseTag = typeof adapter.releaseTag === 'function'
-        ? adapter.releaseTag(tag)
+        ? adapter.releaseTag(tag, source)
         : tag.startsWith('v') ? tag : 'v' + tag;
       tag = releaseTag;
       try {
         release = await github.releaseByTag(
-          adapter.repo,
+          adapter.repoFor(source),
           releaseTag,
           proxyPort,
           (message) => this.onLog(message),
@@ -1133,7 +1135,7 @@ class CoreManager {
       }
     }
     const ver = tag.replace(/^v/, '');
-    const asset = adapter.releaseAsset(ver, goos, arch, release);
+    const asset = adapter.releaseAsset(ver, goos, arch, release, source);
 
     const binDir = this.ensureCoreDir(coreType);
     const archivePath = path.join(binDir, asset.fileName);
@@ -1313,20 +1315,20 @@ class CoreManager {
   }
 
   /** Latest stable core release tag — GitHub API first, jsDelivr fallback. */
-  async _latestVersion(proxyPort = 0, type = this.getCoreType(), signal = null) {
-    const repo = getCoreAdapter(type).repo;
-    const { tag, release, source } = await github.latestReleaseTag(
+  async _latestVersion(proxyPort = 0, type = this.getCoreType(), signal = null, source = 'custom') {
+    const repo = getCoreAdapter(type).repoFor(source);
+    const { tag, release, source: resolvedVia } = await github.latestReleaseTag(
       repo,
       proxyPort,
       (m) => this.onLog(m),
       { signal }
     );
-    if (source !== 'github') this.onLog('[gui] core version resolved via jsDelivr: ' + tag);
+    if (resolvedVia !== 'github') this.onLog('[gui] core version resolved via jsDelivr: ' + tag);
     return { tag, release };
   }
 
-  _coreAsset(ver, goos, arch, release, type = this.getCoreType()) {
-    return getCoreAdapter(type).releaseAsset(ver, goos, arch, release);
+  _coreAsset(ver, goos, arch, release, type = this.getCoreType(), source = 'custom') {
+    return getCoreAdapter(type).releaseAsset(ver, goos, arch, release, source);
   }
 
   /** Extract a core into an isolated staging directory, then atomically install it. */

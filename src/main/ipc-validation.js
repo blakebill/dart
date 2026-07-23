@@ -7,23 +7,25 @@ const MAX_RULE_GROUP_SELECTION_ENTRIES = 512;
 const VALID_CRS_FORMATS = ['clash', 'sing-box'];
 const VALID_SUBSCRIPTION_UA_MODES = ['auto', 'sing-box', 'clash'];
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
+const VALID_SMART_MODES = ['balanced', 'latency', 'stable'];
 const MAX_IPC_CONNECTIONS = 300;
 const MAX_CONFIG_INPUT_BYTES = 32 * 1024 * 1024;
 const MAX_AUTO_UPDATE_MINUTES = 365 * 24 * 60;
 
 const SETTING_KEYS = new Set([
-  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel',
+  'mixedPort', 'clashApiPort', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
-  'testUrl', 'testConcurrency', 'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
+  'testUrl', 'smartMode',
+  'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
 ]);
 
 const CORE_CONFIG_SETTINGS = new Set([
-  'mixedPort', 'clashApiPort', 'enableClashApi', 'logLevel', 'autoSetSystemProxy',
+  'mixedPort', 'clashApiPort', 'logLevel', 'autoSetSystemProxy',
   'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
   // ruleGroupSelections is NOT core-config: picks apply live via Clash API and
   // only become config defaults on the next start/rebuild.
-  'ruleOverrides', 'coreType', 'testUrl',
+  'ruleOverrides', 'coreType', 'testUrl', 'smartMode',
 ]);
 
 function reqStr(value, name) {
@@ -118,7 +120,7 @@ function validateSettingsPatch(patch, current) {
     }
   }
   for (const key of [
-    'enableClashApi', 'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
+    'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
     'notifications', 'enableIpv6', 'useBuiltinRules',
   ]) {
     if (key in patch && typeof patch[key] !== 'boolean') throw new Error(`invalid ${key}`);
@@ -131,6 +133,7 @@ function validateSettingsPatch(patch, current) {
   if ('language' in patch) reqEnum(patch.language, ['zh', 'en'], 'language');
   if ('theme' in patch) reqEnum(patch.theme, ['dark', 'light', 'system'], 'theme');
   if ('clashMode' in patch) reqEnum(patch.clashMode, VALID_MODES, 'clashMode');
+  if ('smartMode' in patch) reqEnum(patch.smartMode, VALID_SMART_MODES, 'smartMode');
   for (const key of ['dnsRemote', 'dnsLocal']) {
     if (!(key in patch)) continue;
     const value = reqStr(patch[key], key).trim();
@@ -144,9 +147,6 @@ function validateSettingsPatch(patch, current) {
     dnsServerFromAddress(value, 'validate');
   }
   if ('testUrl' in patch && patch.testUrl) reqUrl(patch.testUrl, 'testUrl');
-  if ('testConcurrency' in patch && (
-    !Number.isInteger(patch.testConcurrency) || patch.testConcurrency < 1 || patch.testConcurrency > 32
-  )) throw new Error('invalid testConcurrency');
   if ('ruleOverrides' in patch) {
     if (!patch.ruleOverrides || typeof patch.ruleOverrides !== 'object' || Array.isArray(patch.ruleOverrides)) {
       throw new Error('invalid ruleOverrides');
@@ -172,7 +172,7 @@ function validateSettingsPatch(patch, current) {
     }
   }
   const next = { ...current, ...patch };
-  if (next.enableClashApi && next.mixedPort === next.clashApiPort) {
+  if (next.mixedPort === next.clashApiPort) {
     throw new Error('mixedPort and clashApiPort must be different');
   }
 }

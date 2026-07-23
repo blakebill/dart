@@ -44,7 +44,6 @@ function updateTrayTooltip(up, down) {
 function startTrafficStream() {
   stopTrafficStream();
   const settings = state.store.getSettings();
-  if (!settings.enableClashApi) return;
   // Runs whenever the core is up (independent of window visibility) so the tray
   // tooltip keeps showing live speed while minimized.
   if (!state.singbox || !state.singbox.isRunning()) return;

@@ -89,6 +89,22 @@ function configFingerprint(value) {
   return hash.digest('hex');
 }
 
+/**
+ * Stable identity for Smart history. Display names are intentionally excluded
+ * so a renamed subscription node keeps its observations; every routing-
+ * relevant field (including credentials) remains covered by the local digest.
+ */
+function nodeFingerprint(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return '';
+  const identity = {};
+  for (const key of Object.keys(node).sort()) {
+    if (key !== 'name' && node[key] !== undefined) identity[key] = node[key];
+  }
+  const hash = crypto.createHash('sha256');
+  updateFingerprint(hash, identity);
+  return hash.digest('hex');
+}
+
 /** Parse the airport traffic info header `subscription-userinfo`. */
 function parseUserInfo(headers) {
   const raw = headers['subscription-userinfo'];
@@ -311,6 +327,7 @@ module.exports = {
   parseSubscriptionContent,
   parseUserInfo,
   configFingerprint,
+  nodeFingerprint,
   formatSubscriptionForEditing,
   uniqueNodeNames,
 };

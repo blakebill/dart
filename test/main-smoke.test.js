@@ -155,6 +155,13 @@ require.cache[require.resolve(subscriptionPath)] = {
     },
     parseSubscriptionContent: () => ({ nodes: [], policyGroups: [], format: 'unknown', rules: [], raw: '' }),
     formatSubscriptionForEditing: (value, target) => `editable:${target}:${value}`,
+    nodeFingerprint: (node) => JSON.stringify({
+      type: node && node.type,
+      server: node && node.server,
+      port: node && node.port,
+      password: node && node.password,
+      uuid: node && node.uuid,
+    }),
     configFingerprint: (value) => JSON.stringify([
       value.nodes || [],
       value.policyGroups || value.groups || [],
@@ -230,17 +237,17 @@ async function main() {
   if (childWindow.options.backgroundMaterial !== undefined) {
     assert.strictEqual(childWindow.options.backgroundMaterial, 'mica');
   } else {
-    assert.strictEqual(childWindow.options.backgroundColor, '#202024');
+    assert.strictEqual(childWindow.options.backgroundColor, '#f3f3f5');
   }
   assert.ok(childWindow.loadedUrl.startsWith('file://'));
   assert.ok(childWindow.loadedUrl.endsWith('/dialog.html'));
   assert.ok(!childWindow.loadedUrl.includes('\\'));
   assert.deepStrictEqual(await handlers['dialog:getContext'](childEvent), {
-    type: 'route', payload: {}, language: 'zh', theme: 'dark',
+    type: 'route', payload: {}, language: 'zh', theme: 'system', themeEffective: 'light',
   });
   assert.deepStrictEqual(childWindow.webContents.sent.at(-1), {
     channel: 'dialog:context',
-    payload: { type: 'route', payload: {}, language: 'zh', theme: 'dark' },
+    payload: { type: 'route', payload: {}, language: 'zh', theme: 'system', themeEffective: 'light' },
   });
   assert.strictEqual(await handlers['dialog:viewReady'](childEvent), true);
   assert.strictEqual(childWindow.shown, true);
@@ -337,6 +344,41 @@ async function main() {
   // running core didn't have: delay tests "timed out" and node selection
   // failed with "clash api 400".
   const core = require(path.join(__dirname, '..', 'src', 'main', 'core-control'));
+  const capabilityOriginals = {
+    isCoreInstalled: state.singbox.isCoreInstalled,
+    peekCoreVersion: state.singbox.peekCoreVersion,
+    getCoreVersion: state.singbox.getCoreVersion,
+    resolveBinaryPath: state.singbox.resolveBinaryPath,
+    checkConfigFor: state.singbox.checkConfigFor,
+  };
+  let capabilityVersion = '1.13.14-dart.1';
+  state.singbox.isCoreInstalled = () => true;
+  state.singbox.peekCoreVersion = () => capabilityVersion;
+  state.singbox.getCoreVersion = async () => capabilityVersion;
+  state.singbox.resolveBinaryPath = () => __filename;
+  state.singbox.checkConfigFor = async (type, config) => {
+    const groups = type === 'mihomo' ? config['proxy-groups'] : config.outbounds;
+    assert.ok(groups.some((group) => group.type === 'smart'));
+    if (type === 'mihomo') throw new Error('unknown group type smart');
+    if (groups.some((group) => group.type === 'smart' && group.mode)) {
+      throw new Error('unknown field mode');
+    }
+    return true;
+  };
+  try {
+    const probedSingBox = await core.resolveKernelSmart('sing-box');
+    assert.strictEqual(probedSingBox.kernelSmart, true, 'binary probe did not override an old Dart suffix');
+    assert.strictEqual(probedSingBox.kernelSmartMode, false, 'old Smart core accepted mode');
+    assert.strictEqual(probedSingBox.detection, 'probe');
+    capabilityVersion = '1.19.29-dart.99';
+    const probedMihomo = await core.resolveKernelSmart('mihomo');
+    assert.strictEqual(probedMihomo.kernelSmart, false, 'version suffix overrode a failed capability probe');
+    assert.strictEqual(probedMihomo.kernelSmartMode, false);
+    assert.strictEqual(probedMihomo.detection, 'probe');
+  } finally {
+    Object.assign(state.singbox, capabilityOriginals);
+  }
+  console.log('✓ kernel Smart support follows a real config probe instead of release numbering');
 
   const persistentStore = state.store;
   const fallbackProfiles = [{ id: 'stable-a' }, { id: 'stable-b' }];
@@ -400,7 +442,13 @@ async function main() {
   assert.strictEqual(rendererSubA.userAgentMode, 'sing-box');
   const rendererNodes = await handlers['nodes:get']();
   assert.strictEqual(rendererNodes.activeSub, subA.id);
-  assert.deepStrictEqual(rendererNodes.nodes, [{ name: 'node-of-a', type: 'trojan', server: 's.example.com', port: 443 }]);
+  assert.ok(rendererNodes.nodes.every((node) => !Object.prototype.hasOwnProperty.call(node, 'server')));
+  assert.deepStrictEqual(rendererNodes.nodes, [{
+    name: 'node-of-a',
+    type: 'trojan',
+    security: 'TLS',
+    isNode: true,
+  }]);
 
   const fetchesBeforeUaEdit = subscriptionFetchCalls.length;
   await handlers['sub:edit'](null, { id: subA.id, userAgentMode: 'clash' });
@@ -534,7 +582,7 @@ async function main() {
     });
     try {
       state.store.set('activeSub', subA.id);
-      state.store.updateSettings({ autoSetSystemProxy: false, enableClashApi: false });
+      state.store.updateSettings({ autoSetSystemProxy: false });
       state.store.upsertSubscription({
         ...autoRollbackSnapshot,
         autoUpdateMinutes: 60,
@@ -552,7 +600,6 @@ async function main() {
       autoManager.stop = autoManagerOriginals.stop;
       state.store.updateSettings({
         autoSetSystemProxy: autoSettings.autoSetSystemProxy,
-        enableClashApi: autoSettings.enableClashApi,
       });
     }
 
@@ -595,7 +642,7 @@ async function main() {
       body: Buffer.from('DOMAIN-SUFFIX,broken-rule.example,PROXY'),
     });
     try {
-      state.store.updateSettings({ autoSetSystemProxy: false, enableClashApi: false });
+      state.store.updateSettings({ autoSetSystemProxy: false });
       state.store.upsertCustomRuleSet(previousAutoRule);
       await scheduledAutoUpdate();
       const restoredRule = state.store.getCustomRuleSet(autoRuleId);
@@ -609,7 +656,6 @@ async function main() {
       ruleManager.stop = ruleManagerOriginals.stop;
       state.store.updateSettings({
         autoSetSystemProxy: ruleSettings.autoSetSystemProxy,
-        enableClashApi: ruleSettings.enableClashApi,
       });
     }
   } finally {
@@ -952,7 +998,7 @@ async function main() {
   restartManager.ensureSingBoxGeoData = () => true;
   restartManager.updateGeoData = async () => null;
   try {
-    state.store.updateSettings({ autoSetSystemProxy: false, enableClashApi: false });
+    state.store.updateSettings({ autoSetSystemProxy: false });
     state.store.set('activeSub', subA.id);
     const firstRestart = core.restartIfRunning();
     await firstStartSeen;
@@ -984,7 +1030,6 @@ async function main() {
     restartManager.updateGeoData = restartOriginals.updateGeoData;
     state.store.updateSettings({
       autoSetSystemProxy: restartSettings.autoSetSystemProxy,
-      enableClashApi: restartSettings.enableClashApi,
     });
     state.store.set('activeSub', subB.id);
   }
@@ -1195,6 +1240,10 @@ async function main() {
     handlers['core:download'](null, { version: '1.2.3', coreType: 'other' }),
     /invalid coreType/
   );
+  await assert.rejects(
+    handlers['core:download'](null, { version: '1.2.3', source: 'other' }),
+    /invalid source/
+  );
   const updateType = state.singbox.getCoreType();
   const updateDir = state.singbox.ensureCoreDir(updateType);
   const updateTarget = path.join(updateDir, state.singbox.binNameFor(updateType));
@@ -1243,14 +1292,21 @@ async function main() {
 
     updateStarts = 0;
     let requestedCoreType = null;
+    let requestedSource = null;
     const alternateType = updateType === 'mihomo' ? 'sing-box' : 'mihomo';
     state.singbox.downloadCore = async (_version, _progress, options) => {
       requestedCoreType = options.coreType;
+      requestedSource = options.source;
       await options.beforeInstall();
       return path.join(state.singbox.ensureCoreDir(alternateType), state.singbox.binNameFor(alternateType));
     };
-    await handlers['core:download'](null, { version: '1.2.3', coreType: alternateType });
+    await handlers['core:download'](null, {
+      version: '1.2.3',
+      coreType: alternateType,
+      source: 'official',
+    });
     assert.strictEqual(requestedCoreType, alternateType);
+    assert.strictEqual(requestedSource, 'official');
     assert.strictEqual(updateRunning, true, 'installing the inactive core stopped the active core');
     assert.strictEqual(updateStarts, 0, 'installing the inactive core restarted the active core');
   } finally {
@@ -1440,13 +1496,11 @@ async function main() {
 
   const originalAutoRunning = state.singbox.isRunning;
   const originalAutoCoreType = state.singbox.getCoreType;
-  const originalAutoApiEnabled = state.store.getSettings().enableClashApi;
   let autoRequest = null;
   let autoRequestBody = '';
   let autoCoreType = 'sing-box';
   state.singbox.isRunning = () => true;
   state.singbox.getCoreType = () => autoCoreType;
-  state.store.updateSettings({ enableClashApi: true });
   http.request = (options, callback) => {
     autoRequest = options;
     const request = new EventEmitter();
@@ -1477,7 +1531,6 @@ async function main() {
     http.request = originalHttpRequest;
     state.singbox.isRunning = originalAutoRunning;
     state.singbox.getCoreType = originalAutoCoreType;
-    state.store.updateSettings({ enableClashApi: originalAutoApiEnabled });
   }
   console.log('✓ both cores apply the fastest measured node through the same managed Auto selector');
 
@@ -1514,7 +1567,6 @@ async function main() {
       coreType: 'mihomo',
       clashMode: 'rule',
       enableTun: false,
-      enableClashApi: false,
       autoSetSystemProxy: false,
     });
     await assert.rejects(core.setProxyMode('block'), /new block config failed/);
@@ -1532,7 +1584,6 @@ async function main() {
       coreType: modeRecoverySettings.coreType,
       clashMode: modeRecoverySettings.clashMode,
       enableTun: modeRecoverySettings.enableTun,
-      enableClashApi: modeRecoverySettings.enableClashApi,
       autoSetSystemProxy: modeRecoverySettings.autoSetSystemProxy,
     });
     state.store.set('lastRunning', modeRecoveryLastRunning);
@@ -1879,7 +1930,7 @@ async function main() {
   const forcedModeCalls = [];
   const forcedContext = {
     state: {
-      store: { getSettings: () => ({ enableClashApi: true, clashMode: 'rule' }) },
+      store: { getSettings: () => ({ clashMode: 'rule' }) },
       singbox: { isRunning: () => true },
     },
     core: {
@@ -2010,7 +2061,7 @@ async function main() {
     state: {
       store: {
         get: () => 'direct',
-        getSettings: () => ({ enableClashApi: true, clashMode: 'rule' }),
+        getSettings: () => ({ clashMode: 'rule' }),
       },
       singbox: { isRunning: () => true, getCoreType: () => 'sing-box' },
     },
@@ -2142,6 +2193,10 @@ async function main() {
   const checkedConfigs = await handlers['tools:configCheck']();
   assert.deepStrictEqual(checkedConfigs.results.map((result) => result.coreType), ['sing-box', 'mihomo']);
   assert.ok(checkedConfigs.results.every((result) => result.summary), 'both generated configs need a comparison summary');
+  assert.ok(
+    checkedConfigs.results.find((result) => result.coreType === 'sing-box').preview.includes('\n  "'),
+    'sing-box config preview is not formatted for humans'
+  );
   assert.strictEqual(state.singbox.getCoreType(), coreBeforeValidation, 'dual-core validation switched the active runtime core');
   console.log('✓ route inspection, forced proxy probes and dual-core validation preserve runtime state');
 

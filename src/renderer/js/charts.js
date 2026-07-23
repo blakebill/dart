@@ -26,34 +26,40 @@
     do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
     return (n >= 10 ? Math.round(n) : n.toFixed(1)) + units[i] + '/s';
   }
-  // Resolve a preference ('dark' | 'light' | 'system') to the effective theme,
-  // consulting the OS for 'system'.
-  function effectiveTheme(pref) {
+  // Resolve a preference ('dark' | 'light' | 'system') to the effective theme.
+  // For 'system', prefer an explicit value from main (nativeTheme) — in Electron,
+  // matchMedia still reflects the previous themeSource until main switches it.
+  function effectiveTheme(pref, forcedEffective) {
+    if (forcedEffective === 'light' || forcedEffective === 'dark') return forcedEffective;
     if (pref === 'system') {
       try {
         return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       } catch (_) {
-        return 'dark';
+        return 'light';
       }
     }
-    return pref === 'light' ? 'light' : 'dark';
+    return pref === 'dark' ? 'dark' : 'light';
   }
 
   // Paint the resolved theme: set data-theme, refresh the chart palette, and
-  // mirror the effective value to localStorage so theme-init.js can match it
-  // before first paint next launch (avoids the dark→light flash).
-  function paintTheme(pref) {
-    const th = effectiveTheme(pref);
-    try { localStorage.setItem('theme', th); } catch (e) { /* ignore */ }
+  // mirror preference + effective values for theme-init.js / next launch.
+  function paintTheme(pref, forcedEffective) {
+    const th = effectiveTheme(pref, forcedEffective);
+    try {
+      localStorage.setItem('themePref', ['dark', 'light', 'system'].includes(pref) ? pref : 'system');
+      localStorage.setItem('theme', th);
+    } catch (e) { /* ignore */ }
     if (document.documentElement.getAttribute('data-theme') !== th) {
       document.documentElement.setAttribute('data-theme', th);
+      refreshPalette();
+    } else {
       refreshPalette();
     }
   }
 
   let osThemeBound = false;
-  function applyTheme(theme) {
-    App.themePref = theme === 'light' || theme === 'system' ? theme : 'dark';
+  function applyTheme(theme, forcedEffective) {
+    App.themePref = ['dark', 'light', 'system'].includes(theme) ? theme : 'system';
     // Re-paint automatically when the OS light/dark setting changes, but only
     // while following the system.
     if (!osThemeBound) {
@@ -64,7 +70,7 @@
         });
       } catch (_) { /* matchMedia unavailable */ }
     }
-    paintTheme(App.themePref);
+    paintTheme(App.themePref, forcedEffective);
     if (App.renderThemeLabel) App.renderThemeLabel();
   }
 

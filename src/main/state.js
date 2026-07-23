@@ -61,6 +61,8 @@ function sendToMain(channel, payload) {
 
 const RECENT_LOG_LIMIT = 120000;
 const RECENT_LOG_LINE_LIMIT = 16 * 1024;
+// Cap history handed to the renderer so opening the Logs tab stays light.
+const RECENT_LOG_HISTORY_ENTRIES = 800;
 let recentLogs = [];
 let recentLogStart = 0;
 let recentLogChars = 0;
@@ -83,7 +85,11 @@ function sendLog(line) {
 }
 
 function getRecentLogs() {
-  return { sequence: logSequence, entries: recentLogs.slice(recentLogStart) };
+  const start = Math.max(recentLogStart, recentLogs.length - RECENT_LOG_HISTORY_ENTRIES);
+  return {
+    sequence: logSequence,
+    entries: recentLogs.slice(start),
+  };
 }
 
 function clearRecentLogs() {

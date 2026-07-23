@@ -82,7 +82,6 @@ function withDiagnosticMode(context, mode, operation) {
     const settings = context.state.store.getSettings();
     const proxyPort = context.core.currentProxyPort();
     if (!context.state.singbox.isRunning() || !proxyPort) return operation(0, false);
-    if (!settings.enableClashApi) throw new Error('enable Clash API to run forced-mode diagnostics');
 
     let runtimeMode = settings.clashMode || 'rule';
     const modeRevision = typeof context.core.getModeRevision === 'function'
@@ -465,7 +464,7 @@ async function inspectRoute(value, context) {
   const built = await context.core.buildCurrentConfigAsync();
   const { config } = built;
   let settings = built.settings;
-  if (context.state.singbox.isRunning() && settings.enableClashApi) {
+  if (context.state.singbox.isRunning()) {
     try {
       const runtime = await context.core.clashApi('GET', '/configs');
       const runtimeMode = String(runtime && runtime.mode || '').toLowerCase();
@@ -483,7 +482,7 @@ async function inspectRoute(value, context) {
   // `DEFAULT: field=value` entries, which cannot be matched reliably; its
   // generated config below retains the original structured matcher fields.
   const adapter = getCoreAdapter(settings.coreType);
-  if (!forcedPolicy && adapter.supportsLiveRuleInspection && context.state.singbox.isRunning() && settings.enableClashApi) {
+  if (!forcedPolicy && adapter.supportsLiveRuleInspection && context.state.singbox.isRunning()) {
     try {
       const live = await context.core.clashApi('GET', '/rules');
       if (Array.isArray(live.rules) && live.rules.length) {
@@ -612,7 +611,7 @@ async function inspectPorts(value, context) {
     const probe = await tcpProbe('127.0.0.1', port);
     const owner = probe.open ? await portOwner(port) : null;
     const role = port === settings.mixedPort ? 'mixed' : port === settings.clashApiPort ? 'clash-api' : 'custom';
-    const expected = running && (role === 'mixed' || (role === 'clash-api' && settings.enableClashApi));
+    const expected = running && (role === 'mixed' || role === 'clash-api');
     const ours = !!(owner && corePid && owner.pid === corePid);
     return {
       port,
@@ -1004,7 +1003,7 @@ async function networkDiagnostics(context) {
           return externalIp(proxyPort);
         }).catch((error) => ({ error: errorText(error) }))
       : Promise.resolve({ skipped: true }),
-    running && settings.enableClashApi
+    running
       ? context.core.clashApi('GET', '/version').then((value) => ({ value })).catch((error) => ({ error: errorText(error) }))
       : Promise.resolve({ skipped: true }),
     process.platform === 'win32' ? context.proxy.isSystemProxyActive(server).catch(() => false) : Promise.resolve(null),
@@ -1018,8 +1017,8 @@ async function networkDiagnostics(context) {
   add('coreInstalled', installed ? 'pass' : 'fail', installed ? `${context.state.singbox.coreLabel} ${version ? 'v' + version : ''}`.trim() : 'core not installed');
   add('coreRunning', running ? 'pass' : 'warn', running ? 'running' : 'stopped');
   add('mixedPort', running ? (mixed.open ? 'pass' : 'fail') : (mixed.open ? 'warn' : 'skip'), mixed.open ? `127.0.0.1:${settings.mixedPort} listening` : `127.0.0.1:${settings.mixedPort} closed`, mixed.durationMs);
-  add('apiPort', settings.enableClashApi ? (running ? (apiPort.open ? 'pass' : 'fail') : 'skip') : 'skip', settings.enableClashApi ? (apiPort.open ? `127.0.0.1:${settings.clashApiPort} listening` : `127.0.0.1:${settings.clashApiPort} closed`) : 'disabled', apiPort.durationMs);
-  add('clashApi', apiProbe.skipped ? 'skip' : apiProbe.error ? 'fail' : 'pass', apiProbe.skipped ? 'not running or disabled' : apiProbe.error || 'API authenticated');
+  add('apiPort', running ? (apiPort.open ? 'pass' : 'fail') : 'skip', apiPort.open ? `127.0.0.1:${settings.clashApiPort} listening` : `127.0.0.1:${settings.clashApiPort} closed`, apiPort.durationMs);
+  add('clashApi', apiProbe.skipped ? 'skip' : apiProbe.error ? 'fail' : 'pass', apiProbe.skipped ? 'not running' : apiProbe.error || 'API authenticated');
   add('systemProxy', process.platform !== 'win32' ? 'skip' : stateStatus(systemProxy, stateExpected(context.state.systemProxyOn)), process.platform !== 'win32' ? 'Windows only' : systemProxy ? server : 'not active');
 
   const interfaces = tunInterfaces();
@@ -1048,7 +1047,7 @@ function stateStatus(actual, expected) {
 }
 
 function configText(coreType, config) {
-  return getCoreAdapter(coreType).serializeConfig(config);
+  return getCoreAdapter(coreType).serializeConfig(config, { pretty: true });
 }
 
 function configSummary(coreType, config, sourceNodes, sourceRules, text) {

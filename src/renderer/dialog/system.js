@@ -20,6 +20,13 @@
           </select>
         </div>
         <div class="setting-row">
+          <label for="dialogCoreSource" data-i18n="settings.downloadSource">${escapeHtml(t('settings.downloadSource'))}</label>
+          <select id="dialogCoreSource" class="input small">
+            <option value="custom" data-i18n="settings.customCore">${escapeHtml(t('settings.customCore'))}</option>
+            <option value="official" data-i18n="settings.officialCore">${escapeHtml(t('settings.officialCore'))}</option>
+          </select>
+        </div>
+        <div class="setting-row">
           <div class="setting-label">
             <span data-i18n="settings.corePath">${escapeHtml(t('settings.corePath'))}</span>
             <span id="dialogCoreStatus" class="hint" data-dialog-status></span>
@@ -27,7 +34,10 @@
           <button id="dialogCoreFolder" class="btn" data-i18n="settings.openCoreFolder">${escapeHtml(t('settings.openCoreFolder'))}</button>
         </div>
         <div id="dialogProgress" class="progress dialog-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
-        <p class="hint dialog-core-hint" data-i18n="settings.coreHint">${escapeHtml(t('settings.coreHint'))}</p>
+        <div class="dialog-feature-status">
+          <span><span data-i18n="settings.featureStatus">${escapeHtml(t('settings.featureStatus'))}</span><span aria-hidden="true">:</span></span>
+          <span class="dialog-feature-detail"><span data-i18n="settings.smartFeature">${escapeHtml(t('settings.smartFeature'))}</span><span aria-hidden="true">: </span><strong id="dialogSmartSupport"></strong></span>
+        </div>
       </div>
       ${Dialog.footer(`
         <button id="dialogCoreRestart" class="btn" data-i18n="dash.restartCore">${escapeHtml(t('dash.restartCore'))}</button>
@@ -36,6 +46,17 @@
       `)}
     `);
     $('#dialogCoreType').value = (state.settings && state.settings.coreType) || status.coreType || 'sing-box';
+    $('#dialogCoreSource').value = status.coreInstalled && !/-dart\.\d+/i.test(status.coreVersion || '')
+      ? 'official'
+      : 'custom';
+
+    function renderFeatureStatus() {
+      const supported = $('#dialogCoreSource').value === 'custom';
+      const value = $('#dialogSmartSupport');
+      value.textContent = t(supported ? 'settings.supported' : 'settings.unsupported');
+      value.classList.toggle('supported', supported);
+      value.classList.toggle('unsupported', !supported);
+    }
 
     function renderStatus(next) {
       status = { ...status, ...next };
@@ -62,6 +83,7 @@
     }
 
     renderStatus(status);
+    renderFeatureStatus();
     await refreshStatus();
 
     const removeProgress = api.onDownloadProgress((progress) => {
@@ -70,6 +92,7 @@
     window.addEventListener('beforeunload', removeProgress, { once: true });
 
     Dialog.bind('#dialogCoreFolder', 'click', () => Dialog.call(api.openCoreFolder));
+    Dialog.bind('#dialogCoreSource', 'change', renderFeatureStatus);
     Dialog.bind('#dialogCoreApply', 'click', async () => {
       await Dialog.runBusy($('#dialogCoreApply'), null, async () => {
         await applySelection();
@@ -93,7 +116,8 @@
       try {
         await Dialog.runBusy($('#dialogCoreUpdate'), 'settings.updatingCore', async () => {
           const coreType = $('#dialogCoreType').value;
-          await Dialog.call(api.downloadCore, { version: '', coreType });
+          const source = $('#dialogCoreSource').value;
+          await Dialog.call(api.downloadCore, { version: '', coreType, source });
           await applySelection();
           await refreshStatus();
           await Dialog.changed('state');

@@ -11,13 +11,25 @@ const os = require('os');
 const path = require('path');
 const vm = require('vm');
 const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('../src/main/delay');
-const { SmartSelectionModel } = require('../src/main/smart-selection');
+const { SmartSelectionModel, computeCohortCostProfile } = require('../src/main/smart-selection');
+const { nodeFingerprint } = require('../src/main/subscription');
 const { ManagedAutoSelection } = require('../src/main/managed-auto-selection');
 
 let passed = 0;
+const pendingTests = [];
 function test(name, fn) {
   try {
-    fn();
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      pendingTests.push(Promise.resolve(result).then(() => {
+        passed++;
+        console.log('  ✓ ' + name);
+      }).catch((e) => {
+        console.error('  ✗ ' + name + '\n    ' + e.message);
+        process.exitCode = 1;
+      }));
+      return;
+    }
     passed++;
     console.log('  ✓ ' + name);
   } catch (e) {
@@ -97,13 +109,41 @@ test('Smart batches prioritize winner and unseen nodes and force-quick only a su
 });
 
 test('Smart selection smooths RTT and ignores insignificant improvements', () => {
-  const model = new SmartSelectionModel({ minDwellMs: 0, switchThresholdMs: 20, switchThresholdRatio: 0 });
-  const choose = (measurements, now) => model.choose({
-    contextKey: 'sing-box:profile-a', names: ['a', 'b'], current: 'a', measurements, now,
+  const model = new SmartSelectionModel({
+    minDwellMs: 0,
+    switchThresholdMs: 20,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 2,
   });
-  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 90 }], 1000), 'a');
-  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 61_000), 'a');
-  assert.strictEqual(choose([{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 121_000), 'b');
+  const choose = (current, measurements, now) => model.choose({
+    contextKey: 'sing-box:profile-a', names: ['a', 'b'], current, measurements, now,
+  });
+  assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 90 }], 1000), 'a');
+  // One-shot low probe (and the jitter it creates) is not enough to flip.
+  assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 50 }], 61_000), 'a');
+  assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 48 }], 121_000), 'a');
+  // Stable, clearly better samples calm jitter; first winning round only pending.
+  for (let i = 0; i < 6; i++) {
+    model.observe({ name: 'b', delay: 42 + (i % 2) }, 200_000 + i * 500);
+  }
+  model.observe({ name: 'a', delay: 100 }, 204_000);
+  assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 42 }], 250_000), 'a');
+  // Second consecutive round confirms the switch (A2).
+  assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 43 }], 251_000), 'b');
+});
+
+test('Smart cold start applies a clear winner without waiting through dwell', () => {
+  const model = new SmartSelectionModel();
+  assert.strictEqual(model.choose({
+    contextKey: 'cold-start',
+    names: ['default', 'clear-winner'],
+    current: 'default',
+    now: 1_000,
+    measurements: [
+      { name: 'default', delay: 180 },
+      { name: 'clear-winner', delay: 40 },
+    ],
+  }), 'clear-winner');
 });
 
 test('Smart adaptive acceptable delay follows p75 of healthy samples', () => {
@@ -120,6 +160,41 @@ test('Smart adaptive acceptable delay follows p75 of healthy samples', () => {
   const slowLine = computeAdaptiveAcceptableDelayMs(slow, opts, 1000);
   assert.ok(slowLine > 500, String(slowLine));
   assert.ok(slowLine <= 2000, String(slowLine));
+});
+
+test('Smart adaptive delay ceiling resets when the profile context changes', () => {
+  const model = new SmartSelectionModel();
+  const slowNames = Array.from({ length: 8 }, (_, i) => `slow-${i}`);
+  model.choose({
+    contextKey: 'profile-a',
+    names: slowNames,
+    current: slowNames[0],
+    now: 1000,
+    measurements: slowNames.map((name, i) => ({ name, delay: 700 + i * 20 })),
+  });
+  assert.ok(model.acceptableDelayMs > 500);
+  model.choose({
+    contextKey: 'profile-b',
+    names: ['only'],
+    current: 'only',
+    now: 2000,
+    measurements: [{ name: 'only', delay: 800 }],
+  });
+  assert.strictEqual(model.acceptableDelayMs, 500);
+});
+
+test('Smart keeps primary URL delay for display without changing blended scoring RTT', () => {
+  const model = new SmartSelectionModel();
+  model.choose({
+    contextKey: 'display',
+    names: ['node'],
+    current: 'node',
+    now: 1000,
+    measurements: [{ name: 'node', delay: 220 }],
+  });
+  model.observeDisplayDelay('node', 80, 1100);
+  assert.strictEqual(Math.round(model.peek('node').ewma), 220);
+  assert.strictEqual(model.qualities(['node'], 1200).node.ewma, 80);
 });
 
 test('Smart selection never prefers UI-red high delay when a healthy node exists', () => {
@@ -234,7 +309,6 @@ test('managed Auto scheduler uses fast interval when active and idle when standb
       }
       return { now: 'n1', all: ['n1', 'n2'] };
     },
-    getSettings: () => ({ enableClashApi: true, testConcurrency: 2 }),
     activeIntervalMs: 60_000,
     idleIntervalMs: 240_000,
     isRunning: () => true,
@@ -274,6 +348,465 @@ test('Smart selection isolates history by core and active profile', () => {
   const snapshot = model.snapshot();
   assert.strictEqual(snapshot.contextKey, 'mihomo:a');
   assert.deepStrictEqual([...snapshot.nodes.keys()], ['b']);
+});
+
+test('connection feedback denoise ignores probes and needs a soft-fail streak', () => {
+  const { ConnectionFeedbackTracker, leafOutbound } = require('../src/main/smart-selection');
+  assert.strictEqual(leafOutbound(['node-a', '🧠 Smart', '🚀 Proxy']), 'node-a');
+
+  const tracker = new ConnectionFeedbackTracker({ softFailEmitThreshold: 3 });
+  tracker.setIgnoreHosts(['www.gstatic.com']);
+  const t0 = 1_000_000;
+  const open = (id, name, host, at, bytes = 0) => ({
+    id,
+    chains: [name, '🧠 Smart', '🚀 Proxy'],
+    upload: 0,
+    download: bytes,
+    start: new Date(at).toISOString(),
+    metadata: { host, network: 'tcp' },
+  });
+  // Probe host must never produce soft-fail events.
+  tracker.ingest([open('p1', 'probe-node', 'www.gstatic.com', t0)], t0);
+  let events = tracker.ingest([], t0 + 1_500);
+  assert.ok(!events.some((e) => e.kind === 'softFail'));
+
+  tracker.reset();
+  // One short death is not enough.
+  tracker.ingest([open('c1', 'flaky', 'cdn.example.com', t0)], t0);
+  events = tracker.ingest([], t0 + 1_500);
+  assert.ok(!events.some((e) => e.kind === 'softFail'));
+  // Second short death still under threshold.
+  tracker.ingest([open('c2', 'flaky', 'cdn.example.com', t0 + 2_000)], t0 + 2_000);
+  events = tracker.ingest([], t0 + 3_500);
+  assert.ok(!events.some((e) => e.kind === 'softFail'));
+  // Third completes the streak → one softFail event.
+  tracker.ingest([open('c3', 'flaky', 'cdn.example.com', t0 + 4_000)], t0 + 4_000);
+  events = tracker.ingest([], t0 + 5_500);
+  assert.ok(events.some((e) => e.kind === 'softFail' && e.name === 'flaky'));
+
+  // Real traffic on TCP host still counts.
+  tracker.reset();
+  tracker.ingest([open('t1', 'real-path', 'api.example.com', t0, 0)], t0);
+  events = tracker.ingest([{
+    id: 't1',
+    chains: ['real-path', '🧠 Smart', '🚀 Proxy'],
+    upload: 5_000,
+    download: 40_000,
+    start: new Date(t0).toISOString(),
+    metadata: { host: 'api.example.com', network: 'tcp' },
+  }], t0 + 2_000);
+  assert.ok(events.some((e) => e.kind === 'traffic' && e.name === 'real-path'));
+
+  // Empty network + destinationIP still counts (cores sometimes omit network/host).
+  tracker.reset();
+  tracker.ingest([{
+    id: 'ip1',
+    chains: ['ip-node', '🧠 Smart', '🚀 Proxy'],
+    upload: 0,
+    download: 0,
+    start: new Date(t0).toISOString(),
+    metadata: { destinationIP: '1.2.3.4' },
+  }], t0);
+  events = tracker.ingest([{
+    id: 'ip1',
+    chains: ['ip-node', '🧠 Smart', '🚀 Proxy'],
+    upload: 2_000,
+    download: 20_000,
+    start: new Date(t0).toISOString(),
+    metadata: { destinationIP: '1.2.3.4' },
+  }], t0 + 2_000);
+  assert.ok(events.some((e) => e.kind === 'traffic' && e.name === 'ip-node'));
+
+  // Source policy groups in the chain must not be mistaken for leaf nodes.
+  tracker.reset();
+  tracker.setNodeNames(['leaf-node']);
+  tracker.ingest([{
+    ...open('leaf1', 'Policy Group', 'api.example.com', t0),
+    chains: ['Policy Group', 'leaf-node', '🧠 Smart'],
+  }], t0);
+  events = tracker.ingest([{
+    ...open('leaf1', 'Policy Group', 'api.example.com', t0, 50_000),
+    chains: ['Policy Group', 'leaf-node', '🧠 Smart'],
+  }], t0 + 2_000);
+  assert.ok(events.some((e) => e.kind === 'traffic' && e.name === 'leaf-node'));
+  assert.ok(!events.some((e) => e.name === 'Policy Group'));
+});
+
+test('Smart prefers real traffic over slightly lower URL delay', () => {
+  const { SmartSelectionModel: Model } = require('../src/main/smart-selection');
+  const model = new Model({
+    minDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 2,
+  });
+  const t0 = 1_000_000;
+  model.choose({
+    contextKey: 'traffic',
+    names: ['fast-204', 'real-path'],
+    current: 'fast-204',
+    now: t0,
+    measurements: [
+      { name: 'fast-204', delay: 40 },
+      { name: 'real-path', delay: 90 },
+    ],
+  });
+  model.observeConnection({ name: 'real-path', kind: 'traffic', bytes: 80_000 }, t0 + 1_000);
+  model.observeConnection({ name: 'fast-204', kind: 'softFail' }, t0 + 1_000);
+  model.observeConnection({ name: 'fast-204', kind: 'softFail' }, t0 + 1_100);
+  // Soft-fail makes the stick unusable → leave immediately (no two-round wait).
+  const pick = model.choose({
+    contextKey: 'traffic',
+    names: ['fast-204', 'real-path'],
+    current: 'fast-204',
+    now: t0 + 130_000,
+    measurements: [
+      { name: 'fast-204', delay: 42 },
+      { name: 'real-path', delay: 88 },
+    ],
+  });
+  const failedState = model.peek('fast-204');
+  assert.ok(failedState.softFails > 1, String(failedState.softFails));
+  assert.strictEqual(failedState.consecutiveFailures, 0, 'URL success must not own real connection failures');
+  assert.strictEqual(pick, 'real-path');
+});
+
+test('Smart scheduleHint adapts to stable and failing nodes', () => {
+  const { SmartSelectionModel: Model } = require('../src/main/smart-selection');
+  const model = new Model({ minDwellMs: 0, switchThresholdMs: 0, switchThresholdRatio: 0, switchConfirmRounds: 1 });
+  assert.strictEqual(model.scheduleHint(1000), 'normal');
+  model.choose({
+    contextKey: 'hint',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1000,
+    measurements: [
+      { name: 'a', delay: 80 }, { name: 'a', delay: 82 }, { name: 'a', delay: 79 },
+      { name: 'a', delay: 81 }, { name: 'a', delay: 80 },
+      { name: 'b', delay: 200 },
+    ],
+  });
+  assert.strictEqual(model.scheduleHint(2000), 'relaxed');
+  model.observe({ name: 'a', delay: null }, 3000);
+  model.observe({ name: 'a', delay: null }, 3100);
+  assert.strictEqual(model.scheduleHint(3200), 'urgent');
+});
+
+test('Smart healthy switch needs two consecutive winning rounds', () => {
+  const model = new SmartSelectionModel({
+    minDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 2,
+  });
+  // Establish stick on a with only a measured first.
+  assert.strictEqual(model.choose({
+    contextKey: 'confirm',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1000,
+    measurements: [{ name: 'a', delay: 100 }],
+  }), 'a');
+  // First round b wins → stay on a (pending confirm).
+  assert.strictEqual(model.choose({
+    contextKey: 'confirm',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 130_000,
+    measurements: [{ name: 'a', delay: 100 }, { name: 'b', delay: 40 }],
+  }), 'a');
+  const samplesBeforeCache = model.peek('b').samples;
+  // Reusing the same cached ranking does not count as a confirming round.
+  assert.strictEqual(model.choose({
+    contextKey: 'confirm',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 130_500,
+    measurements: [{ name: 'a', delay: 100, fresh: false }, { name: 'b', delay: 40, fresh: false }],
+  }), 'a');
+  assert.strictEqual(model.peek('b').samples, samplesBeforeCache);
+  // Second consecutive win → switch.
+  assert.strictEqual(model.choose({
+    contextKey: 'confirm',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 131_000,
+    measurements: [{ name: 'a', delay: 100 }, { name: 'b', delay: 40 }],
+  }), 'b');
+  // Failures still leave without waiting a second round.
+  const fail = new SmartSelectionModel({
+    minDwellMs: 600_000,
+    failedDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 2,
+  });
+  assert.strictEqual(fail.choose({
+    contextKey: 'fail',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1000,
+    measurements: [{ name: 'a', delay: 50 }, { name: 'b', delay: 80 }],
+  }), 'a');
+  assert.strictEqual(fail.choose({
+    contextKey: 'fail',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 2000,
+    measurements: [{ name: 'a', delay: null }, { name: 'b', delay: 80 }],
+  }), 'b');
+});
+
+test('Smart mode changes switching posture without discarding history', () => {
+  const model = new SmartSelectionModel({ mode: 'stable' });
+  model.observe({ name: 'a', delay: 80 }, 1000);
+  const samples = model.peek('a').samples;
+  assert.strictEqual(model.mode, 'stable');
+  assert.strictEqual(model.options.switchConfirmRounds, 3);
+  assert.strictEqual(model.setMode('latency'), true);
+  assert.strictEqual(model.mode, 'latency');
+  assert.strictEqual(model.options.switchConfirmRounds, 1);
+  assert.strictEqual(model.peek('a').samples, samples);
+  assert.strictEqual(model.setMode('invalid'), true);
+  assert.strictEqual(model.mode, 'balanced');
+});
+
+test('Smart suppresses correlated failures during a likely local outage', () => {
+  const model = new SmartSelectionModel();
+  const names = ['a', 'b', 'c', 'd'];
+  model.choose({
+    contextKey: 'outage', names, current: 'a', now: 1000,
+    measurements: names.map((name, index) => ({ name, delay: 60 + index * 5 })),
+  });
+  model.choose({
+    contextKey: 'outage', names, current: 'a', now: 2000,
+    measurements: names.map((name) => ({ name, delay: null })),
+  });
+  for (const name of names) {
+    assert.strictEqual(model.peek(name).consecutiveFailures, 0);
+  }
+  assert.strictEqual(model.scheduleHint(2500), 'urgent');
+});
+
+test('Smart background batches cap recovery probes', () => {
+  const model = new SmartSelectionModel();
+  const names = Array.from({ length: 24 }, (_, index) => `n${index}`);
+  for (const name of names) model.observe({ name, delay: 80 }, 1000);
+  for (const name of names.slice(0, 8)) {
+    model.observe({ name, delay: null }, 2000);
+    model.observe({ name, delay: null }, 2100);
+  }
+  const batch = selectSmartTestBatch(names, 'n20', 0, false, { model, now: 40_000 });
+  const recovering = batch.candidates.filter((name) => names.slice(0, 8).includes(name));
+  assert.ok(recovering.length > 0);
+  assert.ok(recovering.length <= 2, recovering.join(','));
+});
+
+test('Smart bandit exploration fades as a node gains evidence', () => {
+  const model = new SmartSelectionModel();
+  for (let i = 0; i < 40; i++) model.observe({ name: 'mature', delay: 100 }, 1000 + i);
+  model.observe({ name: 'uncertain', delay: 100 }, 2000);
+  let priorities = model.probePriorities(['mature', 'uncertain'], 3000);
+  assert.ok(priorities.get('uncertain') > priorities.get('mature'));
+  for (let i = 0; i < 80; i++) model.observe({ name: 'uncertain', delay: 100 }, 4000 + i);
+  priorities = model.probePriorities(['mature', 'uncertain'], 5000);
+  assert.ok(priorities.get('mature') > priorities.get('uncertain'));
+});
+
+test('Smart node identity survives display-name changes without sharing changed endpoints', () => {
+  const original = { name: 'Old name', type: 'trojan', server: 'a.example', port: 443, password: 'secret' };
+  const renamed = { ...original, name: 'New name' };
+  const changed = { ...renamed, server: 'b.example' };
+  assert.strictEqual(nodeFingerprint(original), nodeFingerprint(renamed));
+  assert.notStrictEqual(nodeFingerprint(renamed), nodeFingerprint(changed));
+
+  const model = new SmartSelectionModel();
+  const identity = nodeFingerprint(original);
+  model.clear('rename');
+  model.setNodeIdentities(new Map([['Old name', identity]]));
+  model.choose({
+    contextKey: 'rename',
+    names: ['Old name'],
+    current: 'Old name',
+    now: 1_000,
+    measurements: [{ name: 'Old name', delay: 80 }],
+  });
+  model.setNodeIdentities(new Map([['New name', identity]]));
+  assert.strictEqual(model.peek('Old name'), null);
+  assert.strictEqual(model.peek('New name').samples, 1);
+  assert.strictEqual(model.snapshot().selected, 'New name');
+});
+
+test('Smart discounts old evidence and retains only a weak prior after network changes', () => {
+  const model = new SmartSelectionModel({
+    sampleHalfLifeMs: 60_000,
+    failureHalfLifeMs: 60_000,
+    networkChangeRetention: 0.25,
+  });
+  model.setNetworkKey('wifi-a', 1_000);
+  for (let i = 0; i < 8; i++) model.observe({ name: 'node', delay: 100 }, 1_000 + i);
+  const before = model.peek('node').effectiveAttempts;
+  model.probePriorities(['node'], 61_007);
+  const decayed = model.peek('node').effectiveAttempts;
+  assert.ok(decayed < before * 0.55 && decayed > before * 0.45, String(decayed));
+  model.setNetworkKey('wifi-b', 61_007);
+  const retained = model.peek('node').effectiveAttempts;
+  assert.ok(retained > 0 && retained < decayed * 0.3, String(retained));
+  const snapshot = model.snapshot();
+  snapshot.nodes.get('node').effectiveAttempts = 0;
+  snapshot.nodes.get('node').effectiveSamples = 0;
+  const restored = new SmartSelectionModel();
+  restored.restore(snapshot, 'default');
+  assert.strictEqual(restored.peek('node').effectiveAttempts, 0);
+  assert.strictEqual(restored.peek('node').effectiveSamples, 0);
+});
+
+test('Smart uses UCB-V only for probes and never selects an arm for uncertainty alone', () => {
+  const model = new SmartSelectionModel({
+    minDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 1,
+  });
+  for (let i = 0; i < 20; i++) model.observe({ name: 'proven', delay: 100 }, 1_000 + i);
+  model.observe({ name: 'uncertain', delay: 100 }, 2_000);
+  const priorities = model.probePriorities(['proven', 'uncertain'], 3_000);
+  assert.ok(priorities.get('uncertain') > priorities.get('proven'));
+  assert.strictEqual(model.choose({
+    contextKey: 'probe-vs-select',
+    names: ['proven', 'uncertain'],
+    current: 'proven',
+    now: 4_000,
+    measurements: [],
+  }), 'proven');
+});
+
+test('Smart UCB-V assigns more probe confidence to noisy equal-sample nodes', () => {
+  const model = new SmartSelectionModel();
+  for (let i = 0; i < 12; i++) {
+    model.observe({ name: 'steady', delay: 100 }, 1_000 + i);
+    model.observe({ name: 'noisy', delay: i % 2 ? 160 : 40 }, 1_000 + i);
+  }
+  const priorities = model.probePriorities(['steady', 'noisy'], 3_000);
+  assert.ok(priorities.get('noisy') > priorities.get('steady'));
+});
+
+test('real traffic reduces probe uncertainty without directly discounting selection cost', () => {
+  const options = {
+    minDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 1,
+  };
+  const model = new SmartSelectionModel(options);
+  for (let i = 0; i < 6; i++) {
+    model.observe({ name: 'a', delay: 80 }, 1_000 + i);
+    model.observe({ name: 'b', delay: 100 }, 1_000 + i);
+  }
+  const before = model.probePriorities(['a', 'b'], 2_000).get('b');
+  model.observeConnection({ name: 'b', kind: 'traffic', bytes: 200_000 }, 2_100);
+  const after = model.probePriorities(['a', 'b'], 2_200).get('b');
+  assert.ok(after < before);
+  assert.strictEqual(model.choose({
+    contextKey: 'traffic-evidence',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 3_000,
+    measurements: [],
+  }), 'a');
+});
+
+test('Smart cohort penalties adapt robustly without an outlier dominating scale', () => {
+  const options = new SmartSelectionModel().options;
+  const local = computeCohortCostProfile([
+    { ewma: 40, cooldownUntil: 0, consecutiveFailures: 0 },
+    { ewma: 45, cooldownUntil: 0, consecutiveFailures: 0 },
+    { ewma: 50, cooldownUntil: 0, consecutiveFailures: 0 },
+    { ewma: 2_000, cooldownUntil: 0, consecutiveFailures: 0 },
+  ], options, 1_000);
+  const longHaul = computeCohortCostProfile([
+    { ewma: 350, cooldownUntil: 0, consecutiveFailures: 0 },
+    { ewma: 400, cooldownUntil: 0, consecutiveFailures: 0 },
+    { ewma: 450, cooldownUntil: 0, consecutiveFailures: 0 },
+  ], options, 1_000);
+  assert.ok(local.median < 100);
+  assert.ok(local.spread < 100);
+  assert.ok(longHaul.failurePenalty > local.failurePenalty);
+});
+
+test('managed Auto override pin is measured even when outside the rotating batch', async () => {
+  let putName = null;
+  let now = 'n1';
+  let override = null;
+  const names = Array.from({ length: 30 }, (_, i) => `n${i + 1}`);
+  const measured = [];
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '♻️ Auto',
+    clashApi: async (method, apiPath, body) => {
+      if (method === 'PUT') {
+        putName = body && body.name;
+        now = putName;
+        return {};
+      }
+      return { now, all: names };
+    },
+    activeIntervalMs: 60_000,
+    idleIntervalMs: 240_000,
+    isRunning: () => true,
+    selectBatch: selectAutoTestBatch,
+    resolveOverride: (names) => (override && names.includes(override) ? override : null),
+    testDelay: async (name) => {
+      measured.push(name);
+      return name === 'n2' ? 10 : 100;
+    },
+  });
+  await managed.refresh({ force: false });
+  assert.strictEqual(putName, 'n2');
+  assert.strictEqual(now, 'n2');
+  override = 'n30';
+  putName = null;
+  measured.length = 0;
+  await managed.refresh({ force: false });
+  assert.ok(measured.includes('n30'));
+  assert.strictEqual(putName, 'n30');
+  assert.strictEqual(now, 'n30');
+  managed.stop();
+});
+
+test('managed selection discards an in-flight result after stop', async () => {
+  let releaseProbe;
+  let signalProbe;
+  let selected = 0;
+  let put = 0;
+  const entered = new Promise((resolve) => { signalProbe = resolve; });
+  const gate = new Promise((resolve) => { releaseProbe = resolve; });
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '🧠 Smart',
+    clashApi: async (method) => {
+      if (method === 'PUT') put++;
+      return { now: 'n1', all: ['n1'] };
+    },
+    isRunning: () => true,
+    selectBatch: selectAutoTestBatch,
+    testDelay: async () => {
+      signalProbe();
+      await gate;
+      return 10;
+    },
+    selectCandidate: () => {
+      selected++;
+      return 'n1';
+    },
+  });
+  const run = managed.refresh();
+  await entered;
+  managed.stop();
+  releaseProbe();
+  assert.strictEqual(await run, null);
+  assert.strictEqual(selected, 0);
+  assert.strictEqual(put, 0);
 });
 
 // i18n.js is a browser IIFE; evaluate it with a stub window to get the DICT.
@@ -665,7 +1198,7 @@ test('external-input fields stay HTML-escaped in the renderer templates', () => 
     ['js/dashboard.js', 'escapeHtml(s.name)'],
     ['js/nodes.js', 'escapeHtml(name)'],
     ['js/conns.js', 'escapeHtml(target)'],
-    ['js/conns.js', 'escapeHtml(c.rule'],
+    ['js/conns.js', 'escapeHtml(connectionLabel(c.rule))'],
     ['js/conns.js', 'escapeHtml(chains)'],
     ['js/rules.js', 'escapeHtml(it.payload)'],
     ['js/rules.js', 'escapeHtml(it.id)'],
@@ -891,14 +1424,53 @@ test('dashboard traffic chart is compact and tracks session totals with switch t
   assert.ok(!indexHtml.includes('id="quickPanel"'));
   const systemDialogs = fs.readFileSync(path.join(rendererDir, 'dialog', 'system.js'), 'utf-8');
   assert.ok(systemDialogs.includes('id="dialogCoreRestart"'));
+  assert.ok(systemDialogs.includes('id="dialogCoreSource"'));
+  assert.ok(systemDialogs.includes('id="dialogSmartSupport"'));
+  assert.ok(systemDialogs.includes('source = $(\'#dialogCoreSource\').value'));
+  assert.ok(!systemDialogs.includes('settings.coreHint'));
   assert.ok(indexHtml.includes('id="openPanelBtn"'));
   assert.ok(indexHtml.includes('data-i18n="tools.panelHint"'));
-  assert.ok(!indexHtml.includes('settings.clashApiHint'));
+  assert.ok(!indexHtml.includes('setClashApi'));
   assert.ok(charts.includes('upTotalEl'));
   assert.ok(charts.includes('sessionUp'));
   assert.ok(css.includes('height: 120px'));
   assert.ok(css.includes('.switch-track'));
   assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+});
+
+test('settings isolates Smart features before DNS and removes obsolete controls', () => {
+  const settings = fs.readFileSync(path.join(rendererDir, 'js', 'settings.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const languageIndex = indexHtml.indexOf('id="setLanguage"');
+  const englishIndex = indexHtml.indexOf('<option value="en">English</option>', languageIndex);
+  const chineseIndex = indexHtml.indexOf('<option value="zh">中文</option>', languageIndex);
+  const featureIndex = indexHtml.indexOf('data-i18n="settings.featuresSection"');
+  const dnsIndex = indexHtml.indexOf('data-i18n="settings.dnsSection"');
+  assert.ok(languageIndex >= 0 && englishIndex > languageIndex && englishIndex < chineseIndex);
+  assert.ok(featureIndex >= 0 && featureIndex < dnsIndex);
+  assert.ok(indexHtml.includes('id="saveFeatures"'));
+  assert.ok(settings.includes("$('#saveFeatures').addEventListener"));
+  assert.ok(!indexHtml.includes('setTestConcurrency'));
+  assert.ok(!settings.includes('testConcurrency'));
+  assert.ok(!indexHtml.includes('setClashApi'));
+  assert.ok(!settings.includes('enableClashApi'));
+  assert.ok(conns.includes("direct: 'Direct'"));
+  assert.ok(conns.includes("proxy: 'Proxy'"));
+});
+
+test('node cards distinguish protocol variants without exposing endpoints', () => {
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const ipc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf-8');
+  assert.ok(nodes.includes("return 'Shadowsocks 2022'"));
+  assert.ok(nodes.includes("return 'VLESS Vision'"));
+  assert.ok(nodes.includes("socks: 'SOCKS5'"));
+  assert.ok(nodes.includes("ws: 'WebSocket'"));
+  assert.ok(nodes.includes("grpc: 'gRPC'"));
+  assert.ok(nodes.includes("value.replace(/^2022-blake3-/i, '')"));
+  assert.ok(ipc.includes("result.variant = '2022'"));
+  assert.ok(ipc.includes("result.variant = 'vision'"));
+  assert.ok(!ipc.slice(ipc.indexOf('function nodeResult'), ipc.indexOf('/** Register every IPC handler')).includes('server:'));
+  assert.ok(!ipc.slice(ipc.indexOf('function nodeResult'), ipc.indexOf('/** Register every IPC handler')).includes('port:'));
 });
 
 test('dynamic first-paint regions reserve dimensions to limit layout shift', () => {
@@ -974,6 +1546,7 @@ test('language changes refresh enhanced select labels immediately', () => {
 test('secondary panels use a real transient native material window', () => {
   const css = readRendererCss();
   const dialogCss = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
+  const dialogMain = fs.readFileSync(path.join(rendererDir, 'dialog', 'main.js'), 'utf-8');
   const host = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
   const dropdown = css.slice(css.indexOf('.ui-select-menu {'), css.indexOf('.ui-select-opt {'));
   assert.ok(css.includes('--menu-surface: rgba(250, 251, 252, 0.96)'));
@@ -989,6 +1562,8 @@ test('secondary panels use a real transient native material window', () => {
   assert.ok(host.includes('win.loadURL(DIALOG_URL)'));
   assert.ok(host.includes('PREWARM_TTL_MS = 8_000'));
   assert.ok(host.includes('skipTaskbar: true'));
+  assert.ok(host.includes("themeEffective: appearance.dark ? 'dark' : 'light'"));
+  assert.ok(dialogMain.includes("applyTheme(context.theme || 'system', context.themeEffective)"));
   assert.ok(dialogCss.includes('background: transparent !important'));
   assert.ok(dialogHtml.includes('<script src="js/select.js"></script>'));
   const windowStyle = dialogCss.slice(dialogCss.indexOf('.native-dialog-window {'), dialogCss.indexOf(':root[data-theme'));
@@ -1060,6 +1635,8 @@ test('node test actions fit inside the fixed virtualized card height', () => {
   assert.ok(css.includes('.node-quality'));
   assert.ok(css.includes('.node-quality.probing'));
   assert.ok(css.includes('.node-quality.unavailable'));
+  assert.ok(css.includes('.node-context-menu'));
+  assert.ok(css.includes('.node-tag-override'));
   assert.ok(css.includes('border-radius: 999px'));
   assert.ok(action.includes('min-height: 26px'));
   assert.ok(action.includes('padding-block: 2px'));
@@ -1108,9 +1685,12 @@ test('core adapters own paths, commands, formats and release assets', () => {
   assert.ok(mihomo.serializeConfig({ mode: 'rule' }).includes('mode: rule'));
   assert.strictEqual(singBox.configFormat, 'JSON');
   assert.strictEqual(singBox.repo, 'blakebill/sing-box');
+  assert.strictEqual(singBox.repoFor('official'), 'SagerNet/sing-box');
   assert.strictEqual(singBox.releaseTag('1.13.14'), 'v1.13.14-dart.1');
   assert.strictEqual(singBox.releaseTag('v1.13.14-dart.2'), 'v1.13.14-dart.2');
+  assert.strictEqual(singBox.releaseTag('v1.13.14-dart.2', 'official'), 'v1.13.14');
   assert.strictEqual(mihomo.configFormat, 'YAML');
+  assert.strictEqual(mihomo.repoFor('official'), 'MetaCubeX/mihomo');
   assert.strictEqual(singBox.routeEntries({ route: { rules: [{}] } })[0].kind, 'sing-box');
   assert.strictEqual(mihomo.routeEntries({ rules: ['MATCH,DIRECT'] })[0].kind, 'clash');
   assert.deepStrictEqual(
@@ -1130,6 +1710,8 @@ test('core adapters own paths, commands, formats and release assets', () => {
     }],
   });
   assert.strictEqual(asset.sha256, digest);
+  const officialFallback = singBox.releaseAsset('1.13.14', 'windows', 'amd64', null, 'official');
+  assert.ok(officialFallback.url.includes('SagerNet/sing-box/releases/download/v1.13.14/'));
   assert.strictEqual(mihomo.modeChangeNeedsRestart('rule', 'block'), true);
   assert.strictEqual(singBox.modeChangeNeedsRestart('rule', 'block'), false);
 });
@@ -1616,13 +2198,38 @@ test('settings merge defaults with stored values', () => {
   store.updateSettings({
     mixedPort: 1234,
     testUrl: 'https://www.gstatic.com/generate_204',
+    testConcurrency: 16,
+    enableSmartThroughputProbe: true,
+    enableClashApi: false,
   });
   const s = new Store(dir).getSettings();
   assert.strictEqual(s.mixedPort, 1234);
   assert.strictEqual(s.clashApiPort, 9090); // default still present
+  assert.strictEqual(s.theme, 'system');
   assert.strictEqual(s.testUrl, 'http://www.gstatic.com/generate_204');
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
   assert.strictEqual(persisted.settings.testUrl, 'http://www.gstatic.com/generate_204');
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted.settings, 'enableSmartThroughputProbe'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted.settings, 'testConcurrency'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted.settings, 'enableClashApi'));
+});
+
+test('theme migration defaults incomplete configs to system and preserves explicit choices', () => {
+  const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-theme-'));
+  const missingStore = new Store(missingDir);
+  missingStore.updateSettings({ theme: 'light' });
+  const missingFile = path.join(missingDir, 'config.json');
+  const missingData = JSON.parse(fs.readFileSync(missingFile, 'utf-8'));
+  delete missingData.settings.theme;
+  fs.writeFileSync(missingFile, JSON.stringify(missingData), 'utf-8');
+  const migrated = new Store(missingDir);
+  assert.strictEqual(migrated.getSettings().theme, 'system');
+  assert.strictEqual(JSON.parse(fs.readFileSync(missingFile, 'utf-8')).settings.theme, 'system');
+
+  const explicitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-theme-'));
+  const explicitStore = new Store(explicitDir);
+  explicitStore.updateSettings({ theme: 'dark' });
+  assert.strictEqual(new Store(explicitDir).getSettings().theme, 'dark');
 });
 
 test('large subscription payloads migrate to independent profile files', () => {
@@ -2019,4 +2626,6 @@ test('mihomo geodata validation cache survives restarts and follows core changes
   assert.notStrictEqual(mgr._mihomoGeoDataKey(coreDir, bin), key, 'a core update invalidates the cache key');
 });
 
-console.log(`\nDone, ${passed} tests passed.`);
+Promise.all(pendingTests).then(() => {
+  console.log(`\nDone, ${passed} tests passed.`);
+});

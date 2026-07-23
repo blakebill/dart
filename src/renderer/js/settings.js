@@ -52,14 +52,13 @@
     changed = setFieldValue($('#setClashPort'), s.clashApiPort) || changed;
     changed = setFieldValue($('#setLogLevel'), s.logLevel) || changed;
     changed = setFieldValue($('#setAutoProxy'), !!s.autoSetSystemProxy, true) || changed;
-    changed = setFieldValue($('#setClashApi'), !!s.enableClashApi, true) || changed;
     changed = setFieldValue($('#setAutoLaunch'), !!s.autoLaunch, true) || changed;
     changed = setFieldValue($('#setSilentStart'), !!s.silentStart, true) || changed;
     changed = setFieldValue($('#setNotifications'), s.notifications !== false, true) || changed;
     changed = setFieldValue($('#setIpv6'), !!s.enableIpv6, true) || changed;
     changed = setFieldValue($('#setBuiltinRules'), !!s.useBuiltinRules, true) || changed;
     changed = setFieldValue($('#setTestUrl'), s.testUrl || '') || changed;
-    changed = setFieldValue($('#setTestConcurrency'), s.testConcurrency || 8) || changed;
+    changed = setFieldValue($('#setSmartMode'), s.smartMode || 'balanced') || changed;
     changed = setFieldValue($('#setLanguage'), s.language || 'zh') || changed;
     changed = setFieldValue($('#setDnsRemote'), s.dnsRemote || '') || changed;
     changed = setFieldValue($('#setDnsLocal'), s.dnsLocal || '') || changed;
@@ -131,14 +130,12 @@
       clashApiPort: parseInt($('#setClashPort').value, 10),
       logLevel: $('#setLogLevel').value,
       autoSetSystemProxy: $('#setAutoProxy').checked,
-      enableClashApi: $('#setClashApi').checked,
       autoLaunch: $('#setAutoLaunch').checked,
       silentStart: $('#setSilentStart').checked,
       notifications: $('#setNotifications').checked,
       enableIpv6: $('#setIpv6').checked,
       useBuiltinRules: $('#setBuiltinRules').checked,
       testUrl: $('#setTestUrl').value.trim(),
-      testConcurrency: Math.max(1, Math.min(32, parseInt($('#setTestConcurrency').value, 10) || 8)),
       language: $('#setLanguage').value,
     };
     try {
@@ -150,6 +147,15 @@
     try {
       await call(api.checkConfig);
       toast(t('settings.checkOk'));
+    } catch (_) {}
+  });
+
+  $('#saveFeatures').addEventListener('click', async (event) => {
+    try {
+      await persistChangedSettings(
+        { smartMode: $('#setSmartMode').value },
+        event.currentTarget
+      );
     } catch (_) {}
   });
 

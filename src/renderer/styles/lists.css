@@ -256,6 +256,51 @@
   opacity: 0.7;
 }
 
+.node-tag-override {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.node-item.is-override {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.node-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised, var(--surface));
+  box-shadow: var(--panel-shadow);
+}
+
+.node-context-menu.hidden {
+  display: none;
+}
+
+.node-context-item {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.node-context-item:hover,
+.node-context-item:focus-visible {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  outline: none;
+}
+
 .node-item:first-child {
   border-top: 1px solid var(--border);
 }

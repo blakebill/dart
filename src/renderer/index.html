@@ -252,7 +252,7 @@
               <input id="subUrl" class="input grow" data-i18n-ph="subs.urlPh" />
               <label class="sr-only" for="subUserAgent" data-i18n="subs.userAgent">订阅格式</label>
               <select id="subUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
+                <option value="auto" data-i18n="subs.userAgentAuto">自动</option>
                 <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
                 <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
               </select>
@@ -285,7 +285,7 @@
             <div class="setting-row">
               <label for="editUserAgent" data-i18n="subs.userAgent">订阅格式</label>
               <select id="editUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
+                <option value="auto" data-i18n="subs.userAgentAuto">自动</option>
                 <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
                 <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
               </select>
@@ -327,7 +327,7 @@
             <div class="setting-row">
               <div class="setting-label">
                 <span id="toolPanelLabel" data-i18n="dash.openPanel">打开控制面板</span>
-                <span class="hint" data-i18n="tools.panelHint">在浏览器中打开内核自带的 Web 面板（需启动内核并启用 Clash API）</span>
+                <span class="hint" data-i18n="tools.panelHint">在浏览器中打开内核自带的 Web 面板</span>
               </div>
               <button id="openPanelBtn" class="btn" aria-labelledby="toolPanelLabel openPanelBtn" data-i18n="tools.open">打开</button>
             </div>
@@ -427,8 +427,8 @@
             <div class="setting-row">
               <label for="setLanguage" data-i18n="settings.language">界面语言</label>
               <select id="setLanguage" class="input small">
-                <option value="zh">中文</option>
                 <option value="en">English</option>
+                <option value="zh">中文</option>
               </select>
             </div>
             <div class="setting-row">
@@ -454,10 +454,6 @@
               <input id="setAutoProxy" type="checkbox" />
             </div>
             <div class="setting-row">
-              <label for="setClashApi" data-i18n="settings.clashApi">启用 Clash API</label>
-              <input id="setClashApi" type="checkbox" />
-            </div>
-            <div class="setting-row">
               <label for="setAutoLaunch" data-i18n="settings.autoLaunch">开机自启</label>
               <input id="setAutoLaunch" type="checkbox" />
             </div>
@@ -481,10 +477,6 @@
               <label for="setTestUrl" data-i18n="settings.testUrl">测速地址</label>
               <input id="setTestUrl" class="input" data-i18n-ph="settings.testUrlPh" />
             </div>
-            <div class="setting-row">
-              <label for="setTestConcurrency" data-i18n="settings.testConcurrency">测速并发数（全部测速，1–32）</label>
-              <input id="setTestConcurrency" class="input small" type="number" min="1" max="32" />
-            </div>
             <div class="row save-row">
               <button id="saveSettings" class="btn primary" data-i18n="settings.save">保存设置</button>
               <button id="checkConfigBtn" class="btn" data-i18n="settings.check">校验当前配置</button>
@@ -493,6 +485,22 @@
           </div>
 
           <div class="settings-column">
+          <div class="panel">
+            <h2 data-i18n="settings.featuresSection">功能</h2>
+            <div class="setting-row">
+              <label for="setSmartMode" data-i18n="settings.smartMode">Smart 模式</label>
+              <select id="setSmartMode" class="input small">
+                <option value="balanced" data-i18n="settings.smartModeBalanced">平衡</option>
+                <option value="latency" data-i18n="settings.smartModeLatency">低延迟</option>
+                <option value="stable" data-i18n="settings.smartModeStable">稳定优先</option>
+              </select>
+            </div>
+            <p class="hint" data-i18n="settings.smartModeHint">调整 Smart 的切换速度与稳定性权重。</p>
+            <div class="row save-row">
+              <button id="saveFeatures" class="btn primary" data-i18n="settings.save">保存设置</button>
+            </div>
+          </div>
+
           <div class="panel">
             <h2 data-i18n="settings.dnsSection">DNS</h2>
             <p class="hint" data-i18n="settings.dnsHint"></p>

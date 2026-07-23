@@ -25,7 +25,6 @@ const DEFAULT_SETTINGS = {
   mixedPort: 7890,
   clashApiPort: 9090,
   enableTun: false,
-  enableClashApi: true,
   logLevel: 'info',
   autoSetSystemProxy: true,
   autoLaunch: false,
@@ -36,14 +35,14 @@ const DEFAULT_SETTINGS = {
   dnsLocal: 'https://223.5.5.5/dns-query',
   dnsStrategy: 'prefer_ipv4',
   language: 'zh',
-  theme: 'dark',
+  theme: 'system',
   clashMode: 'rule',
   coreType: 'sing-box',
   useBuiltinRules: false,
   ruleOverrides: {},
   ruleGroupSelections: {},
   testUrl: DEFAULT_TEST_URL,
-  testConcurrency: 8,
+  smartMode: 'balanced',
 };
 
 function hasOwn(value, key) {
@@ -72,11 +71,33 @@ class Store {
 
   _migrateSettingsDefaults() {
     const settings = this.data.settings;
-    if (!settings || settings.testUrl !== LEGACY_DEFAULT_TEST_URL) return;
-    this.data = {
-      ...this.data,
-      settings: { ...settings, testUrl: DEFAULT_TEST_URL },
-    };
+    if (!settings) return;
+    const next = { ...settings };
+    let changed = false;
+    if (next.testUrl === LEGACY_DEFAULT_TEST_URL) {
+      next.testUrl = DEFAULT_TEST_URL;
+      changed = true;
+    }
+    // Removed in 0.9.5: Clash delay endpoints use HEAD and cannot measure
+    // per-node throughput, so retaining this setting would be misleading.
+    if (hasOwn(next, 'enableSmartThroughputProbe')) {
+      delete next.enableSmartThroughputProbe;
+      changed = true;
+    }
+    if (hasOwn(next, 'testConcurrency')) {
+      delete next.testConcurrency;
+      changed = true;
+    }
+    if (hasOwn(next, 'enableClashApi')) {
+      delete next.enableClashApi;
+      changed = true;
+    }
+    if (!['dark', 'light', 'system'].includes(next.theme)) {
+      next.theme = 'system';
+      changed = true;
+    }
+    if (!changed) return;
+    this.data = { ...this.data, settings: next };
     try { this._writeConfig(); } catch (_) {
       // Keep the migrated value in memory if a read-only disk prevents repair.
     }

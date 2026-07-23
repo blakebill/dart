@@ -24,7 +24,7 @@ const { normalizePolicyGroups } = require('./policy-groups');
 const { geoDataUrls } = require('./singbox');
 const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { ManagedAutoSelection } = require('./managed-auto-selection');
-const { SmartSelectionModel } = require('./smart-selection');
+const { SmartSelectionModel, ConnectionFeedbackTracker, hostnameFromUrl } = require('./smart-selection');
 const { OperationCoordinator } = require('./operation-coordinator');
 const { createAutoLaunchService } = require('./auto-launch');
 const crypto = require('crypto');
@@ -53,6 +53,20 @@ const SMART_PROXY_GROUP = '🧠 Smart';
 const MANAGED_AUTO_INTERVAL_MS = 60_000;
 // Non-selected Auto/Smart groups still pre-warm winners, but much less often.
 const MANAGED_IDLE_INTERVAL_MS = 4 * 60_000;
+const SMART_INTERVAL_URGENT_MS = 30_000;
+const SMART_INTERVAL_NORMAL_MS = 60_000;
+const SMART_INTERVAL_RELAXED_MS = 150_000;
+const SMART_INTERVAL_OVERRIDE_MS = 90_000;
+const SMART_FEEDBACK_INTERVAL_MS = 3_000;
+// Secondary latency URL for Smart dual-probe (A4) — same 204 style as gstatic.
+const SMART_SECONDARY_TEST_URL = 'http://cp.cloudflare.com/generate_204';
+const OVERRIDE_FAIL_CLEAR_STREAK = 2;
+// Secondary Cloudflare probe can reuse a short in-memory cache (not UI delay cache).
+const SECONDARY_DELAY_TTL_MS = 90_000;
+const SECONDARY_DELAY_FAIL_TTL_MS = 12_000;
+let overrideFailStreak = 0;
+let managedSelectionSyncRevision = 0;
+const secondaryDelayCache = new Map();
 const DELAY_RESULT_TTL_MS = 45_000;
 const DELAY_FAILURE_TTL_MS = 8_000;
 const delayRequestCache = new Map();
@@ -60,7 +74,13 @@ const delayRequestCache = new Map();
 const delayResultCache = new Map();
 // Last successful version probe → whether config emits type: smart.
 // Used only for diagnostics / optional UI; config path always re-resolves.
-let lastKernelSmartMeta = { coreType: null, version: null, kernelSmart: false };
+let lastKernelSmartMeta = {
+  coreType: null,
+  version: null,
+  kernelSmart: false,
+  kernelSmartMode: false,
+};
+const kernelSmartProbeCache = new Map();
 let tunWasActive = false;
 let tunAdaptersClean = false;
 const operations = new OperationCoordinator();
@@ -619,10 +639,67 @@ async function processCustomRuleSet(c, { beforeCommit } = {}) {
   return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
 }
 
-/**
- * Resolve whether the installed core can emit type: smart.
- * Always probes when cache is cold so we do not silently fall back to selector.
- */
+function kernelSmartProbeConfig(coreType, includeMode = false) {
+  if (coreType === 'mihomo') {
+    const group = {
+      name: 'Dart Smart Capability Probe',
+      type: 'smart',
+      proxies: ['DIRECT'],
+      url: 'http://www.gstatic.com/generate_204',
+    };
+    if (includeMode) group.mode = 'balanced';
+    return {
+      proxies: [],
+      'proxy-groups': [group],
+      rules: ['MATCH,Dart Smart Capability Probe'],
+    };
+  }
+  const group = { type: 'smart', tag: 'dart-smart-capability-probe', outbounds: ['direct-probe'] };
+  if (includeMode) group.mode = 'balanced';
+  return {
+    log: { disabled: true },
+    outbounds: [
+      group,
+      { type: 'direct', tag: 'direct-probe' },
+    ],
+    route: { final: 'dart-smart-capability-probe' },
+  };
+}
+
+function kernelSmartProbeKey(coreType, coreVersion) {
+  const bin = state.singbox.resolveBinaryPath(coreType);
+  if (!bin) return null;
+  try {
+    const stat = fs.statSync(bin);
+    return `${coreType}:${bin}:${stat.size}:${stat.mtimeMs}`;
+  } catch (_) {
+    return `${coreType}:${bin}:${coreVersion || 'unknown'}`;
+  }
+}
+
+async function probeKernelSmart(coreType, coreVersion) {
+  const fallback = coreSupportsKernelSmart(coreType, coreVersion);
+  if (
+    !state.singbox.isCoreInstalled(coreType) ||
+    typeof state.singbox.checkConfigFor !== 'function'
+  ) return { supported: fallback, mode: false, detection: 'version' };
+  const key = kernelSmartProbeKey(coreType, coreVersion);
+  if (!key) return { supported: fallback, mode: false, detection: 'version' };
+  const cached = kernelSmartProbeCache.get(key);
+  if (cached) return cached;
+  const operation = state.singbox.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, true))
+    .then(() => ({ supported: true, mode: true, detection: 'probe' }))
+    .catch(() => state.singbox.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, false))
+      .then(() => ({ supported: true, mode: false, detection: 'probe' }))
+      .catch(() => ({ supported: false, mode: false, detection: 'probe' })));
+  if (kernelSmartProbeCache.size >= 16) {
+    kernelSmartProbeCache.delete(kernelSmartProbeCache.keys().next().value);
+  }
+  kernelSmartProbeCache.set(key, operation);
+  return operation;
+}
+
+/** Resolve type: smart support from the binary itself, not its release suffix. */
 async function resolveKernelSmart(coreType = null) {
   const resolvedCoreType = normalizeCoreType(coreType || state.singbox.getCoreType());
   let coreVersion = state.singbox.peekCoreVersion(resolvedCoreType);
@@ -633,8 +710,16 @@ async function resolveKernelSmart(coreType = null) {
       coreVersion = null;
     }
   }
-  const kernelSmart = coreSupportsKernelSmart(resolvedCoreType, coreVersion);
-  lastKernelSmartMeta = { coreType: resolvedCoreType, version: coreVersion, kernelSmart };
+  const capability = await probeKernelSmart(resolvedCoreType, coreVersion);
+  const kernelSmart = capability.supported;
+  const kernelSmartMode = capability.mode;
+  lastKernelSmartMeta = {
+    coreType: resolvedCoreType,
+    version: coreVersion,
+    kernelSmart,
+    kernelSmartMode,
+    detection: capability.detection,
+  };
   return lastKernelSmartMeta;
 }
 
@@ -663,10 +748,26 @@ function buildCurrentConfig(coreType = null, options = {}) {
   const coreVersion = options.coreVersion !== undefined
     ? options.coreVersion
     : state.singbox.peekCoreVersion(resolvedCoreType);
+  const probedCapability = lastKernelSmartMeta.detection === 'probe' &&
+    lastKernelSmartMeta.coreType === resolvedCoreType &&
+    lastKernelSmartMeta.version === coreVersion;
   const kernelSmart = options.kernelSmart !== undefined
     ? !!options.kernelSmart
-    : coreSupportsKernelSmart(resolvedCoreType, coreVersion);
-  lastKernelSmartMeta = { coreType: resolvedCoreType, version: coreVersion, kernelSmart };
+    : probedCapability
+      ? !!lastKernelSmartMeta.kernelSmart
+      : coreSupportsKernelSmart(resolvedCoreType, coreVersion);
+  const kernelSmartMode = options.kernelSmartMode !== undefined
+    ? !!options.kernelSmartMode
+    : probedCapability
+      ? !!lastKernelSmartMeta.kernelSmartMode
+      : false;
+  lastKernelSmartMeta = {
+    coreType: resolvedCoreType,
+    version: coreVersion,
+    kernelSmart,
+    kernelSmartMode,
+    detection: probedCapability ? 'probe' : 'version',
+  };
   const commonOpts = {
     ruleOverrides: settings.ruleOverrides,
     ruleGroupSelections: settings.ruleGroupSelections,
@@ -674,7 +775,6 @@ function buildCurrentConfig(coreType = null, options = {}) {
     clashApiPort: settings.clashApiPort,
     clashApiSecret: state.clashApiSecret,
     enableTun: settings.enableTun,
-    enableClashApi: settings.enableClashApi,
     logLevel: settings.logLevel,
     selected: state.store.get('selected'),
     clashMode: settings.clashMode,
@@ -686,9 +786,11 @@ function buildCurrentConfig(coreType = null, options = {}) {
     dnsLocal: settings.dnsLocal,
     dnsStrategy: settings.dnsStrategy,
     testUrl: settings.testUrl,
+    smartMode: settings.smartMode,
     extraRules,
     extraRuleSets,
     kernelSmart,
+    kernelSmartMode,
     coreVersion,
   };
   const config = adapter.buildConfig(allNodes, commonOpts, {
@@ -699,7 +801,7 @@ function buildCurrentConfig(coreType = null, options = {}) {
     availableGeoSet,
     loadRuleSetData,
   });
-  return { config, settings, kernelSmart, coreVersion };
+  return { config, settings, kernelSmart, kernelSmartMode, coreVersion };
 }
 
 /** Always probe core version before building (start/export/validate paths). */
@@ -1335,17 +1437,17 @@ async function restartIfRunning() {
   return restartPromise;
 }
 
-function delayResultKey(name) {
+function delayResultKey(name, contextKey = smartSelectionContextKey(), testUrl = null) {
   const settings = state.store.getSettings();
+  const identity = activeSmartNodeIdentities().get(name) || name;
   return JSON.stringify([
-    smartSelectionContextKey(),
-    String(settings.testUrl || '').trim(),
-    name,
+    contextKey,
+    String(testUrl == null ? settings.testUrl || '' : testUrl).trim(),
+    identity,
   ]);
 }
 
-function readDelayResultCache(name) {
-  const key = delayResultKey(name);
+function readDelayResultCache(key) {
   const hit = delayResultCache.get(key);
   if (!hit) return null;
   if (hit.expires <= Date.now()) {
@@ -1355,7 +1457,7 @@ function readDelayResultCache(name) {
   return hit;
 }
 
-function writeDelayResultCache(name, delay) {
+function writeDelayResultCache(key, delay) {
   if (delayResultCache.size >= 2048) {
     let drop = 256;
     for (const key of delayResultCache.keys()) {
@@ -1364,7 +1466,7 @@ function writeDelayResultCache(name, delay) {
     }
   }
   const ok = Number.isFinite(delay);
-  delayResultCache.set(delayResultKey(name), {
+  delayResultCache.set(key, {
     delay: ok ? Number(delay) : null,
     expires: Date.now() + (ok ? DELAY_RESULT_TTL_MS : DELAY_FAILURE_TTL_MS),
   });
@@ -1396,7 +1498,18 @@ networkFingerprint.expires = 0;
 
 function ensureSmartModelContext() {
   const key = smartSelectionContextKey();
-  if (smartSelectionModel.contextKey !== key) smartSelectionModel.clear(key);
+  smartSelectionModel.setMode(state.store.getSettings().smartMode);
+  if (smartSelectionModel.contextKey !== key) {
+    smartSelectionModel.clear(key);
+    appliedSmartIdentities = null;
+    connectionFeedbackTracker.reset();
+  }
+  const identities = activeSmartNodeIdentities();
+  if (appliedSmartIdentities !== identities) {
+    if (appliedSmartIdentities) connectionFeedbackTracker.reset();
+    smartSelectionModel.setNodeIdentities(identities);
+    appliedSmartIdentities = identities;
+  }
   smartSelectionModel.setNetworkKey(networkFingerprint());
 }
 
@@ -1411,41 +1524,58 @@ function ensureSmartModelContext() {
  */
 function testNodeDelay(name, options = {}) {
   const force = !!(options && options.force);
-  if (!force) {
-    const cached = readDelayResultCache(name);
-    if (cached && cached.delay != null) {
-      return Promise.resolve(cached.delay);
+  const skipObserve = !!(options && options.skipObserve);
+  const skipResultCache = !!(options && (options.skipResultCache || options.url));
+  const resultMeta = options && options.resultMeta && typeof options.resultMeta === 'object'
+    ? options.resultMeta
+    : null;
+  const timeoutMs = Math.max(2_000, Math.min(30_000, Number(options.timeoutMs) || 8_000));
+  const settings = state.store.getSettings();
+  const contextKey = smartSelectionContextKey();
+  const testUrl = String(options.url || settings.testUrl || '').trim();
+  const resultKey = delayResultKey(name, contextKey, settings.testUrl || '');
+  if (!force && !skipResultCache) {
+    const cached = readDelayResultCache(resultKey);
+    if (cached) {
+      if (resultMeta) resultMeta.fresh = false;
+      if (cached.delay != null) return Promise.resolve(cached.delay);
+      const error = new Error('timeout');
+      error.fresh = false;
+      return Promise.reject(error);
     }
-  } else {
+  } else if (!skipResultCache) {
     // Drop any stale success/failure so concurrent background readers also refresh.
-    try { delayResultCache.delete(delayResultKey(name)); } catch (_) {}
+    delayResultCache.delete(resultKey);
   }
 
-  const settings = state.store.getSettings();
-  const testUrl = String(settings.testUrl || '').trim();
   // Coalesce concurrent probes of the same node (force or not); only the
   // result-cache short-circuit is skipped when force is set.
   const requestKey = JSON.stringify([
-    smartSelectionContextKey(),
+    contextKey,
     settings.clashApiPort,
-    name,
+    activeSmartNodeIdentities().get(name) || name,
     testUrl,
+    skipObserve ? 1 : 0,
   ]);
   const pending = delayRequestCache.get(requestKey);
-  if (pending) return pending;
+  if (pending) {
+    if (resultMeta) resultMeta.fresh = true;
+    return pending;
+  }
+  if (resultMeta) resultMeta.fresh = true;
 
   const request = new Promise((resolve, reject) => {
     const done = responseLatch(resolve, reject);
     // Keep `url` first: this is the documented Clash API shape and avoids older
     // compatibility layers silently falling back to their built-in test URL.
-    const reqPath = buildDelayApiPath(name, testUrl);
+    const reqPath = buildDelayApiPath(name, testUrl, timeoutMs);
     const req = http.request(
       {
         host: '127.0.0.1',
         port: settings.clashApiPort,
         path: reqPath,
         method: 'GET',
-        timeout: 8000,
+        timeout: timeoutMs + 2_000,
         agent: clashAgent,
         headers: { Authorization: 'Bearer ' + state.clashApiSecret },
       },
@@ -1483,13 +1613,29 @@ function testNodeDelay(name, options = {}) {
   });
   const shared = request.then(
     (delay) => {
-      writeDelayResultCache(name, delay);
-      try { ensureSmartModelContext(); smartSelectionModel.observe({ name, delay }); } catch (_) {}
+      if (!skipResultCache) writeDelayResultCache(resultKey, delay);
+      if (!skipObserve && smartSelectionContextKey() === contextKey) {
+        try {
+          ensureSmartModelContext();
+          if (smartSelectionModel.contextKey === contextKey) {
+            smartSelectionModel.observe({ name, delay });
+            smartSelectionModel.observeDisplayDelay(name, delay);
+          }
+        } catch (_) {}
+      }
       return delay;
     },
     (error) => {
-      writeDelayResultCache(name, null);
-      try { ensureSmartModelContext(); smartSelectionModel.observe({ name, delay: null }); } catch (_) {}
+      if (!skipResultCache) writeDelayResultCache(resultKey, null);
+      if (!skipObserve && smartSelectionContextKey() === contextKey) {
+        try {
+          ensureSmartModelContext();
+          if (smartSelectionModel.contextKey === contextKey) {
+            smartSelectionModel.observe({ name, delay: null });
+            smartSelectionModel.observeDisplayDelay(name, null);
+          }
+        } catch (_) {}
+      }
       throw error;
     }
   ).finally(() => {
@@ -1572,19 +1718,341 @@ function clashApi(method, apiPath, body) {
 }
 
 const smartSelectionModel = new SmartSelectionModel();
+const connectionFeedbackTracker = new ConnectionFeedbackTracker();
+let smartIdentityCache = { subscription: null, identities: new Map() };
+let appliedSmartIdentities = null;
+let smartFeedbackTimer = null;
+let smartFeedbackRun = null;
+let smartFeedbackGeneration = 0;
 
 function smartSelectionContextKey() {
   const id = getActiveSubId() || '';
-  const profile = id ? state.store.getSubscription(id) : null;
-  const fingerprint = profile && (profile.configHash || profile.updatedAt) || '';
   const settings = state.store.getSettings();
-  return `${state.singbox.getCoreType()}:${id}:${fingerprint}:${settings.testUrl || ''}`;
+  return `${state.singbox.getCoreType()}:${id}:${settings.testUrl || ''}`;
+}
+
+function activeSmartNodeIdentities() {
+  const active = getActiveSubscription();
+  if (smartIdentityCache.subscription === active) return smartIdentityCache.identities;
+  const identities = new Map();
+  const duplicates = new Map();
+  for (const node of (active && active.nodes) || []) {
+    if (!node || typeof node.name !== 'string' || !node.name) continue;
+    const base = subscription.nodeFingerprint(node) || node.name;
+    const occurrence = (duplicates.get(base) || 0) + 1;
+    duplicates.set(base, occurrence);
+    identities.set(node.name, occurrence === 1 ? base : `${base}:${occurrence}`);
+  }
+  smartIdentityCache = { subscription: active, identities };
+  return identities;
+}
+
+/**
+ * Pull Clash /connections and fold real traffic / soft-fail events into Smart.
+ * Mid-term path: selection is no longer URL-delay-only.
+ */
+async function harvestConnectionFeedback() {
+  if (!state.singbox.isRunning()) return 0;
+  ensureSmartModelContext();
+  const contextKey = smartSelectionContextKey();
+  const settings = state.store.getSettings();
+  const extraIgnore = [];
+  const host = hostnameFromUrl(settings.testUrl);
+  if (host) extraIgnore.push(host);
+  const secondaryHost = hostnameFromUrl(SMART_SECONDARY_TEST_URL);
+  if (secondaryHost) extraIgnore.push(secondaryHost);
+  connectionFeedbackTracker.setIgnoreHosts(extraIgnore);
+  const active = getActiveSubscription();
+  const nodeNames = ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean);
+  let data;
+  try {
+    data = await clashApi('GET', '/connections');
+  } catch (_) {
+    return 0;
+  }
+  if (smartSelectionContextKey() !== contextKey) return 0;
+  connectionFeedbackTracker.setNodeNames(nodeNames);
+  const connections = Array.isArray(data && data.connections) ? data.connections : [];
+  const events = connectionFeedbackTracker.ingest(connections, Date.now());
+  for (const event of events) {
+    try { smartSelectionModel.observeConnection(event); } catch (_) { /* ignore */ }
+  }
+  return events.length;
+}
+
+function stopSmartFeedbackSampler() {
+  smartFeedbackGeneration += 1;
+  if (smartFeedbackTimer) clearTimeout(smartFeedbackTimer);
+  smartFeedbackTimer = null;
+  smartFeedbackRun = null;
+  connectionFeedbackTracker.reset();
+}
+
+/** Sample local Clash connection snapshots only while Smart carries traffic. */
+function setSmartFeedbackSamplerActive(active) {
+  if (!active || !state.singbox.isRunning()) {
+    stopSmartFeedbackSampler();
+    return;
+  }
+  if (smartFeedbackTimer || smartFeedbackRun) return;
+  const generation = ++smartFeedbackGeneration;
+  const schedule = (delayMs) => {
+    if (generation !== smartFeedbackGeneration) return;
+    smartFeedbackTimer = setTimeout(tick, Math.max(0, Number(delayMs) || 0));
+    if (smartFeedbackTimer.unref) smartFeedbackTimer.unref();
+  };
+  const tick = async () => {
+    smartFeedbackTimer = null;
+    if (
+      generation !== smartFeedbackGeneration ||
+      !managedSmartSelection.isActive() ||
+      !state.singbox.isRunning()
+    ) return;
+    const operation = harvestConnectionFeedback();
+    smartFeedbackRun = operation;
+    try { await operation; } catch (_) { /* advisory signal */ }
+    if (smartFeedbackRun === operation) smartFeedbackRun = null;
+    if (generation === smartFeedbackGeneration) schedule(SMART_FEEDBACK_INTERVAL_MS);
+  };
+  schedule(0);
+}
+
+function smartActiveIntervalMs() {
+  if (readManagedOverride()) return SMART_INTERVAL_OVERRIDE_MS;
+  ensureSmartModelContext();
+  const hint = smartSelectionModel.scheduleHint(Date.now());
+  if (hint === 'urgent') return SMART_INTERVAL_URGENT_MS;
+  if (hint === 'relaxed') return SMART_INTERVAL_RELAXED_MS;
+  return SMART_INTERVAL_NORMAL_MS;
+}
+
+/**
+ * Force-override pin: { name, group } where group is Auto or Smart only.
+ * Legacy string values migrate to Smart.
+ */
+function readManagedOverride() {
+  if (!state.store) return null;
+  const raw = state.store.get('managedNodeOverride');
+  if (!raw) return null;
+  if (typeof raw === 'string' && raw) {
+    return { name: raw, group: SMART_PROXY_GROUP, profileId: getActiveSubId() || '' };
+  }
+  if (raw && typeof raw === 'object' && typeof raw.name === 'string' && raw.name) {
+    const profileId = typeof raw.profileId === 'string' ? raw.profileId : (getActiveSubId() || '');
+    if (profileId && profileId !== (getActiveSubId() || '')) return null;
+    const group = raw.group === AUTO_PROXY_GROUP ? AUTO_PROXY_GROUP : SMART_PROXY_GROUP;
+    return { name: raw.name, group, profileId };
+  }
+  return null;
+}
+
+/** Full pin info for UI (name + Auto/Smart group). */
+function getManagedNodeOverrideInfo() {
+  const ov = readManagedOverride();
+  if (!ov) return { override: null, group: null, profileId: getActiveSubId() || '' };
+  return { override: ov.name, group: ov.group, profileId: ov.profileId || getActiveSubId() || '' };
+}
+
+/** Resolve pin for a specific managed group (Auto or Smart). */
+function resolveManagedOverrideForGroup(group, names) {
+  const ov = readManagedOverride();
+  if (!ov || ov.group !== group) return null;
+  if (!Array.isArray(names) || !names.includes(ov.name)) return null;
+  return ov.name;
+}
+
+async function resolveOuterManagedGroup() {
+  if (!state.singbox.isRunning()) {
+    const selected = state.store.get('selected');
+    if (selected === AUTO_PROXY_GROUP) return AUTO_PROXY_GROUP;
+    if (selected === SMART_PROXY_GROUP) return SMART_PROXY_GROUP;
+    return SMART_PROXY_GROUP;
+  }
+  try {
+    const group = await clashApi('GET', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP));
+    if (group && group.now === AUTO_PROXY_GROUP) return AUTO_PROXY_GROUP;
+    if (group && group.now === SMART_PROXY_GROUP) return SMART_PROXY_GROUP;
+  } catch (_) { /* fall through */ }
+  const selected = state.store.get('selected');
+  if (selected === AUTO_PROXY_GROUP) return AUTO_PROXY_GROUP;
+  return SMART_PROXY_GROUP;
+}
+
+/**
+ * Pin only the active outer managed group (A1). Background still measures.
+ * Failed probes on the pin auto-clear after a short streak.
+ */
+async function setManagedNodeOverride(name) {
+  if (typeof name !== 'string' || !name) throw new Error('invalid node name');
+  const profileId = getActiveSubId() || '';
+  const active = getActiveSubscription();
+  const validNames = new Set(
+    ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean)
+  );
+  if (!validNames.has(name)) throw new Error('node is not part of the active config');
+  const group = await resolveOuterManagedGroup();
+  if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
+  if (state.singbox.isRunning()) {
+    try {
+      const target = await clashApi('GET', '/proxies/' + encodeURIComponent(group));
+      if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
+      if (!Array.isArray(target && target.all) || !target.all.includes(name)) {
+        throw new Error('node is unavailable in the selected group');
+      }
+      await clashApi('PUT', '/proxies/' + encodeURIComponent(group), { name });
+      if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
+    } catch (error) {
+      sendLog(`[gui] override pin ${group} → ${name} failed: ${error.message}`);
+      throw error;
+    }
+  }
+  overrideFailStreak = 0;
+  if (state.store) state.store.set('managedNodeOverride', { name, group, profileId });
+  return { override: name, group, profileId };
+}
+
+function clearManagedNodeOverride(reason = '') {
+  overrideFailStreak = 0;
+  if (state.store) state.store.set('managedNodeOverride', null);
+  if (reason) sendLog('[gui] force override cleared: ' + reason);
+  if (managedAutoSelection.isScheduled()) {
+    managedAutoSelection.refresh({ force: true }).catch(() => null);
+  }
+  if (managedSmartSelection.isScheduled()) {
+    managedSmartSelection.refresh({ force: true }).catch(() => null);
+  }
+  return { override: null };
+}
+
+/** A1: drop pin when the pinned node fails latency probes repeatedly. */
+function noteOverrideProbeResult(group, name, delay) {
+  const ov = readManagedOverride();
+  if (!ov || ov.group !== group || ov.name !== name) return;
+  if (delay == null || !Number.isFinite(delay)) {
+    overrideFailStreak += 1;
+    if (overrideFailStreak >= OVERRIDE_FAIL_CLEAR_STREAK) {
+      clearManagedNodeOverride('pinned node failed latency probes');
+    }
+  } else {
+    overrideFailStreak = 0;
+  }
+}
+
+/**
+ * Dual-URL latency for Smart (A4): primary settings.testUrl + Cloudflare 204.
+ * Primary uses the normal short delay cache; secondary has its own ~90s cache
+ * so background Smart sweeps do not double-probe every node every cycle.
+ */
+async function testNodeDelayDual(name, options = {}) {
+  const force = !!(options && options.force);
+  const contextKey = smartSelectionContextKey();
+  const identity = activeSmartNodeIdentities().get(name) || name;
+  const secondaryKey = JSON.stringify([contextKey, SMART_SECONDARY_TEST_URL, identity]);
+  const primaryMeta = {};
+  let secondaryFresh = false;
+  const now = Date.now();
+  if (secondaryDelayCache.size > 2048) {
+    let drop = 256;
+    for (const key of secondaryDelayCache.keys()) {
+      secondaryDelayCache.delete(key);
+      if (--drop <= 0) break;
+    }
+  }
+  const secHit = !force ? secondaryDelayCache.get(secondaryKey) : null;
+  // Start both independent requests together. Dead nodes otherwise paid two
+  // consecutive 8-second timeouts before Smart could fail over.
+  const primaryRequest = testNodeDelay(name, {
+    force,
+    skipObserve: true,
+    skipResultCache: false,
+    resultMeta: primaryMeta,
+  }).catch(() => null);
+  let secondaryRequest;
+  if (secHit && secHit.expires > now) {
+    secondaryRequest = Promise.resolve(secHit.delay);
+  } else {
+    secondaryFresh = true;
+    secondaryRequest = testNodeDelay(name, {
+      force: true,
+      url: SMART_SECONDARY_TEST_URL,
+      timeoutMs: 8_000,
+      skipObserve: true,
+      skipResultCache: true,
+    }).then((delay) => {
+      secondaryDelayCache.set(secondaryKey, {
+        delay,
+        expires: Date.now() + SECONDARY_DELAY_TTL_MS,
+      });
+      return delay;
+    }).catch(() => {
+      secondaryDelayCache.set(secondaryKey, {
+        delay: null,
+        expires: Date.now() + SECONDARY_DELAY_FAIL_TTL_MS,
+      });
+      return null;
+    });
+  }
+  const [primary, secondary] = await Promise.all([primaryRequest, secondaryRequest]);
+  const fresh = primaryMeta.fresh === true || secondaryFresh;
+  if (primary == null && secondary == null) {
+    if (fresh && smartSelectionContextKey() === contextKey) {
+      ensureSmartModelContext();
+      smartSelectionModel.observeDisplayDelay(name, null);
+      noteOverrideProbeResult(SMART_PROXY_GROUP, name, null);
+    }
+    // Let ManagedAutoSelection / choose() record the failure once.
+    const error = new Error('timeout');
+    error.fresh = fresh;
+    throw error;
+  }
+  const blended = primary != null && secondary != null
+    ? Math.round(primary * 0.55 + secondary * 0.45)
+    : (primary != null ? primary : secondary);
+  if (smartSelectionContextKey() === contextKey) {
+    ensureSmartModelContext();
+    smartSelectionModel.observeDisplayDelay(name, primary != null ? primary : blended);
+    if (fresh) noteOverrideProbeResult(SMART_PROXY_GROUP, name, blended);
+  }
+  // Cached values can rank nodes, but must not become new model samples.
+  return { delay: blended, fresh };
+}
+
+/**
+ * When outer Auto/Smart changes, remount an existing pin onto that group so
+ * "强制" stays meaningful. Non-managed outer leaves the pin stored but inactive.
+ */
+async function remountManagedOverrideForOuter(outer) {
+  const ov = readManagedOverride();
+  if (!ov || !ov.name) return null;
+  const profileId = getActiveSubId() || '';
+  if (outer !== AUTO_PROXY_GROUP && outer !== SMART_PROXY_GROUP) return ov;
+  if (ov.group === outer) return ov;
+  if (state.singbox.isRunning()) {
+    try {
+      const target = await clashApi('GET', '/proxies/' + encodeURIComponent(outer));
+      if ((getActiveSubId() || '') !== profileId) return null;
+      if (!Array.isArray(target && target.all) || !target.all.includes(ov.name)) {
+        clearManagedNodeOverride('pinned node is unavailable in the selected group');
+        return null;
+      }
+      await clashApi('PUT', '/proxies/' + encodeURIComponent(outer), { name: ov.name });
+      if ((getActiveSubId() || '') !== profileId) return null;
+      sendLog(`[gui] force override remounted ${ov.name} → ${outer}`);
+    } catch (error) {
+      sendLog(`[gui] force override remount failed: ${error.message}`);
+      return ov;
+    }
+  }
+  overrideFailStreak = 0;
+  if ((getActiveSubId() || '') !== profileId) return null;
+  const next = { name: ov.name, group: outer, profileId: ov.profileId || profileId };
+  if (state.store) state.store.set('managedNodeOverride', next);
+  return next;
 }
 
 const managedSelectionOptions = {
   appGroup: APP_PROXY_GROUP,
   clashApi,
-  getSettings: () => state.store.getSettings(),
   activeIntervalMs: MANAGED_AUTO_INTERVAL_MS,
   idleIntervalMs: MANAGED_IDLE_INTERVAL_MS,
   isRunning: () => state.singbox.isRunning(),
@@ -1595,12 +2063,32 @@ const managedAutoSelection = new ManagedAutoSelection({
   ...managedSelectionOptions,
   autoGroup: AUTO_PROXY_GROUP,
   selectBatch: selectAutoTestBatch,
+  resolveOverride: (names) => resolveManagedOverrideForGroup(AUTO_PROXY_GROUP, names),
+  // Fresh probes for selection decisions — stale 45s cache made Auto pick "ghost" winners.
+  testDelay: async (name) => {
+    try {
+      // Auto is intentionally independent: do not mix its primary-only RTT into
+      // Smart's dual-URL history model.
+      const delay = await testNodeDelay(name, { force: true, skipObserve: true });
+      noteOverrideProbeResult(AUTO_PROXY_GROUP, name, delay);
+      return delay;
+    } catch (error) {
+      noteOverrideProbeResult(AUTO_PROXY_GROUP, name, null);
+      throw error;
+    }
+  },
 });
 
 const managedSmartSelection = new ManagedAutoSelection({
   ...managedSelectionOptions,
   autoGroup: SMART_PROXY_GROUP,
   selectionModel: smartSelectionModel,
+  resolveOverride: (names) => resolveManagedOverrideForGroup(SMART_PROXY_GROUP, names),
+  testDelay: (name, options) => testNodeDelayDual(name, options),
+  getIntervalMs: ({ active }) => {
+    if (!active) return MANAGED_IDLE_INTERVAL_MS;
+    return smartActiveIntervalMs();
+  },
   selectBatch: (names, current, cursor, force, opts) => selectSmartTestBatch(
     names,
     current,
@@ -1610,6 +2098,16 @@ const managedSmartSelection = new ManagedAutoSelection({
   ),
   selectCandidate: ({ names, current, measurements }) => {
     ensureSmartModelContext();
+    const override = resolveManagedOverrideForGroup(SMART_PROXY_GROUP, names);
+    if (override) {
+      for (const measurement of measurements || []) {
+        try { smartSelectionModel.observe(measurement); } catch (_) { /* ignore */ }
+      }
+      return override;
+    }
+    // Always return the model pick so ManagedAutoSelection can PUT it to Clash.
+    // With Dart type:smart the kernel still dial-failovers; GUI preferred "now"
+    // must stay aligned with choose() or the Smart badge diverges from routing.
     const pick = smartSelectionModel.choose({
       contextKey: smartSelectionContextKey(),
       names,
@@ -1622,12 +2120,17 @@ const managedSmartSelection = new ManagedAutoSelection({
 
 /** Apply the fastest result from the visible node sweep without testing twice. */
 function applyMeasuredAutoCandidate(name) {
+  const override = readManagedOverride();
+  if (override && override.group === AUTO_PROXY_GROUP) return Promise.resolve(override.name);
   return managedAutoSelection.applyMeasuredCandidate(name);
 }
 
 function stopManagedAutoSelection() {
+  managedSelectionSyncRevision += 1;
   managedAutoSelection.stop();
   managedSmartSelection.stop();
+  stopSmartFeedbackSampler();
+  overrideFailStreak = 0;
 }
 
 /**
@@ -1635,10 +2138,12 @@ function stopManagedAutoSelection() {
  * - the outer-selected group uses the fast interval (~60s)
  * - the other group idles at ~4 minutes so a switch is already warm
  * - a plain node selection leaves both on the idle cadence
- * - with kernel type: smart, JS still measures and PUTs preferred; kernel failovers on dial
+ * - with kernel type: smart, JS still measures and PUTs preferred "now";
+ *   kernel may failover per dial without permanently desyncing the badge
  */
 async function syncManagedSelectionSchedulers({ forceRefresh = null } = {}) {
-  if (!state.singbox.isRunning() || !state.store.getSettings().enableClashApi) {
+  const syncRevision = managedSelectionSyncRevision;
+  if (!state.singbox.isRunning()) {
     stopManagedAutoSelection();
     return null;
   }
@@ -1649,13 +2154,22 @@ async function syncManagedSelectionSchedulers({ forceRefresh = null } = {}) {
   } catch (_) {
     /* fall back to the persisted selection */
   }
+  if (syncRevision !== managedSelectionSyncRevision) return null;
   managedAutoSelection.setActive(outer === AUTO_PROXY_GROUP);
   managedSmartSelection.setActive(outer === SMART_PROXY_GROUP);
+  setSmartFeedbackSamplerActive(outer === SMART_PROXY_GROUP);
+  // Keep force-override attached to the active Auto/Smart outer when it changes.
+  try {
+    await remountManagedOverrideForOuter(outer);
+  } catch (_) { /* best-effort */ }
+  if (syncRevision !== managedSelectionSyncRevision) return null;
   if (!managedAutoSelection.isScheduled()) {
-    managedAutoSelection.start({ active: outer === AUTO_PROXY_GROUP });
+    const active = outer === AUTO_PROXY_GROUP;
+    managedAutoSelection.start({ active, initialDelayMs: active ? 250 : 15_000 });
   }
   if (!managedSmartSelection.isScheduled()) {
-    managedSmartSelection.start({ active: outer === SMART_PROXY_GROUP });
+    const active = outer === SMART_PROXY_GROUP;
+    managedSmartSelection.start({ active, initialDelayMs: active ? 250 : 15_000 });
   }
   if (forceRefresh === AUTO_PROXY_GROUP) {
     managedAutoSelection.refresh({ force: true }).catch(() => null);
@@ -2231,6 +2745,10 @@ module.exports = {
   stopProxyGuard,
   testNodeDelay,
   smartNodeQualities,
+  getManagedNodeOverrideInfo,
+  setManagedNodeOverride,
+  clearManagedNodeOverride,
+  harvestConnectionFeedback,
   applyMeasuredAutoCandidate,
   clashApi,
   setClashSelector,

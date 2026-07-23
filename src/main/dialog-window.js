@@ -56,7 +56,7 @@ function cleanPayload(type, payload) {
 
 function rendererTheme() {
   const settings = state.store ? state.store.getSettings() : {};
-  const theme = settings.theme || 'dark';
+  const theme = settings.theme || 'system';
   const dark = theme === 'system' ? nativeTheme.shouldUseDarkColors : theme !== 'light';
   return { theme, dark, language: settings.language || 'zh' };
 }
@@ -233,6 +233,7 @@ async function openDialog(type, payload) {
     payload: cleanPayload(type, payload),
     language: appearance.language,
     theme: appearance.theme,
+    themeEffective: appearance.dark ? 'dark' : 'light',
   };
   const prepared = !!(
     dialogWindow &&

@@ -1,137 +1,155 @@
-# Dual-core Smart outbound (Surge-inspired)
+# Dart Smart Selection
 
-## Goal
+## Purpose
 
-Implement **connection-level Smart group** behavior in both kernels:
+Smart is Dart's adaptive outbound-selection mode. It aims to keep an available,
+responsive route without treating a single latency sample as complete evidence.
+The application owns the preferred-node decision so the node badge, active
+selection, diagnostics, and runtime state remain consistent.
 
-| Capability | GUI today | Kernel Smart |
-| --- | --- | --- |
-| Pick best node via URL delay | yes | cold-start / recovery only |
-| Same-request failover before returning from dial | no | **yes** |
-| First-write handshake feedback for the next connection | no | **yes** |
-| Soft-fail when dial ≫ historical mean (×1.5) | no | **yes** |
-| Exponential penalty + time decay + success wipe | partial | **yes** |
-| Per-host sticky + exploration | no | **yes** |
-| Top-K weighted pick | no | **yes** |
+Smart operates in two layers:
 
-Forks:
+- The application evaluates nodes, schedules probes, learns from recent
+  sessions, and applies the preferred node through the local runtime API.
+- A compatible Dart runtime may provide connection-level failover and report
+  additional observations. The application remains the source of truth for the
+  preferred node.
 
-- `D:\WorkFiles\sing-box` → publish as Dart sing-box release
-- `D:\WorkFiles\mihomo` → publish as Dart mihomo release
+When runtime enhancement is unavailable, Smart continues to work entirely
+through application-managed selection.
 
-GUI (`singbox-gui`) only **emits** `type: smart` groups and surfaces stats; decision lives in-kernel.
+## Inputs
 
-## Upstream-friendly layout (critical)
+Smart uses bounded, non-sensitive observations:
 
-**Do not edit upstream group logic in place.** Prefer **new files + one-line registration hooks**.
-
-### Shared algorithm (no kernel imports)
-
-Engine lives **in each fork** (keep the two copies algorithmically identical when changing logic):
-
-- `sing-box/protocol/group/smart/engine/`
-- `mihomo/adapter/outboundgroup/smartengine/`
-
-**Upstream sync is GitHub Actions** on each fork (`.github/workflows/dart-sync.yml`), not local scripts.
-
-### sing-box adapter (new package only)
-
-```
-protocol/group/smart/
-  outbound.go      # DialContext / ListenPacket with retry
-  register.go
-option/smart.go    # SmartOutboundOptions  (or option/group.go append — prefer separate file)
-constant/proxy.go  # + TypeSmart = "smart"   ← unavoidable one-line merge zone
-include/registry.go # + group.RegisterSmart  ← one-line merge zone
-```
-
-### mihomo adapter
-
-```
-adapter/outboundgroup/smart.go
-adapter/outboundgroup/smartengine/  # copy of shared engine
-constant/adapters.go                # + Smart type enum if needed
-parser.go                           # case "smart":  ← one-line merge zone
-```
-
-### Merge zone policy
-
-| Change type | Strategy |
+| Signal | Use |
 | --- | --- |
-| New files under `protocol/group/smart/` / `smart.go` | zero upstream conflict |
-| Shared `engine/` | keep both fork copies algorithmically identical when you change logic |
-| Registration one-liners | marked `// dart-smart:register` for easy conflict resolution after merge |
-| Touching `urltest.go` | **forbidden** unless emergency |
+| Primary probe RTT | Main responsiveness signal and the delay shown in the UI |
+| Secondary probe RTT | Reduces dependence on one destination |
+| Jitter and robust cohort spread | Penalizes unstable results without allowing one outlier to dominate |
+| Probe failures | Applies cooldown and availability penalties |
+| Connection outcomes | Records successful traffic and repeated soft failures |
+| Recent traffic evidence | Reduces uncertainty for nodes proven by real use |
+| Current selection | Adds dwell and confirmation protection against unnecessary switching |
+| Network context | Separates history by profile, runtime, and network environment |
 
-## Engine responsibilities (pure)
+Probe destinations and known diagnostic traffic are excluded from connection
+feedback. Explicit UDP observations that cannot provide useful response
+evidence are ignored.
 
-- Member stats: EWMA handshake/dial latency, fail count, penalty score, last success/fail
-- `RecordSuccess(tag, rtt)`, `RecordFailure(tag)`, `RecordSoftFail(tag, rtt)`
-- `Select(ctx, host, now) → ordered candidates` (sticky host → top-K weighted → explore)
-- Penalty: exponential grow, time decay, strong wipe on success
-- Soft-fail: `rtt > max(ewma*1.5, ewma+80ms)`
-- Host sticky map (bounded LRU)
-- Optional: cold URLTest results as initial prior only
+## Selection Model
 
-## Dial path (both kernels)
+Each node keeps a compact, decaying history:
 
-```
-for candidate in Select(host):
-  start = now
-  conn, err = member.Dial(...)
-  if err != nil:
-    RecordFailure; continue
-  if NeedHandshake(conn):
-    wrap FirstWrite / handshake timer
-    return conn
-    // The observer records success/failure/soft-fail for the next connection.
-    // Never replay a successful application write on another connection.
-  else:
-    RecordSuccess; return conn
-return lastErr
-```
+- Smoothed RTT and jitter
+- Success and failure counts
+- Consecutive-failure state
+- Cooldown deadline
+- Last observation time
+- Probe and real-traffic evidence
 
-UDP: best-effort same ordering; soft-fail may be dial-error only.
+Old evidence decays so a node can recover and a changed network does not remain
+anchored to stale measurements. Node identity is derived from stable connection
+properties rather than the display name, allowing harmless renames without
+sharing history with a materially different endpoint.
 
-## GUI integration (later PR)
+The final selection cost combines responsiveness, stability, failure risk,
+cooldown state, and mode-specific weights. Exploration uses a discounted
+UCB-V-style score only to decide which nodes should be probed. Uncertainty alone
+can never make a node the active route.
 
-1. `converter.js`: build `type: smart` for 🧠 Smart (sing-box) / `type: smart` proxy-group (mihomo)
-2. Remove or demote Node `ManagedAutoSelection` for Smart when core supports it
-3. Clash API: expose smart stats if needed (`/proxies/🧠 Smart` already shows `now`)
-4. Version gate: only emit smart if core version reports capability
+## Switching Rules
 
-## Upstream sync automation
+Smart applies the following protections:
 
-Per-fork GitHub Actions: **Actions → “Sync upstream…” → Run workflow**.
+1. An unavailable or repeatedly failing current node can be replaced
+   immediately.
+2. A healthy challenger must win consecutive evaluation rounds before a
+   switch.
+3. Small improvements are ignored to avoid oscillation.
+4. Correlated failures across many nodes are treated as a probable local
+   outage instead of penalizing every node independently.
+5. A user override pins the selected node to the active Smart group and clears
+   automatically after repeated probe failures.
 
-| Fork | Workflow | Upstream |
-| --- | --- | --- |
-| `blakebill/sing-box` | `dart-sync.yml` | `SagerNet/sing-box` `stable` |
-| `blakebill/mihomo` | `dart-sync.yml` | `MetaCubeX/mihomo` `Meta`/`Alpha` |
+The three user modes adjust weighting rather than changing the model:
 
-Each run: merge upstream → verify Dart Smart hooks → `go test` smart packages → build smoke → push fork branch.
+- **Balanced**: normal responsiveness and stability weights.
+- **Low latency**: reacts faster to a consistently quicker healthy node.
+- **Stability first**: gives stronger weight to jitter, failures, and dwell.
 
-Release tags (`vX.Y.Z-dart.N`) still go through the existing GUI `fetch-core` pipeline after a Dart core publish.
-## Phased delivery
+## Probe Scheduling
 
-| Phase | Scope | Exit criteria |
-| --- | --- | --- |
-| **P0** | Shared engine + dial failover (fail only) on both cores | compiles; failover unit tests |
-| **P1** | Soft-fail 1.5×, penalty model | stress dial tests |
-| **P2** | Per-host sticky + Top-K random | host regression tests |
-| **P3** | GUI emits smart; demote JS Smart selector | e2e with Dart app |
-| **P4** | Selective background probe (not full urltest) | CPU/network budget OK |
+Probe work is bounded:
 
-## Non-goals (v1)
+- Active Smart normally evaluates a rotating candidate batch.
+- The current winner, unseen nodes, recovery candidates, and a forced override
+  receive priority.
+- Stable sessions move to a relaxed interval.
+- Failures or insufficient evidence move to an urgent interval.
+- Primary results use a short cache; secondary results use a longer independent
+  cache.
+- Probe concurrency is fixed internally to prevent an invalid setting from
+  overwhelming the runtime or network.
 
-- Full Surge bandwidth modeling
-- Perfect packet-loss metrics without kernel TCP introspection
-- Using other groups as smart members (same restriction as Surge)
+Only the primary probe delay is displayed on node cards. The internal blended
+value may differ because it includes secondary and stability evidence.
 
-## Risk notes
+## Runtime Enhancement
 
-- Dual-core means **two adapters**, one engine — keep engine free of `C.Proxy` / `adapter.Outbound`
-- Windows + TUN: ensure failed dial path does not leak half-open sockets
-- First-write failures cannot be transparently retried after DialContext returns;
-  replaying application bytes may duplicate a request. They affect subsequent selection.
-- Multiplex / connection reuse: soft-fail must not break pooled conns incorrectly
+A compatible Dart runtime can add connection-level behavior that is unsafe or
+impossible to implement after a connection has already been returned to the
+application:
+
+- Retry another candidate when a dial fails before application data is sent.
+- Record dial or first-write outcomes for subsequent decisions.
+- Keep connection-level failover local to the runtime.
+
+Already-sent application data is never replayed automatically. Replaying bytes
+could duplicate requests or violate protocol state. First-write failures are
+therefore recorded for future selection unless the runtime can prove that no
+application data was accepted.
+
+The application detects runtime capability from a real configuration probe.
+Release names and version strings are advisory only and do not enable features
+by themselves.
+
+## State and Privacy
+
+Smart history is session-scoped and bounded. It is cleared when the application
+closes and separated when the active profile, runtime, or network context
+changes. Stored profile data does not gain Smart telemetry.
+
+The renderer receives node names and limited presentation metadata, not server
+addresses. Smart observations remain in the main process and are not included
+in exported diagnostics or backups unless a future export explicitly documents
+them.
+
+## Limits
+
+- URL RTT cannot fully predict application throughput.
+- Connection snapshots cannot provide complete packet-loss or UDP response
+  measurements.
+- Multiplexed traffic provides fewer independent observations than separate
+  connections.
+- A local outage can delay useful scoring until probes recover.
+- Connection-level replay after application data has been sent is intentionally
+  unsupported.
+
+These limits are handled conservatively: Smart prefers bounded exploration,
+decaying evidence, and stable switching over aggressive prediction.
+
+## Verification
+
+Changes to Smart should cover:
+
+- Cold start and clear-winner selection
+- Stable-node dwell and challenger confirmation
+- Failure cooldown and recovery
+- Context and profile isolation
+- Outlier-resistant cohort scoring
+- Probe-only exploration
+- Override lifecycle
+- Runtime capability fallback
+- Cancellation of in-flight work after stop or profile change
+- Bounded history, candidate batches, and timers

@@ -1,17 +1,17 @@
 # Dart Network Control
 
-Dart Network Control is a native-feeling Windows desktop workspace for operating both the
-[Dart's maintained sing-box fork](https://github.com/blakebill/sing-box) and
-[mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) network cores. It brings profiles, routing, traffic, connections, logs, TUN, system proxy controls, and core maintenance into one operational interface. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
+Dart Network Control is a native-feeling Windows desktop workspace for operating the
+[Dart sing-box](https://github.com/blakebill/sing-box) and
+[Dart mihomo](https://github.com/blakebill/mihomo) forks, with official upstream builds available as alternatives. It brings profiles, routing, traffic, connections, logs, TUN, system proxy controls, and core maintenance into one operational interface. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
 
 This is an independent project and is not affiliated with or endorsed by sing-box, mihomo, or Zashboard.
 
 ### Features
 
-- Run and manage sing-box and mihomo independently, including in-app switching, downloads, and updates.
-- Import Clash, sing-box, Base64, and share-link configs, with automatic bidirectional conversion between Clash and sing-box.
+- Run and manage sing-box and mihomo independently, including official or Dart builds, in-app switching, downloads, updates, and Smart capability detection.
+- Import Clash, sing-box, Base64, and share-link configs, with selectable request formats and automatic bidirectional conversion.
 - Use system proxy or TUN alongside launch-at-login, silent startup, notifications, and UWP loopback exemptions.
-- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing.
+- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing. Smart combines latency, jitter, failures, recent traffic, cooldowns, and bounded exploration.
 - Monitor nodes, traffic, connections, logs, and latency, or open the locally hosted [Zashboard](https://github.com/Zephyruso/zashboard).
 - Inspect routes, validate configs, diagnose networking and DNS, inspect ports, and back up or restore user data.
 
@@ -22,12 +22,12 @@ This is an independent project and is not affiliated with or endorsed by sing-bo
 3. Select sing-box or mihomo in **Core Management**, choose a node and routing mode, and start the core.
 4. Enable **System Proxy** for application proxying or **TUN** for system-wide routing. Administrator permission is requested only by operations that require it.
 
-Release installers bundle both cores and their matching GeoData. Core Management can keep either bundled copy, download the latest stable release, or switch between the two independent runtime directories.
+Release installers bundle both Dart cores and their matching GeoData. Core Management can install the latest stable official or Dart release, reports whether the selected binary supports kernel Smart, and keeps both independent runtime directories available.
 
 ### Desktop Experience
 
 - A frameless custom title bar and Windows 11 Mica material where supported, with transparent Fluent-style surfaces rather than a browser-like page background.
-- System, light, and dark themes plus complete English and Simplified Chinese interface switching.
+- System, light, and dark themes, defaulting to the Windows setting, plus complete English and Simplified Chinese interface switching.
 - Full-width responsive pages with equal outer spacing. Nodes, connections, and logs fill the remaining window height and scroll internally.
 - Two-column node cards, compact live traffic, the current outbound in the sidebar, and a tray icon that reflects stopped or running state.
 - Close-to-tray and silent-start behavior, with background rendering and polling reduced while the window is hidden.
@@ -41,7 +41,7 @@ Release installers bundle both cores and their matching GeoData. Core Management
 | Config Converter | Auto-detects Clash, sing-box, or share-link input and previews either Clash or sing-box output |
 | Route Inspector | Shows the matched rule, policy target, final outbound, and DNS path for a domain or IP |
 | Network Diagnostics | Checks the core, Clash API, ports, system proxy, TUN, DNS, and direct/proxy egress; reports can be exported |
-| Config Checker | Validates generated sing-box and mihomo configurations and reports precise error locations |
+| Config Checker | Validates generated sing-box and mihomo configurations, shows readable bounded previews, and reports precise error locations |
 | Port Inspector | Shows listeners and owning processes for the proxy, API, or custom ports |
 | Backup & Restore | Exports configs, settings, and rules without cores or caches; selected files are revalidated before restore |
 | DNS Comparison | Compares system, local, and remote DNS answers, latency, and suspicious divergence |
@@ -75,7 +75,7 @@ flowchart LR
     MANAGER --> SB["sing-box process"]
     MANAGER --> MH["mihomo process"]
 
-    MAIN --> SMART["Session Smart selector\nRTT, jitter, failures, cooldown"]
+    MAIN --> SMART["Session Smart selector\nRTT, jitter, traffic, failures, UCB-V"]
     SMART -->|"Clash API selection"| MANAGER
 
     SB -->|"Clash API"| MAIN
@@ -96,7 +96,7 @@ Configuration flow:
 2. Parsed data is normalized into an internal node, rule, and policy-group model.
 3. The selected core adapter generates sing-box JSON or mihomo YAML and supplies its paths, commands, GeoData capabilities, release assets, and export behavior.
 4. `CoreManager` uses that adapter to write and validate the configuration, verify downloaded core archives, and start the independent child process.
-5. The main process reads runtime state through a local Clash API protected by a per-session random secret and sends only the required data to the renderer.
+5. Both generated core configurations always expose a loopback-only Clash API protected by a per-session random secret. The main process uses it for runtime state and managed selection, then sends only the required data to the renderer.
 
 ### Data Directories
 
@@ -145,6 +145,7 @@ singbox-gui/
 │   │   ├── ipc-validation.js    # Shared payload limits and validation
 │   │   ├── core-control.js      # Core, proxy, rule, and update orchestration
 │   │   ├── core-adapters.js     # sing-box and mihomo capabilities
+│   │   ├── smart-selection.js   # Adaptive Smart scoring and bounded exploration
 │   │   ├── operation-coordinator.js # Serialized mutations and stale-work guards
 │   │   ├── singbox.js           # Core processes, downloads, paths, and GeoData
 │   │   ├── tun-adapter.js       # Windows Dart TUN cleanup and display naming
@@ -210,7 +211,7 @@ The Dart Network Control Electron UI, configuration management, and process orch
 | Component | Purpose and distribution | Upstream license |
 | --- | --- | --- |
 | [Dart sing-box fork](https://github.com/blakebill/sing-box) | Independent core process bundled with the installer; patched from [SagerNet/sing-box](https://github.com/SagerNet/sing-box) | [GPL v3 or later with the upstream additional notice](https://github.com/SagerNet/sing-box/blob/dev/LICENSE) |
-| [mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) | Independent core process bundled with the installer | [GPL v3](https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE) |
+| [Dart mihomo fork](https://github.com/blakebill/mihomo) | Independent core process bundled with the installer; patched from [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) | [GPL v3](https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE) |
 | [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip) | Bundled and updateable sing-box GeoIP rules | [GPL v3 or later](https://github.com/SagerNet/sing-geoip/blob/main/LICENSE) |
 | [SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) | Bundled and updateable sing-box Geosite rules | [GPL v3 or later](https://github.com/SagerNet/sing-geosite/blob/main/LICENSE) |
 | [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) | Bundled and updateable mihomo GeoData | [GPL v3](https://github.com/MetaCubeX/meta-rules-dat/blob/master/LICENSE) |

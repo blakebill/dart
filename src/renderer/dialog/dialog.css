@@ -171,11 +171,30 @@ body.native-dialog-body .toast {
   user-select: text;
 }
 
-.dialog-core-hint {
+.dialog-feature-status {
+  display: flex;
   margin-top: auto;
-  padding-top: 8px;
-  line-height: 1.55;
-  white-space: normal;
+  padding-top: 12px;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.dialog-feature-detail {
+  color: var(--text);
+}
+
+.dialog-feature-status strong {
+  font-weight: 600;
+}
+
+.dialog-feature-status .supported {
+  color: var(--green);
+}
+
+.dialog-feature-status .unsupported {
+  color: var(--text-dim);
 }
 
 .dialog-result {

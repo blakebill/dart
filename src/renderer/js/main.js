@@ -21,7 +21,10 @@
 
   App.commitSettings = function commitSettings(settings) {
     localSettingsRevision++;
-    App.state.settings = settings || {};
+    const clean = { ...(settings || {}) };
+    // Ephemeral field from settings:update when theme changes — not a store key.
+    delete clean.themeEffective;
+    App.state.settings = clean;
     return App.state.settings;
   };
   App.patchSettings = function patchSettings(patch) {
@@ -271,16 +274,24 @@
     if (tab === 'rules') {
       showRulesTab();
     } else if (tab === 'conns') {
-      App.loadConnections().then((data) => {
-        if (!document.hidden && App.currentTab === 'conns') {
-          scheduleConnectionPoll(connectionPollDelay(data));
-        }
+      // Defer Clash API + list paint so the tab switch stays responsive.
+      afterPaint(() => {
+        if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== 'conns') return;
+        App.loadConnections().then((data) => {
+          if (!document.hidden && App.currentTab === 'conns') {
+            scheduleConnectionPoll(connectionPollDelay(data));
+          }
+        });
       });
     } else if (tab === 'nodes') {
       App.loadNodes();
       App.refreshGroupSelections();
     } else if (tab === 'logs') {
-      App.flushLogs();
+      // History may be large; flush after paint in rAF-sized chunks (logs.js).
+      afterPaint(() => {
+        if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== 'logs') return;
+        if (App.flushLogs) App.flushLogs();
+      });
     } else if (tab === 'subs') {
       App.renderSubs();
     } else if (tab === 'settings') {
@@ -441,7 +452,15 @@
     const languageChanged = !!(lang && lang !== getLang());
     if (languageChanged) setLanguage(lang);
     const theme = App.state.settings && App.state.settings.theme;
-    if (theme !== previousTheme || languageChanged) App.applyTheme(theme);
+    if (theme !== previousTheme || languageChanged) {
+      if (theme === 'system' && api && api.resolveTheme) {
+        api.resolveTheme()
+          .then((resolved) => App.applyTheme(theme, resolved && resolved.effective))
+          .catch(() => App.applyTheme(theme));
+      } else {
+        App.applyTheme(theme);
+      }
+    }
     // Cheap status chrome always tracks runtime truth; heavier panels only repaint
     // when their backing snapshot actually changed (or language rebuilt the UI).
     if (statusChanged || languageChanged) App.renderStatus();
@@ -555,6 +574,16 @@
   App.trafficChart.draw();
   App.miniChart.draw();
   App.initVersion();
+  // Connections has no eager data subscription, so parsing it while idle is
+  // cheap. Logs stays lazy to avoid retaining history when that tab is unused.
+  const warmConnectionTab = () => {
+    ensureTabModules('conns').catch(() => {});
+  };
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(warmConnectionTab, { timeout: 4000 });
+  } else {
+    setTimeout(warmConnectionTab, 1500);
+  }
   // Silent update check at most once a day (the manual button always runs).
   try {
     const last = parseInt(localStorage.getItem('lastUpdateCheck') || '0', 10);

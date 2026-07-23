@@ -1,5 +1,8 @@
 'use strict';
 
+const MANAGED_TEST_CONCURRENCY = 8;
+const OVERRIDE_TEST_CONCURRENCY = 4;
+
 class ManagedAutoSelection {
   constructor(options) {
     this.options = options;
@@ -11,10 +14,6 @@ class ManagedAutoSelection {
     this.active = false;
     this.selectorTail = Promise.resolve();
     this.outerSelectorTail = Promise.resolve();
-  }
-
-  enabled() {
-    return !!this.options.getSettings().enableClashApi;
   }
 
   /** Active outer group uses the fast interval; standby groups use the idle one. */
@@ -46,7 +45,7 @@ class ManagedAutoSelection {
 
   queueCandidate(name, revision) {
     const apply = () => {
-      if (revision !== this.revision || !this.options.isRunning() || !this.enabled()) return null;
+      if (revision !== this.revision || !this.options.isRunning()) return null;
       return this.options.clashApi(
         'PUT',
         '/proxies/' + encodeURIComponent(this.options.autoGroup),
@@ -60,11 +59,11 @@ class ManagedAutoSelection {
 
   applyMeasuredCandidate(name) {
     if (!this.options.isRunning()) throw new Error('core not running');
-    return this.enabled() ? this.queueCandidate(name, ++this.revision) : null;
+    return this.queueCandidate(name, ++this.revision);
   }
 
   refresh({ force = false, generation = this.generation, refine = false } = {}) {
-    if (!this.options.isRunning() || !this.enabled()) return Promise.resolve(null);
+    if (!this.options.isRunning()) return Promise.resolve(null);
     if (this.run && this.run.generation === generation) {
       if (force && !this.run.force) {
         return this.run.promise.catch(() => null).then(() => this.refresh({ force: true, generation }));
@@ -87,18 +86,26 @@ class ManagedAutoSelection {
     );
     const names = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
     if (!names.length) return null;
+    // Optional real-path feedback (e.g. Clash /connections) before URL delay.
+    if (typeof this.options.harvestFeedback === 'function') {
+      try { await this.options.harvestFeedback(); } catch (_) { /* advisory */ }
+    }
+    const overridePinned = typeof this.options.resolveOverride === 'function'
+      ? this.options.resolveOverride(names)
+      : null;
     const batch = this.options.selectBatch(names, group && group.now, this.cursor, force && !refine, {
       model: this.options.selectionModel || null,
       now: Date.now(),
     });
     if (!force || refine) this.cursor = batch.nextCursor;
-    const candidates = batch.candidates;
+    const candidates = Array.isArray(batch.candidates) ? batch.candidates.slice() : [];
+    if (overridePinned && !candidates.includes(overridePinned)) candidates.unshift(overridePinned);
     const revision = this.revision;
-    const concurrency = Math.max(1, Math.min(
-      16,
-      Number(this.options.getSettings().testConcurrency) || 8,
-      candidates.length
-    ));
+    // Override: still probe for history, but keep concurrency modest.
+    const baseConcurrency = Math.max(1, Math.min(MANAGED_TEST_CONCURRENCY, candidates.length));
+    const concurrency = overridePinned
+      ? Math.max(1, Math.min(OVERRIDE_TEST_CONCURRENCY, baseConcurrency))
+      : baseConcurrency;
     let cursor = 0;
     const measurements = new Array(candidates.length);
     const worker = async () => {
@@ -106,15 +113,36 @@ class ManagedAutoSelection {
         const index = cursor++;
         const name = candidates[index];
         try {
-          const delay = await this.options.testDelay(name);
-          measurements[index] = { name, delay };
-        } catch (_) {
-          measurements[index] = { name, delay: null };
+          const result = await this.options.testDelay(name, { force, refine, generation });
+          measurements[index] = result && typeof result === 'object'
+            ? { name, delay: result.delay, fresh: result.fresh !== false }
+            : { name, delay: result, fresh: true };
+        } catch (error) {
+          measurements[index] = { name, delay: null, fresh: !(error && error.fresh === false) };
         }
       }
     };
     await Promise.all(Array.from({ length: concurrency }, worker));
+    if (generation !== this.generation || revision !== this.revision) return null;
+    // Second harvest after probes so short-lived sockets from delay tests also count.
+    if (typeof this.options.harvestFeedback === 'function') {
+      try { await this.options.harvestFeedback(); } catch (_) { /* advisory */ }
+    }
     const completeMeasurements = measurements.filter(Boolean);
+    if (typeof this.options.afterMeasure === 'function') {
+      try {
+        await this.options.afterMeasure({
+          names,
+          candidates,
+          current: group && group.now,
+          measurements: completeMeasurements,
+          force,
+          refine,
+          generation,
+        });
+      } catch (_) { /* advisory */ }
+    }
+    if (generation !== this.generation || revision !== this.revision) return null;
     let bestName;
     if (this.options.selectCandidate) {
       bestName = this.options.selectCandidate({
@@ -123,6 +151,7 @@ class ManagedAutoSelection {
         measurements: completeMeasurements,
       });
     } else {
+      // Classic Auto: lowest delay among this batch's successful probes.
       let bestDelay = Infinity;
       for (const measurement of completeMeasurements) {
         if (Number.isFinite(measurement.delay) && measurement.delay >= 0 && measurement.delay < bestDelay) {
@@ -131,6 +160,8 @@ class ManagedAutoSelection {
         }
       }
     }
+    // User force-override wins over algorithm picks (still measured above).
+    if (overridePinned) bestName = overridePinned;
     if (!bestName || generation !== this.generation || revision !== this.revision) {
       // Still schedule a refine pass after a quick force sweep.
       if (force && !refine && batch.refine && generation === this.generation) {
@@ -139,6 +170,9 @@ class ManagedAutoSelection {
       return null;
     }
     let applied = bestName;
+    // Push preferred member whenever it differs from Clash "now" so UI badges
+    // and actual group selection stay aligned (including Dart type:smart).
+    // Kernel Smart may still failover per-dial; preferred "now" is GUI's call.
     if (bestName !== (group && group.now)) {
       applied = await this.queueCandidate(bestName, revision);
     }
@@ -170,7 +204,7 @@ class ManagedAutoSelection {
   async _tick(generation) {
     if (generation !== this.generation) return;
     try { await this.refresh({ generation }); } catch (_) {}
-    if (generation !== this.generation || !this.options.isRunning() || !this.enabled()) return;
+    if (generation !== this.generation || !this.options.isRunning()) return;
     this.scheduleNext(this.intervalMs());
   }
 
@@ -186,7 +220,6 @@ class ManagedAutoSelection {
   start({ active = this.active, initialDelayMs = 250 } = {}) {
     this.stop();
     this.active = !!active;
-    if (!this.enabled()) return;
     this.scheduleNext(initialDelayMs);
   }
 

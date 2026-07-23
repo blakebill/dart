@@ -9,6 +9,7 @@
   const NODE_COLUMNS = 2;
   const VIRTUAL_NODE_ROW_HEIGHT = 78;
   const VIRTUAL_OVERSCAN = 5;
+  const NODE_TEST_CONCURRENCY = 8;
   const AUTO_GROUP = '♻️ Auto';
   const SMART_GROUP = '🧠 Smart';
   const FALLBACK_GROUP = '🛟 Fallback';
@@ -24,11 +25,14 @@
   const qualities = new Map();
   let qualityRefresh = null;
 
-  let groupNow = { proxy: null, auto: null, smart: null, fallback: null };
+  let groupNow = { proxy: null, auto: null, smart: null, fallback: null, override: null, overrideGroup: null };
   let groupRefresh = null;
   let groupPollTimer = null;
   let currentNodeFrame = 0;
   let nodeWindowFrame = 0;
+  let contextMenuEl = null;
+  let contextMenuName = null;
+  let contextMenuInvoker = null;
 
   function scheduleGroupPoll() {
     if (groupPollTimer) {
@@ -72,21 +76,32 @@
   }
 
   async function refreshGroupSelections() {
-    if (groupRefresh) return groupRefresh;
-    groupRefresh = (async () => {
-      let next = { proxy: null, auto: null, smart: null, fallback: null };
-      if (App.state.status && App.state.status.running) {
-        try { next = await api.getGroupSelections(App.currentTab === 'nodes'); } catch (_) {}
-      }
-      if (!(App.state.status && App.state.status.running)) next = {};
+    const profileId = App.state.activeSub || null;
+    if (groupRefresh && groupRefresh.profileId === profileId) return groupRefresh.promise;
+    const token = {};
+    const promise = (async () => {
+      let next = { proxy: null, auto: null, smart: null, fallback: null, override: null, overrideGroup: null };
+      try {
+        if (App.state.status && App.state.status.running) {
+          next = await api.getGroupSelections(App.currentTab === 'nodes');
+        } else if (api.getNodeOverride) {
+          const ov = await api.getNodeOverride();
+          next.override = ov && ov.override || null;
+          next.overrideGroup = ov && ov.group || null;
+        }
+      } catch (_) {}
+      if ((App.state.activeSub || null) !== profileId) return;
       next = {
         proxy: next && next.proxy || null,
         auto: next && next.auto || null,
         smart: next && next.smart || null,
         fallback: next && next.fallback || null,
+        override: next && next.override || null,
+        overrideGroup: next && next.overrideGroup || null,
       };
       const changed = next.proxy !== groupNow.proxy || next.auto !== groupNow.auto ||
-        next.smart !== groupNow.smart || next.fallback !== groupNow.fallback;
+        next.smart !== groupNow.smart || next.fallback !== groupNow.fallback ||
+        next.override !== groupNow.override || next.overrideGroup !== groupNow.overrideGroup;
       groupNow = next;
       renderCurrentNode();
       if (changed && App.currentTab === 'nodes' && !document.hidden) renderNodes();
@@ -96,10 +111,13 @@
         refreshQualities();
       }
     })().finally(() => {
-      groupRefresh = null;
-      scheduleGroupPoll();
+      if (groupRefresh && groupRefresh.token === token) {
+        groupRefresh = null;
+        scheduleGroupPoll();
+      }
     });
-    return groupRefresh;
+    groupRefresh = { token, profileId, promise };
+    return promise;
   }
   document.addEventListener('visibilitychange', scheduleGroupPoll);
   scheduleGroupPoll();
@@ -119,6 +137,7 @@
   }
 
   function releaseNodes({ cancelTests = true } = {}) {
+    hideNodeContextMenu();
     qualities.clear();
     if (cancelTests) {
       for (const name of delayRequests.keys()) {
@@ -345,34 +364,107 @@
     return sel === name;
   }
 
-  function nodeRowHtml(name, type, server, port) {
+  function protocolLabel(type, variant, security) {
+    const key = String(type || '').toLowerCase();
+    if (key === 'ss' && variant === '2022') return 'Shadowsocks 2022';
+    if (key === 'vless' && variant === 'vision') return 'VLESS Vision';
+    if (key === 'http' && security === 'TLS') return 'HTTPS';
+    const labels = {
+      ss: 'Shadowsocks',
+      vmess: 'VMess',
+      vless: 'VLESS',
+      trojan: 'Trojan',
+      hysteria: 'Hysteria',
+      hysteria2: 'Hysteria2',
+      tuic: 'TUIC',
+      anytls: 'AnyTLS',
+      socks: 'SOCKS5',
+      socks5: 'SOCKS5',
+      http: 'HTTP',
+      https: 'HTTPS',
+    };
+    return labels[key] || (key ? key[0].toUpperCase() + key.slice(1) : '');
+  }
+
+  function cipherLabel(cipher, variant) {
+    const value = String(cipher || '').trim();
+    if (!value) return '';
+    const concise = variant === '2022'
+      ? value.replace(/^2022-blake3-/i, '')
+      : value;
+    return concise.toUpperCase();
+  }
+
+  function transportLabel(transport) {
+    const labels = {
+      ws: 'WebSocket',
+      grpc: 'gRPC',
+      http: 'HTTP/2',
+      h2: 'HTTP/2',
+      quic: 'QUIC',
+    };
+    const key = String(transport || '').toLowerCase();
+    return labels[key] || (key ? key.toUpperCase() : '');
+  }
+
+  function pluginLabel(plugin) {
+    const labels = {
+      obfs: 'Simple Obfs',
+      'simple-obfs': 'Simple Obfs',
+      'obfs-local': 'Simple Obfs',
+      'v2ray-plugin': 'V2Ray Plugin',
+    };
+    const key = String(plugin || '').toLowerCase();
+    return labels[key] || '';
+  }
+
+  function nodeRowHtml(name, type, security, isNode, variant, cipher, transport, plugin) {
     const active = isActiveNode(name);
     const d = delays.get(name);
     const delayHtml =
       d !== undefined ? `<span class="node-delay ${delayClass(d)}">${delayText(d)}</span>` : '<span class="node-delay"></span>';
     // The automatic group's current pick: shown on the Auto row ("当前: X")
     // and as a marker on that node's own row.
-    let tagHtml = type ? `<span class="node-tag">${escapeHtml(String(type))}</span>` : '';
-    if (server && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
-    if (server && groupNow.smart && name === groupNow.smart) tagHtml += '<span class="node-tag">🧠</span>';
-    if (server && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
-    let metaHtml = server ? `<span class="sub-meta">${escapeHtml(String(server))}:${escapeHtml(String(port))}</span>` : '';
+    let tagHtml = '';
+    if (isNode && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
+    if (isNode && groupNow.smart && name === groupNow.smart) tagHtml += '<span class="node-tag">🧠</span>';
+    if (isNode && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
+    const isOverride = !!(isNode && groupNow.override && name === groupNow.override);
+    if (isOverride) {
+      const groupLabel = groupNow.overrideGroup === AUTO_GROUP
+        ? t('nodes.override.tagAuto')
+        : groupNow.overrideGroup === SMART_GROUP
+          ? t('nodes.override.tagSmart')
+          : t('nodes.override.tag');
+      tagHtml += `<span class="node-tag node-tag-override" title="${escapeHtml(t('nodes.override.hint'))}">${escapeHtml(groupLabel)}</span>`;
+    }
+    const protocol = protocolLabel(type, variant, security);
+    const details = isNode
+      ? [
+          protocol,
+          cipherLabel(cipher, variant),
+          protocol === 'HTTPS' ? '' : security,
+          transportLabel(transport),
+          pluginLabel(plugin),
+        ].filter(Boolean).join(' · ')
+      : '';
+    let metaHtml = details ? `<span class="sub-meta">${escapeHtml(details)}</span>` : '';
     const selectedNow = name === AUTO_GROUP
       ? groupNow.auto
       : name === SMART_GROUP
         ? groupNow.smart
         : name === FALLBACK_GROUP ? groupNow.fallback : null;
-    if (!server && selectedNow) {
+    if (!isNode && selectedNow) {
       metaHtml = `<span class="sub-meta">${t('nodes.autoNow', escapeHtml(selectedNow))}</span>`;
     }
     const safeName = escapeHtml(name);
     // Stability short label + sample count (not a second latency traffic light).
-    const qualityHtml = server ? qualityHtmlFor(name) : '';
-    const testHtml = server
+    const qualityHtml = isNode ? qualityHtmlFor(name) : '';
+    const testHtml = isNode
       ? `<button type="button" class="node-test-btn" data-name="${safeName}" aria-label="${escapeHtml(t('nodes.test') + ': ' + name)}">${t('nodes.test')}</button>`
       : '';
     const activeHtml = active ? `<span class="node-active">✓ ${t('nodes.active')}</span>` : '';
-    return `<div class="node-item${active ? ' active' : ''}${server ? ' has-test' : ''}" role="listitem" data-name="${safeName}">
+    return `<div class="node-item${active ? ' active' : ''}${isNode ? ' has-test' : ''}${isOverride ? ' is-override' : ''}" role="listitem" data-name="${safeName}" data-node="${isNode ? '1' : '0'}">
       <button type="button" class="node-select-btn" data-select-name="${safeName}" aria-pressed="${String(active)}">
       <span class="node-top">
         <span class="node-identity"><span class="node-name">${safeName}</span>${tagHtml}</span>
@@ -413,7 +505,16 @@
     html += '<div class="node-grid-window">';
     for (let i = start; i < end; i++) {
       const n = nodeRows[i];
-      html += nodeRowHtml(n.name, n.type, n.server, n.port);
+      html += nodeRowHtml(
+        n.name,
+        n.type,
+        n.security,
+        !!n.isNode,
+        n.variant,
+        n.cipher,
+        n.transport,
+        n.plugin
+      );
     }
     html += '</div>';
     const afterRows = totalRows - endRow;
@@ -445,6 +546,7 @@
     renderNodeWindow();
   }
   $('#nodeList').addEventListener('click', (e) => {
+    hideNodeContextMenu();
     const tb = e.target.closest('.node-test-btn');
     if (tb) {
       e.stopPropagation();
@@ -456,6 +558,131 @@
       selectNode(selectButton.dataset.selectName, document.activeElement === selectButton);
     }
   });
+
+  function ensureContextMenu() {
+    if (contextMenuEl) return contextMenuEl;
+    contextMenuEl = document.createElement('div');
+    contextMenuEl.id = 'nodeContextMenu';
+    contextMenuEl.className = 'node-context-menu hidden';
+    contextMenuEl.setAttribute('role', 'menu');
+    document.body.appendChild(contextMenuEl);
+    contextMenuEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-override-act]');
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const act = btn.dataset.overrideAct;
+      const name = contextMenuName;
+      hideNodeContextMenu();
+      if (act === 'set' && name) setNodeOverride(name);
+      else if (act === 'clear') clearNodeOverride();
+    });
+    contextMenuEl.addEventListener('keydown', (e) => {
+      const items = [...contextMenuEl.querySelectorAll('.node-context-item')];
+      const index = items.indexOf(document.activeElement);
+      let next = -1;
+      if (e.key === 'ArrowDown') next = (index + 1) % items.length;
+      else if (e.key === 'ArrowUp') next = (index - 1 + items.length) % items.length;
+      else if (e.key === 'Home') next = 0;
+      else if (e.key === 'End') next = items.length - 1;
+      else if (e.key === 'Escape') {
+        e.preventDefault();
+        hideNodeContextMenu(true);
+        return;
+      }
+      if (next >= 0) {
+        e.preventDefault();
+        items[next].focus();
+      }
+    });
+    return contextMenuEl;
+  }
+
+  function hideNodeContextMenu(restoreFocus = false) {
+    if (!contextMenuEl) return;
+    const invoker = contextMenuInvoker;
+    contextMenuEl.classList.add('hidden');
+    contextMenuEl.innerHTML = '';
+    contextMenuName = null;
+    contextMenuInvoker = null;
+    if (restoreFocus && invoker && invoker.isConnected) invoker.focus({ preventScroll: true });
+  }
+
+  function showNodeContextMenu(clientX, clientY, name, isServerNode, invoker) {
+    if (!isServerNode || !api.setNodeOverride) return;
+    const menu = ensureContextMenu();
+    contextMenuName = name;
+    contextMenuInvoker = invoker || null;
+    const override = groupNow.override;
+    let html = `<button type="button" class="node-context-item" role="menuitem" data-override-act="set">${escapeHtml(t('nodes.override.menu'))}</button>`;
+    if (override) {
+      html += `<button type="button" class="node-context-item" role="menuitem" data-override-act="clear">${escapeHtml(t('nodes.override.clearMenu'))}</button>`;
+    }
+    menu.innerHTML = html;
+    menu.classList.remove('hidden');
+    const pad = 8;
+    const rect = menu.getBoundingClientRect();
+    const anchor = invoker && invoker.getBoundingClientRect ? invoker.getBoundingClientRect() : null;
+    const x = clientX > 0 ? clientX : (anchor ? anchor.left + 24 : pad);
+    const y = clientY > 0 ? clientY : (anchor ? anchor.top + 24 : pad);
+    const left = Math.min(x, window.innerWidth - rect.width - pad);
+    const top = Math.min(y, window.innerHeight - rect.height - pad);
+    menu.style.left = Math.max(pad, left) + 'px';
+    menu.style.top = Math.max(pad, top) + 'px';
+    const first = menu.querySelector('.node-context-item');
+    if (first) first.focus({ preventScroll: true });
+  }
+
+  $('#nodeList').addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.node-item');
+    if (!item || item.dataset.node !== '1') {
+      hideNodeContextMenu();
+      return;
+    }
+    e.preventDefault();
+    const name = item.dataset.name;
+    if (!name) return;
+    showNodeContextMenu(e.clientX, e.clientY, name, true, item.querySelector('.node-select-btn'));
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideNodeContextMenu(true);
+  });
+  document.addEventListener('pointerdown', (e) => {
+    if (contextMenuEl && !contextMenuEl.contains(e.target)) hideNodeContextMenu();
+  }, true);
+  window.addEventListener('blur', hideNodeContextMenu);
+  window.addEventListener('resize', hideNodeContextMenu);
+
+  async function setNodeOverride(name) {
+    const profileId = App.state.activeSub || null;
+    try {
+      const result = await api.setNodeOverride(name);
+      if ((App.state.activeSub || null) !== profileId) return;
+      groupNow.override = result && result.override || name;
+      groupNow.overrideGroup = result && result.group || null;
+      toast(t('toast.nodeOverride', name));
+      if (App.currentTab === 'nodes' && !document.hidden) renderNodes();
+      refreshGroupSelections();
+    } catch (e) {
+      toast(e.message || String(e), true);
+    }
+  }
+
+  async function clearNodeOverride() {
+    const profileId = App.state.activeSub || null;
+    try {
+      await api.clearNodeOverride();
+      if ((App.state.activeSub || null) !== profileId) return;
+      groupNow.override = null;
+      groupNow.overrideGroup = null;
+      toast(t('toast.nodeOverrideCleared'));
+      if (App.currentTab === 'nodes' && !document.hidden) renderNodes();
+      refreshGroupSelections();
+    } catch (e) {
+      toast(e.message || String(e), true);
+    }
+  }
 
   async function selectNode(name, restoreFocus = false) {
     try {
@@ -561,9 +788,8 @@
     await loadNodes();
     if (run.cancelled) return;
     const names = activeNodes().map((n) => n && n.name).filter(Boolean);
-    // Limited-concurrency pool to avoid hammering the core (and any shared
-    // upstream server). User-configurable; clamp to a sane range.
-    const concurrency = Math.max(1, Math.min(32, parseInt(App.state.settings.testConcurrency, 10) || 8));
+    // Bounded pool avoids hammering the core and shared upstream endpoints.
+    const concurrency = Math.min(NODE_TEST_CONCURRENCY, Math.max(1, names.length));
     let idx = 0;
     let bestName = null;
     let bestDelay = Infinity;

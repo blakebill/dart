@@ -609,54 +609,32 @@ test('custom latency URL is used by both cores health-check groups', () => {
     .every((group) => group.url === defaultUrl));
 });
 
-test('Auto groups actively track lower HTTP RTT without a wide sticky margin', () => {
+test('Auto groups stay app-managed selectors for both cores', () => {
   const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
   const singbox = buildSingboxConfig([node]);
   const singboxAuto = singbox.outbounds.find((outbound) => outbound.tag === '♻️ Auto');
   assert.strictEqual(singboxAuto.type, 'selector');
   assert.deepStrictEqual(singboxAuto.outbounds, ['n']);
   assert.strictEqual(singboxAuto.default, 'n');
-  const headlessAuto = buildSingboxConfig([node], { enableClashApi: false })
-    .outbounds.find((outbound) => outbound.tag === '♻️ Auto');
-  assert.strictEqual(headlessAuto.type, 'urltest');
-  assert.strictEqual(headlessAuto.tolerance, 1);
-
   const mihomo = buildMihomoConfig([node]);
   const mihomoAuto = mihomo['proxy-groups'].find((group) => group.name === '♻️ Auto');
   assert.strictEqual(mihomoAuto.type, 'select');
   assert.deepStrictEqual(mihomoAuto.proxies, ['n']);
-  const mihomoHeadlessAuto = buildMihomoConfig([node], { enableClashApi: false })
-    ['proxy-groups'].find((group) => group.name === '♻️ Auto');
-  assert.strictEqual(mihomoHeadlessAuto.type, 'url-test');
-  assert.strictEqual(mihomoHeadlessAuto.interval, 60);
-  assert.strictEqual(mihomoHeadlessAuto.tolerance, 1);
-  assert.strictEqual(mihomoHeadlessAuto.lazy, true);
-  assert.strictEqual(mihomoHeadlessAuto.timeout, 5000);
-  assert.strictEqual(mihomoHeadlessAuto['max-failed-times'], 2);
 });
 
-test('Smart groups are app-managed selectors with a headless URL-test fallback', () => {
+test('Smart groups are app-managed selectors', () => {
   const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
   const singbox = buildSingboxConfig([node]);
   const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
   assert.strictEqual(singboxSmart.type, 'selector');
   assert.deepStrictEqual(singboxSmart.outbounds, ['n']);
-  const singboxHeadless = buildSingboxConfig([node], { enableClashApi: false })
-    .outbounds.find((outbound) => outbound.tag === '🧠 Smart');
-  assert.strictEqual(singboxHeadless.type, 'urltest');
-  assert.strictEqual(singboxHeadless.tolerance, 50);
-
   const mihomo = buildMihomoConfig([node]);
   const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
   assert.strictEqual(mihomoSmart.type, 'select');
   assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
-  const mihomoHeadless = buildMihomoConfig([node], { enableClashApi: false })
-    ['proxy-groups'].find((group) => group.name === '🧠 Smart');
-  assert.strictEqual(mihomoHeadless.type, 'url-test');
-  assert.strictEqual(mihomoHeadless.tolerance, 50);
 });
 
-test('kernel Smart is gated by Dart core version', () => {
+test('kernel Smart version fallback stays conservative for old Dart builds', () => {
   const { coreSupportsKernelSmart } = require('../src/main/converter');
   assert.strictEqual(coreSupportsKernelSmart('unknown', '1.13.14-dart.99'), false);
   assert.strictEqual(coreSupportsKernelSmart('sing-box', null), false);
@@ -671,18 +649,36 @@ test('kernel Smart is gated by Dart core version', () => {
   assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29-dart.4'), true);
 });
 
-test('kernel Smart emits type smart for both cores', () => {
+test('kernel Smart emits type and mode for both cores', () => {
   const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const singbox = buildSingboxConfig([node], { kernelSmart: true });
+  const singbox = buildSingboxConfig([node], {
+    kernelSmart: true, kernelSmartMode: true, smartMode: 'stable',
+  });
   const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
   assert.strictEqual(singboxSmart.type, 'smart');
+  assert.strictEqual(singboxSmart.mode, 'stable');
   assert.deepStrictEqual(singboxSmart.outbounds, ['n']);
   assert.strictEqual(singboxSmart.interrupt_exist_connections, false);
 
-  const mihomo = buildMihomoConfig([node], { kernelSmart: true });
+  const mihomo = buildMihomoConfig([node], {
+    kernelSmart: true, kernelSmartMode: true, smartMode: 'latency',
+  });
   const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
   assert.strictEqual(mihomoSmart.type, 'smart');
+  assert.strictEqual(mihomoSmart.mode, 'latency');
   assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
+});
+
+test('kernel Smart omits mode for older compatible Dart cores', () => {
+  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
+  const singbox = buildSingboxConfig([node], { kernelSmart: true, smartMode: 'stable' });
+  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
+  assert.strictEqual(singboxSmart.type, 'smart');
+  assert.strictEqual(singboxSmart.mode, undefined);
+  const mihomo = buildMihomoConfig([node], { kernelSmart: true, smartMode: 'stable' });
+  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
+  assert.strictEqual(mihomoSmart.type, 'smart');
+  assert.strictEqual(mihomoSmart.mode, undefined);
 });
 
 test('interface binding only in TUN mode (VPN/WireGuard coexistence)', () => {

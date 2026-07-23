@@ -237,16 +237,42 @@ function currentRuleSetForUpdate(id, sourceKey, token = null) {
   return latest;
 }
 
+const TLS_NODE_TYPES = new Set(['trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls', 'https']);
+
+function nodeMetaToken(value, maxLength = 64) {
+  if (typeof value !== 'string') return '';
+  return value.trim().slice(0, maxLength);
+}
+
 function nodeResult(node) {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
   const name = String(node.name || '').trim();
   if (!name) return null;
-  return {
+  const type = typeof node.type === 'string' ? node.type.toLowerCase() : '';
+  const security = node.reality
+    ? 'Reality'
+    : (node.tls || TLS_NODE_TYPES.has(type) || (node.pluginOpts && node.pluginOpts.tls))
+      ? 'TLS'
+      : '';
+  const result = {
     name,
-    type: typeof node.type === 'string' ? node.type : '',
-    server: typeof node.server === 'string' ? node.server : '',
-    port: Number.isInteger(node.port) ? node.port : null,
+    type,
+    security,
+    isNode: true,
   };
+  const cipher = nodeMetaToken(node.cipher);
+  if (type === 'ss' && cipher) {
+    result.cipher = cipher;
+    if (/^2022-/i.test(cipher)) result.variant = '2022';
+  }
+  if (type === 'vless' && /\bvision\b/i.test(nodeMetaToken(node.flow))) {
+    result.variant = 'vision';
+  }
+  const transport = nodeMetaToken(node.network, 16).toLowerCase();
+  if (transport && transport !== 'tcp') result.transport = transport;
+  const plugin = nodeMetaToken(node.plugin, 32).toLowerCase();
+  if (plugin) result.plugin = plugin;
+  return result;
 }
 
 /** Register every IPC handler. Called once during boot. */
@@ -667,8 +693,11 @@ function registerIpc() {
     }
     const wasRunning = state.singbox.isRunning();
     const settings = state.store.updateSettings(patch);
+    let themeResolved = null;
     if (Object.prototype.hasOwnProperty.call(patch, 'theme')) {
-      try { require('./window').applyNativeThemeSource(); } catch (_) { /* ignore */ }
+      try {
+        themeResolved = require('./window').applyNativeThemeSource();
+      } catch (_) { /* ignore */ }
     }
     if (coreTypeChanged) {
       try {
@@ -702,8 +731,22 @@ function registerIpc() {
         return rollbackSettingsAfterFailure(previous, wasRunning, error);
       }
     }
+    // When theme changes, tell the renderer the effective scheme after
+    // themeSource is updated (matchMedia alone is stale until that runs).
+    if (themeResolved) {
+      return { ...settings, themeEffective: themeResolved.effective };
+    }
     return settings;
   }));
+
+  // Resolve OS/app theme after applying nativeTheme.themeSource from store.
+  ipcMain.handle('theme:resolve', () => {
+    try {
+      return require('./window').applyNativeThemeSource();
+    } catch (_) {
+      return { preference: 'dark', dark: true, effective: 'dark' };
+    }
+  });
 
   // Show a desktop notification (renderer-triggered, already localized). Gated
   // by the `notifications` setting inside notify().
@@ -740,10 +783,23 @@ function registerIpc() {
   // Smart stability labels for node cards (probing/good/mid/bad/unavailable + ewma).
   ipcMain.handle('node:qualities', () => core.smartNodeQualities());
 
+  // Force-override pin for Auto/Smart managed selection (right-click on a node).
+  ipcMain.handle('node:getOverride', () => core.getManagedNodeOverrideInfo());
+  ipcMain.handle('node:setOverride', async (_e, { name }) => {
+    reqStr(name, 'name');
+    return core.setManagedNodeOverride(name);
+  });
+  ipcMain.handle('node:clearOverride', () => core.clearManagedNodeOverride());
+
   // Resolve the live outer selector plus the health-check groups. Outside the
   // Nodes tab only the active automatic group is queried, keeping polling tiny.
   ipcMain.handle('node:groupSelections', async (_e, { all = false } = {}) => {
-    if (!state.singbox.isRunning()) return { proxy: null, auto: null, smart: null, fallback: null };
+    const info = core.getManagedNodeOverrideInfo();
+    const override = info.override;
+    const overrideGroup = info.group;
+    if (!state.singbox.isRunning()) {
+      return { proxy: null, auto: null, smart: null, fallback: null, override, overrideGroup };
+    }
     const current = async (name) => {
       try {
         const group = await core.clashApi('GET', '/proxies/' + encodeURIComponent(name));
@@ -759,7 +815,7 @@ function registerIpc() {
       all || selected === '🧠 Smart' ? current('🧠 Smart') : null,
       all || selected === '🛟 Fallback' ? current('🛟 Fallback') : null,
     ]);
-    return { proxy, auto, smart, fallback };
+    return { proxy, auto, smart, fallback, override, overrideGroup };
   });
 
   // Select an outbound and persist it as the default for the next start.
@@ -1542,6 +1598,9 @@ function registerIpc() {
     const coreType = payload.coreType === undefined
       ? selectedCoreType
       : reqEnum(payload.coreType, ['sing-box', 'mihomo'], 'coreType');
+    const source = payload.source === undefined
+      ? 'custom'
+      : reqEnum(payload.source, ['custom', 'official'], 'source');
     const target = path.join(state.singbox.ensureCoreDir(coreType), state.singbox.binNameFor(coreType));
     let restartAfterInstall = false;
     let backup = null;
@@ -1556,6 +1615,7 @@ function registerIpc() {
         },
         {
           coreType,
+          source,
           proxyPort: core.currentProxyPort(),
           beforeInstall: async () => {
             if (state.singbox.getCoreType() !== selectedCoreType) {

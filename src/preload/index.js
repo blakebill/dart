@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld('api', {
 
   // Settings
   updateSettings: (patch) => ipcRenderer.invoke('settings:update', patch),
+  /** Apply store theme to nativeTheme and return { preference, dark, effective }. */
+  resolveTheme: () => ipcRenderer.invoke('theme:resolve'),
 
   // Desktop notification (renderer passes already-localized text)
   notify: (title, body) => ipcRenderer.invoke('app:notify', { title, body }),
@@ -63,6 +65,10 @@ contextBridge.exposeInMainWorld('api', {
   },
   applyAutoCandidate: (name) => ipcRenderer.invoke('node:autoCandidate', { name }),
   getNodeQualities: () => ipcRenderer.invoke('node:qualities'),
+  /** Force Auto/Smart to pin a node until cleared (right-click override). */
+  getNodeOverride: () => ipcRenderer.invoke('node:getOverride'),
+  setNodeOverride: (name) => ipcRenderer.invoke('node:setOverride', { name }),
+  clearNodeOverride: () => ipcRenderer.invoke('node:clearOverride'),
 
   // Node selection (+ current picks for the automatic groups)
   selectNode: (name) => ipcRenderer.invoke('node:select', { name }),

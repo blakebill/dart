@@ -23,18 +23,23 @@
     dns: 'dialog/toolbox.js',
   });
 
-  function applyTheme(preference) {
+  function applyTheme(preference, forcedEffective) {
     let theme = preference;
-    if (theme === 'system') {
+    if (forcedEffective === 'light' || forcedEffective === 'dark') {
+      theme = forcedEffective;
+    } else if (theme === 'system') {
       try {
         theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       } catch (_) {
-        theme = 'dark';
+        theme = 'light';
       }
     }
-    theme = theme === 'light' ? 'light' : 'dark';
+    theme = theme === 'dark' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', theme);
-    try { localStorage.setItem('theme', theme); } catch (_) {}
+    try {
+      localStorage.setItem('themePref', ['dark', 'light', 'system'].includes(preference) ? preference : 'system');
+      localStorage.setItem('theme', theme);
+    } catch (_) {}
   }
 
   $('#dialogCloseTop').addEventListener('click', Dialog.close);
@@ -66,7 +71,7 @@
     if (!module) throw new Error('Unsupported dialog');
     initialization = (async () => {
       setLang(context.language === 'en' ? 'en' : 'zh');
-      applyTheme(context.theme || 'dark');
+      applyTheme(context.theme || 'system', context.themeEffective);
       applyI18n();
       document.documentElement.lang = context.language === 'en' ? 'en' : 'zh-CN';
       document.title = t('appName');

@@ -8,27 +8,63 @@
   const VIRTUAL_CONNECTION_ROW_HEIGHT = 62;
   const VIRTUAL_OVERSCAN = 7;
   let connectionItems = [];
+  const CONNECTION_LABELS = Object.freeze({
+    direct: 'Direct',
+    proxy: 'Proxy',
+    reject: 'Reject',
+    'reject-drop': 'Reject Drop',
+    block: 'Block',
+    global: 'Global',
+    match: 'Match',
+    pass: 'Pass',
+  });
 
-  let connectionsLoading = false;
+  function connectionLabel(value) {
+    const text = String(value || '');
+    return CONNECTION_LABELS[text.toLowerCase()] || text;
+  }
+
+  let connectionsRequest = null;
+  let connectionsGeneration = 0;
   async function loadConnections() {
-    if (connectionsLoading) return;
-    connectionsLoading = true;
-    try {
-      const data = await api.getConnections();
-      if (App.currentTab === 'conns' && !document.hidden) renderConnections(data);
-      return data;
-    } catch (e) {
-      /* ignore */
-      return null;
-    } finally {
-      connectionsLoading = false;
+    const generation = connectionsGeneration;
+    if (connectionsRequest && connectionsRequest.generation === generation) {
+      return connectionsRequest.promise;
     }
+    const token = {};
+    const promise = (async () => {
+      try {
+        const data = await api.getConnections();
+        if (generation !== connectionsGeneration) return data;
+        if (App.currentTab !== 'conns' || document.hidden) return data;
+        // Let the tab chrome paint before building the virtual list.
+        await new Promise((resolve) => {
+          if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => resolve());
+          else setTimeout(resolve, 0);
+        });
+        if (
+          generation === connectionsGeneration &&
+          App.currentTab === 'conns' &&
+          !document.hidden
+        ) renderConnections(data);
+        return data;
+      } catch (e) {
+        /* ignore */
+        return null;
+      } finally {
+        if (connectionsRequest && connectionsRequest.token === token) connectionsRequest = null;
+      }
+    })();
+    connectionsRequest = { token, generation, promise };
+    return promise;
   }
   function connRowInner(c) {
     const m = c.metadata || {};
     const host = m.host || m.destinationIP || '';
     const target = host + (m.destinationPort ? ':' + m.destinationPort : '');
-    const chains = Array.isArray(c.chains) ? c.chains.slice().reverse().join(' → ') : '';
+    const chains = Array.isArray(c.chains)
+      ? c.chains.slice().reverse().map(connectionLabel).join(' → ')
+      : '';
     const net = (m.network || '').toUpperCase();
     const netCls = net === 'TCP' ? ' tcp' : net === 'UDP' ? ' udp' : '';
     const netHtml = net ? `<span class="conn-net${netCls}">${escapeHtml(net)}</span>` : '';
@@ -38,7 +74,7 @@
     return (
       `<div class="conn-main">` +
       `<span class="conn-host">${escapeHtml(target)}</span>` +
-      `<span class="conn-sub">${netHtml}<span class="sub-meta">${escapeHtml(c.rule || '')}</span></span></div>` +
+      `<span class="conn-sub">${netHtml}<span class="sub-meta">${escapeHtml(connectionLabel(c.rule))}</span></span></div>` +
       `<div class="conn-right"><span class="conn-chains">${escapeHtml(chains)}</span>` +
       `<span class="sub-meta conn-traffic">↑ ${fmtBytes(c.upload || 0)} ↓ ${fmtBytes(c.download || 0)}</span></div>${closeHtml}`
     );
@@ -81,6 +117,7 @@
   }
 
   function clearConnections() {
+    connectionsGeneration++;
     connectionItems = [];
     const list = $('#connList');
     list.classList.remove('is-empty');

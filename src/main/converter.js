@@ -11,9 +11,13 @@ const SMART_GROUP = '🧠 Smart';
 const FALLBACK_GROUP = '🛟 Fallback';
 const APP_PROXY_GROUP = '🚀 Proxy';
 const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
-const AUTO_TEST_TOLERANCE_MS = 1;
 const AUTO_TEST_INTERVAL_SECONDS = 60;
 const AUTO_TEST_TIMEOUT_MS = 5000;
+const SMART_MODES = new Set(['balanced', 'latency', 'stable']);
+
+function normalizeSmartMode(value) {
+  return SMART_MODES.has(value) ? value : 'balanced';
+}
 
 const APP_SELECTOR_ANCHORS = [APP_PROXY_GROUP, AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP];
 
@@ -178,8 +182,9 @@ function sourceGroupPickOptions(nodes = [], groups = []) {
 }
 
 /**
- * Whether the installed Dart core binary includes in-kernel Smart groups.
- * Stock upstream builds never do. Dart forks report versions like
+ * Conservative version fallback for callers that cannot execute the core.
+ * Runtime config generation probes a minimal type:smart config instead.
+ * Stock upstream builds never do. Older Dart forks report versions like
  * `1.13.14-dart.3` / `1.19.29-dart.4`.
  *
  * First builds that shipped kernel Smart:
@@ -201,41 +206,32 @@ function coreSupportsKernelSmart(coreType, version) {
 function buildSingboxSmartGroup(nodeTags, opts = {}) {
   const {
     kernelSmart = false,
-    enableClashApi = true,
-    latencyUrl = DEFAULT_TEST_URL,
+    kernelSmartMode = false,
+    smartMode = 'balanced',
   } = opts;
   if (kernelSmart) {
-    return {
+    const group = {
       type: 'smart',
       tag: SMART_GROUP,
       outbounds: nodeTags,
       interrupt_exist_connections: false,
     };
+    if (kernelSmartMode) group.mode = normalizeSmartMode(smartMode);
+    return group;
   }
-  if (enableClashApi) {
-    return { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] };
-  }
-  return {
-    type: 'urltest',
-    tag: SMART_GROUP,
-    outbounds: nodeTags,
-    url: latencyUrl,
-    interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
-    tolerance: 50,
-    idle_timeout: '30m',
-    interrupt_exist_connections: false,
-  };
+  return { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] };
 }
 
 /** Build the 🧠 Smart proxy-group for mihomo (kernel smart or app-managed fallback). */
 function buildMihomoSmartGroup(proxyNames, opts = {}) {
   const {
     kernelSmart = false,
-    enableClashApi = true,
+    kernelSmartMode = false,
     latencyUrl = DEFAULT_TEST_URL,
+    smartMode = 'balanced',
   } = opts;
   if (kernelSmart) {
-    return {
+    const group = {
       name: SMART_GROUP,
       type: 'smart',
       proxies: proxyNames,
@@ -244,21 +240,10 @@ function buildMihomoSmartGroup(proxyNames, opts = {}) {
       timeout: AUTO_TEST_TIMEOUT_MS,
       lazy: true,
     };
+    if (kernelSmartMode) group.mode = normalizeSmartMode(smartMode);
+    return group;
   }
-  if (enableClashApi) {
-    return { name: SMART_GROUP, type: 'select', proxies: proxyNames };
-  }
-  return {
-    name: SMART_GROUP,
-    type: 'url-test',
-    proxies: proxyNames,
-    url: latencyUrl,
-    interval: AUTO_TEST_INTERVAL_SECONDS,
-    tolerance: 50,
-    timeout: AUTO_TEST_TIMEOUT_MS,
-    'max-failed-times': 2,
-    lazy: true,
-  };
+  return { name: SMART_GROUP, type: 'select', proxies: proxyNames };
 }
 
 /**
@@ -1309,7 +1294,6 @@ function buildRoute(opts = {}) {
  * @param {object}   opts   options
  *   - mixedPort: mixed inbound port (default 7890)
  *   - enableTun: whether to enable TUN (default false)
- *   - enableClashApi: whether to enable Clash API (default true, port 9090)
  *   - logLevel: log level (default info)
  *   - finalOutbound: fallback outbound tag (default node selector)
  * @returns {object} sing-box config
@@ -1318,7 +1302,6 @@ function buildSingboxConfig(nodes, opts = {}) {
   const {
     mixedPort = 7890,
     enableTun = false,
-    enableClashApi = true,
     clashApiPort = 9090,
     clashApiSecret = '', // when set, the Clash API requires Authorization
     externalUiDir = '', // serve a local dashboard at /ui when set
@@ -1374,26 +1357,13 @@ function buildSingboxConfig(nodes, opts = {}) {
     outbounds: proxyMembers,
     default: defaultOutbound,
   };
-  // Sing-Box's Clash API updates per-node delay history without asking a
-  // URLTest group to re-elect. With the API enabled, Dart owns this selector
-  // and applies the winner after user/background sweeps. Keep the native group
-  // as a no-API fallback so Auto still works in headless configurations.
-  const autoGroup = enableClashApi
-    ? { type: 'selector', tag: AUTO_GROUP, outbounds: nodeTags, default: nodeTags[0] }
-    : {
-        type: 'urltest',
-        tag: AUTO_GROUP,
-        outbounds: nodeTags,
-        url: latencyUrl,
-        interval: `${AUTO_TEST_INTERVAL_SECONDS}s`,
-        tolerance: AUTO_TEST_TOLERANCE_MS,
-        idle_timeout: '30m',
-        interrupt_exist_connections: false,
-      };
+  // Dart owns Auto selection and applies its measured winner through the
+  // always-on local Clash API.
+  const autoGroup = { type: 'selector', tag: AUTO_GROUP, outbounds: nodeTags, default: nodeTags[0] };
   const smartGroup = buildSingboxSmartGroup(nodeTags, {
     kernelSmart: !!opts.kernelSmart,
-    enableClashApi,
-    latencyUrl,
+    kernelSmartMode: !!opts.kernelSmartMode,
+    smartMode: opts.smartMode,
   });
   const fallbackGroup = {
     type: 'urltest',
@@ -1497,27 +1467,25 @@ function buildSingboxConfig(nodes, opts = {}) {
   // routing table into the WG tunnel — i.e. proxy-over-WG chaining just works.
   if (enableTun) config.route.auto_detect_interface = true;
 
-  if (enableClashApi) {
-    config.experimental = {
-      clash_api: {
-        external_controller: `127.0.0.1:${clashApiPort}`,
-        default_mode: clashMode || 'rule',
-        ...(clashApiSecret ? { secret: clashApiSecret } : {}),
-        // Local panel hosting: the core serves the dashboard at /ui (same
-        // origin as the API) and downloads it through its own proxy outbound.
-        ...(externalUiDir
-          ? {
-              external_ui: externalUiDir,
-              ...(externalUiDownloadUrl ? { external_ui_download_url: externalUiDownloadUrl } : {}),
-              external_ui_download_detour: '🚀 Proxy',
-            }
-          : {}),
-      },
-      cache_file: {
-        enabled: true,
-      },
-    };
-  }
+  config.experimental = {
+    clash_api: {
+      external_controller: `127.0.0.1:${clashApiPort}`,
+      default_mode: clashMode || 'rule',
+      ...(clashApiSecret ? { secret: clashApiSecret } : {}),
+      // Local panel hosting: the core serves the dashboard at /ui (same
+      // origin as the API) and downloads it through its own proxy outbound.
+      ...(externalUiDir
+        ? {
+            external_ui: externalUiDir,
+            ...(externalUiDownloadUrl ? { external_ui_download_url: externalUiDownloadUrl } : {}),
+            external_ui_download_detour: '🚀 Proxy',
+          }
+        : {}),
+    },
+    cache_file: {
+      enabled: true,
+    },
+  };
 
   return config;
 }
@@ -1622,7 +1590,6 @@ function normalizeMihomoRuleProviders(ruleProviders) {
 function buildMihomoConfig(nodes, opts = {}) {
   const {
     mixedPort = 7890,
-    enableClashApi = true,
     clashApiPort = 9090,
     clashApiSecret = '',
     logLevel = 'info',
@@ -1677,23 +1644,12 @@ function buildMihomoConfig(nodes, opts = {}) {
   addManual(defaultProxy);
   for (const name of proxyMembers) addManual(name);
 
-  const autoGroup = enableClashApi
-    ? { name: AUTO_GROUP, type: 'select', proxies: proxyNames }
-    : {
-        name: AUTO_GROUP,
-        type: 'url-test',
-        proxies: proxyNames,
-        url: latencyUrl,
-        interval: AUTO_TEST_INTERVAL_SECONDS,
-        tolerance: AUTO_TEST_TOLERANCE_MS,
-        timeout: AUTO_TEST_TIMEOUT_MS,
-        'max-failed-times': 2,
-        lazy: true,
-      };
+  const autoGroup = { name: AUTO_GROUP, type: 'select', proxies: proxyNames };
   const smartGroup = buildMihomoSmartGroup(proxyNames, {
     kernelSmart: !!opts.kernelSmart,
-    enableClashApi,
+    kernelSmartMode: !!opts.kernelSmartMode,
     latencyUrl,
+    smartMode: opts.smartMode,
   });
 
   const rules = [];
@@ -1794,13 +1750,11 @@ function buildMihomoConfig(nodes, opts = {}) {
       'dns-hijack': ['any:53', 'tcp://any:53'],
     };
   }
-  if (enableClashApi) {
-    config['external-controller'] = `127.0.0.1:${clashApiPort}`;
-    if (clashApiSecret) config.secret = clashApiSecret;
-    if (externalUiDir) {
-      config['external-ui'] = externalUiDir;
-      if (externalUiDownloadUrl) config['external-ui-url'] = externalUiDownloadUrl;
-    }
+  config['external-controller'] = `127.0.0.1:${clashApiPort}`;
+  if (clashApiSecret) config.secret = clashApiSecret;
+  if (externalUiDir) {
+    config['external-ui'] = externalUiDir;
+    if (externalUiDownloadUrl) config['external-ui-url'] = externalUiDownloadUrl;
   }
   if (availableRuleProviders.size) config['rule-providers'] = mihomoRuleProviders;
   return config;

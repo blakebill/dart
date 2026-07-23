@@ -36,15 +36,26 @@ function scheduleDeepSleep(win) {
 function resolveBackground() {
   // Windows Mica needs a fully transparent window background.
   if (isWin) return '#00000000';
-  const theme = (state.store && state.store.getSettings().theme) || 'dark';
+  const theme = (state.store && state.store.getSettings().theme) || 'system';
   const dark = theme === 'system' ? nativeTheme.shouldUseDarkColors : theme !== 'light';
   return dark ? '#202020' : '#ffffff';
 }
 
-/** Sync DWM/Chromium dark mode so Mica tint matches the app theme. */
+/**
+ * Sync Chromium/DWM color scheme with the app theme preference.
+ * Returns the effective scheme Electron will report to matchMedia / CSS:
+ * must run BEFORE the renderer resolves 'system', otherwise matchMedia still
+ * reflects the previous forced light/dark themeSource.
+ */
 function applyNativeThemeSource() {
-  const theme = (state.store && state.store.getSettings().theme) || 'dark';
+  const theme = (state.store && state.store.getSettings().theme) || 'system';
   nativeTheme.themeSource = theme === 'light' || theme === 'system' ? theme : 'dark';
+  return {
+    preference: theme === 'light' || theme === 'system' ? theme : 'dark',
+    dark: theme === 'light' ? false : theme === 'dark' ? true : !!nativeTheme.shouldUseDarkColors,
+    effective: theme === 'light' ? 'light' : theme === 'dark' ? 'dark'
+      : (nativeTheme.shouldUseDarkColors ? 'dark' : 'light'),
+  };
 }
 
 function applyMica(win) {
@@ -117,6 +128,16 @@ function createWindow(startHidden = false) {
   // The traffic stream runs for as long as the core is up (so the tray tooltip
   // stays live while hidden), so the window doesn't start/stop it on show/hide.
 
+  // Windows may paint the taskbar button orange/yellow ("attention") when focus
+  // is refused or a notification arrives. This app never calls flashFrame(true);
+  // still clear any OS/Chromium residual so switching away does not leave a
+  // stuck yellow flash on the taskbar.
+  const clearTaskbarAttention = () => {
+    try { mainWindow.flashFrame(false); } catch (_) { /* ignore */ }
+  };
+  mainWindow.on('focus', clearTaskbarAttention);
+  mainWindow.on('blur', clearTaskbarAttention);
+
   // Frame-rate gating: a hidden tray-only window paints nothing useful, so cap
   // the renderer to 1 fps while hidden and restore the default on show. This is
   // belt-and-suspenders on top of backgroundThrottling — Chromium already idles
@@ -130,6 +151,7 @@ function createWindow(startHidden = false) {
     clearDeepSleepTimer();
     try { mainWindow.webContents.setFrameRate(60); } catch (_) { /* ignore */ }
     applyMica(mainWindow);
+    clearTaskbarAttention();
   });
   mainWindow.on('closed', () => {
     if (state.mainWindow === mainWindow) {

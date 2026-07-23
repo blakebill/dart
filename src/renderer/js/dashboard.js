@@ -292,19 +292,32 @@
     }).catch(() => {});
   });
 
-  const THEME_ORDER = ['dark', 'light', 'system'];
+  const THEME_ORDER = ['system', 'light', 'dark'];
   function renderThemeLabel() {
     const span = $('#themeLabel');
-    if (span) span.textContent = t('theme.' + (App.themePref || 'dark'));
+    if (span) span.textContent = t('theme.' + (App.themePref || 'system'));
   }
   $('#themeBtn').addEventListener('click', async () => {
-    const cur = App.themePref || App.state.settings.theme || 'dark';
+    const cur = App.themePref || App.state.settings.theme || 'system';
     const next = THEME_ORDER[(THEME_ORDER.indexOf(cur) + 1) % THEME_ORDER.length];
-    App.applyTheme(next);
+    App.themePref = next;
+    if (App.renderThemeLabel) App.renderThemeLabel();
     App.patchSettings({ theme: next });
-    if (!api || !api.updateSettings) return;
+    if (!api || !api.updateSettings) {
+      App.applyTheme(next);
+      return;
+    }
     try {
-      App.commitSettings(await call(api.updateSettings, { theme: next }));
+      // Persist first so main can set nativeTheme.themeSource before we resolve
+      // 'system' — otherwise matchMedia still reports the previous forced scheme.
+      const result = await call(api.updateSettings, { theme: next });
+      const effective = result && result.themeEffective;
+      const settings = result && typeof result === 'object' ? { ...result } : result;
+      if (settings && Object.prototype.hasOwnProperty.call(settings, 'themeEffective')) {
+        delete settings.themeEffective;
+      }
+      App.commitSettings(settings);
+      App.applyTheme(next, effective);
     } catch (_) {
       App.applyTheme(cur);
       App.patchSettings({ theme: cur });

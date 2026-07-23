@@ -63,11 +63,13 @@
     return escapeHtml(line) + '\n';
   }
   const LOG_LIMIT = 120000;
-  const LOG_FLUSH_LINES = 240;
+  const LOG_FLUSH_LINES = 100;
+  const LOG_FLUSH_LINES_HEAVY = 48;
   let logBuf = [];
   let logBufStart = 0;
   let logBufLen = 0;
   let logFlushTimer = null;
+  let logFlushRaf = 0;
   let logLen = 0; // total kept text length across chunks
   let lastLogSequence = 0;
   let historyLoaded = !(api && api.getRecentLogs);
@@ -75,14 +77,29 @@
   let clearGeneration = 0;
 
   function scheduleLogFlush(delay = 200) {
-    if (logFlushTimer || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    if (logFlushTimer || logFlushRaf || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    const pending = logBuf.length - logBufStart;
+    // Large backlog: yield to the browser paint loop instead of tight timers.
+    if (delay <= 0 && pending > LOG_FLUSH_LINES && typeof requestAnimationFrame === 'function') {
+      logFlushRaf = requestAnimationFrame(() => {
+        logFlushRaf = 0;
+        flushLogs();
+      });
+      return;
+    }
     logFlushTimer = setTimeout(flushLogs, delay);
   }
 
   function flushLogs() {
     logFlushTimer = null;
+    if (logFlushRaf) {
+      cancelAnimationFrame(logFlushRaf);
+      logFlushRaf = 0;
+    }
     if (document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
-    const end = Math.min(logBuf.length, logBufStart + LOG_FLUSH_LINES);
+    const pending = logBuf.length - logBufStart;
+    const chunkSize = pending > 400 ? LOG_FLUSH_LINES_HEAVY : LOG_FLUSH_LINES;
+    const end = Math.min(logBuf.length, logBufStart + chunkSize);
     let html = '';
     let len = 0;
     for (let index = logBufStart; index < end; index++) {
@@ -115,7 +132,7 @@
     // During history backfill, reading scrollHeight after every chunk forces a
     // full synchronous layout. Scroll once after the final chunk instead.
     if (drained && $('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
-    scheduleLogFlush(16);
+    if (!drained) scheduleLogFlush(pending > 200 ? 0 : 16);
   }
 
   function enqueueLog(value) {
@@ -161,6 +178,10 @@
     if (api.clearRecentLogs) api.clearRecentLogs().catch(() => {});
     clearTimeout(logFlushTimer);
     logFlushTimer = null;
+    if (logFlushRaf) {
+      cancelAnimationFrame(logFlushRaf);
+      logFlushRaf = 0;
+    }
     logBuf = [];
     logBufStart = 0;
     logBufLen = 0;

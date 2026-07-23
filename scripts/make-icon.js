@@ -5,7 +5,7 @@
  * a full-bleed graphite canvas with a simplified cyan route/dart mark).
  *
  *   - build/icon.ico  — app/installer icon, multi-size (16/32/48/256), with a
- *                       Windows-friendly transparent rounded mask applied to
+ *                       Windows-friendly transparent circular mask applied to
  *                       the platform-neutral square source.
  *   - build/icon.png  — 256px PNG of the same (gitignored; a convenience copy).
  *   - src/main/assets/tray-stopped.png — 32px app icon for the stopped state.
@@ -36,8 +36,8 @@ const TRAY_DIR = path.join(__dirname, '..', 'src', 'main', 'assets');
 const ICO_SIZES = [16, 32, 48, 256];
 const TRAY_SIZE = 32;
 const WORK = 1024; // working resolution for the app icon
-const MARGIN = 16; // rounded-mask inset (WORK space)
-const RADIUS = 232; // rounded-mask corner radius (WORK space)
+const MARGIN = 20; // circular-mask inset (WORK space)
+const OPTICAL_OFFSET_X = 24; // compensate for the subject's heavier curved right side
 const TRAY_ONLY = process.argv.includes('--tray-only');
 
 /** Wrap PNG buffers into a multi-image ICO container (PNG-in-ICO, Vista+). */
@@ -80,18 +80,24 @@ function readIcoPng(file, wantedSize = 256) {
 
 /**
  * The app icon uses the opaque, full-bleed source as-is with a small saturation
- * nudge. The rounded alpha mask is applied only to the Windows ICO output, so
+ * nudge. The circular alpha mask is applied only to generated app/tray assets, so
  * the source stays reusable on platforms that provide their own icon mask.
  * Returns a WORK-sized RGBA PNG buffer.
  */
 async function appIcon() {
   const mask = Buffer.from(
-    `<svg width="${WORK}" height="${WORK}"><rect x="${MARGIN}" y="${MARGIN}" ` +
-      `width="${WORK - 2 * MARGIN}" height="${WORK - 2 * MARGIN}" ` +
-      `rx="${RADIUS}" ry="${RADIUS}" fill="#fff"/></svg>`
+    `<svg width="${WORK}" height="${WORK}"><circle cx="${WORK / 2}" cy="${WORK / 2}" ` +
+      `r="${WORK / 2 - MARGIN}" fill="#fff"/></svg>`
   );
   return sharp(SRC)
     .resize(WORK, WORK)
+    .affine(
+      [
+        [1, 0],
+        [0, 1]
+      ],
+      { idx: OPTICAL_OFFSET_X, idy: 0, background: '#20252d' }
+    )
     .modulate({ saturation: 1.06 })
     .composite([{ input: mask, blend: 'dest-in' }])
     .png()

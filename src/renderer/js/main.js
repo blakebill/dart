@@ -464,6 +464,7 @@
     // Cheap status chrome always tracks runtime truth; heavier panels only repaint
     // when their backing snapshot actually changed (or language rebuilt the UI).
     if (statusChanged || languageChanged) App.renderStatus();
+    else if (subsChanged && App.renderDashboard) App.renderDashboard();
     if ((subsChanged || languageChanged) && App.renderSubs) App.renderSubs();
     if (App.currentTab === 'nodes' && App.loadNodes && (activeChanged || languageChanged || selectedChanged)) {
       App.loadNodes();

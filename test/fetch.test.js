@@ -249,6 +249,36 @@ async function main() {
         const ua = options.headers['User-Agent'];
         requestedAgents.push(ua);
         const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
+        return { body: Buffer.from(ua === 'mihomo/1.18.10' ? encodedLinks : clashConfig), headers: {} };
+      };
+      const autoMihomo = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'mihomo' }
+      );
+      assert.strictEqual(autoMihomo.format, 'clash');
+      assert.deepStrictEqual(requestedAgents, ['mihomo/1.18.10', 'clash-verge/v2.0.2']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        const ua = options.headers['User-Agent'];
+        requestedAgents.push(ua);
+        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
+        return { body: Buffer.from(ua.startsWith('sing-box/') ? encodedLinks : clashConfig), headers: {} };
+      };
+      const autoSingboxFallback = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'sing-box' }
+      );
+      assert.strictEqual(autoSingboxFallback.format, 'clash');
+      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0', 'mihomo/1.18.10']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        const ua = options.headers['User-Agent'];
+        requestedAgents.push(ua);
+        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
         return { body: Buffer.from(ua.startsWith('clash-verge/') ? encodedLinks : clashConfig), headers: {} };
       };
       const forcedClash = await subscription.fetchSubscription(
@@ -284,6 +314,20 @@ async function main() {
       );
       assert.strictEqual(unavailable.nodes.length, 0);
       assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
+
+      requestedAgents.length = 0;
+      fetch.getBufferWithFallback = async (_url, options) => {
+        requestedAgents.push(options.headers['User-Agent']);
+        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
+        return { body: Buffer.from(encodedLinks), headers: {} };
+      };
+      const linksOnly = await subscription.fetchSubscription(
+        'https://example.invalid/sub',
+        () => {},
+        { coreType: 'mihomo' }
+      );
+      assert.strictEqual(linksOnly.format, 'links');
+      assert.strictEqual(linksOnly.nodes.length, 1);
     } finally {
       fetch.getBufferWithFallback = originalGetBufferWithFallback;
     }

@@ -12,6 +12,7 @@ class ManagedAutoSelection {
     this.cursor = 0;
     this.revision = 0;
     this.active = false;
+    this.preferred = null;
     this.selectorTail = Promise.resolve();
     this.outerSelectorTail = Promise.resolve();
   }
@@ -50,7 +51,10 @@ class ManagedAutoSelection {
         'PUT',
         '/proxies/' + encodeURIComponent(this.options.autoGroup),
         { name }
-      ).then(() => name);
+      ).then(() => {
+        this.preferred = name;
+        return name;
+      });
     };
     const operation = this.selectorTail.then(apply, apply);
     this.selectorTail = operation.catch(() => {});
@@ -115,7 +119,7 @@ class ManagedAutoSelection {
         try {
           const result = await this.options.testDelay(name, { force, refine, generation });
           measurements[index] = result && typeof result === 'object'
-            ? { name, delay: result.delay, fresh: result.fresh !== false }
+            ? { ...result, name, delay: result.delay, fresh: result.fresh !== false }
             : { name, delay: result, fresh: true };
         } catch (error) {
           measurements[index] = { name, delay: null, fresh: !(error && error.fresh === false) };
@@ -154,7 +158,7 @@ class ManagedAutoSelection {
       // Classic Auto: lowest delay among this batch's successful probes.
       let bestDelay = Infinity;
       for (const measurement of completeMeasurements) {
-        if (Number.isFinite(measurement.delay) && measurement.delay >= 0 && measurement.delay < bestDelay) {
+        if (Number.isFinite(measurement.delay) && measurement.delay > 0 && measurement.delay < bestDelay) {
           bestDelay = measurement.delay;
           bestName = measurement.name;
         }
@@ -173,7 +177,8 @@ class ManagedAutoSelection {
     // Push preferred member whenever it differs from Clash "now" so UI badges
     // and actual group selection stay aligned (including Dart type:smart).
     // Kernel Smart may still failover per-dial; preferred "now" is GUI's call.
-    if (bestName !== (group && group.now)) {
+    const appliedName = this.options.authoritativePreferred ? this.preferred : (group && group.now);
+    if (bestName !== appliedName) {
       applied = await this.queueCandidate(bestName, revision);
     }
     // Force two-phase: after a quick pick, keep probing the rest in the background.
@@ -188,6 +193,10 @@ class ManagedAutoSelection {
 
   isScheduled() {
     return !!this.timer || !!(this.run);
+  }
+
+  getPreferred() {
+    return this.preferred;
   }
 
   scheduleNext(delayMs) {
@@ -215,6 +224,7 @@ class ManagedAutoSelection {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.run = null;
+    this.preferred = null;
   }
 
   start({ active = this.active, initialDelayMs = 250 } = {}) {

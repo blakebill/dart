@@ -24,7 +24,15 @@ const { normalizePolicyGroups } = require('./policy-groups');
 const { geoDataUrls } = require('./singbox');
 const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { ManagedAutoSelection } = require('./managed-auto-selection');
-const { SmartSelectionModel, ConnectionFeedbackTracker, hostnameFromUrl } = require('./smart-selection');
+const {
+  CALIBRATION_OPTION_KEYS,
+  SmartSelectionModel,
+  ConnectionFeedbackTracker,
+  hostnameFromUrl,
+} = require('./smart-selection');
+const { SmartProbeSignalWeights, buildSmartProbeFamilies } = require('./smart-probe-signals');
+const { SmartShadowEvaluator } = require('./smart-shadow-evaluator');
+const { KernelDialFeedback } = require('./kernel-dial-feedback');
 const { OperationCoordinator } = require('./operation-coordinator');
 const { createAutoLaunchService } = require('./auto-launch');
 const crypto = require('crypto');
@@ -33,8 +41,9 @@ const proxy = require('./proxy');
 const fetch = require('./fetch');
 const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
 const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('./delay');
+const { smartRegionMembers } = require('./node-region');
 const os = require('os');
-const { uniqueSibling, replaceFileSync } = require('./file-utils');
+const { uniqueSibling, replaceFileSync, writeJsonAtomicSync } = require('./file-utils');
 
 /**
  * Core control: everything that drives the selected proxy core — building the
@@ -58,6 +67,9 @@ const SMART_INTERVAL_NORMAL_MS = 60_000;
 const SMART_INTERVAL_RELAXED_MS = 150_000;
 const SMART_INTERVAL_OVERRIDE_MS = 90_000;
 const SMART_FEEDBACK_INTERVAL_MS = 3_000;
+const SMART_SHADOW_PERSIST_DELAY_MS = 60_000;
+const SMART_SHADOW_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const SMART_SHADOW_HISTORY_FILE = 'smart-shadow-history.json';
 // Secondary latency URL for Smart dual-probe (A4) — same 204 style as gstatic.
 const SMART_SECONDARY_TEST_URL = 'http://cp.cloudflare.com/generate_204';
 const OVERRIDE_FAIL_CLEAR_STREAK = 2;
@@ -787,6 +799,7 @@ function buildCurrentConfig(coreType = null, options = {}) {
     dnsStrategy: settings.dnsStrategy,
     testUrl: settings.testUrl,
     smartMode: settings.smartMode,
+    smartRegions: settings.smartRegions,
     extraRules,
     extraRuleSets,
     kernelSmart,
@@ -967,6 +980,7 @@ async function startCoreNow() {
   }
   assertLifecycleOpen();
   await state.singbox.start(config);
+  kernelDialFeedback.reset();
   tunWasActive = !!settings.enableTun;
   if (tunWasActive) {
     tunAdaptersClean = false;
@@ -1233,12 +1247,13 @@ async function stopCoreNow(remember, { preserveSystemProxyIntent = false } = {})
   stopManagedAutoSelection();
   stopTrafficStream();
   stopProxyGuard();
-  const hadOwnedProxy = state.systemProxyOn || !!persistedSystemProxyOwnership();
+  const persistedOwnedProxy = persistedSystemProxyOwnership();
+  const hadOwnedProxy = state.systemProxyOn || !!persistedOwnedProxy;
   // Restarts must re-assert a manually enabled system proxy; explicit Stop must
   // not leave a resume intent that would surprise the user on the next Start.
   pendingSystemProxyResume = !!(preserveSystemProxyIntent && hadOwnedProxy);
-  if (state.systemProxyOn) {
-    const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
+  if (state.systemProxyOn || persistedOwnedProxy) {
+    const ownedServer = state.systemProxyServer || persistedOwnedProxy;
     let released = true;
     try {
       if (ownedServer) await disableOwnedSystemProxy(ownedServer);
@@ -1259,6 +1274,7 @@ async function stopCoreNow(remember, { preserveSystemProxyIntent = false } = {})
   }
   try {
     await state.singbox.stop();
+    kernelDialFeedback.reset();
     if (tunWasActive) tunAdaptersClean = await cleanupTunAdapters(sendLog);
     tunWasActive = false;
     if (remember) persistLastRunning(false);
@@ -1382,6 +1398,7 @@ function setSystemProxyEnabled(enable) {
 async function cleanup() {
   operations.close();
   stopManagedAutoSelection();
+  flushSmartShadowHistory();
   if (typeof state.cancelPendingUpdates === 'function') {
     await state.cancelPendingUpdates();
   }
@@ -1465,7 +1482,9 @@ function writeDelayResultCache(key, delay) {
       if (--drop <= 0) break;
     }
   }
-  const ok = Number.isFinite(delay);
+  // Clash-compatible cores may encode a timeout as delay: 0. A measured RTT
+  // is always positive, so never cache zero as a successful/fast result.
+  const ok = Number.isFinite(delay) && delay > 0;
   delayResultCache.set(key, {
     delay: ok ? Number(delay) : null,
     expires: Date.now() + (ok ? DELAY_RESULT_TTL_MS : DELAY_FAILURE_TTL_MS),
@@ -1481,9 +1500,22 @@ function networkFingerprint() {
     const nics = os.networkInterfaces() || {};
     const parts = [];
     for (const [name, addrs] of Object.entries(nics)) {
-      for (const addr of addrs || []) {
-        if (!addr || addr.internal) continue;
-        parts.push(`${name}|${addr.family}|${addr.address}`);
+      // App-owned tunnel adapters appear after the core starts and must not
+      // masquerade as a physical network change.
+      if (/(^|[\s_-])(dart|tun\d*|meta|sing-tun|wintun)([\s_-]|$)/i.test(name)) continue;
+      const usable = (addrs || []).filter((addr) => {
+        if (!addr || addr.internal) return false;
+        const address = String(addr.address || '').toLowerCase();
+        if (!address || address.startsWith('169.254.') || address.startsWith('fe80:')) return false;
+        return true;
+      });
+      const hasIpv4 = usable.some((addr) => String(addr.family).toLowerCase() === 'ipv4' || addr.family === 4);
+      for (const addr of usable) {
+        const family = String(addr.family).toLowerCase();
+        // IPv6 privacy addresses rotate independently of the actual network.
+        // Prefer the stable IPv4 identity when an interface has both.
+        if (hasIpv4 && (family === 'ipv6' || addr.family === 6)) continue;
+        parts.push(`${name}|${addr.mac || ''}|${family}|${addr.address}`);
       }
     }
     networkFingerprint.cached = parts.sort().join(';') || 'none';
@@ -1511,12 +1543,14 @@ function ensureSmartModelContext() {
     appliedSmartIdentities = identities;
   }
   smartSelectionModel.setNetworkKey(networkFingerprint());
+  ensureSmartShadowContext(key);
 }
 
 /**
  * Query the latency of a node via the sing-box Clash API.
- * Results are shared across Auto/Smart sweeps for a short TTL, and every
- * observation is fed into the Smart history model.
+ * Results are shared across Auto/Smart sweeps for a short TTL. A standalone
+ * probe updates the UI delay only; Smart route history requires dual-source
+ * measurements from testNodeDelayDual.
  * @param {string} name outbound tag (node name)
  * @param {{ force?: boolean }} [options] `force: true` skips the result cache
  *   (used by explicit UI tests so a click always re-probes).
@@ -1597,7 +1631,7 @@ function testNodeDelay(name, options = {}) {
           if (tooLarge) return;
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            if (typeof data.delay === 'number') done.ok(data.delay);
+            if (Number.isFinite(data.delay) && data.delay > 0) done.ok(data.delay);
             else done.fail(new Error(data.message || 'timeout'));
           } catch (e) {
             done.fail(new Error('timeout'));
@@ -1618,7 +1652,6 @@ function testNodeDelay(name, options = {}) {
         try {
           ensureSmartModelContext();
           if (smartSelectionModel.contextKey === contextKey) {
-            smartSelectionModel.observe({ name, delay });
             smartSelectionModel.observeDisplayDelay(name, delay);
           }
         } catch (_) {}
@@ -1631,7 +1664,6 @@ function testNodeDelay(name, options = {}) {
         try {
           ensureSmartModelContext();
           if (smartSelectionModel.contextKey === contextKey) {
-            smartSelectionModel.observe({ name, delay: null });
             smartSelectionModel.observeDisplayDelay(name, null);
           }
         } catch (_) {}
@@ -1719,16 +1751,187 @@ function clashApi(method, apiPath, body) {
 
 const smartSelectionModel = new SmartSelectionModel();
 const connectionFeedbackTracker = new ConnectionFeedbackTracker();
+const smartProbeSignalWeights = new SmartProbeSignalWeights();
+const smartShadowEvaluator = new SmartShadowEvaluator();
+const kernelDialFeedback = new KernelDialFeedback();
 let smartIdentityCache = { subscription: null, identities: new Map() };
+let smartProbeFamilyCache = { subscription: null, families: new Map() };
 let appliedSmartIdentities = null;
 let smartFeedbackTimer = null;
 let smartFeedbackRun = null;
 let smartFeedbackGeneration = 0;
+let smartShadowLoadedPath = null;
+let smartShadowPersistTimer = null;
+let smartShadowPersistFailed = false;
 
 function smartSelectionContextKey() {
   const id = getActiveSubId() || '';
   const settings = state.store.getSettings();
   return `${state.singbox.getCoreType()}:${id}:${settings.testUrl || ''}`;
+}
+
+function smartShadowHistoryPath() {
+  const dir = state.store && typeof state.store.dir === 'string'
+    ? state.store.dir
+    : '';
+  return dir ? path.join(dir, SMART_SHADOW_HISTORY_FILE) : '';
+}
+
+function loadSmartShadowHistory() {
+  const file = smartShadowHistoryPath();
+  if (!file || smartShadowLoadedPath === file) return;
+  smartShadowLoadedPath = file;
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > SMART_SHADOW_MAX_FILE_BYTES) return;
+    smartShadowEvaluator.restore(JSON.parse(fs.readFileSync(file, 'utf-8')));
+  } catch (_) {
+    // History is advisory. A missing/corrupt sidecar must never affect routing.
+  }
+}
+
+function flushSmartShadowHistory() {
+  if (smartShadowPersistTimer) clearTimeout(smartShadowPersistTimer);
+  smartShadowPersistTimer = null;
+  const file = smartShadowHistoryPath();
+  if (!file || smartShadowLoadedPath !== file) return false;
+  try {
+    const snapshot = smartShadowEvaluator.snapshot();
+    if (Buffer.byteLength(JSON.stringify(snapshot), 'utf-8') > SMART_SHADOW_MAX_FILE_BYTES) {
+      return false;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeJsonAtomicSync(file, snapshot);
+    smartShadowPersistFailed = false;
+    return true;
+  } catch (error) {
+    if (!smartShadowPersistFailed) {
+      smartShadowPersistFailed = true;
+      sendLog('[gui] local Smart shadow history could not be saved: ' + error.message);
+    }
+    return false;
+  }
+}
+
+function scheduleSmartShadowPersist() {
+  if (smartShadowPersistTimer || !smartShadowHistoryPath()) return;
+  smartShadowPersistTimer = setTimeout(
+    flushSmartShadowHistory,
+    SMART_SHADOW_PERSIST_DELAY_MS
+  );
+  if (smartShadowPersistTimer.unref) smartShadowPersistTimer.unref();
+}
+
+function smartShadowHash(namespace, value) {
+  return crypto
+    .createHash('sha256')
+    .update(`${namespace}\0${String(value || '')}`)
+    .digest('hex')
+    .slice(0, 24);
+}
+
+function smartShadowNetworkKey() {
+  return smartShadowHash('network', networkFingerprint());
+}
+
+function smartShadowContextKey(contextKey = smartSelectionContextKey()) {
+  // The production context contains subscription IDs and a probe URL. Shadow
+  // replay only needs a stable namespace, so never persist those raw values.
+  return smartShadowHash('context', contextKey || 'default');
+}
+
+function smartShadowNodeKey(name) {
+  if (typeof name !== 'string' || !name) return '';
+  const identity = activeSmartNodeIdentities().get(name) || name;
+  return smartShadowHash('node', identity);
+}
+
+function smartShadowLegacyOptions() {
+  // These switches are intentionally local to shadow models. Production keeps
+  // every current feature enabled; the legacy arm exists only as a benchmark.
+  return {
+    routeChangeDetection: false,
+    multiSignalHealth: false,
+  };
+}
+
+function applySmartShadowCalibration(calibration) {
+  if (typeof smartSelectionModel.setCalibrationOptions !== 'function') return false;
+  const desired = calibration && typeof calibration === 'object' ? calibration : {};
+  const current = smartSelectionModel.calibrationOptions || {};
+  const patch = {};
+  for (const key of CALIBRATION_OPTION_KEYS || []) {
+    if (Object.prototype.hasOwnProperty.call(desired, key)) {
+      patch[key] = desired[key];
+    } else if (Object.prototype.hasOwnProperty.call(current, key)) {
+      patch[key] = null;
+    }
+  }
+  return Object.keys(patch).length > 0
+    ? smartSelectionModel.setCalibrationOptions(patch)
+    : false;
+}
+
+function ensureSmartShadowContext(contextKey = smartSelectionContextKey()) {
+  loadSmartShadowHistory();
+  const baseOptions = typeof smartSelectionModel.getUncalibratedOptions === 'function'
+    ? smartSelectionModel.getUncalibratedOptions()
+    : smartSelectionModel.options;
+  const summary = smartShadowEvaluator.configure({
+    contextKey: smartShadowContextKey(contextKey),
+    mode: smartSelectionModel.mode,
+    baseOptions,
+    legacyOptions: smartShadowLegacyOptions(),
+  });
+  if (summary) applySmartShadowCalibration(summary.calibration);
+}
+
+function recordSmartShadowRound({
+  contextKey,
+  names,
+  current,
+  measurements,
+  productionPick,
+  now = Date.now(),
+}) {
+  ensureSmartShadowContext(contextKey);
+  const shadowNames = (names || []).map(smartShadowNodeKey);
+  const shadowMeasurements = (measurements || []).map((measurement) => ({
+    ...measurement,
+    name: smartShadowNodeKey(measurement && measurement.name),
+  }));
+  const result = smartShadowEvaluator.recordRound({
+    contextKey: smartShadowContextKey(contextKey),
+    networkKey: smartShadowNetworkKey(),
+    names: shadowNames,
+    current: current ? smartShadowNodeKey(current) : null,
+    measurements: shadowMeasurements,
+    productionPick: productionPick ? smartShadowNodeKey(productionPick) : null,
+    now,
+  });
+  const calibration = result && result.calibration;
+  if (
+    calibration &&
+    calibration.patch &&
+    typeof smartSelectionModel.setCalibrationOptions === 'function'
+  ) {
+    const changed = applySmartShadowCalibration(calibration.patch);
+    if (changed) {
+      sendLog(`[gui] Smart shadow calibration applied (${calibration.variant})`);
+    }
+  }
+  scheduleSmartShadowPersist();
+  return result;
+}
+
+function observeSmartShadowConnection(event, now = Date.now()) {
+  ensureSmartShadowContext();
+  if (smartShadowEvaluator.observeConnection({
+    ...event,
+    name: smartShadowNodeKey(event && event.name),
+  }, now)) {
+    scheduleSmartShadowPersist();
+  }
 }
 
 function activeSmartNodeIdentities() {
@@ -1747,9 +1950,66 @@ function activeSmartNodeIdentities() {
   return identities;
 }
 
+function activeSmartProbeFamilies() {
+  const active = getActiveSubscription();
+  if (smartProbeFamilyCache.subscription === active) return smartProbeFamilyCache.families;
+  const nodes = (active && active.nodes) || [];
+  const families = buildSmartProbeFamilies(
+    nodes,
+    nodes.map((node) => node && node.name).filter(Boolean)
+  );
+  smartProbeFamilyCache = { subscription: active, families };
+  return families;
+}
+
 /**
- * Pull Clash /connections and fold real traffic / soft-fail events into Smart.
- * Mid-term path: selection is no longer URL-delay-only.
+ * Pull the custom-kernel's bounded real dial events when available. Official
+ * kernels return 404 and transparently keep using /connections feedback.
+ */
+async function harvestKernelDialFeedback(nodeNames, contextKey) {
+  const result = await kernelDialFeedback.poll(
+    (apiPath) => clashApi('GET', apiPath),
+    {
+      allowedNames: new Set(nodeNames),
+      group: SMART_PROXY_GROUP,
+      now: Date.now(),
+    }
+  );
+  if (smartSelectionContextKey() !== contextKey) {
+    return { ...result, events: [] };
+  }
+  const preferred = getManagedSmartPreferred();
+  let preferredFailed = false;
+  for (const event of result.events || []) {
+    try { smartSelectionModel.observeConnection(event); } catch (_) { /* advisory */ }
+    try { observeSmartShadowConnection(event); } catch (_) { /* advisory */ }
+    if (
+      (event.kind === 'dialFailure' || event.kind === 'softFail') &&
+      event.name === preferred &&
+      typeof smartSelectionModel.isConnectionUnavailable === 'function' &&
+      smartSelectionModel.isConnectionUnavailable(preferred)
+    ) {
+      preferredFailed = true;
+    }
+  }
+  if (preferredFailed && managedSmartSelection.isActive()) {
+    // The kernel already failed over this one dial. Prompt the GUI's long-term
+    // model now as well instead of waiting out a previously relaxed timer.
+    queueMicrotask(() => {
+      if (
+        !state.singbox.isRunning() ||
+        !managedSmartSelection.isActive() ||
+        smartSelectionContextKey() !== contextKey
+      ) return;
+      managedSmartSelection.refresh({ force: true }).catch(() => null);
+    });
+  }
+  return result;
+}
+
+/**
+ * Fold real kernel dial outcomes plus Clash /connections traffic into Smart.
+ * Destination addresses never leave the core; only node-level health is used.
  */
 async function harvestConnectionFeedback() {
   if (!state.singbox.isRunning()) return 0;
@@ -1762,22 +2022,29 @@ async function harvestConnectionFeedback() {
   const secondaryHost = hostnameFromUrl(SMART_SECONDARY_TEST_URL);
   if (secondaryHost) extraIgnore.push(secondaryHost);
   connectionFeedbackTracker.setIgnoreHosts(extraIgnore);
-  const active = getActiveSubscription();
-  const nodeNames = ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean);
+  const nodeNames = configuredManagedGroupNames(SMART_PROXY_GROUP);
+  const dialResult = await harvestKernelDialFeedback(nodeNames, contextKey);
   let data;
   try {
     data = await clashApi('GET', '/connections');
   } catch (_) {
-    return 0;
+    return (dialResult.events || []).length;
   }
   if (smartSelectionContextKey() !== contextKey) return 0;
   connectionFeedbackTracker.setNodeNames(nodeNames);
   const connections = Array.isArray(data && data.connections) ? data.connections : [];
-  const events = connectionFeedbackTracker.ingest(connections, Date.now());
+  let events = connectionFeedbackTracker.ingest(connections, Date.now());
+  // A custom kernel reports the actual dial failure directly. Keep traffic and
+  // completed-connection evidence, but avoid counting the heuristic short-life
+  // detector as a second copy of the same failure.
+  if (dialResult.available === true) {
+    events = events.filter((event) => event.kind !== 'softFail');
+  }
   for (const event of events) {
     try { smartSelectionModel.observeConnection(event); } catch (_) { /* ignore */ }
+    try { observeSmartShadowConnection(event); } catch (_) { /* ignore */ }
   }
-  return events.length;
+  return (dialResult.events || []).length + events.length;
 }
 
 function stopSmartFeedbackSampler() {
@@ -1850,7 +2117,26 @@ function readManagedOverride() {
 function getManagedNodeOverrideInfo() {
   const ov = readManagedOverride();
   if (!ov) return { override: null, group: null, profileId: getActiveSubId() || '' };
+  if (!managedOverrideEligible(ov.name, ov.group)) {
+    clearManagedNodeOverride('pinned node is unavailable in the selected group');
+    return { override: null, group: null, profileId: getActiveSubId() || '' };
+  }
   return { override: ov.name, group: ov.group, profileId: ov.profileId || getActiveSubId() || '' };
+}
+
+/** Candidate names implied by the current profile and Smart region scope. */
+function configuredManagedGroupNames(group) {
+  const active = getActiveSubscription();
+  const entries = ((active && active.nodes) || [])
+    .filter((node) => node && typeof node.name === 'string' && node.name);
+  const names = entries.map((node) => node.name);
+  if (group !== SMART_PROXY_GROUP) return names;
+  const settings = state.store ? state.store.getSettings() : {};
+  return smartRegionMembers(entries, names, settings.smartRegions);
+}
+
+function managedOverrideEligible(name, group) {
+  return configuredManagedGroupNames(group).includes(name);
 }
 
 /** Resolve pin for a specific managed group (Auto or Smart). */
@@ -1892,6 +2178,9 @@ async function setManagedNodeOverride(name) {
   if (!validNames.has(name)) throw new Error('node is not part of the active config');
   const group = await resolveOuterManagedGroup();
   if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
+  if (!managedOverrideEligible(name, group)) {
+    throw new Error('node is unavailable in the selected group');
+  }
   if (state.singbox.isRunning()) {
     try {
       const target = await clashApi('GET', '/proxies/' + encodeURIComponent(group));
@@ -1993,7 +2282,8 @@ async function testNodeDelayDual(name, options = {}) {
     });
   }
   const [primary, secondary] = await Promise.all([primaryRequest, secondaryRequest]);
-  const fresh = primaryMeta.fresh === true || secondaryFresh;
+  const primaryFresh = primaryMeta.fresh === true;
+  const fresh = primaryFresh || secondaryFresh;
   if (primary == null && secondary == null) {
     if (fresh && smartSelectionContextKey() === contextKey) {
       ensureSmartModelContext();
@@ -2005,16 +2295,22 @@ async function testNodeDelayDual(name, options = {}) {
     error.fresh = fresh;
     throw error;
   }
-  const blended = primary != null && secondary != null
-    ? Math.round(primary * 0.55 + secondary * 0.45)
-    : (primary != null ? primary : secondary);
+  const sourceWeights = smartProbeSignalWeights.weights(contextKey, networkFingerprint());
+  const blended = Math.round(smartProbeSignalWeights.blend(primary, secondary, sourceWeights));
   if (smartSelectionContextKey() === contextKey) {
     ensureSmartModelContext();
     smartSelectionModel.observeDisplayDelay(name, primary != null ? primary : blended);
     if (fresh) noteOverrideProbeResult(SMART_PROXY_GROUP, name, blended);
   }
   // Cached values can rank nodes, but must not become new model samples.
-  return { delay: blended, fresh };
+  return {
+    delay: blended,
+    fresh,
+    primaryDelay: primary,
+    secondaryDelay: secondary,
+    primaryFresh,
+    secondaryFresh,
+  };
 }
 
 /**
@@ -2026,7 +2322,6 @@ async function remountManagedOverrideForOuter(outer) {
   if (!ov || !ov.name) return null;
   const profileId = getActiveSubId() || '';
   if (outer !== AUTO_PROXY_GROUP && outer !== SMART_PROXY_GROUP) return ov;
-  if (ov.group === outer) return ov;
   if (state.singbox.isRunning()) {
     try {
       const target = await clashApi('GET', '/proxies/' + encodeURIComponent(outer));
@@ -2035,9 +2330,13 @@ async function remountManagedOverrideForOuter(outer) {
         clearManagedNodeOverride('pinned node is unavailable in the selected group');
         return null;
       }
-      await clashApi('PUT', '/proxies/' + encodeURIComponent(outer), { name: ov.name });
+      if (target.now !== ov.name) {
+        await clashApi('PUT', '/proxies/' + encodeURIComponent(outer), { name: ov.name });
+      }
       if ((getActiveSubId() || '') !== profileId) return null;
-      sendLog(`[gui] force override remounted ${ov.name} → ${outer}`);
+      if (ov.group !== outer || target.now !== ov.name) {
+        sendLog(`[gui] force override remounted ${ov.name} → ${outer}`);
+      }
     } catch (error) {
       sendLog(`[gui] force override remount failed: ${error.message}`);
       return ov;
@@ -2082,6 +2381,7 @@ const managedAutoSelection = new ManagedAutoSelection({
 const managedSmartSelection = new ManagedAutoSelection({
   ...managedSelectionOptions,
   autoGroup: SMART_PROXY_GROUP,
+  authoritativePreferred: true,
   selectionModel: smartSelectionModel,
   resolveOverride: (names) => resolveManagedOverrideForGroup(SMART_PROXY_GROUP, names),
   testDelay: (name, options) => testNodeDelayDual(name, options),
@@ -2094,29 +2394,75 @@ const managedSmartSelection = new ManagedAutoSelection({
     current,
     cursor,
     force,
-    { ...(opts || {}), model: smartSelectionModel }
+    {
+      ...(opts || {}),
+      model: smartSelectionModel,
+      familyForName: activeSmartProbeFamilies(),
+    }
   ),
   selectCandidate: ({ names, current, measurements }) => {
     ensureSmartModelContext();
+    const contextKey = smartSelectionContextKey();
+    const now = Date.now();
+    const weightedMeasurements = smartProbeSignalWeights.annotate(
+      measurements,
+      smartSelectionModel,
+      contextKey,
+      networkFingerprint()
+    );
     const override = resolveManagedOverrideForGroup(SMART_PROXY_GROUP, names);
     if (override) {
-      for (const measurement of measurements || []) {
-        try { smartSelectionModel.observe(measurement); } catch (_) { /* ignore */ }
+      for (const measurement of weightedMeasurements) {
+        try { smartSelectionModel.observe(measurement, now); } catch (_) { /* ignore */ }
       }
+      try {
+        recordSmartShadowRound({
+          contextKey,
+          names,
+          current,
+          measurements: weightedMeasurements,
+          productionPick: override,
+          now,
+        });
+      } catch (_) { /* advisory */ }
       return override;
     }
     // Always return the model pick so ManagedAutoSelection can PUT it to Clash.
     // With Dart type:smart the kernel still dial-failovers; GUI preferred "now"
     // must stay aligned with choose() or the Smart badge diverges from routing.
     const pick = smartSelectionModel.choose({
-      contextKey: smartSelectionContextKey(),
+      contextKey,
       names,
       current,
-      measurements,
+      measurements: weightedMeasurements,
+      now,
     });
+    try {
+      recordSmartShadowRound({
+        contextKey,
+        names,
+        current,
+        measurements: weightedMeasurements,
+        productionPick: pick,
+        now,
+      });
+    } catch (_) { /* advisory */ }
     return pick;
   },
 });
+
+function getManagedSmartPreferred() {
+  return managedSmartSelection.getPreferred() || smartSelectionModel.selected || null;
+}
+
+/** Apply app-managed Smart weights immediately without discarding observations. */
+function applySmartMode(mode) {
+  const changed = smartSelectionModel.setMode(mode);
+  if (changed && state.singbox.isRunning() && managedSmartSelection.isScheduled()) {
+    managedSmartSelection.refresh({ force: true }).catch(() => null);
+  }
+  return smartSelectionModel.mode;
+}
 
 /** Apply the fastest result from the visible node sweep without testing twice. */
 function applyMeasuredAutoCandidate(name) {
@@ -2745,6 +3091,8 @@ module.exports = {
   stopProxyGuard,
   testNodeDelay,
   smartNodeQualities,
+  getManagedSmartPreferred,
+  applySmartMode,
   getManagedNodeOverrideInfo,
   setManagedNodeOverride,
   clearManagedNodeOverride,

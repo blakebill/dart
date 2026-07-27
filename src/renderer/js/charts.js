@@ -88,8 +88,17 @@
     let sessionDown = 0;
     let lastUp = 0;
     let lastDown = 0;
+    let activeSamples = 0;
     const pad = fill ? 8 : 2;
     const base = fill ? 4 : 1;
+    // Resolve the six chart labels once. Traffic arrives every second, so
+    // querying the same immutable elements on every sample is pure overhead.
+    const labels = {
+      up: upEl ? $(upEl) : null,
+      down: downEl ? $(downEl) : null,
+      upTotal: upTotalEl ? $(upTotalEl) : null,
+      downTotal: downTotalEl ? $(downTotalEl) : null,
+    };
 
     // Plot rect inside the canvas. The canvas already spans the panel's content
     // width (left-aligned with the heading), so 'outer' only keeps a 2px safety
@@ -205,20 +214,38 @@
       if (axes === 'inner') drawInnerAxes(p, top);
     }
 
+    function setLabel(element, value) {
+      if (element && element.textContent !== value) element.textContent = value;
+    }
+
     function setLabels(u, d) {
-      if (upEl) { const e = $(upEl); if (e) e.textContent = fmtBytes(u) + '/s'; }
-      if (downEl) { const e = $(downEl); if (e) e.textContent = fmtBytes(d) + '/s'; }
-      if (upTotalEl) { const e = $(upTotalEl); if (e) e.textContent = fmtBytes(sessionUp); }
-      if (downTotalEl) { const e = $(downTotalEl); if (e) e.textContent = fmtBytes(sessionDown); }
+      setLabel(labels.up, fmtBytes(u) + '/s');
+      setLabel(labels.down, fmtBytes(d) + '/s');
+      setLabel(labels.upTotal, fmtBytes(sessionUp));
+      setLabel(labels.downTotal, fmtBytes(sessionDown));
     }
     function push(u, d) {
       // Clash /traffic is ~1 Hz; treat each sample as one second of throughput.
-      lastUp = Math.max(0, Number(u) || 0);
-      lastDown = Math.max(0, Number(d) || 0);
+      const nextUp = Math.max(0, Number(u) || 0);
+      const nextDown = Math.max(0, Number(d) || 0);
+      // Once the complete history is already zero, another zero sample cannot
+      // change pixels, labels, or totals. Avoid waking Canvas/DOM indefinitely
+      // while an otherwise-running proxy is idle.
+      if (!activeSamples && !nextUp && !nextDown) {
+        lastUp = 0;
+        lastDown = 0;
+        return;
+      }
+      if (up[0] > 0 || down[0] > 0) activeSamples--;
+      up.shift();
+      down.shift();
+      up.push(nextUp);
+      down.push(nextDown);
+      if (nextUp > 0 || nextDown > 0) activeSamples++;
+      lastUp = nextUp;
+      lastDown = nextDown;
       sessionUp += lastUp;
       sessionDown += lastDown;
-      up.push(lastUp); up.shift();
-      down.push(lastDown); down.shift();
       draw();
     }
     function reset() {
@@ -227,9 +254,21 @@
       sessionDown = 0;
       lastUp = 0;
       lastDown = 0;
+      activeSamples = 0;
       draw();
     }
-    window.addEventListener('resize', draw);
+    let resizeFrame = 0;
+    window.addEventListener('resize', () => {
+      if (resizeFrame) return;
+      if (typeof window.requestAnimationFrame !== 'function') {
+        draw();
+        return;
+      }
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = 0;
+        draw();
+      });
+    });
     return { push, reset, draw };
   }
 

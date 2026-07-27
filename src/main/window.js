@@ -3,7 +3,7 @@
 const path = require('path');
 const { app, BrowserWindow, nativeTheme, dialog } = require('electron');
 
-const { state, isDev, sendLog } = require('./state');
+const { state, isDev, sendLog, setRecentLogStreaming } = require('./state');
 
 const isWin = process.platform === 'win32';
 const DEEP_SLEEP_DELAY_MS = 60_000;
@@ -154,6 +154,7 @@ function createWindow(startHidden = false) {
     clearTaskbarAttention();
   });
   mainWindow.on('closed', () => {
+    setRecentLogStreaming(mainWindow.webContents, false);
     if (state.mainWindow === mainWindow) {
       state.mainWindow = null;
       clearDeepSleepTimer();

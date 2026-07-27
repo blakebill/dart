@@ -9,15 +9,16 @@ This is an independent project and is not affiliated with or endorsed by sing-bo
 ### Features
 
 - Run and manage sing-box and mihomo independently, including official or Dart builds, in-app switching, downloads, updates, and Smart capability detection.
-- Import Clash, sing-box, Base64, and share-link configs, with selectable request formats and automatic bidirectional conversion.
+- Import Clash, sing-box, Base64, and share-link configs, with automatic bidirectional conversion. Subscription requests follow the active core's User-Agent ecosystem by default, while an explicit User-Agent can be pinned when a provider requires it.
 - Use system proxy or TUN alongside launch-at-login, silent startup, notifications, and UWP loopback exemptions.
-- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing. Smart combines latency, jitter, failures, recent traffic, cooldowns, and bounded exploration.
+- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing. Auto selects the lowest valid measured latency and excludes timeouts. Smart combines latency, jitter, failures, recent traffic, cooldowns, and bounded exploration, with an optional region allowlist inferred from node labels.
+- Smart keeps GUI long-term preference separate from kernel dial failover, detects per-node route changes with CUSUM/Page-Hinkley signals, tracks TCP, UDP, handshake, and first-byte health independently, and uses bounded shadow replay to calibrate scoring without causing live node switches.
 - Monitor nodes, traffic, connections, logs, and latency, or open the locally hosted [Zashboard](https://github.com/Zephyruso/zashboard).
 - Inspect routes, validate configs, diagnose networking and DNS, inspect ports, and back up or restore user data.
 
 ### Quick Start
 
-1. Download the latest Windows x64 installer from [GitHub Releases](https://github.com/blakebill/singbox-gui/releases/latest).
+1. Download the latest Windows x64 installer from [GitHub Releases](https://github.com/blakebill/dart/releases/latest).
 2. Add a config from Clash YAML, sing-box JSON, a subscription URL, or supported share links, then make it active.
 3. Select sing-box or mihomo in **Core Management**, choose a node and routing mode, and start the core.
 4. Enable **System Proxy** for application proxying or **TUN** for system-wide routing. Administrator permission is requested only by operations that require it.
@@ -27,6 +28,7 @@ Release installers bundle both Dart cores and their matching GeoData. Core Manag
 ### Desktop Experience
 
 - A frameless custom title bar and Windows 11 Mica material where supported, with transparent Fluent-style surfaces rather than a browser-like page background.
+- Dropdowns and context menus use opaque high-elevation Fluent surfaces, theme-specific borders, and layered shadows so underlying controls cannot reduce readability.
 - System, light, and dark themes, defaulting to the Windows setting, plus complete English and Simplified Chinese interface switching.
 - Full-width responsive pages with equal outer spacing. Nodes, connections, and logs fill the remaining window height and scroll internally.
 - Two-column node cards, compact live traffic, the current outbound in the sidebar, and a tray icon that reflects stopped or running state.
@@ -56,6 +58,7 @@ Backups contain raw profile contents and node credentials. Treat exported backup
 - Status IPC uses compact snapshots, connection polling is coalesced, and retained log output is capped.
 - Atomic store writes protect settings, while large profile contents live in separate files to avoid rewriting them on every preference change.
 - Hidden windows stop view-specific polling and reduce renderer frame rate, while the main process keeps the tray state current.
+- Transient menus avoid redundant real-time backdrop blur; Mica and lightweight translucency remain on the surfaces where they provide useful visual depth.
 
 ### Architecture
 
@@ -75,7 +78,7 @@ flowchart LR
     MANAGER --> SB["sing-box process"]
     MANAGER --> MH["mihomo process"]
 
-    MAIN --> SMART["Session Smart selector\nRTT, jitter, traffic, failures, UCB-V"]
+    MAIN --> SMART["Session Smart selector\nmulti-signal health, route-change detection, shadow replay"]
     SMART -->|"Clash API selection"| MANAGER
 
     SB -->|"Clash API"| MAIN
@@ -92,9 +95,9 @@ The Network Control renderer has no direct access to Node.js or operating-system
 
 Configuration flow:
 
-1. Format detection dispatches an imported profile to the Clash, sing-box, or share-link parser.
+1. Format detection dispatches an imported profile to the Clash, sing-box, or share-link parser. The stored source format remains independent from the currently selected runtime core.
 2. Parsed data is normalized into an internal node, rule, and policy-group model.
-3. The selected core adapter generates sing-box JSON or mihomo YAML and supplies its paths, commands, GeoData capabilities, release assets, and export behavior.
+3. The selected core adapter always generates the matching runtime format—sing-box JSON or mihomo YAML—and supplies its paths, commands, GeoData capabilities, release assets, and export behavior.
 4. `CoreManager` uses that adapter to write and validate the configuration, verify downloaded core archives, and start the independent child process.
 5. Both generated core configurations always expose a loopback-only Clash API protected by a per-session random secret. The main process uses it for runtime state and managed selection, then sends only the required data to the renderer.
 
@@ -145,7 +148,8 @@ singbox-gui/
 │   │   ├── ipc-validation.js    # Shared payload limits and validation
 │   │   ├── core-control.js      # Core, proxy, rule, and update orchestration
 │   │   ├── core-adapters.js     # sing-box and mihomo capabilities
-│   │   ├── smart-selection.js   # Adaptive Smart scoring and bounded exploration
+│   │   ├── smart-selection.js   # Multi-signal Smart scoring, change detection, and replay
+│   │   ├── managed-auto-selection.js # Valid-latency Auto probing and selection
 │   │   ├── operation-coordinator.js # Serialized mutations and stale-work guards
 │   │   ├── singbox.js           # Core processes, downloads, paths, and GeoData
 │   │   ├── tun-adapter.js       # Windows Dart TUN cleanup and display naming

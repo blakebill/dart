@@ -17,6 +17,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
@@ -280,9 +281,23 @@ async function main() {
   assert.ok(exemptionCommands.at(-1).includes(oldSid), 'failed UWP update did not restore the previous exemptions');
   console.log('✓ UWP exemption replacement rolls back a partial privileged write');
 
+  const stateModule = require(path.join(__dirname, '..', 'src', 'main', 'state'));
+  const sentLogCount = () => mainWindow.webContents.sent
+    .filter((event) => event.channel === 'singbox:log').length;
+  const logEventsBefore = sentLogCount();
+  stateModule.sendLog('[gui] retained without a stream');
+  assert.strictEqual(sentLogCount(), logEventsBefore);
+  assert.throws(() => handlers['logs:stream'](windowEvent, { enabled: 'yes' }), /invalid enabled/);
+  assert.strictEqual(handlers['logs:stream'](windowEvent, { enabled: true }), true);
+  stateModule.sendLog('[gui] streamed on demand');
+  assert.strictEqual(sentLogCount(), logEventsBefore + 1);
+  assert.strictEqual(handlers['logs:stream'](windowEvent, { enabled: false }), false);
+  stateModule.sendLog('[gui] retained after leaving logs');
+  assert.strictEqual(sentLogCount(), logEventsBefore + 1);
+  console.log('✓ main process streams chatty logs only while the Logs tab requests them');
+
   await handlers['window:close'](windowEvent);
   assert.strictEqual(mainWindow.closed, true);
-  const stateModule = require(path.join(__dirname, '..', 'src', 'main', 'state'));
   const { state } = stateModule;
   const statusManager = state.singbox;
   // This smoke test has no executable core. Treat generated configs as valid
@@ -412,6 +427,19 @@ async function main() {
   state.systemProxyOn = false;
   state.systemProxyServer = null;
 
+  let persistedExitClears = 0;
+  state.store.set('ownedSystemProxyServer', '127.0.0.1:7890');
+  proxyAfterExit.disableSystemProxyIfOurs = async (server) => {
+    persistedExitClears += 1;
+    assert.strictEqual(server, '127.0.0.1:7890');
+    return true;
+  };
+  state.singbox.onExit();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(persistedExitClears, 1, 'crash cleanup ignored persisted-only proxy ownership');
+  assert.strictEqual(state.store.get('ownedSystemProxyServer'), null);
+  proxyAfterExit.disableSystemProxyIfOurs = originalExitProxyDisable;
+
   const subA = await handlers['sub:add'](null, {
     name: 'A', url: 'https://example.com/a', userAgentMode: 'sing-box',
   });
@@ -447,8 +475,36 @@ async function main() {
     name: 'node-of-a',
     type: 'trojan',
     security: 'TLS',
+    region: 'ZZ',
     isNode: true,
   }]);
+
+  const profileBeforeSmartRegionPin = state.store.getSubscription(subA.id);
+  const settingsBeforeSmartRegionPin = state.store.getSettings();
+  const selectedBeforeSmartRegionPin = state.store.get('selected');
+  state.store.upsertSubscription({
+    ...profileBeforeSmartRegionPin,
+    nodes: [
+      { ...profileBeforeSmartRegionPin.nodes[0], name: 'US node', server: 'us.example.com' },
+      { ...profileBeforeSmartRegionPin.nodes[0], name: 'HK node', server: 'hk.example.com' },
+    ],
+  });
+  state.store.set('selected', '🧠 Smart');
+  state.store.updateSettings({ smartRegions: [] });
+  assert.deepStrictEqual(
+    await handlers['node:setOverride'](null, { name: 'US node' }),
+    { override: 'US node', group: '🧠 Smart', profileId: subA.id }
+  );
+  await handlers['settings:update'](null, { smartRegions: ['HK'] });
+  assert.deepStrictEqual(
+    handlers['node:getOverride'](),
+    { override: null, group: null, profileId: subA.id },
+    'Smart region filtering left an excluded force pin visible'
+  );
+  assert.strictEqual(state.store.get('managedNodeOverride'), null);
+  state.store.upsertSubscription(profileBeforeSmartRegionPin);
+  state.store.set('selected', selectedBeforeSmartRegionPin);
+  state.store.updateSettings({ smartRegions: settingsBeforeSmartRegionPin.smartRegions });
 
   const fetchesBeforeUaEdit = subscriptionFetchCalls.length;
   await handlers['sub:edit'](null, { id: subA.id, userAgentMode: 'clash' });
@@ -1121,6 +1177,10 @@ async function main() {
     /invalid dnsRemote/
   );
   await assert.rejects(
+    handlers['settings:update'](null, { smartRegions: ['US', 'US'] }),
+    /invalid smartRegions/
+  );
+  await assert.rejects(
     handlers['sub:edit'](null, { id: subA.id, autoUpdateMinutes: -1 }),
     /invalid autoUpdateMinutes/
   );
@@ -1222,6 +1282,13 @@ async function main() {
     assert.strictEqual(state.systemProxyOn, false, 'a later stop did not retry proxy cleanup');
     assert.strictEqual(state.systemProxyServer, null);
     assert.strictEqual(state.store.get('ownedSystemProxyServer'), null);
+
+    state.systemProxyOn = false;
+    state.systemProxyServer = null;
+    state.store.set('ownedSystemProxyServer', '127.0.0.1:7890');
+    await core.stopCore();
+    assert.strictEqual(stopProxyAttempt, 3, 'persisted-only proxy ownership was not retried');
+    assert.strictEqual(state.store.get('ownedSystemProxyServer'), null);
   } finally {
     state.systemProxyOn = false;
     state.systemProxyServer = null;
@@ -1230,7 +1297,7 @@ async function main() {
     state.singbox.stop = originalManagerStop;
     state.store.set('ownedSystemProxyServer', originalProxyOwner || null);
   }
-  console.log('✓ failed stop cleanup retains proxy ownership for a later retry');
+  console.log('✓ stop cleanup retries failed and persisted-only proxy ownership');
 
   await assert.rejects(
     handlers['core:download'](null, { version: '../../bad' }),
@@ -1322,6 +1389,9 @@ async function main() {
   const originalSettingsRunning = state.singbox.isRunning;
   const originalSettingsRestart = core.restartIfRunning;
   const originalApplyAutoLaunch = core.applyAutoLaunch;
+  const originalApplySmartMode = core.applySmartMode;
+  const originalKernelSmartMeta = core.getKernelSmartMeta;
+  const originalResolveKernelSmart = core.resolveKernelSmart;
   const originalSetCoreType = state.singbox.setCoreType;
   const originalUpdateSettings = state.store.updateSettings;
   let settingsRestartCount = 0;
@@ -1344,6 +1414,44 @@ async function main() {
     assert.strictEqual(autoLaunchApplyCount, 0, 'an unchanged settings save touched OS login registration');
     state.store.updateSettings = originalUpdateSettings;
     core.applyAutoLaunch = originalApplyAutoLaunch;
+
+    const previousSmartMode = state.store.getSettings().smartMode;
+    const nextSmartMode = previousSmartMode === 'latency' ? 'stable' : 'latency';
+    let liveSmartMode = null;
+    core.getKernelSmartMeta = () => ({
+      coreType: state.singbox.getCoreType(),
+      kernelSmartMode: false,
+    });
+    core.applySmartMode = (mode) => { liveSmartMode = mode; };
+    await handlers['settings:update'](null, { smartMode: nextSmartMode });
+    assert.strictEqual(settingsRestartCount, 0, 'app-managed Smart mode change restarted the core');
+    assert.strictEqual(liveSmartMode, nextSmartMode, 'app-managed Smart mode was not applied live');
+    state.store.updateSettings({ smartMode: previousSmartMode });
+
+    core.getKernelSmartMeta = () => ({
+      coreType: state.singbox.getCoreType(),
+      kernelSmartMode: true,
+    });
+    const kernelMode = nextSmartMode === 'stable' ? 'latency' : 'stable';
+    await handlers['settings:update'](null, { smartMode: kernelMode });
+    assert.strictEqual(settingsRestartCount, 1, 'kernel Smart mode change did not rebuild the core');
+    state.store.updateSettings({ smartMode: previousSmartMode });
+    settingsRestartCount = 0;
+
+    let resolvedSmartCore = null;
+    core.getKernelSmartMeta = () => ({ coreType: 'mihomo', kernelSmartMode: false });
+    core.resolveKernelSmart = async (coreType) => {
+      resolvedSmartCore = coreType;
+      return { coreType, kernelSmartMode: true };
+    };
+    await handlers['settings:update'](null, { smartMode: nextSmartMode });
+    assert.strictEqual(resolvedSmartCore, state.singbox.getCoreType(), 'Smart capability used the wrong core');
+    assert.strictEqual(settingsRestartCount, 1, 'cross-core capability pollution skipped a required restart');
+    state.store.updateSettings({ smartMode: previousSmartMode });
+    settingsRestartCount = 0;
+    core.getKernelSmartMeta = originalKernelSmartMeta;
+    core.resolveKernelSmart = originalResolveKernelSmart;
+    core.applySmartMode = originalApplySmartMode;
 
     const testUrl = 'https://example.com/dart-204';
     await handlers['settings:update'](null, { testUrl });
@@ -1439,6 +1547,9 @@ async function main() {
     state.singbox.setCoreType = originalSetCoreType;
     core.restartIfRunning = originalSettingsRestart;
     core.applyAutoLaunch = originalApplyAutoLaunch;
+    core.applySmartMode = originalApplySmartMode;
+    core.getKernelSmartMeta = originalKernelSmartMeta;
+    core.resolveKernelSmart = originalResolveKernelSmart;
     state.store.updateSettings = originalUpdateSettings;
   }
   console.log('✓ settings reject invalid values and apply custom health-check URLs to both cores');
@@ -1635,6 +1746,32 @@ async function main() {
   }
   console.log('✓ interrupted Clash API responses reject promptly without an unhandled stream error');
 
+  http.request = (_options, callback) => {
+    const request = new EventEmitter();
+    request.write = () => {};
+    request.end = () => {
+      const response = new EventEmitter();
+      response.statusCode = 200;
+      response.headers = {};
+      callback(response);
+      queueMicrotask(() => {
+        response.emit('data', Buffer.from('{"delay":0,"message":"timeout"}'));
+        response.emit('end');
+      });
+    };
+    request.destroy = (error) => request.emit('error', error);
+    return request;
+  };
+  try {
+    await assert.rejects(
+      core.testNodeDelay('zero-timeout', { force: true }),
+      /timeout/
+    );
+  } finally {
+    http.request = originalHttpRequest;
+  }
+  console.log('✓ zero-delay timeout responses cannot win managed Auto selection');
+
   // ---- Regression: inline custom rule-sets must stay OR-semantics ----
   // A rule with both domain and ip_cidr fields is an AND in sing-box, so older
   // persisted inline rule-sets must be split when building the route.
@@ -1743,6 +1880,20 @@ async function main() {
     /SHA-256 mismatch/
   );
 
+  github.latestReleaseTag = async () => ({
+    tag: 'v0.7.9',
+    source: 'github',
+    release: {
+      html_url: 'https://example.com/release-without-installer',
+      assets: [
+        { name: 'Dart.Portable.0.7.9.zip', browser_download_url: 'https://example.com/portable.zip' },
+      ],
+    },
+  });
+  const missingInstallerUpdate = await appUpdate.checkUpdate('0.7.8');
+  assert.strictEqual(missingInstallerUpdate.assetName, null);
+  assert.strictEqual(missingInstallerUpdate.assetUrl, null);
+
   github.latestReleaseTag = async () => ({ tag: '0.7.9', source: 'jsdelivr', release: null });
   const unprefixedUpdate = await appUpdate.checkUpdate('0.7.8');
   assert.strictEqual(
@@ -1753,6 +1904,44 @@ async function main() {
   console.log('✓ app updates select the matching Dart installer asset');
 
   const { CoreManager } = require(path.join(__dirname, '..', 'src', 'main', 'singbox'));
+  const occupiedServer = net.createServer();
+  await new Promise((resolve, reject) => {
+    occupiedServer.once('error', reject);
+    occupiedServer.listen(0, '127.0.0.1', resolve);
+  });
+  const occupiedPort = occupiedServer.address().port;
+  const conflictRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-conflict-'));
+  const conflictManager = new CoreManager({ runtimeDir: conflictRuntime, coreType: 'sing-box' });
+  fs.writeFileSync(
+    path.join(conflictManager.ensureCoreDir('sing-box'), conflictManager.binNameFor('sing-box')),
+    'unused test executable'
+  );
+  try {
+    for (const config of [
+      { inbounds: [{ type: 'mixed', listen: '127.0.0.1', listen_port: occupiedPort }] },
+      {
+        inbounds: [
+          { type: 'mixed', listen: '127.0.0.1' },
+          { type: 'mixed', listen: '127.0.0.1', listen_port: occupiedPort },
+        ],
+      },
+      {
+        inbounds: [],
+        experimental: { clash_api: { external_controller: `127.0.0.1:${occupiedPort}` } },
+      },
+    ]) {
+      await assert.rejects(
+        conflictManager.start(config),
+        new RegExp(`local port ${occupiedPort} is already in use`)
+      );
+      assert.strictEqual(conflictManager.isRunning(), false);
+    }
+  } finally {
+    await new Promise((resolve) => occupiedServer.close(resolve));
+    fs.rmSync(conflictRuntime, { recursive: true, force: true });
+  }
+  console.log('✓ core startup rejects occupied proxy and controller ports before spawning');
+
   const coreRuntime = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-install-'));
   const manager = new CoreManager({ runtimeDir: coreRuntime, coreType: 'mihomo' });
   const coreDir = manager.ensureCoreDir('mihomo');

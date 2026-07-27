@@ -4,8 +4,8 @@ name: Build & Release
 # Triggers:
 #   - pushing a tag like v0.1.0      -> publishes a release (prerelease if the
 #                                       tag contains a hyphen, e.g. v0.1.0-pre)
-#   - manual run (workflow_dispatch) -> builds and publishes a prerelease at the
-#                                       given tag (default v0.1.0-pre)
+#   - manual run (workflow_dispatch) -> builds and optionally publishes the
+#                                       requested tag
 on:
   push:
     tags:
@@ -45,6 +45,21 @@ jobs:
       contents: read
       actions: write # delete and upload build artifacts
     steps:
+      - name: Validate canonical release target
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" || "$PUBLISH_REQUESTED" == "true" ]]; then
+            if [[ "$REPOSITORY" != "blakebill/dart" ]]; then
+              echo "::error::Dart releases must be published from blakebill/dart, not $REPOSITORY."
+              exit 1
+            fi
+          fi
+
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -91,38 +106,41 @@ jobs:
       - name: Run self-tests
         run: npm test
 
-      - name: Validate release inputs
-        if: github.event_name == 'workflow_dispatch' && inputs.publish == true
-        shell: bash
-        run: |
-          if [ -z "${{ inputs.tag }}" ]; then
-            echo "::error::A release tag is required when Publish is enabled."
-            exit 1
-          fi
-
       - name: Sync package version to release tag
         # The installer file name (Dart.Setup.<version>.exe) is derived
         # from package.json "version". Align it with the release tag so the
-        # artifact name always matches the tag (e.g. v0.1.2-pre -> 0.1.2).
+        # artifact name always matches the tag, including prerelease suffixes.
         # For a manual build-only run with an empty tag, skip the sync and keep
         # the version that is already in package.json.
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           # On a tag push, github.ref_name is the tag. On a manual run it's the
-          # branch, so take the tag only from the input. (Don't use the GHA
-          # "A && B || C" idiom here: when inputs.tag is empty it falls through
-          # to the branch name, which then gets mangled into a bogus version.)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          # branch, so take the tag only from the input. Values travel through
+          # the environment instead of being interpolated into this script.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$REF_NAME"
           fi
-          if [ -z "$TAG" ]; then
+          if [[ -z "$TAG" ]]; then
+            if [[ "$PUBLISH_REQUESTED" == "true" ]]; then
+              echo "::error::A release tag is required when Publish is enabled."
+              exit 1
+            fi
             echo "No tag supplied; keeping current package.json version."
             exit 0
           fi
-          VERSION="${TAG#v}"        # strip leading "v"
-          VERSION="${VERSION%%-*}"  # strip any prerelease suffix (e.g. "-pre")
+          if [[ "$TAG" != v* ]]; then
+            echo "::error::Release tag must start with v."
+            exit 1
+          fi
+          VERSION="$(node scripts/release-metadata.js --version-from-tag "$TAG")"
           echo "Setting package.json version to $VERSION (from tag $TAG)"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
@@ -200,7 +218,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           # Manual dispatch: use the 'prerelease' input. Tag push: prerelease when
           # the tag contains a hyphen (e.g. v0.1.0-pre).
-          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || (github.event_name == 'push' && contains(github.ref_name, '-')) }}
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
           files: |
             release/*.exe
             release/*.blockmap

@@ -259,6 +259,9 @@
     const sequence = ++tabActivationSequence;
     const previousTab = App.currentTab;
     App.currentTab = tab;
+    if (previousTab === 'logs' && tab !== 'logs' && App.setLogStreaming) {
+      App.setLogStreaming(false);
+    }
     if (previousTab === 'conns' && tab !== 'conns' && App.clearConnections) App.clearConnections();
     // Keep the small session-only latency cache and let an explicit sweep finish
     // while releasing the heavier node list whenever the user changes pages.
@@ -287,6 +290,9 @@
       App.loadNodes();
       App.refreshGroupSelections();
     } else if (tab === 'logs') {
+      // Main retains a bounded history, so stream chatty core output only while
+      // it can actually be consumed. Re-entry snapshots the missed sequence.
+      if (App.setLogStreaming) App.setLogStreaming(true);
       // History may be large; flush after paint in rAF-sized chunks (logs.js).
       afterPaint(() => {
         if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== 'logs') return;
@@ -316,6 +322,8 @@
   const DIALOG_LAUNCHER_SELECTOR = [
     'button[id$="Open"]',
     '#coreManageBtn',
+    '#smartRegionsBtn',
+    '#smartRegionScope',
     '#geoManageBtn',
     '#lrAdd',
     '#subList button[data-act="editraw"]',
@@ -341,6 +349,7 @@
     if (document.hidden) {
       cancelNavIndicatorAnimation();
       tabActivationSequence++;
+      if (App.setLogStreaming) App.setLogStreaming(false);
       if (connTimer) {
         clearTimeout(connTimer);
         connTimer = null;
@@ -353,6 +362,9 @@
       App.trafficChart.draw();
       App.miniChart.draw();
     }
+  });
+  window.addEventListener('pagehide', () => {
+    if (App.setLogStreaming) App.setLogStreaming(false);
   });
 
   // ---------- Data refresh ----------
@@ -370,13 +382,6 @@
     // Settings objects are small; a stable JSON form is cheaper than rebuilding
     // the whole settings form on every refresh when nothing changed.
     try { return JSON.stringify(settings || null); } catch (_) { return String(Date.now()); }
-  }
-
-  function subsSignature(subs, activeSub) {
-    const rows = (subs || []).map((sub) =>
-      [sub.id, sub.updatedAt || 0, sub.nodeCount || 0, sub.name || '', sub.userInfo && sub.userInfo.expire || ''].join('\0')
-    );
-    return `${activeSub || ''}|${rows.join('|')}`;
   }
 
   function statusSignature(status) {
@@ -397,6 +402,7 @@
     const statusRevisionAtStart = statusEventRevision;
     const settingsRevisionAtStart = localSettingsRevision;
     const previousTheme = App.state.settings && App.state.settings.theme;
+    const previousCoreType = App.state.settings && App.state.settings.coreType;
     const nextState = await api.getState();
     if (sequence !== refreshSequence) return;
     // A compact status event can overtake this slower full snapshot. Preserve
@@ -424,11 +430,13 @@
       (App.state.settings && App.state.settings.ruleOverrides) || {},
     ]);
     const nextSettingsSignature = settingsSignature(App.state.settings);
-    const nextSubsSignature = subsSignature(App.state.subscriptions, App.state.activeSub);
+    const nextSubsSignature = App.subscriptionStateSignature(App.state.subscriptions, App.state.activeSub);
     const nextStatusSignature = statusSignature(App.state.status);
     const settingsChanged = nextSettingsSignature !== prevSettingsSignature;
     const subsChanged = nextSubsSignature !== prevSubsSignature;
     const statusChanged = nextStatusSignature !== prevStatusSignature;
+    const subscriptionTargetChanged = previousCoreType !==
+      (App.state.settings && App.state.settings.coreType);
     const selectedChanged = App.state.selected !== prevSelected;
     const activeChanged = App.state.activeSub !== prevActiveSub || activeRevision !== prevActiveRevision;
     // A same-id refresh may still replace every node/rule in the profile.
@@ -465,9 +473,11 @@
     // when their backing snapshot actually changed (or language rebuilt the UI).
     if (statusChanged || languageChanged) App.renderStatus();
     else if (subsChanged && App.renderDashboard) App.renderDashboard();
-    if ((subsChanged || languageChanged) && App.renderSubs) App.renderSubs();
+    if ((subsChanged || languageChanged || subscriptionTargetChanged) && App.renderSubs) App.renderSubs();
     if (App.currentTab === 'nodes' && App.loadNodes && (activeChanged || languageChanged || selectedChanged)) {
       App.loadNodes();
+    } else if (App.currentTab === 'nodes' && settingsChanged && App.renderNodes) {
+      App.renderNodes();
     }
     if ((settingsChanged || languageChanged) && App.renderSettings) App.renderSettings();
     if (settingsChanged || languageChanged || statusChanged) App.renderMode();

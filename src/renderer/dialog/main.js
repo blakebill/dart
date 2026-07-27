@@ -13,6 +13,7 @@
     'raw-profile': 'dialog/editors.js',
     convert: 'dialog/editors.js',
     core: 'dialog/system.js',
+    'smart-regions': 'dialog/system.js',
     geodata: 'dialog/system.js',
     uwp: 'dialog/system.js',
     route: 'dialog/toolbox.js',

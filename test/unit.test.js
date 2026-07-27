@@ -11,7 +11,23 @@ const os = require('os');
 const path = require('path');
 const vm = require('vm');
 const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('../src/main/delay');
-const { SmartSelectionModel, computeCohortCostProfile } = require('../src/main/smart-selection');
+const {
+  CALIBRATION_OPTION_KEYS,
+  DEFAULT_OPTIONS,
+  SmartSelectionModel,
+  computeCohortCostProfile,
+} = require('../src/main/smart-selection');
+const {
+  SmartProbeSignalWeights,
+  smartProbeFamily,
+  buildSmartProbeFamilies,
+} = require('../src/main/smart-probe-signals');
+const {
+  SmartShadowEvaluator,
+  defaultVariantSpecs,
+} = require('../src/main/smart-shadow-evaluator');
+const { KernelDialFeedback } = require('../src/main/kernel-dial-feedback');
+const { detectNodeRegion, normalizeSmartRegions, smartRegionMembers } = require('../src/main/node-region');
 const { nodeFingerprint } = require('../src/main/subscription');
 const { ManagedAutoSelection } = require('../src/main/managed-auto-selection');
 
@@ -108,6 +124,40 @@ test('Smart batches prioritize winner and unseen nodes and force-quick only a su
   assert.ok(forced.candidates.includes('keep'));
 });
 
+test('Smart batches cover endpoint families before spending duplicate route slots', () => {
+  const names = Array.from({ length: 30 }, (_, index) => `node-${index}`);
+  const families = new Map(names.map((name, index) => [
+    name,
+    index < 20 ? 'tcp:shared.example' : `tcp:unique-${index}.example`,
+  ]));
+  const batch = selectSmartTestBatch(names, names[0], 0, false, {
+    familyForName: families,
+    now: 1_000,
+  });
+  assert.strictEqual(batch.candidates.length, 17);
+  for (const name of names.slice(20)) {
+    assert.ok(batch.candidates.includes(name), `${name} was hidden behind one endpoint family`);
+  }
+  assert.ok(batch.candidates.includes(names[0]));
+});
+
+test('Smart probe families use real endpoints and detours instead of display regions', () => {
+  const nodes = [
+    { name: 'HK A', type: 'trojan', server: 'Shared.EXAMPLE.', port: 443 },
+    { name: 'US B', type: 'vmess', server: 'shared.example', port: 8443 },
+    { name: 'UDP C', type: 'hysteria2', server: 'shared.example', port: 443 },
+    { name: 'Relay A', type: 'trojan', server: 'a.example', detour: 'Parent' },
+    { name: 'Relay B', type: 'trojan', server: 'b.example', detour: 'Parent' },
+    { name: 'Unknown' },
+  ];
+  const families = buildSmartProbeFamilies(nodes, nodes.map((node) => node.name));
+  assert.strictEqual(families.get('HK A'), families.get('US B'));
+  assert.notStrictEqual(families.get('HK A'), families.get('UDP C'));
+  assert.strictEqual(families.get('Relay A'), families.get('Relay B'));
+  assert.strictEqual(smartProbeFamily(nodes[0]), 'tcp:shared.example');
+  assert.strictEqual(families.get('Unknown'), 'node:Unknown');
+});
+
 test('Smart selection smooths RTT and ignores insignificant improvements', () => {
   const model = new SmartSelectionModel({
     minDwellMs: 0,
@@ -195,6 +245,109 @@ test('Smart keeps primary URL delay for display without changing blended scoring
   model.observeDisplayDelay('node', 80, 1100);
   assert.strictEqual(Math.round(model.peek('node').ewma), 220);
   assert.strictEqual(model.qualities(['node'], 1200).node.ewma, 80);
+});
+
+test('Smart smooths primary and secondary probe signals independently', () => {
+  const model = new SmartSelectionModel({ alpha: 0.3 });
+  model.choose({
+    contextKey: 'dual-signals',
+    names: ['a'],
+    current: 'a',
+    now: 1_000,
+    measurements: [{
+      name: 'a',
+      delay: 112,
+      primaryDelay: 40,
+      secondaryDelay: 200,
+      primaryFresh: true,
+      secondaryFresh: true,
+    }],
+  });
+  model.choose({
+    contextKey: 'dual-signals',
+    names: ['a'],
+    current: 'a',
+    now: 2_000,
+    measurements: [{
+      name: 'a',
+      delay: 31,
+      primaryDelay: 40,
+      secondaryDelay: 20,
+      primaryFresh: true,
+      secondaryFresh: false,
+    }],
+  });
+  assert.ok(model.peek('a').ewma > 100, 'cached secondary result was treated as a fresh signal');
+});
+
+test('Smart normalizes adaptive primary and secondary probe weights', () => {
+  const weighted = new SmartSelectionModel();
+  weighted.choose({
+    contextKey: 'weighted-signals',
+    names: ['node'],
+    current: 'node',
+    now: 1_000,
+    measurements: [{
+      name: 'node',
+      delay: 190,
+      primaryDelay: 100,
+      secondaryDelay: 300,
+      primaryFresh: true,
+      secondaryFresh: true,
+      primaryWeight: 9,
+      secondaryWeight: 1,
+    }],
+  });
+  assert.strictEqual(Math.round(weighted.peek('node').ewma), 120);
+
+  const compatible = new SmartSelectionModel();
+  compatible.choose({
+    contextKey: 'default-signals',
+    names: ['node'],
+    current: 'node',
+    now: 1_000,
+    measurements: [{
+      name: 'node',
+      delay: 190,
+      primaryDelay: 100,
+      secondaryDelay: 300,
+      primaryFresh: true,
+      secondaryFresh: true,
+    }],
+  });
+  assert.strictEqual(Math.round(compatible.peek('node').ewma), 190);
+});
+
+test('Smart probe source reliability adapts per network and recovers cautiously', () => {
+  const signals = new SmartProbeSignalWeights();
+  const model = {
+    peek: () => ({ primaryEwma: 100, secondaryEwma: 100 }),
+  };
+  const failedPrimary = Array.from({ length: 4 }, (_, index) => ({
+    name: `node-${index}`,
+    delay: 100,
+    primaryDelay: null,
+    secondaryDelay: 100 + index,
+    primaryFresh: true,
+    secondaryFresh: true,
+  }));
+  const annotated = signals.annotate(failedPrimary, model, 'profile', 'wifi-a');
+  const degraded = signals.weights('profile', 'wifi-a');
+  assert.ok(degraded.primary < 0.5, JSON.stringify(degraded));
+  assert.strictEqual(annotated[0].primaryWeight, 0);
+  assert.strictEqual(annotated[0].secondaryWeight, 1);
+  assert.strictEqual(annotated[0].delay, 100);
+
+  const untouched = signals.weights('profile', 'wifi-b');
+  assert.ok(Math.abs(untouched.primary - 0.55) < 1e-9);
+  const healthy = failedPrimary.map((item, index) => ({
+    ...item,
+    primaryDelay: 100 + index,
+  }));
+  signals.annotate(healthy, model, 'profile', 'wifi-a');
+  const recovering = signals.weights('profile', 'wifi-a');
+  assert.ok(recovering.primary > degraded.primary);
+  assert.ok(recovering.primary < 0.55, 'one healthy sweep restored a failed source too quickly');
 });
 
 test('Smart selection never prefers UI-red high delay when a healthy node exists', () => {
@@ -334,6 +487,27 @@ test('managed Auto scheduler uses fast interval when active and idle when standb
   assert.strictEqual(managed.isScheduled(), false);
 });
 
+test('managed Auto never treats a zero timeout as the fastest node', async () => {
+  let putName = null;
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '♻️ Auto',
+    clashApi: async (method, _apiPath, body) => {
+      if (method === 'PUT') {
+        putName = body && body.name;
+        return {};
+      }
+      return { now: 'timeout-node', all: ['timeout-node', 'valid-node'] };
+    },
+    isRunning: () => true,
+    selectBatch: selectAutoTestBatch,
+    testDelay: async (name) => (name === 'timeout-node' ? 0 : 42),
+  });
+  assert.strictEqual(await managed.refresh({ force: true }), 'valid-node');
+  assert.strictEqual(putName, 'valid-node');
+  managed.stop();
+});
+
 test('Smart selection isolates history by core and active profile', () => {
   const model = new SmartSelectionModel();
   model.choose({
@@ -432,6 +606,169 @@ test('connection feedback denoise ignores probes and needs a soft-fail streak', 
   assert.ok(!events.some((e) => e.name === 'Policy Group'));
 });
 
+test('kernel dial feedback is incremental, filtered, and restart-safe', async () => {
+  const feedback = new KernelDialFeedback();
+  const paths = [];
+  let phase = 'initial';
+  const request = async (apiPath) => {
+    paths.push(apiPath);
+    if (phase === 'initial') {
+      return {
+        sequence: 4,
+        events: [
+          { sequence: 1, group: '🧠 Smart', outbound: 'a', success: true, durationMs: 15 },
+          { sequence: 2, group: '🧠 Smart', outbound: 'a', success: false, errorClass: 'canceled' },
+          { sequence: 3, group: '🧠 Smart', outbound: 'a', success: false, errorClass: 'soft-fail' },
+          { sequence: 4, group: 'Other', outbound: 'a', success: false, errorClass: 'network' },
+        ],
+      };
+    }
+    if (phase === 'incremental') {
+      return {
+        sequence: 5,
+        events: [
+          { sequence: 5, outbound: 'a', success: false, errorClass: 'network' },
+        ],
+      };
+    }
+    if (new URL(apiPath, 'http://localhost').searchParams.get('since') === '5') {
+      return { sequence: 1, events: [] };
+    }
+    return {
+      sequence: 2,
+      events: [{ sequence: 2, outbound: 'a', success: true, durationMs: 9 }],
+    };
+  };
+  const options = { allowedNames: new Set(['a']), group: '🧠 Smart', now: 1_000 };
+  const initial = await feedback.poll(request, options);
+  assert.strictEqual(initial.supported, true);
+  assert.strictEqual(initial.available, true);
+  assert.deepStrictEqual(initial.events.map((event) => event.kind), ['dialSuccess', 'softFail']);
+  assert.deepStrictEqual(paths, ['/dart/dial-feedback?since=0&signals=1']);
+
+  phase = 'incremental';
+  const incremental = await feedback.poll(request, { ...options, now: 2_000 });
+  assert.deepStrictEqual(incremental.events.map((event) => event.kind), ['dialFailure']);
+  assert.strictEqual(paths.at(-1), '/dart/dial-feedback?since=4&signals=1');
+
+  phase = 'restart';
+  const restarted = await feedback.poll(request, { ...options, now: 3_000 });
+  assert.strictEqual(restarted.restarted, true);
+  assert.deepStrictEqual(restarted.events.map((event) => event.kind), ['dialSuccess']);
+  assert.deepStrictEqual(paths.slice(-2), [
+    '/dart/dial-feedback?since=5&signals=1',
+    '/dart/dial-feedback?since=0&signals=1',
+  ]);
+});
+
+test('kernel dial feedback refetches when a new instance overtakes the old cursor', async () => {
+  const feedback = new KernelDialFeedback();
+  const paths = [];
+  let instance = 'old-instance';
+  const request = async (apiPath) => {
+    paths.push(apiPath);
+    const since = new URL(apiPath, 'http://localhost').searchParams.get('since');
+    if (instance === 'old-instance') {
+      return {
+        instance,
+        sequence: 5,
+        events: [{ sequence: 5, outbound: 'a', success: true, durationMs: 20 }],
+      };
+    }
+    if (since === '5') {
+      // The new process has already passed the old cursor. Sequence rollback
+      // alone cannot detect this restart and would lose its first five events.
+      return {
+        instance,
+        sequence: 10,
+        events: [{ sequence: 6, outbound: 'a', success: false, errorClass: 'network' }],
+      };
+    }
+    return {
+      instance,
+      sequence: 10,
+      events: [
+        { sequence: 1, outbound: 'a', success: true, durationMs: 8 },
+        { sequence: 10, outbound: 'a', success: false, errorClass: 'timeout' },
+      ],
+    };
+  };
+  const options = { allowedNames: new Set(['a']), now: 1_000 };
+  const initial = await feedback.poll(request, options);
+  assert.strictEqual(initial.restarted, false);
+  assert.strictEqual(feedback.instance, 'old-instance');
+
+  instance = 'new-instance';
+  const restarted = await feedback.poll(request, { ...options, now: 2_000 });
+  assert.strictEqual(restarted.restarted, true);
+  assert.strictEqual(feedback.instance, 'new-instance');
+  assert.deepStrictEqual(restarted.events.map((event) => event.sequence), [1, 10]);
+  assert.deepStrictEqual(paths.slice(-2), [
+    '/dart/dial-feedback?since=5&signals=1',
+    '/dart/dial-feedback?since=0&signals=1',
+  ]);
+});
+
+test('official kernels disable unsupported dial feedback until core reset', async () => {
+  const feedback = new KernelDialFeedback();
+  let calls = 0;
+  const request = async () => {
+    calls += 1;
+    throw new Error('clash api 404');
+  };
+  const unsupported = await feedback.poll(request);
+  assert.strictEqual(unsupported.supported, false);
+  assert.strictEqual(unsupported.available, false);
+  assert.strictEqual((await feedback.poll(request)).supported, false);
+  assert.strictEqual(calls, 1);
+  feedback.reset();
+  assert.strictEqual((await feedback.poll(request)).supported, false);
+  assert.strictEqual(calls, 2);
+});
+
+test('kernel dial feedback keeps four stages separate and rejects unknown signals', async () => {
+  const feedback = new KernelDialFeedback();
+  const result = await feedback.poll(async (apiPath) => {
+    const query = new URL(apiPath, 'http://localhost').searchParams;
+    assert.strictEqual(query.get('signals'), '1');
+    return {
+      instance: 'staged-kernel',
+      sequence: 5,
+      events: [
+        { sequence: 1, outbound: 'node', network: 'udp', success: true },
+        { sequence: 2, outbound: 'node', signal: 'handshake', success: true, durationMs: 18 },
+        {
+          sequence: 3,
+          outbound: 'node',
+          signal: 'first-byte',
+          success: false,
+          errorClass: 'soft-fail',
+        },
+        { sequence: 4, outbound: 'node', signal: 'tls-secret', success: false },
+        {
+          sequence: 5,
+          outbound: 'node',
+          signal: 'tcp',
+          success: false,
+          errorClass: 'canceled',
+        },
+      ],
+    };
+  }, {
+    allowedNames: new Set(['node']),
+    now: 1_000,
+  });
+  assert.deepStrictEqual(
+    result.events.map(({ signal, network, kind }) => ({ signal, network, kind })),
+    [
+      { signal: 'udp', network: 'udp', kind: 'dialSuccess' },
+      { signal: 'handshake', network: 'tcp', kind: 'dialSuccess' },
+      { signal: 'first-byte', network: 'tcp', kind: 'softFail' },
+    ]
+  );
+  assert.strictEqual(feedback.sequence, 5);
+});
+
 test('Smart prefers real traffic over slightly lower URL delay', () => {
   const { SmartSelectionModel: Model } = require('../src/main/smart-selection');
   const model = new Model({
@@ -469,6 +806,62 @@ test('Smart prefers real traffic over slightly lower URL delay', () => {
   assert.ok(failedState.softFails > 1, String(failedState.softFails));
   assert.strictEqual(failedState.consecutiveFailures, 0, 'URL success must not own real connection failures');
   assert.strictEqual(pick, 'real-path');
+});
+
+test('kernel dial feedback fails over immediately and recovers gradually', () => {
+  const options = {
+    minDwellMs: 0,
+    failedDwellMs: 600_000,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 3,
+  };
+  const model = new SmartSelectionModel(options);
+  model.choose({
+    contextKey: 'dial-feedback',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1_000,
+    measurements: [{ name: 'a', delay: 50 }, { name: 'b', delay: 80 }],
+  });
+  model.observeConnection({
+    name: 'a',
+    kind: 'dialSuccess',
+    durationMs: 5_000,
+  }, 1_100);
+  assert.strictEqual(model.peek('a').dialEwma, 5_000);
+  // Dial duration is retained for diagnostics/future learning, not RTT score.
+  assert.strictEqual(model.choose({
+    contextKey: 'dial-feedback',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1_200,
+    measurements: [],
+  }), 'a');
+
+  const snapshot = model.snapshot();
+  const restored = new SmartSelectionModel(options);
+  restored.restore(snapshot, 'dial-feedback');
+  assert.strictEqual(restored.peek('a').dialEwma, 5_000);
+  assert.strictEqual(restored.peek('a').dialSamples, 1);
+
+  restored.observeConnection({ name: 'a', kind: 'dialFailure' }, 1_300);
+  assert.ok(restored.peek('a').softFails >= 2);
+  assert.strictEqual(restored.choose({
+    contextKey: 'dial-feedback',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1_301,
+    measurements: [],
+  }), 'b');
+
+  const failureRate = restored.peek('a').connectionFailureRate;
+  restored.observeConnection({ name: 'a', kind: 'dialSuccess', durationMs: 100 }, 1_400);
+  assert.ok(restored.peek('a').softFails >= 2, 'one success recovered an explicit failure too quickly');
+  restored.observeConnection({ name: 'a', kind: 'dialSuccess', durationMs: 90 }, 1_500);
+  assert.ok(restored.peek('a').softFails < 2);
+  assert.ok(restored.peek('a').connectionFailureRate < failureRate);
+  assert.ok(restored.peek('a').dialEwma < 5_000);
 });
 
 test('Smart scheduleHint adapts to stable and failing nodes', () => {
@@ -557,6 +950,108 @@ test('Smart healthy switch needs two consecutive winning rounds', () => {
   }), 'b');
 });
 
+test('Smart requires a variance-aware advantage but bypasses it on explicit failure', () => {
+  const options = {
+    minDwellMs: 0,
+    failedDwellMs: 0,
+    switchThresholdMs: 0,
+    switchThresholdRatio: 0,
+    switchConfirmRounds: 1,
+    switchConfidenceZ: 1.5,
+    selectionRiskWeight: 0,
+    jitterWeight: 0,
+    ewmaWeight: 1,
+  };
+  const model = new SmartSelectionModel(options);
+  model.choose({
+    contextKey: 'variance-gate',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1_000,
+    measurements: [{ name: 'a', delay: 80 }, { name: 'b', delay: 95 }],
+  });
+  const uncertain = model.snapshot();
+  Object.assign(uncertain.nodes.get('a'), {
+    ewma: 80,
+    delayMean: 80,
+    delayM2: 0,
+    samples: 20,
+    effectiveSamples: 20,
+    lastSuccess: 1_000,
+  });
+  Object.assign(uncertain.nodes.get('b'), {
+    ewma: 70,
+    delayMean: 70,
+    delayM2: 3_600,
+    samples: 4,
+    effectiveSamples: 4,
+    lastSuccess: 1_000,
+  });
+  uncertain.selected = 'a';
+  uncertain.selectedAt = 1_000;
+  model.restore(uncertain, 'variance-gate');
+
+  // A nominal 10ms win is inside the challenger's combined uncertainty.
+  assert.strictEqual(model.choose({
+    contextKey: 'variance-gate',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 2_000,
+    measurements: [],
+  }), 'a');
+
+  const decisive = new SmartSelectionModel(options);
+  const decisiveSnapshot = model.snapshot();
+  decisiveSnapshot.nodes.get('b').ewma = 40;
+  decisiveSnapshot.nodes.get('b').delayMean = 40;
+  decisive.restore(decisiveSnapshot, 'variance-gate');
+  assert.strictEqual(decisive.choose({
+    contextKey: 'variance-gate',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 2_000,
+    measurements: [{ name: 'a', delay: 80 }, { name: 'b', delay: 40 }],
+  }), 'b');
+
+  const failed = model.snapshot();
+  failed.nodes.get('a').softFails = 3;
+  failed.nodes.get('a').lastConnectionFailure = 2_000;
+  model.restore(failed, 'variance-gate');
+  assert.strictEqual(model.choose({
+    contextKey: 'variance-gate',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 2_100,
+    measurements: [],
+  }), 'b');
+});
+
+test('Smart does not adopt a kernel dial failover as its confirmed selection', () => {
+  const model = new SmartSelectionModel({
+    minDwellMs: 120_000,
+    switchThresholdMs: 25,
+    switchThresholdRatio: 0.1,
+    switchConfirmRounds: 2,
+  });
+  assert.strictEqual(model.choose({
+    contextKey: 'kernel-failover',
+    names: ['a', 'b'],
+    current: 'a',
+    now: 1_000,
+    measurements: [{ name: 'a', delay: 50 }, { name: 'b', delay: 90 }],
+  }), 'a');
+  // A type:smart core may report b for a single dial. The GUI should restore
+  // its confirmed healthy pick rather than resetting dwell around b.
+  assert.strictEqual(model.choose({
+    contextKey: 'kernel-failover',
+    names: ['a', 'b'],
+    current: 'b',
+    now: 2_000,
+    measurements: [{ name: 'a', delay: 52 }, { name: 'b', delay: 88 }],
+  }), 'a');
+  assert.strictEqual(model.selected, 'a');
+});
+
 test('Smart mode changes switching posture without discarding history', () => {
   const model = new SmartSelectionModel({ mode: 'stable' });
   model.observe({ name: 'a', delay: 80 }, 1000);
@@ -569,6 +1064,605 @@ test('Smart mode changes switching posture without discarding history', () => {
   assert.strictEqual(model.peek('a').samples, samples);
   assert.strictEqual(model.setMode('invalid'), true);
   assert.strictEqual(model.mode, 'balanced');
+});
+
+test('Smart runtime calibration is bounded, non-compounding, and survives mode/snapshot changes', () => {
+  const model = new SmartSelectionModel({ mode: 'balanced' });
+  model.observe({ name: 'a', delay: 80 }, 1_000);
+  const samples = model.peek('a').samples;
+  const base = model.getUncalibratedOptions();
+  assert.strictEqual(base.switchThresholdMs, 25);
+  assert.deepStrictEqual(model.baseOptions(), base);
+
+  assert.strictEqual(model.setCalibrationOptions({
+    switchThresholdMs: 31,
+    switchThresholdRatio: 0.12,
+    switchConfirmRounds: 4,
+    routeChangeThresholdMs: 70,
+    routeChangeBaselineAlpha: 0.08,
+  }), true);
+  assert.strictEqual(model.options.switchThresholdMs, 31);
+  assert.strictEqual(model.getUncalibratedOptions().switchThresholdMs, 25);
+  assert.strictEqual(model.peek('a').samples, samples);
+
+  const calibrationBeforeReject = { ...model.calibrationOptions };
+  assert.throws(
+    () => model.setCalibrationOptions({ switchThresholdMs: 32, maxNodes: 1 }),
+    /unsupported calibration option/
+  );
+  assert.deepStrictEqual(model.calibrationOptions, calibrationBeforeReject);
+  assert.throws(
+    () => model.setCalibrationOptions({ routeChangeMinSamples: 2 }),
+    /between 4 and 64/
+  );
+  assert.deepStrictEqual(model.calibrationOptions, calibrationBeforeReject);
+
+  assert.strictEqual(model.setMode('stable'), true);
+  assert.strictEqual(model.options.switchThresholdMs, 31);
+  assert.strictEqual(model.getUncalibratedOptions().switchThresholdMs, 45);
+  assert.strictEqual(model.peek('a').samples, samples);
+
+  const snapshot = model.snapshot();
+  const restored = new SmartSelectionModel({ mode: 'stable' });
+  assert.strictEqual(restored.restore(snapshot, 'calibration'), true);
+  assert.strictEqual(restored.options.switchThresholdMs, 31);
+  assert.strictEqual(restored.options.routeChangeThresholdMs, 70);
+
+  // Older snapshots have no overlay field; keep the receiving model posture.
+  const legacySnapshot = { ...snapshot };
+  delete legacySnapshot.calibrationOptions;
+  const compatible = new SmartSelectionModel({
+    mode: 'stable',
+    calibrationOptions: { switchThresholdMs: 37 },
+  });
+  assert.strictEqual(compatible.restore(legacySnapshot, 'calibration'), true);
+  assert.strictEqual(compatible.options.switchThresholdMs, 37);
+  assert.ok(!CALIBRATION_OPTION_KEYS.includes('routeChangeDetection'));
+  assert.ok(!CALIBRATION_OPTION_KEYS.includes('multiSignalHealth'));
+  assert.strictEqual(DEFAULT_OPTIONS.routeChangeDetection, true);
+  assert.strictEqual(DEFAULT_OPTIONS.multiSignalHealth, true);
+  assert.throws(
+    () => model.setCalibrationOptions({ multiSignalHealth: false }),
+    /unsupported calibration option/
+  );
+});
+
+test('Smart route-change detector ignores cold start and isolated noise', () => {
+  const cold = new SmartSelectionModel({ routeChangeMinSamples: 6 });
+  [100, 500, 90, 450, 110].forEach((delay, index) => {
+    cold.observe({ name: 'node', delay }, 1_000 + index);
+  });
+  assert.strictEqual(cold.peek('node').routeChange.changes, 0);
+
+  const noisy = new SmartSelectionModel();
+  let now = 2_000;
+  for (let i = 0; i < 12; i++) {
+    noisy.observe({ name: 'node', delay: 100 + (i % 2) }, now++);
+  }
+  noisy.observe({ name: 'node', delay: 600 }, now++);
+  for (let i = 0; i < 40; i++) {
+    noisy.observe({ name: 'node', delay: 100 + (i % 2) }, now++);
+  }
+  const state = noisy.peek('node');
+  assert.strictEqual(state.routeChange.changes, 0);
+  assert.ok(state.ewma < 110, String(state.ewma));
+
+  const warmupOutlier = new SmartSelectionModel();
+  [100, 100, 100, 100, 100, 1_000].forEach((delay, index) => {
+    warmupOutlier.observe({ name: 'node', delay }, 3_000 + index);
+  });
+  warmupOutlier.observe({ name: 'node', delay: 250 }, 3_100);
+  warmupOutlier.observe({ name: 'node', delay: 251 }, 3_101);
+  assert.strictEqual(warmupOutlier.peek('node').routeChange.changes, 1);
+});
+
+test('Smart route reset needs dual-probe consensus and ignores blend-weight changes', () => {
+  const observeDual = (model, primary, secondary, primaryWeight, now) => {
+    const secondaryWeight = 1 - primaryWeight;
+    model.observe({
+      name: 'node',
+      delay: primary * primaryWeight + secondary * secondaryWeight,
+      primaryDelay: primary,
+      secondaryDelay: secondary,
+      primaryFresh: true,
+      secondaryFresh: true,
+      primaryWeight,
+      secondaryWeight,
+    }, now);
+  };
+
+  const weightOnly = new SmartSelectionModel();
+  for (let i = 0; i < 12; i++) {
+    observeDual(weightOnly, 100 + (i % 2), 200 + (i % 2), 0.55, 1_000 + i);
+  }
+  for (let i = 0; i < 4; i++) {
+    observeDual(weightOnly, 100 + (i % 2), 200 + (i % 2), 0.9, 1_100 + i);
+  }
+  assert.strictEqual(weightOnly.peek('node').routeChange.changes, 0);
+  assert.strictEqual(weightOnly.peek('node').samples, 16);
+
+  const oneProbeSite = new SmartSelectionModel();
+  for (let i = 0; i < 12; i++) {
+    observeDual(oneProbeSite, 100 + (i % 2), 200 + (i % 2), 0.55, 2_000 + i);
+  }
+  for (let i = 0; i < 4; i++) {
+    observeDual(oneProbeSite, 400 + (i % 2), 200 + (i % 2), 0.55, 2_100 + i);
+  }
+  assert.strictEqual(oneProbeSite.peek('node').routeChange.changes, 0);
+  assert.strictEqual(oneProbeSite.peek('node').routeChange.primary.changes, 1);
+  assert.strictEqual(oneProbeSite.peek('node').routeChange.secondary.changes, 0);
+
+  const consensus = new SmartSelectionModel();
+  for (let i = 0; i < 12; i++) {
+    observeDual(consensus, 100 + (i % 2), 200 + (i % 2), 0.55, 3_000 + i);
+  }
+  observeDual(consensus, 250, 350, 0.55, 3_100);
+  observeDual(consensus, 251, 351, 0.55, 3_101);
+  const shifted = consensus.peek('node');
+  assert.strictEqual(shifted.routeChange.changes, 1);
+  assert.strictEqual(shifted.routeChange.lastDirection, 'up');
+  assert.strictEqual(shifted.samples, 1);
+
+  const delayedConsensus = new SmartSelectionModel();
+  for (let i = 0; i < 12; i++) {
+    observeDual(
+      delayedConsensus,
+      100 + (i % 2),
+      200 + (i % 2),
+      0.55,
+      4_000 + i
+    );
+  }
+  for (let i = 0; i < 2; i++) {
+    delayedConsensus.observe({
+      name: 'node',
+      delay: 250,
+      primaryDelay: 250 + i,
+      secondaryDelay: 200,
+      primaryFresh: true,
+      secondaryFresh: false,
+      primaryWeight: 1,
+      secondaryWeight: 0,
+    }, 4_100 + i);
+  }
+  const delayedAt = 4_101 + 3 * 60_000 + 1;
+  observeDual(delayedConsensus, 250, 350, 0.55, delayedAt);
+  observeDual(delayedConsensus, 251, 351, 0.55, delayedAt + 1);
+  assert.strictEqual(delayedConsensus.peek('node').routeChange.changes, 1);
+});
+
+test('Smart route changes reset only the shifted node and preserve its selection', () => {
+  const model = new SmartSelectionModel({
+    minDwellMs: 0,
+    switchConfirmRounds: 1,
+  });
+  model.choose({
+    contextKey: 'route-change-up',
+    names: ['target', 'other'],
+    current: 'target',
+    now: 1_000,
+    measurements: [
+      { name: 'target', delay: 100 },
+      { name: 'other', delay: 160 },
+    ],
+  });
+  for (let i = 0; i < 12; i++) {
+    model.observe({ name: 'target', delay: 100 + (i % 2) }, 1_010 + i);
+    model.observe({ name: 'other', delay: 160 + (i % 2) }, 1_010 + i);
+  }
+  model.observe({ name: 'target', delay: null }, 1_030);
+  model.observeConnection({ name: 'target', kind: 'softFail' }, 1_031);
+  model.observeDisplayDelay('target', 99, 1_032);
+  const untouched = model.peek('other');
+
+  model.observe({ name: 'target', delay: 250 }, 1_040);
+  model.observe({ name: 'target', delay: 251 }, 1_041);
+  const shifted = model.peek('target');
+  assert.strictEqual(shifted.routeChange.changes, 1);
+  assert.strictEqual(shifted.routeChange.lastDirection, 'up');
+  assert.strictEqual(shifted.samples, 1);
+  assert.ok(shifted.ewma >= 250, String(shifted.ewma));
+  assert.strictEqual(shifted.failureRate, 0);
+  assert.strictEqual(shifted.softFails, 0);
+  assert.strictEqual(shifted.healthUnavailable, false);
+  assert.strictEqual(shifted.displayDelay, null);
+  assert.strictEqual(model.snapshot().selected, 'target');
+  assert.deepStrictEqual(model.peek('other'), untouched);
+
+  const falling = new SmartSelectionModel();
+  let now = 2_000;
+  for (let i = 0; i < 12; i++) {
+    falling.observe({ name: 'node', delay: 300 + (i % 2) }, now++);
+  }
+  falling.observe({ name: 'node', delay: 100 }, now++);
+  falling.observe({ name: 'node', delay: 101 }, now++);
+  const down = falling.peek('node');
+  assert.strictEqual(down.routeChange.changes, 1);
+  assert.strictEqual(down.routeChange.lastDirection, 'down');
+  assert.ok(down.ewma < 110, String(down.ewma));
+});
+
+test('Smart route-change state is bounded and cannot mutate inactive network history', () => {
+  const model = new SmartSelectionModel({
+    sampleHalfLifeMs: 24 * 60 * 60_000,
+    failureHalfLifeMs: 24 * 60 * 60_000,
+  });
+  model.clear('route-network');
+  model.setNetworkKey('wifi-a', 1_000);
+  for (let i = 0; i < 12; i++) {
+    model.observe({ name: 'node', delay: 80 + (i % 2) }, 1_000 + i);
+  }
+  model.setNetworkKey('wifi-b', 2_000);
+  const cachedBefore = model.snapshot().networkContexts.get('wifi-a').nodes.get('node');
+  model.observe({ name: 'node', delay: 300 }, 2_001);
+  model.observe({ name: 'node', delay: 301 }, 2_002);
+  const cachedAfter = model.snapshot().networkContexts.get('wifi-a').nodes.get('node');
+  assert.deepStrictEqual(cachedAfter, cachedBefore);
+  assert.strictEqual(model.peek('node').routeChange.lastDirection, 'up');
+
+  const bounded = new SmartSelectionModel();
+  for (let i = 0; i < 10_000; i++) {
+    bounded.observe({ name: 'node', delay: 90 + (i % 3) }, 3_000 + i);
+  }
+  const detector = bounded.peek('node').routeChange;
+  assert.strictEqual(Object.keys(detector).length, 13);
+  const pending = [detector];
+  while (pending.length) {
+    const value = pending.pop();
+    assert.ok(!Array.isArray(value));
+    for (const child of Object.values(value || {})) {
+      if (child && typeof child === 'object') pending.push(child);
+    }
+  }
+  assert.ok(detector.count <= 1_000_000);
+  assert.strictEqual(bounded.snapshot().nodes.size, 1);
+});
+
+test('Smart keeps TCP, UDP, handshake, and first-byte health independent', () => {
+  const model = new SmartSelectionModel();
+  model.observe({ name: 'node', delay: 60 }, 1_000);
+  model.observeConnection({ name: 'node', kind: 'dialSuccess', signal: 'tcp' }, 1_001);
+  model.observeConnection({ name: 'node', kind: 'dialSuccess', phase: 'handshake' }, 1_002);
+  model.observeConnection({ name: 'node', kind: 'success', signal: 'firstByte' }, 1_003);
+  model.observeConnection({ name: 'node', kind: 'dialFailure', network: 'udp' }, 1_004);
+  let state = model.peek('node');
+  assert.strictEqual(state.healthSignals.tcp.failures, 0);
+  assert.strictEqual(state.healthSignals.udp.failures, 1);
+  assert.strictEqual(state.healthSignals.handshake.failures, 0);
+  assert.strictEqual(state.healthSignals.firstByte.failures, 0);
+  assert.strictEqual(state.healthUnavailable, false);
+  assert.strictEqual(model.isConnectionUnavailable('node', 1_004), false);
+  assert.strictEqual(model.qualities(['node'], 1_004).node.failed, false);
+  assert.ok(state.connectionFailureRate < state.healthSignals.udp.failureRate);
+  assert.ok(state.softFails < state.healthSignals.udp.softFails);
+
+  model.observeConnection({ name: 'node', kind: 'softFail', phase: 'handshake' }, 1_005);
+  model.observeConnection({ name: 'node', kind: 'softFail', phase: 'handshake' }, 1_006);
+  state = model.peek('node');
+  assert.ok(state.healthSignals.handshake.softFails > 1.99);
+  assert.ok(state.healthSignals.udp.softFails > 0.99);
+  assert.strictEqual(state.healthUnavailable, true);
+  assert.strictEqual(model.isConnectionUnavailable('node', 1_006), true);
+  model.observeConnection({ name: 'node', kind: 'dialSuccess', phase: 'handshake' }, 1_007);
+  assert.strictEqual(model.peek('node').healthUnavailable, false);
+  assert.strictEqual(model.isConnectionUnavailable('node', 1_007), false);
+});
+
+test('Smart first-byte failures need repetition and phase durations never mix', () => {
+  const firstByte = new SmartSelectionModel();
+  firstByte.observe({ name: 'node', delay: 60 }, 1_000);
+  firstByte.observeConnection({
+    name: 'node',
+    kind: 'dialFailure',
+    signal: 'first-byte',
+  }, 1_001);
+  assert.strictEqual(firstByte.peek('node').healthUnavailable, false);
+  assert.strictEqual(firstByte.qualities(['node'], 1_001).node.failed, false);
+  firstByte.observeConnection({
+    name: 'node',
+    kind: 'dialFailure',
+    signal: 'first-byte',
+  }, 1_002);
+  assert.strictEqual(firstByte.peek('node').healthUnavailable, true);
+  assert.strictEqual(firstByte.isConnectionUnavailable('node', 1_002), true);
+
+  const durations = new SmartSelectionModel();
+  durations.observeConnection({
+    name: 'node',
+    kind: 'dialSuccess',
+    signal: 'tcp',
+    durationMs: 100,
+  }, 2_000);
+  durations.observeConnection({
+    name: 'node',
+    kind: 'dialSuccess',
+    signal: 'udp',
+    durationMs: 200,
+  }, 2_001);
+  durations.observeConnection({
+    name: 'node',
+    kind: 'dialSuccess',
+    signal: 'handshake',
+    durationMs: 300,
+  }, 2_002);
+  durations.observeConnection({
+    name: 'node',
+    kind: 'dialSuccess',
+    signal: 'first-byte',
+    durationMs: 400,
+  }, 2_003);
+  const state = durations.peek('node');
+  assert.strictEqual(state.healthSignals.tcp.durationEwma, 100);
+  assert.strictEqual(state.healthSignals.udp.durationEwma, 200);
+  assert.strictEqual(state.healthSignals.handshake.durationEwma, 300);
+  assert.strictEqual(state.healthSignals.firstByte.durationEwma, 400);
+  assert.strictEqual(state.dialEwma, 100, 'legacy TCP diagnostic must not mix phases');
+  assert.strictEqual(
+    state.trafficEvidence,
+    0.5,
+    'one detailed connection must contribute traffic evidence only once'
+  );
+
+  const recovery = new SmartSelectionModel();
+  recovery.observeConnection({ name: 'node', kind: 'dialFailure', signal: 'tcp' }, 3_000);
+  recovery.observeConnection({ name: 'node', kind: 'dialSuccess', signal: 'tcp' }, 3_001);
+  recovery.observeConnection({ name: 'node', kind: 'dialSuccess', signal: 'tcp' }, 3_002);
+  recovery.observeConnection({
+    name: 'node',
+    kind: 'dialFailure',
+    signal: 'first-byte',
+  }, 3_003);
+  recovery.observeConnection({
+    name: 'node',
+    kind: 'dialFailure',
+    signal: 'first-byte',
+  }, 3_004);
+  for (let i = 0; i < 6; i++) {
+    recovery.observeConnection({
+      name: 'node',
+      kind: 'dialSuccess',
+      signal: 'first-byte',
+    }, 3_005 + i);
+  }
+  assert.ok(
+    recovery.peek('node').connectionSuccesses >= 5.99,
+    'an older recovered phase capped the latest phase recovery'
+  );
+});
+
+test('Smart multi-signal health restores old snapshots and can shadow legacy aggregation', () => {
+  const modern = new SmartSelectionModel();
+  modern.observe({ name: 'node', delay: 50 }, 1_000);
+  modern.observeConnection({ name: 'node', kind: 'dialFailure', signal: 'tcp' }, 1_001);
+  modern.observeConnection({ name: 'node', kind: 'softFail' }, 1_002);
+  assert.strictEqual(modern.peek('node').healthSignals.tcp.failures, 1);
+  assert.strictEqual(modern.peek('node').healthSignals.firstByte.failures, 1);
+
+  const snapshot = modern.snapshot();
+  const roundTrip = new SmartSelectionModel();
+  assert.strictEqual(roundTrip.restore(snapshot, 'health'), true);
+  assert.deepStrictEqual(
+    roundTrip.peek('node').healthSignals,
+    modern.peek('node').healthSignals
+  );
+
+  const oldNode = { ...snapshot.nodes.get('node') };
+  delete oldNode.healthSignals;
+  delete oldNode.healthUnavailable;
+  oldNode.connectionFailureRate = 0.5;
+  oldNode.softFails = 3;
+  oldNode.lastConnectionFailure = 2_000;
+  const oldSnapshot = {
+    ...snapshot,
+    nodes: new Map([['node', oldNode]]),
+  };
+  const compatible = new SmartSelectionModel();
+  assert.strictEqual(compatible.restore(oldSnapshot, 'health'), true);
+  assert.strictEqual(compatible.peek('node').healthSignals.tcp.softFails, 3);
+  assert.strictEqual(compatible.peek('node').healthUnavailable, true);
+
+  const legacyShadow = new SmartSelectionModel({ multiSignalHealth: false });
+  legacyShadow.observeConnection({
+    name: 'node',
+    kind: 'dialFailure',
+    signal: 'udp',
+  }, 3_000);
+  assert.strictEqual(legacyShadow.peek('node').healthSignals.tcp.failures, 1);
+  assert.strictEqual(legacyShadow.peek('node').healthSignals.udp.failures, 0);
+});
+
+test('Smart shadow replay is bounded, deterministic, and strips unrelated connection data', () => {
+  const baseOptions = new SmartSelectionModel({
+    minDwellMs: 0,
+    switchConfirmRounds: 1,
+  }).getUncalibratedOptions();
+  const shadow = new SmartShadowEvaluator({
+    maxContexts: 2,
+    maxHistory: 16,
+    maxNames: 8,
+    maxMeasurements: 4,
+    calibrationInterval: 100,
+  });
+  shadow.configure({
+    contextKey: 'shadow-a',
+    mode: 'balanced',
+    baseOptions,
+    legacyOptions: {
+      routeChangeDetection: false,
+      multiSignalHealth: false,
+    },
+  });
+  for (let index = 0; index < 10; index++) {
+    shadow.recordRound({
+      contextKey: 'shadow-a',
+      networkKey: 'network-a',
+      names: ['a', 'b'],
+      current: 'a',
+      productionPick: 'a',
+      now: 1_000 + index,
+      measurements: [
+        { name: 'a', delay: 80 + index % 2, endpoint: 'secret-a.example' },
+        { name: 'b', delay: 110, destination: 'private-b.example' },
+      ],
+    });
+  }
+  for (let index = 0; index < 30; index++) {
+    shadow.observeConnection({
+      name: 'a',
+      kind: 'dialSuccess',
+      signal: 'tcp',
+      durationMs: 10 + index,
+      errorClass: 'raw private error',
+      destination: 'private.example:443',
+    }, 2_000 + index);
+  }
+  // A new round compacts the online runtime back to exactly the retained log.
+  shadow.recordRound({
+    contextKey: 'shadow-a',
+    networkKey: 'network-a',
+    names: ['a', 'b'],
+    current: 'a',
+    productionPick: 'a',
+    now: 3_000,
+    measurements: [{ name: 'a', delay: 82 }, { name: 'b', delay: 108 }],
+  });
+
+  const snapshot = shadow.snapshot();
+  assert.strictEqual(snapshot.contexts.length, 1);
+  assert.ok(snapshot.contexts[0].history.length <= 16);
+  assert.ok(
+    snapshot.contexts[0].history.filter((entry) => entry.type === 'round').length >= 10,
+    'connection traffic erased the probe history'
+  );
+  const serialized = JSON.stringify(snapshot);
+  assert.ok(!serialized.includes('secret-a.example'));
+  assert.ok(!serialized.includes('private-b.example'));
+  assert.ok(!serialized.includes('private.example:443'));
+  assert.ok(!serialized.includes('raw private error'));
+
+  const beforeReplay = shadow.summary().variants;
+  assert.deepStrictEqual(shadow.replay().variants, beforeReplay);
+  const restored = new SmartShadowEvaluator({
+    maxContexts: 2,
+    maxHistory: 16,
+    maxNames: 8,
+    maxMeasurements: 4,
+    calibrationInterval: 100,
+  });
+  assert.strictEqual(restored.restore(snapshot), true);
+  restored.configure({
+    contextKey: 'shadow-a',
+    mode: 'balanced',
+    baseOptions,
+    legacyOptions: {
+      routeChangeDetection: false,
+      multiSignalHealth: false,
+    },
+  });
+  assert.deepStrictEqual(restored.summary().variants, beforeReplay);
+
+  restored.configure({ contextKey: 'shadow-b', mode: 'balanced', baseOptions });
+  restored.configure({ contextKey: 'shadow-c', mode: 'balanced', baseOptions });
+  assert.strictEqual(restored.snapshot().contexts.length, 2);
+  assert.ok(!restored.snapshot().contexts.some((context) => context.contextKey === 'shadow-a'));
+});
+
+test('Smart shadow calibrates only after sustained counterfactual improvement', () => {
+  class FakeShadowModel {
+    constructor(options) {
+      this.options = options;
+    }
+    setNetworkKey() {}
+    observeConnection() {}
+    choose() {
+      return this.options.switchThresholdRatio <= 0.05 ? 'b' : 'a';
+    }
+  }
+  const variantFactory = () => [
+    { name: 'current', options: {}, calibration: null },
+    {
+      name: 'tuned',
+      options: { switchThresholdRatio: 0.04 },
+      calibration: { switchThresholdRatio: 0.04 },
+    },
+  ];
+  const shadow = new SmartShadowEvaluator({
+    Model: FakeShadowModel,
+    variantFactory,
+    minEvaluations: 4,
+    calibrationInterval: 1,
+    recommendationRounds: 2,
+    calibrationCooldownMs: 0,
+    minImprovement: 0.05,
+    discount: 1,
+  });
+  const baseOptions = { switchThresholdRatio: 0.2 };
+  shadow.configure({ contextKey: 'calibrate', mode: 'balanced', baseOptions });
+  let recommendation = null;
+  for (let index = 0; index < 5; index++) {
+    const result = shadow.recordRound({
+      contextKey: 'calibrate',
+      networkKey: 'network',
+      names: ['a', 'b'],
+      current: 'a',
+      productionPick: 'a',
+      measurements: [{ name: 'a', delay: 200 }, { name: 'b', delay: 50 }],
+      now: 10_000 + index,
+    });
+    if (index < 4) assert.strictEqual(result.calibration, null);
+    recommendation = result.calibration || recommendation;
+  }
+  assert.ok(recommendation);
+  assert.strictEqual(recommendation.variant, 'tuned');
+  assert.deepStrictEqual(recommendation.patch, { switchThresholdRatio: 0.04 });
+
+  // Reconfiguration makes the applied posture the new current baseline without
+  // mutating or switching the caller's production choice.
+  shadow.configure({ contextKey: 'calibrate', mode: 'balanced', baseOptions });
+  assert.strictEqual(
+    shadow.runtime.models.get('current').options.switchThresholdRatio,
+    0.04
+  );
+  assert.strictEqual(shadow.summary().calibration.switchThresholdRatio, 0.04);
+
+  const restored = new SmartShadowEvaluator({ Model: FakeShadowModel, variantFactory });
+  assert.strictEqual(restored.restore(shadow.snapshot()), true);
+  restored.configure({ contextKey: 'calibrate', mode: 'balanced', baseOptions });
+  assert.strictEqual(
+    restored.runtime.models.get('current').options.switchThresholdRatio,
+    0.04
+  );
+
+  const variants = defaultVariantSpecs(new SmartSelectionModel().getUncalibratedOptions());
+  const responsive = variants.find((variant) => variant.name === 'responsive');
+  assert.ok(responsive.calibration.routeChangeThresholdMs > 0);
+  assert.ok(responsive.calibration.routeChangeMinSamples >= 4);
+  assert.ok(!Object.prototype.hasOwnProperty.call(
+    responsive.calibration,
+    'routeChangeDetection'
+  ));
+});
+
+test('Smart region detection keeps candidate filtering deterministic and available', () => {
+  const nodes = [
+    { name: '🇭🇰 Hong Kong 01', server: 'hk.example.com' },
+    { name: 'US02', server: 'edge.example.com' },
+    { name: 'Unlabelled', server: 'edge.example.net' },
+  ];
+  assert.strictEqual(detectNodeRegion(nodes[0]), 'HK');
+  assert.strictEqual(detectNodeRegion(nodes[1]), 'US');
+  assert.strictEqual(detectNodeRegion(nodes[2]), 'ZZ');
+  assert.strictEqual(detectNodeRegion({ name: 'UK-01', server: 'edge.example.uk' }), 'GB');
+  assert.deepStrictEqual(normalizeSmartRegions(['us', 'US', 'ZZ', 'bad-code']), ['US', 'ZZ']);
+  assert.deepStrictEqual(
+    smartRegionMembers(nodes, nodes.map((node) => node.name), ['HK']),
+    ['🇭🇰 Hong Kong 01']
+  );
+  // A stale preference after a subscription rename must not make Smart empty.
+  assert.deepStrictEqual(
+    smartRegionMembers(nodes, nodes.map((node) => node.name), ['JP']),
+    nodes.map((node) => node.name)
+  );
 });
 
 test('Smart suppresses correlated failures during a likely local outage', () => {
@@ -659,6 +1753,69 @@ test('Smart discounts old evidence and retains only a weak prior after network c
   restored.restore(snapshot, 'default');
   assert.strictEqual(restored.peek('node').effectiveAttempts, 0);
   assert.strictEqual(restored.peek('node').effectiveSamples, 0);
+});
+
+test('Smart restores bounded per-network histories and snapshots them compatibly', () => {
+  const options = {
+    sampleHalfLifeMs: 24 * 60 * 60_000,
+    failureHalfLifeMs: 24 * 60 * 60_000,
+    networkChangeRetention: 0.1,
+    maxNetworkContexts: 3,
+    maxNetworkContextNodes: 2,
+  };
+  const model = new SmartSelectionModel(options);
+  model.clear('network-history');
+  model.setNodeIdentities(new Map([['node', 'stable-node-identity']]));
+  model.setNetworkKey('wifi-a', 1_000);
+  for (let i = 0; i < 8; i++) {
+    model.observe({ name: 'node', delay: 80 }, 1_000 + i);
+  }
+  model.choose({
+    contextKey: 'network-history',
+    names: ['node'],
+    current: 'node',
+    now: 1_100,
+    measurements: [],
+  });
+
+  model.setNetworkKey('wifi-b', 2_000);
+  for (let i = 0; i < 12; i++) {
+    model.observe({ name: 'node', delay: 300 }, 2_000 + i);
+  }
+  assert.ok(model.peek('node').ewma > 250);
+  model.setNetworkKey('wifi-a', 3_000);
+  assert.ok(model.peek('node').ewma < 100, String(model.peek('node').ewma));
+
+  const persisted = model.snapshot();
+  assert.ok(persisted.networkContexts instanceof Map);
+  const restored = new SmartSelectionModel(options);
+  assert.strictEqual(restored.restore(persisted, 'network-history'), true);
+  restored.setNodeIdentities(new Map([['renamed-node', 'stable-node-identity']]));
+  restored.setNetworkKey('wifi-b', 4_000);
+  assert.strictEqual(restored.peek('node'), null);
+  assert.ok(
+    restored.peek('renamed-node').ewma > 250,
+    String(restored.peek('renamed-node').ewma)
+  );
+
+  // Inactive contexts and their node maps remain bounded (active is the third).
+  restored.observe({ name: 'extra-a', delay: 120 }, 4_100);
+  restored.observe({ name: 'extra-b', delay: 130 }, 4_101);
+  restored.observe({ name: 'extra-c', delay: 140 }, 4_102);
+  restored.setNetworkKey('wifi-c', 5_000);
+  restored.setNetworkKey('wifi-d', 6_000);
+  const bounded = restored.snapshot();
+  assert.ok(bounded.networkContexts.size <= 2);
+  for (const entry of bounded.networkContexts.values()) {
+    assert.ok(entry.nodes.size <= 2);
+  }
+
+  // Snapshots from older versions without networkContexts still restore.
+  const legacy = { ...persisted };
+  delete legacy.networkContexts;
+  const compatible = new SmartSelectionModel(options);
+  assert.strictEqual(compatible.restore(legacy, 'network-history'), true);
+  assert.ok(compatible.peek('node'));
 });
 
 test('Smart uses UCB-V only for probes and never selects an arm for uncertainty alone', () => {
@@ -774,6 +1931,31 @@ test('managed Auto override pin is measured even when outside the rotating batch
   managed.stop();
 });
 
+test('managed Smart applies a preferred node once instead of chasing kernel now', async () => {
+  let puts = 0;
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '🧠 Smart',
+    authoritativePreferred: true,
+    clashApi: async (method) => {
+      if (method === 'PUT') {
+        puts++;
+        return {};
+      }
+      return { now: 'kernel-failover', all: ['preferred', 'kernel-failover'] };
+    },
+    isRunning: () => true,
+    selectBatch: () => ({ candidates: ['preferred'], nextCursor: 0 }),
+    testDelay: async () => 30,
+    selectCandidate: () => 'preferred',
+  });
+  await managed.refresh();
+  await managed.refresh();
+  assert.strictEqual(puts, 1);
+  assert.strictEqual(managed.getPreferred(), 'preferred');
+  managed.stop();
+});
+
 test('managed selection discards an in-flight result after stop', async () => {
   let releaseProbe;
   let signalProbe;
@@ -872,6 +2054,11 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
   assert.strictEqual(zh['rulegroups.targetSource'], '选择出站');
+  assert.strictEqual(zh['subs.userAgent'], '请求 UA');
+  assert.strictEqual(zh['subs.userAgentAuto'], '自动（跟随内核）');
+  assert.strictEqual(zh['subs.userAgentTag'], 'UA {0}');
+  assert.strictEqual(zh['subs.sourceFormat'], '来源 {0}');
+  assert.strictEqual(zh['subs.formatFlow'], '来源 {0} → {1}');
 });
 
 test('static HTML fallbacks keep config terminology', () => {
@@ -884,6 +2071,23 @@ test('static HTML fallbacks keep config terminology', () => {
   }
   assert.ok(html.includes('id="subUserAgent"'), 'add-config User-Agent selector is missing');
   assert.ok(html.includes('id="editUserAgent"'), 'edit-config User-Agent selector is missing');
+  assert.ok(html.includes('自动（跟随内核）'), 'automatic download format does not explain core following');
+});
+
+test('config list distinguishes downloaded source format from runtime core', () => {
+  const subscriptions = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'renderer', 'js', 'subs.js'),
+    'utf-8'
+  );
+  const main = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'renderer', 'js', 'main.js'),
+    'utf-8'
+  );
+  assert.ok(subscriptions.includes("t('subs.sourceFormat', sourceFormat)"));
+  assert.ok(subscriptions.includes("t('subs.formatFlow', sourceFormat, runtimeFormat)"));
+  assert.ok(subscriptions.includes('sourceIsNative'));
+  assert.ok(subscriptions.includes("coreType === 'mihomo' ? 'Mihomo' : 'sing-box'"));
+  assert.ok(main.includes('subscriptionTargetChanged'), 'core switches leave the displayed runtime target stale');
 });
 
 test('rule-set page is folded into rules and native geodata management', () => {
@@ -1188,6 +2392,35 @@ test('escapeHtml neutralizes every HTML metacharacter', () => {
   assert.ok(!/[<>"']/.test(App.escapeHtml('<script>"\'</script>')));
 });
 
+test('subscription renderer signature tracks metadata-only changes', () => {
+  const App = loadRendererUtil();
+  const subscriptions = [{
+    id: 'airport-a',
+    name: 'Airport A',
+    updatedAt: 100,
+    nodeCount: 2,
+    autoUpdateMinutes: 0,
+    updateViaProxy: false,
+    userAgentMode: 'auto',
+    userInfo: { upload: 1, download: 2, total: 10, expire: 20 },
+  }];
+  const before = App.subscriptionStateSignature(subscriptions, 'airport-a');
+  for (const patch of [
+    { autoUpdateMinutes: 60 },
+    { updateViaProxy: true },
+    { userAgentMode: 'clash' },
+    { userInfo: { upload: 1, download: 3, total: 10, expire: 20 } },
+  ]) {
+    const changed = [{ ...subscriptions[0], ...patch }];
+    assert.notStrictEqual(
+      App.subscriptionStateSignature(changed, 'airport-a'),
+      before,
+      `subscription change was omitted from the renderer signature: ${Object.keys(patch)[0]}`
+    );
+  }
+  assert.notStrictEqual(App.subscriptionStateSignature(subscriptions, 'airport-b'), before);
+});
+
 test('external-input fields stay HTML-escaped in the renderer templates', () => {
   // Tripwire: these values come from outside (airport profiles, the Clash
   // API, the OS) and are interpolated into innerHTML templates. If a refactor
@@ -1278,8 +2511,205 @@ test('background renderer work is bounded to visible and useful content', () => 
   assert.ok(!main.includes("if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight"));
   assert.ok(logs.includes("if (drained && $('#logAutoScroll').checked)"));
   assert.ok(logs.includes('for (const entry of pendingLiveLogs) enqueueLog(entry)'));
+  assert.ok(main.includes("previousTab === 'logs' && tab !== 'logs'"));
+  assert.ok(main.includes("window.addEventListener('pagehide'"));
+  assert.ok(main.includes('App.setLogStreaming(false)'));
+  assert.ok(main.includes('App.setLogStreaming(true)'));
   assert.ok(settings.includes('function changedSettingsPatch(candidate)'));
   assert.ok(settings.includes("if (!Object.keys(patch).length)"));
+});
+
+test('idle traffic samples do not repaint unchanged charts or re-query labels', () => {
+  const chartSource = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
+  const makeCanvas = () => {
+    const counts = { clears: 0 };
+    const context = new Proxy({}, {
+      get(target, key) {
+        if (key === 'clearRect') return () => { counts.clears++; };
+        if ([
+          'setTransform', 'beginPath', 'moveTo', 'lineTo', 'closePath',
+          'fill', 'stroke', 'fillText',
+        ].includes(key)) return () => {};
+        return target[key];
+      },
+      set(target, key, value) {
+        target[key] = value;
+        return true;
+      },
+    });
+    return {
+      counts,
+      clientWidth: 600,
+      clientHeight: 120,
+      width: 0,
+      height: 0,
+      offsetParent: {},
+      getClientRects: () => [{}],
+      getContext: () => context,
+    };
+  };
+  const traffic = makeCanvas();
+  const mini = makeCanvas();
+  const elements = new Map([
+    ['#trafficChart', traffic],
+    ['#miniTraffic', mini],
+    ['#trafficUp', { textContent: '' }],
+    ['#trafficDown', { textContent: '' }],
+    ['#trafficUpTotal', { textContent: '' }],
+    ['#trafficDownTotal', { textContent: '' }],
+    ['#miniUp', { textContent: '' }],
+    ['#miniDown', { textContent: '' }],
+  ]);
+  let queries = 0;
+  const chartApp = {
+    $: (selector) => {
+      queries++;
+      return elements.get(selector);
+    },
+    fmtBytes: (value) => Number(value).toFixed(2) + ' B',
+  };
+  const chartWindow = {
+    App: chartApp,
+    devicePixelRatio: 1,
+    addEventListener() {},
+    matchMedia: () => ({ matches: true, addEventListener() {} }),
+  };
+  vm.runInNewContext(chartSource, {
+    window: chartWindow,
+    document: {
+      hidden: false,
+      documentElement: { getAttribute: () => 'dark', setAttribute() {} },
+    },
+    getComputedStyle: () => ({ getPropertyValue: () => '' }),
+    localStorage: { setItem() {} },
+  });
+  chartApp.trafficChart.draw();
+  chartApp.miniChart.draw();
+  const initialQueries = queries;
+  for (let i = 0; i < 600; i++) {
+    chartApp.trafficChart.push(0, 0);
+    chartApp.miniChart.push(0, 0);
+  }
+  assert.strictEqual(traffic.counts.clears, 1);
+  assert.strictEqual(mini.counts.clears, 1);
+  assert.strictEqual(queries, initialQueries);
+
+  // A real sample still paints, and zero samples continue painting only until
+  // that point has aged out of the 60-second history.
+  chartApp.trafficChart.push(1024, 0);
+  const activeDraws = traffic.counts.clears;
+  assert.ok(activeDraws > 1);
+  for (let i = 0; i < 80; i++) chartApp.trafficChart.push(0, 0);
+  const drainedDraws = traffic.counts.clears;
+  chartApp.trafficChart.push(0, 0);
+  assert.strictEqual(traffic.counts.clears, drainedDraws);
+});
+
+test('log streaming resumes from history without gaps or duplicate live lines', async () => {
+  const logSource = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
+  const timers = [];
+  const logBox = {
+    children: [],
+    appendChild(child) { this.children.push(child); },
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); },
+    get firstChild() { return this.children[0] || null; },
+    set textContent(_value) { this.children = []; },
+    get textContent() { return this.children.map((child) => child.textContent || '').join(''); },
+    scrollTop: 0,
+    scrollHeight: 0,
+  };
+  const clearButton = { addEventListener(_name, callback) { this.click = callback; } };
+  const elements = new Map([
+    ['#logBox', logBox],
+    ['#logAutoScroll', { checked: false }],
+    ['#logClear', clearButton],
+  ]);
+  let liveLog = null;
+  let resolveFirstHistory;
+  let signalFirstHistoryRequested;
+  const firstHistoryRequested = new Promise((resolve) => {
+    signalFirstHistoryRequested = resolve;
+  });
+  let historyCalls = 0;
+  const streamCalls = [];
+  const api = {
+    onLog(callback) {
+      liveLog = callback;
+      return () => {};
+    },
+    setLogStreaming(enabled) {
+      streamCalls.push(enabled);
+      return Promise.resolve(enabled);
+    },
+    getRecentLogs() {
+      historyCalls++;
+      if (historyCalls === 1) {
+        return new Promise((resolve) => {
+          resolveFirstHistory = resolve;
+          signalFirstHistoryRequested();
+        });
+      }
+      return Promise.resolve({
+        entries: [
+          { sequence: 2, line: 'history-two' },
+          { sequence: 3, line: 'live-three' },
+          { sequence: 4, line: 'missed-four' },
+        ],
+      });
+    },
+    clearRecentLogs: () => Promise.resolve(true),
+  };
+  const logApp = {
+    currentTab: 'logs',
+    $: (selector) => elements.get(selector),
+    escapeHtml: (value) => String(value),
+  };
+  const context = {
+    window: { App: logApp, api },
+    document: {
+      hidden: false,
+      createElement: () => ({ innerHTML: '', textContent: '' }),
+    },
+    setTimeout(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout() {},
+    requestAnimationFrame(callback) {
+      timers.push(callback);
+      return timers.length;
+    },
+    cancelAnimationFrame() {},
+  };
+  vm.runInNewContext(logSource, context);
+  const flushTimers = () => {
+    while (timers.length) timers.shift()();
+  };
+
+  const firstActivation = logApp.setLogStreaming(true);
+  await firstHistoryRequested;
+  liveLog({ sequence: 3, line: 'live-three' });
+  resolveFirstHistory({
+    entries: [
+      { sequence: 1, line: 'history-one' },
+      { sequence: 2, line: 'history-two' },
+      { sequence: 3, line: 'live-three' },
+    ],
+  });
+  await firstActivation;
+  flushTimers();
+  let output = logBox.children.map((child) => child.innerHTML).join('');
+  assert.strictEqual((output.match(/history-one/g) || []).length, 1);
+  assert.strictEqual((output.match(/history-two/g) || []).length, 1);
+  assert.strictEqual((output.match(/live-three/g) || []).length, 1);
+
+  await logApp.setLogStreaming(false);
+  liveLog({ sequence: 4, line: 'missed-four' });
+  await logApp.setLogStreaming(true);
+  flushTimers();
+  output = logBox.children.map((child) => child.innerHTML).join('');
+  assert.strictEqual((output.match(/missed-four/g) || []).length, 1);
+  assert.deepStrictEqual(streamCalls, [true, false, true]);
 });
 
 test('node, connection and log workspaces use a direct full-height canvas', () => {
@@ -1376,9 +2806,14 @@ test('node strategies keep profile order and expose a stable sidebar readout', (
   const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
   const css = readRendererCss();
   assert.ok(indexHtml.includes('id="miniCurrentNode"'));
+  assert.ok(indexHtml.includes('id="smartRegionScope"'));
   assert.ok(nodes.includes("{ name: AUTO_GROUP }, { name: SMART_GROUP }, { name: FALLBACK_GROUP }, ...nodes"));
+  assert.ok(nodes.includes("App.openDialog('smart-regions')"));
+  assert.ok(nodes.includes('smartScope.effective.has(region)'));
   assert.ok(!nodes.includes('const pinned = []'));
   assert.ok(css.includes('.mini-current-node'));
+  assert.ok(css.includes('.smart-scope-bar'));
+  assert.ok(css.includes('.node-item.smart-excluded'));
   assert.ok(css.includes('--node-offset'));
 });
 
@@ -1410,6 +2845,10 @@ test('dashboard status cards expose current node latency and click actions', () 
   assert.ok(!css.includes('.card-value-sm'));
   assert.ok(dash.includes("action === 'testDelay'"));
   assert.ok(main.includes('App.showTab = showTab'));
+  assert.ok(
+    main.includes('else if (subsChanged && App.renderDashboard) App.renderDashboard()'),
+    'active config changes must refresh the topbar even when runtime status is unchanged'
+  );
 });
 
 test('dashboard traffic chart is compact and tracks session totals with switch toggles', () => {
@@ -1469,6 +2908,7 @@ test('node cards distinguish protocol variants without exposing endpoints', () =
   assert.ok(nodes.includes("value.replace(/^2022-blake3-/i, '')"));
   assert.ok(ipc.includes("result.variant = '2022'"));
   assert.ok(ipc.includes("result.variant = 'vision'"));
+  assert.ok(ipc.includes('region: detectNodeRegion(node)'));
   assert.ok(!ipc.slice(ipc.indexOf('function nodeResult'), ipc.indexOf('/** Register every IPC handler')).includes('server:'));
   assert.ok(!ipc.slice(ipc.indexOf('function nodeResult'), ipc.indexOf('/** Register every IPC handler')).includes('port:'));
 });
@@ -1548,10 +2988,15 @@ test('secondary panels use a real transient native material window', () => {
   const dialogCss = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
   const dialogMain = fs.readFileSync(path.join(rendererDir, 'dialog', 'main.js'), 'utf-8');
   const host = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
-  const dropdown = css.slice(css.indexOf('.ui-select-menu {'), css.indexOf('.ui-select-opt {'));
-  assert.ok(css.includes('--menu-surface: rgba(250, 251, 252, 0.96)'));
-  assert.ok(dropdown.includes('background: var(--menu-surface)'));
-  assert.ok(css.includes('.ui-select-menu,\n.toast {'));
+  const menus = css.slice(css.indexOf('.ui-select-menu,\n.node-context-menu {'), css.indexOf('.ui-select-menu {', css.indexOf('.ui-select-menu,\n.node-context-menu {')));
+  const contextMenu = css.slice(css.indexOf('.node-context-menu {', css.indexOf('.node-context-menu {') + 1), css.indexOf('.node-context-menu.hidden'));
+  assert.ok(css.includes('--menu-surface: rgb(252, 252, 252)'));
+  assert.ok(menus.includes('background: var(--menu-surface)'));
+  assert.ok(menus.includes('border: 1px solid var(--menu-border)'));
+  assert.ok(menus.includes('box-shadow: var(--menu-shadow)'));
+  assert.ok(contextMenu.includes('z-index: 1200'));
+  assert.ok(!contextMenu.includes('--surface-raised'), 'context menus must not expose content underneath');
+  assert.ok(css.includes('.toast {\n  -webkit-backdrop-filter: var(--raised-filter)'));
   assert.ok(css.includes('backdrop-filter: var(--raised-filter)'));
   assert.ok(host.includes('parent,'));
   assert.ok(host.includes('modal: true'));
@@ -1595,7 +3040,8 @@ test('main surfaces avoid diagonal highlights and repeated backdrop filters', ()
     assert.ok(!rule.includes('background-image: linear-gradient'));
   }
   for (const rule of [surfaces, card]) assert.ok(!rule.includes('backdrop-filter'));
-  assert.ok(css.includes('.ui-select-menu,\n.toast {'));
+  const menus = css.slice(css.indexOf('.ui-select-menu,\n.node-context-menu {'), css.indexOf('.ui-select-menu {', css.indexOf('.ui-select-menu,\n.node-context-menu {')));
+  assert.ok(!menus.includes('backdrop-filter'));
 });
 
 test('controls and canvas command bars share a stable size rhythm', () => {
@@ -1660,9 +3106,16 @@ test('pickLatestTag skips prereleases and picks the newest stable', () => {
   assert.strictEqual(github.pickLatestTag([]), null);
   assert.strictEqual(github.pickLatestTag(['1.0.0-rc.1']), null); // nothing stable
   assert.strictEqual(
-    github.pickLatestTag(['v1.13.14', 'v1.13.14-dart.1', 'v1.14.0-alpha.1']),
+    github.pickLatestTag([
+      'v1.13.14',
+      'v1.13.14-dart.1',
+      'v1.14.0-alpha.1',
+      'v999-dart.1',
+      'nightly',
+    ]),
     'v1.13.14-dart.1'
   );
+  assert.strictEqual(github.pickLatestTag(['alpha', 'v1.2.3-rc.1']), null);
 });
 
 console.log('\nCore adapters and integrity:');
@@ -1670,7 +3123,16 @@ console.log('\nCore adapters and integrity:');
 const { getCoreAdapter, listCoreAdapters, normalizeCoreType } = require('../src/main/core-adapters');
 const { normalizeSha256, parseSha256Sums } = require('../src/main/integrity');
 const { OperationCoordinator } = require('../src/main/operation-coordinator');
-const { addBundledComponents } = require('../scripts/release-metadata');
+const {
+  addBundledComponents,
+  releaseVersionFromTag,
+} = require('../scripts/release-metadata');
+const {
+  buildCoreBundle,
+  installStagedBundle,
+  parseDartReleaseTag,
+  selectStableDartRelease,
+} = require('../scripts/download-core');
 
 test('core adapters own paths, commands, formats and release assets', () => {
   assert.deepStrictEqual(listCoreAdapters().map((adapter) => adapter.id), ['sing-box', 'mihomo']);
@@ -1726,6 +3188,74 @@ test('SHA-256 metadata accepts GitHub digests and standard manifests', () => {
   assert.strictEqual(sums.get('core.zip'), b);
 });
 
+test('release inputs keep prerelease versions and select only stable Dart cores', () => {
+  assert.strictEqual(releaseVersionFromTag('v0.9.6'), '0.9.6');
+  assert.strictEqual(releaseVersionFromTag('v0.9.6-beta.1'), '0.9.6-beta.1');
+  assert.throws(() => releaseVersionFromTag('release-0.9.6'), /invalid release tag/);
+  assert.deepStrictEqual(parseDartReleaseTag('v1.19.29-dart.13'), {
+    tag: 'v1.19.29-dart.13',
+    version: '1.19.29-dart.13',
+    base: '1.19.29',
+    baseParts: [1, 19, 29],
+    revision: 13,
+  });
+  assert.strictEqual(parseDartReleaseTag('v1.19.29-alpha.1'), null);
+
+  const releases = [
+    { tag_name: 'v1.19.29-dart.9', draft: false, prerelease: false },
+    { tag_name: 'v1.19.29-dart.13', draft: false, prerelease: false },
+    { tag_name: 'v1.19.30-dart.1', draft: true, prerelease: false },
+    { tag_name: 'v1.20.0-dart.1', draft: false, prerelease: true },
+    { tag_name: 'v1.99.0-alpha.1', draft: false, prerelease: false },
+  ];
+  assert.strictEqual(selectStableDartRelease(releases).tag_name, 'v1.19.29-dart.13');
+  assert.strictEqual(
+    selectStableDartRelease(releases, '1.19.29').tag_name,
+    'v1.19.29-dart.13'
+  );
+  assert.throws(() => selectStableDartRelease(releases, '1.19.30'), /no stable Dart release/);
+});
+
+test('core bundling stages changes and restores prior installs after failures', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-bundle-'));
+  const binDir = path.join(root, 'bin');
+  fs.mkdirSync(path.join(binDir, 'singbox'), { recursive: true });
+  fs.mkdirSync(path.join(binDir, 'mihomo'), { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'singbox', 'old.txt'), 'old-singbox');
+  fs.writeFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'old-mihomo');
+  fs.writeFileSync(path.join(binDir, 'manifest.json'), '{"old":true}');
+
+  await assert.rejects(
+    buildCoreBundle({
+      binDir,
+      goos: 'windows',
+      arch: 'amd64',
+      bundleSingBox: async (_goos, _arch, outputDir) => {
+        fs.mkdirSync(outputDir, { recursive: true });
+        fs.writeFileSync(path.join(outputDir, 'sing-box.exe'), 'staged');
+        return [];
+      },
+      bundleMihomo: async () => {
+        throw new Error('simulated Mihomo download failure');
+      },
+    }),
+    /simulated Mihomo download failure/
+  );
+  assert.strictEqual(fs.readFileSync(path.join(binDir, 'singbox', 'old.txt'), 'utf-8'), 'old-singbox');
+  assert.strictEqual(fs.readFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'utf-8'), 'old-mihomo');
+  assert.deepStrictEqual(
+    fs.readdirSync(binDir).filter((name) => name.startsWith('.core-bundle-')),
+    []
+  );
+
+  const stage = fs.mkdtempSync(path.join(root, 'install-stage-'));
+  fs.mkdirSync(path.join(stage, 'singbox'));
+  fs.writeFileSync(path.join(stage, 'singbox', 'new.txt'), 'new');
+  assert.throws(() => installStagedBundle(stage, binDir), /staged bundle is missing mihomo/);
+  assert.strictEqual(fs.readFileSync(path.join(binDir, 'singbox', 'old.txt'), 'utf-8'), 'old-singbox');
+  assert.strictEqual(fs.readFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'utf-8'), 'old-mihomo');
+});
+
 test('operation coordinator supersedes stale work and closes atomically', () => {
   const coordinator = new OperationCoordinator();
   const first = coordinator.beginRemote('config', 'a');
@@ -1765,6 +3295,11 @@ test('release workflow pins actions and isolates write permission to publishing'
   assert.match(workflow, /permissions:\s*\{\}/);
   assert.match(workflow, /build-windows:[\s\S]*?permissions:\s*\n\s+contents: read/);
   assert.match(workflow, /publish:[\s\S]*?permissions:\s*\n\s+contents: write/);
+  assert.ok(workflow.includes('Dart releases must be published from blakebill/dart'));
+  assert.ok(workflow.includes('INPUT_TAG: ${{ inputs.tag }}'));
+  assert.ok(workflow.includes('release-metadata.js --version-from-tag "$TAG"'));
+  const versionStep = workflow.match(/- name: Sync package version to release tag([\s\S]*?)\n\s+- name:/);
+  assert.ok(versionStep && !versionStep[1].includes('TAG="${{ inputs.tag }}"'));
   const coreDownloadStep = workflow.match(/- name: Download bundled cores and GeoData([\s\S]*?)\n\s+- name:/);
   assert.ok(coreDownloadStep && !coreDownloadStep[1].includes('GITHUB_TOKEN'));
   assert.ok(workflow.includes('release/SHA256SUMS.txt'));
@@ -2495,6 +4030,15 @@ test('Windows TUN lifecycle owns Dart names and removes legacy adapters', () => 
   assert.ok(cleanup.includes("$description -match 'sing-tun'"));
   assert.ok(cleanup.includes('pnputil.exe'));
   assert.ok(tun.renameScript().includes("Rename-NetAdapter"));
+});
+
+test('elevated TUN auto-start preserves silent startup', () => {
+  const { buildTaskXml } = require('../src/main/auto-launch');
+  const visible = buildTaskXml('C:\\Program Files\\Dart & Tools\\Dart.exe', 'PC\\Blake', false);
+  const silent = buildTaskXml('C:\\Program Files\\Dart & Tools\\Dart.exe', 'PC\\Blake', true);
+  assert.ok(!visible.includes('<Arguments>'));
+  assert.ok(silent.includes('<Arguments>--hidden</Arguments>'));
+  assert.ok(silent.includes('Dart &amp; Tools'));
 });
 
 test('system DNS diagnostics use the OS resolver path', () => {

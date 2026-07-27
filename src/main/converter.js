@@ -5,6 +5,7 @@ const {
   singboxPolicyOutbounds,
   mihomoPolicyGroups,
 } = require('./policy-groups');
+const { smartRegionMembers } = require('./node-region');
 
 const AUTO_GROUP = '♻️ Auto';
 const SMART_GROUP = '🧠 Smart';
@@ -1326,11 +1327,17 @@ function buildSingboxConfig(nodes, opts = {}) {
     extraRuleSets = [], // local rule_set defs from custom .srs
   } = opts;
 
-  const nodeOutbounds = dedupeTags(
-    nodes.map(nodeToOutbound).filter(Boolean)
-  );
+  const nodeEntries = nodes
+    .map((node) => ({ node, outbound: nodeToOutbound(node) }))
+    .filter((entry) => !!entry.outbound);
+  const nodeOutbounds = dedupeTags(nodeEntries.map((entry) => entry.outbound));
   const nodeTags = nodeOutbounds.map((o) => o.tag);
   if (!nodeTags.length) throw new Error('No supported proxy nodes are available.');
+  const smartNodeTags = smartRegionMembers(
+    nodeEntries.map((entry) => entry.node),
+    nodeTags,
+    opts.smartRegions
+  );
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
   const sourceGroups = applySourceGroupSelections(
     prepareSourcePolicyGroups(policyGroups, nodeTags),
@@ -1360,7 +1367,7 @@ function buildSingboxConfig(nodes, opts = {}) {
   // Dart owns Auto selection and applies its measured winner through the
   // always-on local Clash API.
   const autoGroup = { type: 'selector', tag: AUTO_GROUP, outbounds: nodeTags, default: nodeTags[0] };
-  const smartGroup = buildSingboxSmartGroup(nodeTags, {
+  const smartGroup = buildSingboxSmartGroup(smartNodeTags, {
     kernelSmart: !!opts.kernelSmart,
     kernelSmartMode: !!opts.kernelSmartMode,
     smartMode: opts.smartMode,
@@ -1612,9 +1619,17 @@ function buildMihomoConfig(nodes, opts = {}) {
     hasGeoData = true,
   } = opts;
 
-  const proxies = dedupeProxyNames(nodes.map(nodeToClashProxy).filter(Boolean));
+  const nodeEntries = nodes
+    .map((node) => ({ node, proxy: nodeToClashProxy(node) }))
+    .filter((entry) => !!entry.proxy);
+  const proxies = dedupeProxyNames(nodeEntries.map((entry) => entry.proxy));
   const proxyNames = proxies.map((p) => p.name);
   if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
+  const smartProxyNames = smartRegionMembers(
+    nodeEntries.map((entry) => entry.node),
+    proxyNames,
+    opts.smartRegions
+  );
   const sourceGroups = applySourceGroupSelections(
     prepareSourcePolicyGroups(policyGroups, proxyNames),
     proxyNames,
@@ -1645,7 +1660,7 @@ function buildMihomoConfig(nodes, opts = {}) {
   for (const name of proxyMembers) addManual(name);
 
   const autoGroup = { name: AUTO_GROUP, type: 'select', proxies: proxyNames };
-  const smartGroup = buildMihomoSmartGroup(proxyNames, {
+  const smartGroup = buildMihomoSmartGroup(smartProxyNames, {
     kernelSmart: !!opts.kernelSmart,
     kernelSmartMode: !!opts.kernelSmartMode,
     latencyUrl,
@@ -1701,6 +1716,11 @@ function buildMihomoConfig(nodes, opts = {}) {
     mode: clashMode === 'global' ? 'global' : clashMode === 'direct' ? 'direct' : 'rule',
     'log-level': logLevel,
     ipv6: !!enableIpv6,
+    // Race every address returned for a hostname and keep the first successful
+    // TCP connection. Mihomo otherwise dials addresses within each IP family
+    // serially, so a stale/unreachable address can stall even DIRECT traffic
+    // for seconds before the next address is attempted.
+    'tcp-concurrent': true,
     'geodata-mode': true,
     'geodata-loader': 'memconservative',
     'geo-auto-update': false,

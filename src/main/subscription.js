@@ -258,6 +258,25 @@ function subscriptionUserAgents(coreType, userAgentMode = 'auto') {
     : [MIHOMO_USER_AGENT, ...CLASH_USER_AGENTS, ...SINGBOX_USER_AGENTS];
 }
 
+function preferredSubscriptionFormat(coreType, userAgentMode = 'auto') {
+  if (userAgentMode === 'sing-box') return 'singbox';
+  if (userAgentMode === 'clash') return 'clash';
+  if (coreType === 'sing-box') return 'singbox';
+  if (coreType === 'mihomo') return 'clash';
+  return null;
+}
+
+function subscriptionFormatRank(format, preferredFormat) {
+  if (format === preferredFormat) return 3;
+  if (format === 'clash' || format === 'singbox') return 2;
+  if (format === 'links') return 1;
+  return 0;
+}
+
+function userAgentNativeFormat(userAgent) {
+  return String(userAgent).startsWith('sing-box/') ? 'singbox' : 'clash';
+}
+
 /**
  * Fetch and parse a subscription. Requests the active core's native format
  * first, then retries with compatible client User-Agents when necessary.
@@ -271,12 +290,17 @@ function subscriptionUserAgents(coreType, userAgentMode = 'auto') {
  */
 async function fetchSubscription(url, log = () => {}, opts = {}) {
   const proxyPort = opts.proxyPort || 0;
-  const expectedFormat = opts.userAgentMode === 'sing-box'
-    ? 'singbox'
-    : opts.userAgentMode === 'clash' ? 'clash' : null;
+  const expectedFormat = preferredSubscriptionFormat(opts.coreType, opts.userAgentMode);
   let last = null;
   let usableFallback = null;
-  for (const ua of subscriptionUserAgents(opts.coreType, opts.userAgentMode)) {
+  let fallbackRank = 0;
+  const userAgents = subscriptionUserAgents(opts.coreType, opts.userAgentMode);
+  let preferredAgentsLeft = expectedFormat
+    ? userAgents.filter((ua) => userAgentNativeFormat(ua) === expectedFormat).length
+    : 0;
+  for (const ua of userAgents) {
+    const isPreferredAgent = userAgentNativeFormat(ua) === expectedFormat;
+    if (isPreferredAgent) preferredAgentsLeft -= 1;
     let res;
     try {
       // One HTTP path for both modes: with proxyPort the request tunnels
@@ -308,8 +332,19 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
     log(`[sub] UA="${ua}" len=${body.length} type="${ct}" format=${result.format} nodes=${result.nodes.length}`);
     if (result.nodes.length > 0) {
       if (!expectedFormat || result.format === expectedFormat) return result;
-      if (!usableFallback) usableFallback = result;
-      log(`[sub] requested ${expectedFormat}, continuing after compatible ${result.format} response`);
+      const rank = subscriptionFormatRank(result.format, expectedFormat);
+      if (rank > fallbackRank) {
+        usableFallback = result;
+        fallbackRank = rank;
+      }
+      // Once every UA from the preferred ecosystem has been tried, a full
+      // config from the other ecosystem is strictly better than Links and no
+      // further request can produce the preferred native format.
+      if (rank >= 2 && preferredAgentsLeft === 0) {
+        log(`[sub] preferred ${expectedFormat} unavailable; using structured ${usableFallback.format} response`);
+        return usableFallback;
+      }
+      log(`[sub] preferred ${expectedFormat}, continuing after compatible ${result.format} response`);
       continue;
     }
     // Help diagnose airports that return an empty/notice config: show a snippet.

@@ -6,7 +6,18 @@ const crypto = require('crypto');
 const yaml = require('js-yaml');
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 
-const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, getRecentLogs, clearRecentLogs, sendStatus, coreStatusInfo } = require('./state');
+const {
+  state,
+  runtimeDir,
+  resourcesBinDir,
+  sendToMain,
+  sendLog,
+  setRecentLogStreaming,
+  getRecentLogs,
+  clearRecentLogs,
+  sendStatus,
+  coreStatusInfo,
+} = require('./state');
 const core = require('./core-control');
 const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
 const { AppUpdateController } = require('./app-update-controller');
@@ -19,6 +30,7 @@ const { notify } = require('./notify');
 const toolbox = require('./toolbox');
 const dialogWindows = require('./dialog-window');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
+const { detectNodeRegion, nodeRegionSummary, normalizeSmartRegions } = require('./node-region');
 const validation = require('./ipc-validation');
 const {
   CORE_CONFIG_SETTINGS,
@@ -199,6 +211,13 @@ function subscriptionUserAgentMode(value) {
   return VALID_SUBSCRIPTION_UA_MODES.includes(value) ? value : 'auto';
 }
 
+function sameSettingValue(left, right) {
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+  return left === right;
+}
+
 function currentSubscriptionForUpdate(id, sourceUrl, token = null) {
   if (token) core.assertRemoteUpdate('subscription', id, token);
   const latest = state.store.getSubscription(id);
@@ -258,6 +277,7 @@ function nodeResult(node) {
     name,
     type,
     security,
+    region: detectNodeRegion(node),
     isNode: true,
   };
   const cipher = nodeMetaToken(node.cipher);
@@ -305,6 +325,11 @@ function registerIpc() {
   });
 
   ipcMain.handle('logs:get', () => getRecentLogs());
+  ipcMain.handle('logs:stream', (event, { enabled } = {}) => {
+    reqBoolean(enabled, 'enabled');
+    const win = senderWindow(event);
+    return setRecentLogStreaming(win.webContents, enabled);
+  });
   ipcMain.handle('logs:clear', () => {
     clearRecentLogs();
     return true;
@@ -316,6 +341,21 @@ function registerIpc() {
     return {
       activeSub,
       nodes: active && Array.isArray(active.nodes) ? active.nodes.map(nodeResult).filter(Boolean) : [],
+    };
+  });
+
+  ipcMain.handle('node:regions', () => {
+    const active = core.getActiveSubscription();
+    const settings = state.store.getSettings();
+    const selected = normalizeSmartRegions(settings.smartRegions);
+    const regions = nodeRegionSummary((active && active.nodes) || []);
+    const available = new Set(regions.map((item) => item.code));
+    for (const code of selected) {
+      if (!available.has(code)) regions.push({ code, count: 0 });
+    }
+    return {
+      regions,
+      selected,
     };
   });
 
@@ -680,19 +720,35 @@ function registerIpc() {
     const previous = state.store.getSettings();
     validateSettingsPatch(patch, previous);
     patch = Object.fromEntries(
-      Object.entries(patch).filter(([key, value]) => value !== previous[key])
+      Object.entries(patch).filter(([key, value]) => !sameSettingValue(value, previous[key]))
     );
     if (!Object.keys(patch).length) return previous;
     const coreTypeChanged = Object.prototype.hasOwnProperty.call(patch, 'coreType') &&
       patch.coreType !== (previous.coreType || 'sing-box');
-    const configChanged = [...CORE_CONFIG_SETTINGS].some(
+    const wasRunning = state.singbox.isRunning();
+    let configChanged = [...CORE_CONFIG_SETTINGS].some(
       (key) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== previous[key]
     );
+    const smartModeChanged = Object.prototype.hasOwnProperty.call(patch, 'smartMode') &&
+      patch.smartMode !== previous.smartMode;
+    // App-managed Smart weights are live model state. Only a runtime that
+    // accepts the kernel `mode` field needs a config rebuild for this change.
+    if (smartModeChanged && wasRunning) {
+      const runningCoreType = state.singbox.getCoreType();
+      let meta = core.getKernelSmartMeta();
+      // Config validation can probe both cores and leave the shared capability
+      // snapshot pointing at the other one. Never let that diagnostic side
+      // effect decide whether the actually running core must restart.
+      if (!meta || meta.coreType !== runningCoreType) {
+        meta = await core.resolveKernelSmart(runningCoreType);
+      }
+      if (meta && meta.kernelSmartMode) configChanged = true;
+    }
     if (configChanged && state.singbox.isCoreDownloadInProgress()) {
       throw new Error('wait for the core update to finish before changing core settings');
     }
-    const wasRunning = state.singbox.isRunning();
     const settings = state.store.updateSettings(patch);
+    if (smartModeChanged && !configChanged) core.applySmartMode(settings.smartMode);
     let themeResolved = null;
     if (Object.prototype.hasOwnProperty.call(patch, 'theme')) {
       try {
@@ -810,12 +866,13 @@ function registerIpc() {
     };
     const proxy = await current('🚀 Proxy');
     const selected = proxy || state.store.get('selected') || '♻️ Auto';
-    const [auto, smart, fallback] = await Promise.all([
+    const [auto, smartActual, fallback] = await Promise.all([
       all || selected === '♻️ Auto' ? current('♻️ Auto') : null,
       all || selected === '🧠 Smart' ? current('🧠 Smart') : null,
       all || selected === '🛟 Fallback' ? current('🛟 Fallback') : null,
     ]);
-    return { proxy, auto, smart, fallback, override, overrideGroup };
+    const smart = core.getManagedSmartPreferred() || smartActual;
+    return { proxy, auto, smart, smartActual, fallback, override, overrideGroup };
   });
 
   // Select an outbound and persist it as the default for the next start.

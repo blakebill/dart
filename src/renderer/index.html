@@ -15,7 +15,7 @@
     <link rel="stylesheet" href="styles/surfaces.css?v=1" />
     <link rel="stylesheet" href="styles/controls.css?v=1" />
     <link rel="stylesheet" href="styles/lists.css?v=1" />
-    <link rel="stylesheet" href="styles/workspaces.css?v=1" />
+    <link rel="stylesheet" href="styles/workspaces.css?v=2" />
     <link rel="stylesheet" href="styles/tools.css?v=1" />
     <link rel="stylesheet" href="styles/motion.css?v=1" />
   </head>
@@ -250,11 +250,11 @@
               <input id="subName" class="input" data-i18n-ph="subs.namePh" />
               <label class="sr-only" for="subUrl" data-i18n="subs.urlPh">配置链接</label>
               <input id="subUrl" class="input grow" data-i18n-ph="subs.urlPh" />
-              <label class="sr-only" for="subUserAgent" data-i18n="subs.userAgent">订阅格式</label>
+              <label class="sr-only" for="subUserAgent" data-i18n="subs.userAgent">请求 UA</label>
               <select id="subUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动</option>
+                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
                 <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
-                <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
+                <option value="clash" data-i18n="subs.userAgentClash">Clash（Mihomo）</option>
               </select>
               <button id="subAddBtn" class="btn primary" data-i18n="subs.addBtn">添加</button>
             </div>
@@ -283,11 +283,11 @@
               </select>
             </div>
             <div class="setting-row">
-              <label for="editUserAgent" data-i18n="subs.userAgent">订阅格式</label>
+              <label for="editUserAgent" data-i18n="subs.userAgent">请求 UA</label>
               <select id="editUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动</option>
+                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
                 <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
-                <option value="clash" data-i18n="subs.userAgentClash">Clash</option>
+                <option value="clash" data-i18n="subs.userAgentClash">Clash（Mihomo）</option>
               </select>
             </div>
             <div class="setting-row">
@@ -317,6 +317,13 @@
             <button id="testAllBtn" class="btn" data-i18n="nodes.testAll">全部测速</button>
             <span class="hint" id="nodeCount"></span>
           </div>
+          <button id="smartRegionScope" class="smart-scope-bar" type="button" aria-haspopup="dialog" hidden>
+            <span class="smart-scope-copy">
+              <span class="smart-scope-label" data-i18n="nodes.smartScope">Smart 候选范围</span>
+              <strong id="smartRegionScopeValue"></strong>
+            </span>
+            <span class="smart-scope-action" data-i18n="nodes.smartScopeChange">更改</span>
+          </button>
           <div id="nodeList" class="node-list" role="list" data-i18n-aria-label="nodes.title"></div>
         </section>
 
@@ -494,6 +501,13 @@
                 <option value="latency" data-i18n="settings.smartModeLatency">低延迟</option>
                 <option value="stable" data-i18n="settings.smartModeStable">稳定优先</option>
               </select>
+            </div>
+            <div class="setting-row">
+              <div class="setting-label">
+                <span data-i18n="settings.smartRegions">Smart 地区范围</span>
+                <span id="smartRegionsSummary" class="hint"></span>
+              </div>
+              <button id="smartRegionsBtn" class="btn" data-i18n="settings.smartRegionsManage">选择地区</button>
             </div>
             <p class="hint" data-i18n="settings.smartModeHint">调整 Smart 的切换速度与稳定性权重。</p>
             <div class="row save-row">

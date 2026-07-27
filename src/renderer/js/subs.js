@@ -33,7 +33,17 @@
       const auInfo = au > 0 ? t('subs.autoUpdateInfo', au) : t('subs.autoUpdateNone');
       const isActive = sub.id === App.state.activeSub;
       if (isActive) div.classList.add('active');
-      const fmt = escapeHtml({ clash: 'Clash', singbox: 'sing-box', links: 'Links' }[sub.format] || sub.format || '-');
+      const sourceFormat = escapeHtml(
+        { clash: 'Clash', singbox: 'sing-box', links: 'Links' }[sub.format] || sub.format || '-'
+      );
+      const coreType = (App.state.settings && App.state.settings.coreType) ||
+        (App.state.status && App.state.status.coreType) || 'sing-box';
+      const runtimeFormat = coreType === 'mihomo' ? 'Mihomo' : 'sing-box';
+      const sourceIsNative = (sub.format === 'singbox' && coreType === 'sing-box') ||
+        (sub.format === 'clash' && coreType === 'mihomo');
+      const formatSummary = sourceIsNative
+        ? t('subs.sourceFormat', sourceFormat)
+        : t('subs.formatFlow', sourceFormat, runtimeFormat);
       const id = escapeHtml(sub.id);
       const viaProxy = sub.updateViaProxy ? ' · ' + t('subs.viaProxyTag') : '';
       const userAgentMode = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
@@ -45,7 +55,7 @@
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(sub.name)}${isActive ? ' ✓' : ''}</div>
-          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${fmt} · ${auInfo}${viaProxy}${userAgentTag} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
+          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${formatSummary} · ${auInfo}${viaProxy}${userAgentTag} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
           ${trafficLine}
         </div>
         <div class="sub-actions">

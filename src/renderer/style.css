@@ -7,7 +7,9 @@
   --surface-hover: rgba(62, 62, 66, 0.76);
   --field: rgba(24, 24, 27, 0.62);
   --raised-filter: blur(22px) saturate(1.16);
-  --menu-surface: rgba(42, 42, 45, 0.96);
+  --menu-surface: rgb(43, 43, 46);
+  --menu-border: rgba(255, 255, 255, 0.19);
+  --menu-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.78), 0 6px 18px -8px rgba(0, 0, 0, 0.62), inset 0 1px 0 rgba(255, 255, 255, 0.09);
   --border: rgba(255, 255, 255, 0.1);
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #ffffff;
@@ -43,7 +45,9 @@
   --surface-raised: rgba(255, 255, 255, 0.8);
   --surface-hover: rgba(255, 255, 255, 0.74);
   --field: rgba(255, 255, 255, 0.56);
-  --menu-surface: rgba(250, 251, 252, 0.96);
+  --menu-surface: rgb(252, 252, 252);
+  --menu-border: rgba(0, 0, 0, 0.16);
+  --menu-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.34), 0 6px 18px -8px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.95);
   --border: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.14);
   --text: #1a1a1a;

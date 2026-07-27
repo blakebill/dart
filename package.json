@@ -1,6 +1,6 @@
 {
   "name": "dart",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "description": "Native-feeling desktop network control for Windows",
   "main": "src/main/index.js",
   "author": "singbox-gui",

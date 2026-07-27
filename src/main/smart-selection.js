@@ -1,5 +1,22 @@
 'use strict';
 
+const {
+  connectionHealthSignal,
+  decayHealthSignals,
+  emptyHealthSignals,
+  healthSummary,
+  importHealthSignals,
+  observeHealthSignal,
+  resetHealthSignals,
+  retainHealthSignals,
+} = require('./smart-health');
+const {
+  ROUTE_CHANGE_DEFAULTS,
+  emptyRouteChangeState,
+  importRouteChangeState,
+  observeRouteMeasurement,
+} = require('./smart-route-change');
+
 const DEFAULT_OPTIONS = Object.freeze({
   alpha: 0.3,
   failureAlpha: 0.25,
@@ -12,9 +29,19 @@ const DEFAULT_OPTIONS = Object.freeze({
   explorationTailRatio: 0.25,
   varianceFloorMs: 15,
   selectionRiskWeight: 0.35,
+  // A challenger must beat the incumbent by more than their combined
+  // standard error. This is a selection guard, not an exploration bonus.
+  switchConfidenceZ: 0.9,
+  switchUncertaintyCapMs: 180,
+  switchUncertaintySpreadCap: 3,
   sampleHalfLifeMs: 15 * 60_000,
   failureHalfLifeMs: 8 * 60_000,
   networkChangeRetention: 0.25,
+  // Keep a few small per-network histories. The active network counts toward
+  // maxNetworkContexts; inactive entries are capped separately by node count.
+  maxNetworkContexts: 4,
+  maxNetworkContextNodes: 256,
+  networkContextMaxAgeMs: 7 * 24 * 60 * 60_000,
   switchThresholdMs: 25,
   switchThresholdRatio: 0.1,
   // Healthy stick needs this many consecutive rounds preferring the challenger.
@@ -40,7 +67,28 @@ const DEFAULT_OPTIONS = Object.freeze({
   maxTrafficEvidence: 4,
   // Soft-fail from short-lived near-zero-byte connections (not full URL timeout).
   softFailAlpha: 0.18,
+  multiSignalHealth: true,
+  ...ROUTE_CHANGE_DEFAULTS,
 });
+
+const CALIBRATION_OPTION_BOUNDS = Object.freeze({
+  switchThresholdMs: Object.freeze({ min: 0, max: 500 }),
+  switchThresholdRatio: Object.freeze({ min: 0, max: 0.75 }),
+  switchConfidenceZ: Object.freeze({ min: 0, max: 4 }),
+  switchConfirmRounds: Object.freeze({ min: 1, max: 8, integer: true }),
+  minDwellMs: Object.freeze({ min: 0, max: 900_000 }),
+  failedDwellMs: Object.freeze({ min: 0, max: 60_000 }),
+  routeChangeMinSamples: Object.freeze({ min: 4, max: 64, integer: true }),
+  routeChangeThresholdMs: Object.freeze({ min: 10, max: 500 }),
+  routeChangeScaleThreshold: Object.freeze({ min: 2, max: 16 }),
+  routeChangeDriftMs: Object.freeze({ min: 0, max: 50 }),
+  routeChangeConfirmSamples: Object.freeze({ min: 2, max: 8, integer: true }),
+  routeChangeBaselineAlpha: Object.freeze({ min: 0.005, max: 0.3 }),
+  routeChangeDeviationAlpha: Object.freeze({ min: 0.01, max: 0.5 }),
+  routeChangeStepCapMs: Object.freeze({ min: 20, max: 1_000 }),
+  routeChangeStepCapScale: Object.freeze({ min: 1, max: 12 }),
+});
+const CALIBRATION_OPTION_KEYS = Object.freeze(Object.keys(CALIBRATION_OPTION_BOUNDS));
 
 const SMART_MODE_OPTIONS = Object.freeze({
   balanced: Object.freeze({}),
@@ -54,6 +102,7 @@ const SMART_MODE_OPTIONS = Object.freeze({
     minDwellMs: 45_000,
     failedDwellMs: 4_000,
     selectionRiskWeight: 0.2,
+    switchConfidenceZ: 0.84,
   }),
   stable: Object.freeze({
     ewmaWeight: 0.5,
@@ -67,11 +116,57 @@ const SMART_MODE_OPTIONS = Object.freeze({
     minDwellMs: 300_000,
     failedDwellMs: 8_000,
     selectionRiskWeight: 0.55,
+    switchConfidenceZ: 1.64,
   }),
 });
 
 function normalizeSmartMode(value) {
   return Object.prototype.hasOwnProperty.call(SMART_MODE_OPTIONS, value) ? value : 'balanced';
+}
+
+function sanitizeCalibrationOptions(patch, current = {}, { strict = true } = {}) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    if (patch == null) return {};
+    if (strict) throw new TypeError('calibration patch must be an object');
+    return { ...current };
+  }
+  const next = { ...current };
+  for (const [key, rawValue] of Object.entries(patch)) {
+    const bounds = CALIBRATION_OPTION_BOUNDS[key];
+    if (!bounds) {
+      if (strict) throw new RangeError(`unsupported calibration option: ${key}`);
+      continue;
+    }
+    if (rawValue == null) {
+      delete next[key];
+      continue;
+    }
+    if (bounds.boolean) {
+      if (typeof rawValue !== 'boolean') {
+        if (strict) throw new TypeError(`${key} must be boolean`);
+        continue;
+      }
+      next[key] = rawValue;
+      continue;
+    }
+    const value = Number(rawValue);
+    if (
+      !Number.isFinite(value) ||
+      value < bounds.min ||
+      value > bounds.max ||
+      (bounds.integer && !Number.isInteger(value))
+    ) {
+      if (strict) {
+        throw new RangeError(
+          `${key} must be ${bounds.integer ? 'an integer ' : ''}between ` +
+          `${bounds.min} and ${bounds.max}`
+        );
+      }
+      continue;
+    }
+    next[key] = value;
+  }
+  return next;
 }
 
 /** Hostnames that are connectivity checks / latency probes — ignore for soft-fail. */
@@ -127,7 +222,11 @@ function computeAdaptiveAcceptableDelayMs(states, options, now = Date.now()) {
   const delays = [];
   for (const state of states) {
     if (!state || state.ewma == null) continue;
-    if (state.consecutiveFailures > 0 || state.cooldownUntil > now) continue;
+    if (
+      state.consecutiveFailures > 0 ||
+      state.healthUnavailable === true ||
+      state.cooldownUntil > now
+    ) continue;
     if (state.effectiveSamples !== undefined && state.effectiveSamples < 0.5) continue;
     if (state.lastSuccess && now - state.lastSuccess > options.maxSampleAgeMs) continue;
     if (!validDelay(state.ewma)) continue;
@@ -158,7 +257,11 @@ function computeCohortCostProfile(states, options, now = Date.now()) {
   const delays = [];
   for (const state of states || []) {
     if (!state || !validDelay(state.ewma)) continue;
-    if (state.cooldownUntil > now || state.consecutiveFailures > 0) continue;
+    if (
+      state.cooldownUntil > now ||
+      state.consecutiveFailures > 0 ||
+      state.healthUnavailable === true
+    ) continue;
     if (state.effectiveSamples !== undefined && state.effectiveSamples < 0.5) continue;
     if (state.lastSuccess && now - state.lastSuccess > options.maxSampleAgeMs) continue;
     delays.push(Number(state.ewma));
@@ -194,12 +297,21 @@ const STABILITY_RECOVER_MID_SUCCESSES = 3;
  * paint a recently-red node green (that was the main UX complaint).
  */
 function stabilityFromState(state, now = Date.now()) {
-  if (!state || state.samples < 1 || state.ewma == null) return { level: 'unknown' };
+  const samples = Math.max(0, Number(state && state.effectiveSamples) || 0);
+  if (!state || samples < 0.5 || state.ewma == null) return { level: 'unknown' };
 
   const softFails = Math.max(0, Number(state.softFails) || 0);
-  const failingNow = state.consecutiveFailures > 0 || softFails >= 2 || state.cooldownUntil > now;
+  const connectionUnavailable = state.healthUnavailable === true ||
+    (state.healthUnavailable === undefined && softFails >= 2);
+  const failingNow = state.consecutiveFailures > 0 ||
+    connectionUnavailable ||
+    state.cooldownUntil > now;
   const urlFailure = Number(state.lastFailure) || 0;
-  const connectionFailure = Number(state.lastConnectionFailure) || 0;
+  // A single UDP/first-byte miss is a scoring penalty, not a sticky hard
+  // failure. Only corroborated connection unavailability enters the red hold.
+  const connectionFailure = connectionUnavailable
+    ? Number(state.lastConnectionFailure) || 0
+    : 0;
   const lastFailure = Math.max(urlFailure, connectionFailure);
   const sinceFailure = lastFailure ? now - lastFailure : Infinity;
   const successSinceFailure = connectionFailure > urlFailure
@@ -231,7 +343,7 @@ function stabilityFromState(state, now = Date.now()) {
   const ewma = state.ewma;
   const jitter = Math.max(Number(state.jitter) || 0, Number(state.peakJitter) || 0);
   const jitterRatio = ewma > 0 ? jitter / ewma : 0;
-  if (state.samples < 5) return { level: 'mid' };
+  if (samples < 5) return { level: 'mid' };
   if (jitterRatio > 0.4) return { level: 'bad' };
   if (jitterRatio > 0.2) return { level: 'mid' };
   if (recentlyFailed) return { level: 'mid' };
@@ -245,6 +357,8 @@ function emptyNodeState() {
     effectiveAttempts: 0,
     samples: 0,
     effectiveSamples: 0,
+    primaryEwma: null,
+    secondaryEwma: null,
     ewma: null,
     delayMean: null,
     delayM2: 0,
@@ -261,12 +375,28 @@ function emptyNodeState() {
     trafficBytes: 0,
     trafficEvidence: 0,
     softFails: 0,
+    healthUnavailable: false,
     connectionFailureRate: 0,
     lastConnectionFailure: 0,
     connectionSuccesses: 0,
+    dialEwma: null,
+    dialSamples: 0,
+    lastDialSuccess: 0,
+    lastDialFailure: 0,
+    healthSignals: emptyHealthSignals(),
+    routeChange: emptyRouteChangeState(),
     displayDelay: null,
     lastDisplayDelay: 0,
     lastDecay: 0,
+  };
+}
+
+function cloneNodeState(state) {
+  const source = state && typeof state === 'object' ? state : emptyNodeState();
+  return {
+    ...source,
+    healthSignals: importHealthSignals(source.healthSignals, source),
+    routeChange: importRouteChangeState(source.routeChange),
   };
 }
 
@@ -420,14 +550,21 @@ class ConnectionFeedbackTracker {
 
 class SmartSelectionModel {
   constructor(options = {}) {
-    const { mode, ...customOptions } = options;
+    const { mode, calibrationOptions, ...customOptions } = options;
     this.customOptions = customOptions;
+    this.calibrationOptions = sanitizeCalibrationOptions(calibrationOptions, {});
     this.mode = normalizeSmartMode(mode);
-    this.options = { ...DEFAULT_OPTIONS, ...SMART_MODE_OPTIONS[this.mode], ...customOptions };
-    this.options.maxNodes = Math.max(1, Math.floor(Number(this.options.maxNodes) || DEFAULT_OPTIONS.maxNodes));
+    this.options = {
+      ...DEFAULT_OPTIONS,
+      ...SMART_MODE_OPTIONS[this.mode],
+      ...customOptions,
+      ...this.calibrationOptions,
+    };
+    this._normalizeOptionBounds();
     this.contextKey = null;
     this.nodes = new Map();
     this.identities = new Map();
+    this.networkContexts = new Map();
     this.selected = null;
     this.selectedAt = 0;
     this.networkKey = null;
@@ -441,6 +578,7 @@ class SmartSelectionModel {
     this.contextKey = contextKey;
     this.nodes.clear();
     this.identities.clear();
+    this.networkContexts.clear();
     this.selected = null;
     this.selectedAt = 0;
     this.pendingSwitch = null;
@@ -452,10 +590,91 @@ class SmartSelectionModel {
     const next = normalizeSmartMode(mode);
     if (next === this.mode) return false;
     this.mode = next;
-    this.options = { ...DEFAULT_OPTIONS, ...SMART_MODE_OPTIONS[next], ...this.customOptions };
-    this.options.maxNodes = Math.max(1, Math.floor(Number(this.options.maxNodes) || DEFAULT_OPTIONS.maxNodes));
+    this.options = {
+      ...DEFAULT_OPTIONS,
+      ...SMART_MODE_OPTIONS[next],
+      ...this.customOptions,
+      ...this.calibrationOptions,
+    };
+    this._normalizeOptionBounds();
+    this._trimNetworkContexts();
     this.pendingSwitch = null;
     return true;
+  }
+
+  /**
+   * Stable anchor for calibration/shadow comparison. This deliberately omits
+   * the runtime calibration overlay so callers never calibrate an already
+   * calibrated value.
+   */
+  getUncalibratedOptions() {
+    return {
+      ...DEFAULT_OPTIONS,
+      ...SMART_MODE_OPTIONS[this.mode],
+      ...this.customOptions,
+    };
+  }
+
+  baseOptions() {
+    return this.getUncalibratedOptions();
+  }
+
+  /**
+   * Apply bounded runtime posture calibration without clearing observations.
+   * Unknown or out-of-range fields are rejected atomically.
+   */
+  setCalibrationOptions(patch) {
+    const next = sanitizeCalibrationOptions(patch, this.calibrationOptions);
+    const changed = CALIBRATION_OPTION_KEYS.some(
+      (key) => next[key] !== this.calibrationOptions[key]
+    );
+    if (!changed) return false;
+    this.calibrationOptions = next;
+    this.options = {
+      ...DEFAULT_OPTIONS,
+      ...SMART_MODE_OPTIONS[this.mode],
+      ...this.customOptions,
+      ...this.calibrationOptions,
+    };
+    this._normalizeOptionBounds();
+    this._trimNetworkContexts();
+    // A half-completed confirmation belongs to the previous posture.
+    this.pendingSwitch = null;
+    return true;
+  }
+
+  _normalizeOptionBounds() {
+    this.options.maxNodes = Math.max(
+      1,
+      Math.floor(Number(this.options.maxNodes) || DEFAULT_OPTIONS.maxNodes)
+    );
+    this.options.maxNetworkContexts = Math.max(
+      1,
+      Math.floor(
+        Number(this.options.maxNetworkContexts) || DEFAULT_OPTIONS.maxNetworkContexts
+      )
+    );
+    this.options.maxNetworkContextNodes = Math.max(
+      1,
+      Math.min(
+        this.options.maxNodes,
+        Math.floor(
+          Number(this.options.maxNetworkContextNodes) ||
+            DEFAULT_OPTIONS.maxNetworkContextNodes
+        )
+      )
+    );
+  }
+
+  _networkHistoryLimit() {
+    return Math.max(0, this.options.maxNetworkContexts - 1);
+  }
+
+  _trimNetworkContexts() {
+    const limit = this._networkHistoryLimit();
+    while (this.networkContexts.size > limit) {
+      this.networkContexts.delete(this.networkContexts.keys().next().value);
+    }
   }
 
   _setContext(contextKey) {
@@ -524,18 +743,138 @@ class SmartSelectionModel {
     state.delayM2 *= sampleFactor;
     state.trafficEvidence *= sampleFactor;
     state.failureRate *= failureFactor;
-    state.connectionFailureRate *= failureFactor;
-    state.softFails *= failureFactor;
+    if (!state.healthSignals) {
+      state.healthSignals = importHealthSignals(null, state);
+    }
+    decayHealthSignals(state.healthSignals, failureFactor);
+    this._syncConnectionHealth(state);
   }
 
-  setNetworkKey(networkKey, now = Date.now()) {
-    const next = networkKey == null ? null : String(networkKey);
-    if (this.networkKey === next) return false;
-    const first = this.networkKey == null;
-    this.networkKey = next;
-    if (first) return true;
-    // Keep a weak prior across interfaces, but make every node uncertain again.
-    const retention = Math.max(0, Math.min(1, Number(this.options.networkChangeRetention) || 0.25));
+  _connectionHealth(state) {
+    if (!state) {
+      return {
+        failureRate: 0,
+        softFails: 0,
+        lastFailure: 0,
+        lastSuccess: 0,
+        successes: 0,
+        samples: 0,
+      };
+    }
+    if (!state.healthSignals) {
+      state.healthSignals = importHealthSignals(null, state);
+    }
+    return healthSummary(state.healthSignals);
+  }
+
+  _syncConnectionHealth(state) {
+    const summary = this._connectionHealth(state);
+    state.connectionFailureRate = summary.failureRate;
+    state.softFails = summary.softFails;
+    state.healthUnavailable = summary.unavailable;
+    state.lastConnectionFailure = summary.lastFailure;
+    state.connectionSuccesses = Math.min(100, summary.successes);
+    return summary;
+  }
+
+  _captureNetworkContext(now) {
+    const limit = this.options.maxNetworkContextNodes;
+    const entries = [...this.nodes.entries()]
+      .sort((a, b) => {
+        if (a[0] === this.selected) return -1;
+        if (b[0] === this.selected) return 1;
+        return (Number(b[1].lastSeen) || 0) - (Number(a[1].lastSeen) || 0);
+      })
+      .slice(0, limit)
+      .map(([name, state]) => [name, cloneNodeState(state)]);
+    return {
+      savedAt: Math.max(0, Number(now) || 0),
+      selected: typeof this.selected === 'string' ? this.selected : null,
+      nodes: new Map(entries),
+    };
+  }
+
+  _saveNetworkContext(networkKey, now) {
+    if (networkKey == null || this._networkHistoryLimit() <= 0) return;
+    const key = String(networkKey);
+    this.networkContexts.delete(key);
+    this.networkContexts.set(key, this._captureNetworkContext(now));
+    this._trimNetworkContexts();
+  }
+
+  _networkContextExpired(entry, now) {
+    const savedAt = Math.max(0, Number(entry && entry.savedAt) || 0);
+    const maxAge = Math.max(
+      60_000,
+      Number(this.options.networkContextMaxAgeMs) ||
+        DEFAULT_OPTIONS.networkContextMaxAgeMs
+    );
+    return savedAt > 0 && now >= savedAt && now - savedAt > maxAge;
+  }
+
+  _restoreNetworkContext(networkKey, now) {
+    if (networkKey == null) return false;
+    const key = String(networkKey);
+    const entry = this.networkContexts.get(key);
+    if (!entry) return false;
+    this.networkContexts.delete(key);
+    if (this._networkContextExpired(entry, now)) return false;
+
+    const stored = entry.nodes instanceof Map ? entry.nodes : new Map();
+    const byIdentity = new Map();
+    for (const [name, state] of stored) {
+      if (!state || typeof state !== 'object') continue;
+      const identity = state.identity || name;
+      if (!byIdentity.has(identity)) byIdentity.set(identity, state);
+    }
+    const restored = new Map();
+    let restoredSelected = null;
+    const selectedState = entry.selected ? stored.get(entry.selected) : null;
+    const selectedIdentity = selectedState
+      ? (selectedState.identity || entry.selected)
+      : null;
+
+    if (this.identities.size) {
+      for (const [name, identity] of this.identities) {
+        const direct = stored.get(name);
+        const state = direct && (!direct.identity || direct.identity === identity)
+          ? direct
+          : byIdentity.get(identity);
+        if (!state) continue;
+        const clone = { ...cloneNodeState(state), identity };
+        this._decayState(clone, now);
+        restored.set(name, clone);
+        if (selectedIdentity && identity === selectedIdentity) restoredSelected = name;
+        if (restored.size >= this.options.maxNodes) break;
+      }
+    } else {
+      for (const [name, state] of stored) {
+        if (typeof name !== 'string' || !state || typeof state !== 'object') continue;
+        const clone = cloneNodeState(state);
+        this._decayState(clone, now);
+        restored.set(name, clone);
+        if (name === entry.selected) restoredSelected = name;
+        if (restored.size >= this.options.maxNodes) break;
+      }
+    }
+
+    this.nodes = restored;
+    this.selected = restoredSelected;
+    this.selectedAt = 0;
+    this.pendingSwitch = null;
+    this.globalOutageUntil = 0;
+    this.acceptableDelayMs =
+      Number(this.options.maxAcceptableDelayMs) || DEFAULT_OPTIONS.maxAcceptableDelayMs;
+    return true;
+  }
+
+  _retainWeakNetworkPrior(now) {
+    // Keep a weak prior for a network not seen before, but make every node
+    // uncertain again. A known network restores its own decayed history above.
+    const retention = Math.max(
+      0,
+      Math.min(1, Number(this.options.networkChangeRetention) || 0.25)
+    );
     for (const state of this.nodes.values()) {
       this._decayState(state, now);
       state.effectiveAttempts *= retention;
@@ -543,12 +882,27 @@ class SmartSelectionModel {
       state.delayM2 *= retention;
       state.trafficEvidence *= retention;
       state.failureRate *= retention;
-      state.connectionFailureRate *= retention;
-      state.softFails *= retention;
+      if (!state.healthSignals) {
+        state.healthSignals = importHealthSignals(null, state);
+      }
+      retainHealthSignals(state.healthSignals, retention);
+      this._syncConnectionHealth(state);
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
       state.lastDecay = now;
     }
+  }
+
+  setNetworkKey(networkKey, now = Date.now()) {
+    const next = networkKey == null ? null : String(networkKey);
+    if (this.networkKey === next) return false;
+    const previous = this.networkKey;
+    const first = previous == null;
+    if (!first) this._saveNetworkContext(previous, now);
+    this.networkKey = next;
+    if (this._restoreNetworkContext(next, now)) return true;
+    if (first) return true;
+    this._retainWeakNetworkPrior(now);
     this.selectedAt = 0;
     this.pendingSwitch = null;
     this.globalOutageUntil = 0;
@@ -558,7 +912,7 @@ class SmartSelectionModel {
 
   peek(name) {
     const state = this.nodes.get(name);
-    return state ? { ...state } : null;
+    return state ? cloneNodeState(state) : null;
   }
 
   _ensure(name, now) {
@@ -585,45 +939,123 @@ class SmartSelectionModel {
     state.lastDisplayDelay = state.displayDelay == null ? 0 : now;
   }
 
+  isConnectionUnavailable(name, now = Date.now()) {
+    if (typeof name !== 'string' || !name) return false;
+    const state = this.nodes.get(name);
+    if (!state) return false;
+    this._decayState(state, now);
+    return this._syncConnectionHealth(state).unavailable === true;
+  }
+
   /**
    * Real-path feedback from Clash /connections diffs (not URL delay).
-   * @param {{ name: string, kind: 'traffic'|'success'|'softFail', bytes?: number }} event
+   * @param {{
+   *   name: string,
+   *   kind: 'traffic'|'success'|'softFail'|'dialSuccess'|'dialFailure',
+   *   bytes?: number,
+   *   durationMs?: number,
+   *   signal?: 'tcp'|'udp'|'handshake'|'firstByte'|'first-byte',
+   *   phase?: 'tcp'|'udp'|'handshake'|'firstByte'|'first-byte',
+   *   network?: 'tcp'|'udp'
+   * }} event
    */
   observeConnection(event, now = Date.now()) {
     const name = event && typeof event.name === 'string' ? event.name : '';
     if (!name) return;
     const kind = event && event.kind;
     const state = this._ensure(name, now);
+    const signalName = connectionHealthSignal(
+      event,
+      this.options.multiSignalHealth !== false
+    );
+    if (!state.healthSignals) {
+      state.healthSignals = importHealthSignals(null, state);
+    }
 
-    if (kind === 'traffic' || kind === 'success') {
+    if (kind === 'traffic' || kind === 'success' || kind === 'dialSuccess') {
       const bytes = Math.max(0, Number(event.bytes) || 0);
-      state.lastTraffic = now;
-      state.trafficBytes = Math.min(1e12, (Number(state.trafficBytes) || 0) + bytes);
-      const evidence = kind === 'traffic'
-        ? Math.max(0.25, Math.min(1, Math.log2(1 + bytes / 12_000) / 4))
-        : 0.5;
-      state.trafficEvidence = Math.min(
-        Math.max(0, Number(this.options.maxTrafficEvidence) || 4),
-        (Number(state.trafficEvidence) || 0) + evidence
-      );
-      // Keep real-path health independent from URL-test health. A successful
-      // 204 must not clear an application connection failure, and vice versa.
-      state.connectionFailureRate *= 1 - this.options.failureAlpha * 0.85;
-      state.softFails = Math.max(0, (Number(state.softFails) || 0) - 1);
-      if (state.lastConnectionFailure) {
-        state.connectionSuccesses = Math.min(100, (Number(state.connectionSuccesses) || 0) + 1);
+      if (kind === 'dialSuccess' && signalName === 'tcp') {
+        // Legacy aggregate retained for diagnostics/snapshot compatibility.
+        // Selection never scores this field; per-phase timing stays in
+        // healthSignals[*].durationEwma and is not mixed across stages.
+        state.lastDialSuccess = now;
+        if (validDelay(event.durationMs)) {
+          const duration = Number(event.durationMs);
+          state.dialEwma = validDelay(state.dialEwma)
+            ? state.dialEwma * (1 - this.options.alpha) + duration * this.options.alpha
+            : duration;
+          state.dialSamples = Math.min(1000, (Number(state.dialSamples) || 0) + 1);
+        }
       }
+      // Detailed kernels can publish TCP, handshake, and first-byte success for
+      // one connection. Only actual payload/first-byte completion is traffic
+      // evidence; transport-stage successes still update their own health EWMA.
+      const isTrafficEvidence =
+        kind === 'traffic' ||
+        kind === 'success' ||
+        (kind === 'dialSuccess' && signalName === 'firstByte');
+      if (isTrafficEvidence) {
+        state.lastTraffic = now;
+        state.trafficBytes = Math.min(1e12, (Number(state.trafficBytes) || 0) + bytes);
+        const evidence = kind === 'traffic'
+          ? Math.max(0.25, Math.min(1, Math.log2(1 + bytes / 12_000) / 4))
+          : 0.5;
+        state.trafficEvidence = Math.min(
+          Math.max(0, Number(this.options.maxTrafficEvidence) || 4),
+          (Number(state.trafficEvidence) || 0) + evidence
+        );
+      }
+      observeHealthSignal(state.healthSignals, signalName, event, this.options, now);
+      this._syncConnectionHealth(state);
+      return;
+    }
+
+    if (kind === 'dialFailure') {
+      // TCP/handshake are hard path failures. UDP and first-byte remain
+      // protocol/target-specific evidence until repeated or corroborated.
+      observeHealthSignal(state.healthSignals, signalName, event, this.options, now);
+      if (signalName === 'tcp') state.lastDialFailure = now;
+      this._syncConnectionHealth(state);
       return;
     }
 
     if (kind === 'softFail') {
       // Tracker already required a streak; each emitted event is meaningful.
-      state.softFails = Math.min(100, (Number(state.softFails) || 0) + 1);
-      state.connectionFailureRate +=
-        (1 - state.connectionFailureRate) * this.options.softFailAlpha;
-      state.lastConnectionFailure = now;
-      state.connectionSuccesses = 0;
+      observeHealthSignal(state.healthSignals, signalName, event, this.options, now);
+      this._syncConnectionHealth(state);
     }
+  }
+
+  _resetNodeRouteStats(state, measurement, now) {
+    state.effectiveAttempts = 0;
+    state.samples = 0;
+    state.effectiveSamples = 0;
+    state.primaryEwma = null;
+    state.secondaryEwma = null;
+    state.ewma = null;
+    state.delayMean = null;
+    state.delayM2 = 0;
+    state.jitter = 0;
+    state.peakJitter = 0;
+    state.failureRate = 0;
+    state.consecutiveFailures = 0;
+    state.cooldownUntil = 0;
+    state.lastSuccess = 0;
+    state.lastFailure = 0;
+    state.successSinceFailure = 0;
+    state.lastTraffic = 0;
+    state.trafficEvidence = 0;
+    state.dialEwma = null;
+    state.dialSamples = 0;
+    state.lastDialSuccess = 0;
+    state.lastDialFailure = 0;
+    state.displayDelay = validDelay(measurement && measurement.primaryDelay)
+      ? Number(measurement.primaryDelay)
+      : null;
+    state.lastDisplayDelay = state.displayDelay == null ? 0 : now;
+    if (!state.healthSignals) state.healthSignals = emptyHealthSignals();
+    resetHealthSignals(state.healthSignals);
+    this._syncConnectionHealth(state);
   }
 
   /**
@@ -640,12 +1072,12 @@ class SmartSelectionModel {
         selected.cooldownUntil > now ||
         selected.failureRate >= 0.2 ||
         selected.connectionFailureRate >= 0.2 ||
-        (Number(selected.softFails) || 0) >= 2
+        selected.healthUnavailable === true
       ) {
         return 'urgent';
       }
       if (
-        selected.samples >= 5 &&
+        selected.effectiveSamples >= 4.5 &&
         selected.failureRate < 0.05 &&
         selected.connectionFailureRate < 0.05 &&
         (Number(selected.softFails) || 0) === 0 &&
@@ -661,10 +1093,10 @@ class SmartSelectionModel {
       this._decayState(state, now);
       if (state.ewma == null) continue;
       scored++;
-      if (state.samples >= 3) mature++;
+      if (state.effectiveSamples >= 2.5) mature++;
       if (
         state.consecutiveFailures > 0 ||
-        state.softFails >= 2 ||
+        state.healthUnavailable === true ||
         state.failureRate >= 0.25 ||
         state.connectionFailureRate >= 0.25 ||
         state.cooldownUntil > now
@@ -681,13 +1113,56 @@ class SmartSelectionModel {
     const name = measurement && typeof measurement.name === 'string' ? measurement.name : '';
     if (!name || measurement.fresh === false) return;
     const state = this._ensure(name, now);
+    if (!state.routeChange) state.routeChange = emptyRouteChangeState();
+    const routeChange = observeRouteMeasurement(
+      state.routeChange,
+      measurement,
+      this.options,
+      now
+    );
+    if (routeChange.changed) this._resetNodeRouteStats(state, measurement, now);
     state.attempts = Math.min(1_000_000, (Number(state.attempts) || 0) + 1);
     state.effectiveAttempts = Math.min(
       1_000_000,
       Math.max(0, Number(state.effectiveAttempts) || 0) + 1
     );
-    if (validDelay(measurement.delay)) {
-      const delay = Number(measurement.delay);
+    let recordedDelay = measurement.delay;
+    const hasComponents = Object.prototype.hasOwnProperty.call(measurement, 'primaryDelay') ||
+      Object.prototype.hasOwnProperty.call(measurement, 'secondaryDelay');
+    if (hasComponents) {
+      const updateSignal = (key, value, fresh) => {
+        if (!validDelay(value)) return;
+        if (routeChange.changed && fresh !== true) return;
+        const delay = Number(value);
+        if (state[key] == null || !Number.isFinite(state[key])) state[key] = delay;
+        else if (fresh) state[key] = state[key] * (1 - this.options.alpha) + delay * this.options.alpha;
+      };
+      updateSignal('primaryEwma', measurement.primaryDelay, measurement.primaryFresh === true);
+      updateSignal('secondaryEwma', measurement.secondaryDelay, measurement.secondaryFresh === true);
+      const primary = validDelay(state.primaryEwma) ? state.primaryEwma : null;
+      const secondary = validDelay(state.secondaryEwma) ? state.secondaryEwma : null;
+      const requestedPrimaryWeight = Number(measurement.primaryWeight);
+      const requestedSecondaryWeight = Number(measurement.secondaryWeight);
+      let primaryWeight = Number.isFinite(requestedPrimaryWeight) && requestedPrimaryWeight >= 0
+        ? requestedPrimaryWeight
+        : 0.55;
+      let secondaryWeight = Number.isFinite(requestedSecondaryWeight) && requestedSecondaryWeight >= 0
+        ? requestedSecondaryWeight
+        : 0.45;
+      const totalWeight = primaryWeight + secondaryWeight;
+      if (totalWeight <= 0) {
+        primaryWeight = 0.55;
+        secondaryWeight = 0.45;
+      } else {
+        primaryWeight /= totalWeight;
+        secondaryWeight /= totalWeight;
+      }
+      recordedDelay = primary != null && secondary != null
+        ? primary * primaryWeight + secondary * secondaryWeight
+        : (primary != null ? primary : secondary);
+    }
+    if (validDelay(recordedDelay)) {
+      const delay = Number(recordedDelay);
       const effectiveSamples = Math.max(0, Number(state.effectiveSamples) || 0);
       if (state.delayMean === null || !Number.isFinite(state.delayMean) || effectiveSamples < 0.001) {
         state.delayMean = delay;
@@ -784,7 +1259,10 @@ class SmartSelectionModel {
     if (now - state.lastSuccess > this.options.maxSampleAgeMs) return true;
     if (state.cooldownUntil > now) return true;
     if (state.consecutiveFailures > 0) return true;
-    if (state.softFails >= 2) return true;
+    if (
+      state.healthUnavailable === true ||
+      (state.healthUnavailable === undefined && state.softFails >= 2)
+    ) return true;
     if (strict && state.ewma >= this.acceptableDelayMs) return true;
     if (strict && this.options.excludeStabilityBad) {
       if (stabilityFromState(state, now).level === 'bad') return true;
@@ -837,6 +1315,30 @@ class SmartSelectionModel {
     const standardError = Math.sqrt(this._delayVariance(state, profile) / samples);
     const riskWeight = Math.max(0, Number(this.options.selectionRiskWeight) || 0);
     return base + Math.min(profile.spread * 3, standardError) * riskWeight;
+  }
+
+  _switchUncertaintyMargin(challenger, incumbent, profile) {
+    if (!challenger || !incumbent) return 0;
+    const confidence = Math.max(0, Number(this.options.switchConfidenceZ) || 0);
+    if (!confidence) return 0;
+    const standardError = (state) => {
+      const samples = Math.max(0.25, Number(state.effectiveSamples) || 0);
+      // Cohort spread calibrates absolute costs, but does not prove that an
+      // individual node is noisy. Keep this gate tied to node evidence.
+      return Math.sqrt(this._delayVariance(state) / samples);
+    };
+    const challengerError = standardError(challenger);
+    const incumbentError = standardError(incumbent);
+    const combined = confidence * Math.hypot(challengerError, incumbentError);
+    const configuredAbsoluteCap = Number(this.options.switchUncertaintyCapMs);
+    const configuredSpreadCap = Number(this.options.switchUncertaintySpreadCap);
+    const absoluteCap = Math.max(0, Number.isFinite(configuredAbsoluteCap)
+      ? configuredAbsoluteCap
+      : DEFAULT_OPTIONS.switchUncertaintyCapMs);
+    const spreadCap = Math.max(0, Number.isFinite(configuredSpreadCap)
+      ? configuredSpreadCap
+      : DEFAULT_OPTIONS.switchUncertaintySpreadCap);
+    return Math.min(absoluteCap, profile.spread * spreadCap, combined);
   }
 
   _probePriority(state, totalAttempts, now) {
@@ -955,14 +1457,6 @@ class SmartSelectionModel {
         this.selected = current;
         this.selectedAt = 0;
       }
-    } else if (activeNames.has(current) && current !== this.selected) {
-      // Clash "now" can lag on a red/failed pin after we already preferred better.
-      // Do not re-stick selection to an unusable current — that restarts dwell.
-      const curState = this.nodes.get(current);
-      if (!this._isUnusable(curState, now, { strict: true })) {
-        this.selected = current;
-        this.selectedAt = now;
-      }
     }
     this._prune(activeNames, new Set([current, this.selected].filter(Boolean)));
 
@@ -990,28 +1484,40 @@ class SmartSelectionModel {
       return this._select(bestName, now);
     }
 
-    // Evaluate stickiness against the live group "now" when it is still healthy;
-    // otherwise only against our last preferred pick.
-    const stickName = (!this._isUnusable(this.nodes.get(current), now, { strict: true }) && activeNames.has(current))
-      ? current
-      : this.selected;
+    // The model's confirmed pick is authoritative. A kernel Smart group may
+    // temporarily expose a different `now` while failing over a single dial;
+    // treating that as a user choice lets the kernel and GUI continually
+    // re-select each other. Explicit user overrides travel through the managed
+    // pin path instead.
+    const stickName = activeNames.has(this.selected) ? this.selected : current;
     const stickState = this.nodes.get(stickName);
+    const stickHealth = this._connectionHealth(stickState);
     const stickUnusable = this._isUnusable(stickState, now, { strict: true });
     const stickScore = this._selectionCost(stickState, now, costProfile, { strict: !stickUnusable });
     const stickFailed = stickUnusable
       || !stickState
       || stickState.consecutiveFailures > 0
       || stickState.cooldownUntil > now;
+    const explicitDialFailure = !!(
+      stickState &&
+      (
+        stickState.healthUnavailable === true ||
+        (stickState.healthUnavailable === undefined && stickState.softFails >= 2)
+      ) &&
+      stickHealth.lastFailure > stickHealth.lastSuccess
+    );
     if (stickName === bestName) {
       this.pendingSwitch = null;
       return this._select(bestName, now);
     }
 
-    const dwellMs = stickFailed ? this.options.failedDwellMs : this.options.minDwellMs;
+    const dwellMs = stickFailed
+      ? (explicitDialFailure ? 0 : this.options.failedDwellMs)
+      : this.options.minDwellMs;
     if (!coldStart && this.selectedAt && now - this.selectedAt < dwellMs) {
       // Failures / red nodes leave only a short settle window, not the full dwell.
       if (!stickFailed && activeNames.has(stickName)) return this._select(stickName, now);
-      if (stickFailed && now - this.selectedAt < this.options.failedDwellMs && activeNames.has(stickName)) {
+      if (stickFailed && now - this.selectedAt < dwellMs && activeNames.has(stickName)) {
         return this._select(stickName, now);
       }
     }
@@ -1020,6 +1526,10 @@ class SmartSelectionModel {
       : Math.max(
         this.options.switchThresholdMs,
         Number.isFinite(stickScore) ? stickScore * this.options.switchThresholdRatio : 0
+      ) + this._switchUncertaintyMargin(
+        this.nodes.get(bestName),
+        stickState,
+        costProfile
       );
     if (!stickFailed && stickScore <= bestScore + threshold && activeNames.has(stickName)) {
       this.pendingSwitch = null;
@@ -1047,35 +1557,48 @@ class SmartSelectionModel {
    */
   qualities(names, now = Date.now()) {
     const out = {};
-    const minSamples = 5;
+    // A decaying count drops infinitesimally below an integer immediately;
+    // use a half-sample tolerance to avoid flickering around the maturity edge.
+    const minSamples = 4.5;
     for (const value of names || []) {
       const name = typeof value === 'string' ? value : '';
       if (!name) continue;
       const state = this.nodes.get(name);
       if (!state) {
-        out[name] = { level: 'unknown', samples: 0, failed: false, ewma: null };
+        out[name] = {
+          level: 'unknown',
+          samples: 0,
+          effectiveSamples: 0,
+          failed: false,
+          ewma: null,
+        };
         continue;
       }
-      const failed = state.consecutiveFailures > 0 || state.softFails >= 2 || state.cooldownUntil > now;
+      const failed = state.consecutiveFailures > 0 ||
+        state.healthUnavailable === true ||
+        (state.healthUnavailable === undefined && state.softFails >= 2) ||
+        state.cooldownUntil > now;
       const displayFresh = state.lastDisplayDelay > 0 &&
         now - state.lastDisplayDelay <= this.options.maxSampleAgeMs;
       const ewma = displayFresh && validDelay(state.displayDelay)
         ? Number(state.displayDelay)
         : (validDelay(state.ewma) ? Number(state.ewma) : null);
+      const effectiveSamples = Math.max(0, Number(state.effectiveSamples) || 0);
       if (failed) {
         out[name] = {
           level: 'unavailable',
-          samples: state.samples,
+          samples: Math.round(effectiveSamples * 10) / 10,
+          effectiveSamples,
           failed: true,
           ewma,
         };
         continue;
       }
-      const effectiveSamples = Math.max(0, Number(state.effectiveSamples) || state.samples || 0);
       if (effectiveSamples < 0.5 || ewma == null) {
         out[name] = {
           level: 'unknown',
-          samples: state.samples,
+          samples: Math.round(effectiveSamples * 10) / 10,
+          effectiveSamples,
           failed: false,
           ewma: null,
         };
@@ -1085,7 +1608,8 @@ class SmartSelectionModel {
       if (effectiveSamples < minSamples) {
         out[name] = {
           level: 'probing',
-          samples: state.samples,
+          samples: Math.round(effectiveSamples * 10) / 10,
+          effectiveSamples,
           failed: false,
           ewma,
         };
@@ -1094,7 +1618,8 @@ class SmartSelectionModel {
       const quality = stabilityFromState(state, now);
       out[name] = {
         level: quality.level,
-        samples: state.samples,
+        samples: Math.round(effectiveSamples * 10) / 10,
+        effectiveSamples,
         failed: false,
         ewma,
       };
@@ -1102,34 +1627,11 @@ class SmartSelectionModel {
     return out;
   }
 
-  snapshot() {
-    return {
-      contextKey: this.contextKey,
-      networkKey: this.networkKey,
-      selected: this.selected,
-      selectedAt: this.selectedAt,
-      pendingSwitch: this.pendingSwitch ? { ...this.pendingSwitch } : null,
-      identities: new Map(this.identities),
-      nodes: new Map([...this.nodes.entries()].map(([name, state]) => [name, { ...state }])),
-    };
-  }
-
-  /** Restore a previously snapshotted model (bounded, best-effort). */
-  restore(snapshot, contextKey = null) {
-    if (!snapshot || typeof snapshot !== 'object') return false;
-    const key = contextKey != null ? String(contextKey) : snapshot.contextKey;
-    this.clear(key || null);
-    this.networkKey = snapshot.networkKey == null ? null : String(snapshot.networkKey);
-    this.selected = typeof snapshot.selected === 'string' ? snapshot.selected : null;
-    this.selectedAt = Number(snapshot.selectedAt) || 0;
-    this.pendingSwitch = null;
-    this.identities = snapshot.identities instanceof Map
-      ? new Map(snapshot.identities)
-      : new Map(Object.entries(snapshot.identities || {}));
-    const entries = snapshot.nodes instanceof Map
-      ? snapshot.nodes.entries()
-      : Object.entries(snapshot.nodes || {});
-    let count = 0;
+  _importNodeMap(source, limit) {
+    const entries = source instanceof Map
+      ? source.entries()
+      : Object.entries(source || {});
+    const imported = new Map();
     for (const [name, state] of entries) {
       if (typeof name !== 'string' || !state || typeof state !== 'object') continue;
       const attempts = Math.max(0, Math.min(
@@ -1143,7 +1645,9 @@ class SmartSelectionModel {
       const effectiveSamples = state.effectiveSamples === undefined
         ? samples
         : Math.max(0, Math.min(1000, Number(state.effectiveSamples) || 0));
-      this.nodes.set(name, {
+      const healthSignals = importHealthSignals(state.healthSignals, state);
+      const importedHealth = healthSummary(healthSignals);
+      imported.set(name, {
         identity: typeof state.identity === 'string'
           ? state.identity
           : this.identities.get(name) || name,
@@ -1151,6 +1655,8 @@ class SmartSelectionModel {
         effectiveAttempts,
         samples,
         effectiveSamples,
+        primaryEwma: validDelay(state.primaryEwma) ? Number(state.primaryEwma) : null,
+        secondaryEwma: validDelay(state.secondaryEwma) ? Number(state.secondaryEwma) : null,
         ewma: validDelay(state.ewma) ? Number(state.ewma) : null,
         delayMean: validDelay(state.delayMean)
           ? Number(state.delayMean)
@@ -1173,15 +1679,101 @@ class SmartSelectionModel {
           Number(this.options.maxTrafficEvidence) || 4,
           Number(state.trafficEvidence) || 0
         )),
-        softFails: Math.max(0, Math.min(100, Number(state.softFails) || 0)),
-        connectionFailureRate: Math.min(1, Math.max(0, Number(state.connectionFailureRate) || 0)),
-        lastConnectionFailure: Math.max(0, Number(state.lastConnectionFailure) || 0),
-        connectionSuccesses: Math.min(100, Math.max(0, Number(state.connectionSuccesses) || 0)),
+        softFails: importedHealth.softFails,
+        healthUnavailable: importedHealth.unavailable,
+        connectionFailureRate: importedHealth.failureRate,
+        lastConnectionFailure: importedHealth.lastFailure,
+        connectionSuccesses: Math.min(100, importedHealth.successes),
+        dialEwma: validDelay(state.dialEwma) ? Number(state.dialEwma) : null,
+        dialSamples: Math.min(1000, Math.max(0, Number(state.dialSamples) || 0)),
+        lastDialSuccess: Math.max(0, Number(state.lastDialSuccess) || 0),
+        lastDialFailure: Math.max(0, Number(state.lastDialFailure) || 0),
+        healthSignals,
+        routeChange: importRouteChangeState(state.routeChange),
         displayDelay: validDelay(state.displayDelay) ? Number(state.displayDelay) : null,
         lastDisplayDelay: Math.max(0, Number(state.lastDisplayDelay) || 0),
         lastDecay: Math.max(0, Number(state.lastDecay) || Number(state.lastSeen) || 0),
       });
-      if (++count >= this.options.maxNodes) break;
+      if (imported.size >= limit) break;
+    }
+    return imported;
+  }
+
+  snapshot() {
+    return {
+      contextKey: this.contextKey,
+      networkKey: this.networkKey,
+      selected: this.selected,
+      selectedAt: this.selectedAt,
+      pendingSwitch: this.pendingSwitch ? { ...this.pendingSwitch } : null,
+      calibrationOptions: { ...this.calibrationOptions },
+      identities: new Map(this.identities),
+      nodes: new Map(
+        [...this.nodes.entries()].map(([name, state]) => [name, cloneNodeState(state)])
+      ),
+      networkContexts: new Map([...this.networkContexts.entries()].map(([key, entry]) => [
+        key,
+        {
+          savedAt: entry.savedAt,
+          selected: entry.selected,
+          nodes: new Map(
+            [...entry.nodes.entries()].map(([name, state]) => [
+              name,
+              cloneNodeState(state),
+            ])
+          ),
+        },
+      ])),
+    };
+  }
+
+  /** Restore a previously snapshotted model (bounded, best-effort). */
+  restore(snapshot, contextKey = null) {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    if (Object.prototype.hasOwnProperty.call(snapshot, 'calibrationOptions')) {
+      this.calibrationOptions = sanitizeCalibrationOptions(
+        snapshot.calibrationOptions,
+        {},
+        { strict: false }
+      );
+      this.options = {
+        ...DEFAULT_OPTIONS,
+        ...SMART_MODE_OPTIONS[this.mode],
+        ...this.customOptions,
+        ...this.calibrationOptions,
+      };
+      this._normalizeOptionBounds();
+    }
+    const key = contextKey != null ? String(contextKey) : snapshot.contextKey;
+    this.clear(key || null);
+    this.networkKey = snapshot.networkKey == null ? null : String(snapshot.networkKey);
+    this.selected = typeof snapshot.selected === 'string' ? snapshot.selected : null;
+    this.selectedAt = Number(snapshot.selectedAt) || 0;
+    this.pendingSwitch = null;
+    this.identities = snapshot.identities instanceof Map
+      ? new Map(snapshot.identities)
+      : new Map(Object.entries(snapshot.identities || {}));
+    this.nodes = this._importNodeMap(snapshot.nodes, this.options.maxNodes);
+
+    const contextEntries = snapshot.networkContexts instanceof Map
+      ? snapshot.networkContexts.entries()
+      : Object.entries(snapshot.networkContexts || {});
+    for (const [networkKey, entry] of contextEntries) {
+      if (
+        typeof networkKey !== 'string' ||
+        !entry ||
+        typeof entry !== 'object' ||
+        networkKey === this.networkKey
+      ) continue;
+      this.networkContexts.set(networkKey, {
+        savedAt: Math.max(0, Number(entry.savedAt) || 0),
+        selected: typeof entry.selected === 'string' ? entry.selected : null,
+        nodes: this._importNodeMap(
+          entry.nodes,
+          this.options.maxNetworkContextNodes
+        ),
+      });
+      this._trimNetworkContexts();
     }
     return true;
   }
@@ -1191,6 +1783,8 @@ class SmartSelectionModel {
 module.exports = {
   DEFAULT_OPTIONS,
   SMART_MODE_OPTIONS,
+  CALIBRATION_OPTION_BOUNDS,
+  CALIBRATION_OPTION_KEYS,
   DEFAULT_IGNORE_HOSTS,
   SmartSelectionModel,
   ConnectionFeedbackTracker,

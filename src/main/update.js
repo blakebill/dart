@@ -60,14 +60,20 @@ async function checkUpdate(current, proxyPort = 0, log = () => {}, options = {})
     const assets = releaseAssets.filter((a) => /\.exe$/i.test(a.name || ''));
     const asset = assets.find((a) => String(a.name).toLowerCase() === expectedName.toLowerCase()) || null;
     const checksumAsset = releaseAssets.find((a) => /^SHA256SUMS(?:\.txt)?$/i.test(a.name || '')) || null;
-    const assetName = asset ? asset.name : installerName(latest);
+    // Authoritative GitHub metadata can prove the expected installer is absent.
+    // Only synthesize its conventional URL when the jsDelivr fallback supplied
+    // a tag without an asset list; otherwise the UI should fall back to the
+    // release page instead of attempting a guaranteed 404.
+    const assetName = asset ? asset.name : release ? null : installerName(latest);
     const encodedTag = encodeURIComponent(tag);
     return {
       current,
       latest,
       hasUpdate: github.compareTags(latest, current) > 0,
       url: release && release.html_url ? release.html_url : `https://github.com/${UPDATE_REPO}/releases/tag/${encodedTag}`,
-      assetUrl: asset ? asset.browser_download_url : `https://github.com/${UPDATE_REPO}/releases/download/${encodedTag}/${assetName}`,
+      assetUrl: asset
+        ? asset.browser_download_url
+        : assetName ? `https://github.com/${UPDATE_REPO}/releases/download/${encodedTag}/${assetName}` : null,
       assetName,
       assetSize: asset ? asset.size : 0,
       assetSha256: assetSha256(asset),

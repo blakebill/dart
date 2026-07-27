@@ -19,7 +19,7 @@ const CORE_START_MIN_ALIVE_MS = 600;
 const CORE_START_MAX_WAIT_MS = 8000;
 const CORE_START_POLL_MS = 100;
 
-/** TCP probe for 127.0.0.1:port — used to confirm the mixed inbound is accepting. */
+/** TCP probe for a generated local proxy/controller port. */
 function probeLocalPort(port, timeoutMs = 250) {
   return new Promise((resolve) => {
     const numeric = Number(port);
@@ -40,16 +40,40 @@ function probeLocalPort(port, timeoutMs = 250) {
   });
 }
 
-/** Mixed inbound port from a generated sing-box or mihomo config, if present. */
-function listenPortFromConfig(config) {
-  if (!config || typeof config !== 'object') return null;
+/** Local ports from a generated sing-box or mihomo config. */
+function listenPortsFromConfig(config) {
+  if (!config || typeof config !== 'object') return [];
+  const ports = new Set();
+  const addPort = (value) => {
+    const port = Number(value);
+    if (Number.isInteger(port) && port > 0 && port <= 65535) ports.add(port);
+  };
   const mixed = Number(config['mixed-port']);
-  if (Number.isInteger(mixed) && mixed > 0 && mixed <= 65535) return mixed;
-  const inbound = Array.isArray(config.inbounds)
-    ? config.inbounds.find((item) => item && item.type === 'mixed')
-    : null;
-  const port = inbound && Number(inbound.listen_port);
-  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+  addPort(mixed);
+  if (Array.isArray(config.inbounds)) {
+    for (const inbound of config.inbounds) {
+      if (inbound && inbound.type === 'mixed') addPort(inbound.listen_port);
+    }
+  }
+
+  const controller = config['external-controller'] ||
+    (config.experimental && config.experimental.clash_api &&
+      config.experimental.clash_api.external_controller);
+  const rawController = String(controller || '').trim();
+  if (rawController) {
+    try {
+      const url = new URL(rawController.startsWith(':')
+        ? `http://127.0.0.1${rawController}`
+        : rawController.includes('://') ? rawController : `http://${rawController}`);
+      const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      if (['127.0.0.1', 'localhost', '0.0.0.0', '::1', '::'].includes(host)) {
+        addPort(url.port);
+      }
+    } catch (_) {
+      /* Unix sockets and malformed custom endpoints are not TCP readiness probes. */
+    }
+  }
+  return [...ports];
 }
 
 // Matches ANSI CSI escape sequences (e.g. color codes like "\x1b[38;5;74m").
@@ -913,6 +937,12 @@ class CoreManager {
       throw new Error(coreLabel + ' core not found. Download or place the core under Settings first.');
     }
     if (config) this.writeConfig(config);
+    const probePorts = listenPortsFromConfig(config);
+    for (const port of probePorts) {
+      if (await probeLocalPort(port)) {
+        throw new Error(`local port ${port} is already in use; stop the conflicting process before starting ${coreLabel}`);
+      }
+    }
 
     this.onLog(`[gui] Starting ${coreLabel} core...`);
     const workDir = this.ensureCoreDir(coreType);
@@ -981,26 +1011,28 @@ class CoreManager {
     });
 
     // Wait until the process has stayed alive long enough to catch fast
-    // crashes, and (when known) until the mixed inbound accepts TCP. A fixed
-    // 600ms sleep alone misses slower bind/TUN failures that exit later.
-    const probePort = listenPortFromConfig(config);
+    // crashes, and (when known) until every local proxy/controller port accepts
+    // TCP. A fixed 600ms sleep alone misses slower bind/TUN failures that exit later.
     const startedAt = Date.now();
-    let portReady = !probePort;
+    const readyPorts = new Set();
     while (true) {
       if (this.proc !== proc) {
         const detail = startupLines.slice(-4).join(' | ');
         throw new Error('core exited immediately after start' + (detail ? ': ' + detail : '; check the logs and config'));
       }
       const elapsed = Date.now() - startedAt;
-      if (probePort && !portReady) {
-        portReady = await probeLocalPort(probePort);
+      for (const port of probePorts) {
+        if (!readyPorts.has(port) && await probeLocalPort(port)) readyPorts.add(port);
       }
-      if (elapsed >= CORE_START_MIN_ALIVE_MS && portReady) break;
+      const portsReady = readyPorts.size === probePorts.length;
+      if (elapsed >= CORE_START_MIN_ALIVE_MS && portsReady) break;
       if (elapsed >= CORE_START_MAX_WAIT_MS) {
-        if (probePort && !portReady) {
+        if (!portsReady) {
           try { await this.stop(); } catch (_) {}
+          const missing = probePorts.filter((port) => !readyPorts.has(port));
           throw new Error(
-            `core process stayed up but proxy port ${probePort} did not open; check the logs and config`
+            `core process stayed up but local port${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ` +
+            'did not open; check the logs and config'
           );
         }
         break;

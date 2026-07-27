@@ -16,16 +16,16 @@ const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
   'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
-  'testUrl', 'smartMode',
+  'testUrl', 'smartMode', 'smartRegions',
   'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
 ]);
 
 const CORE_CONFIG_SETTINGS = new Set([
-  'mixedPort', 'clashApiPort', 'logLevel', 'autoSetSystemProxy',
+  'mixedPort', 'clashApiPort', 'logLevel',
   'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
   // ruleGroupSelections is NOT core-config: picks apply live via Clash API and
   // only become config defaults on the next start/rebuild.
-  'ruleOverrides', 'coreType', 'testUrl', 'smartMode',
+  'ruleOverrides', 'coreType', 'testUrl', 'smartRegions',
 ]);
 
 function reqStr(value, name) {
@@ -134,6 +134,19 @@ function validateSettingsPatch(patch, current) {
   if ('theme' in patch) reqEnum(patch.theme, ['dark', 'light', 'system'], 'theme');
   if ('clashMode' in patch) reqEnum(patch.clashMode, VALID_MODES, 'clashMode');
   if ('smartMode' in patch) reqEnum(patch.smartMode, VALID_SMART_MODES, 'smartMode');
+  if ('smartRegions' in patch) {
+    if (!Array.isArray(patch.smartRegions) || patch.smartRegions.length > 64) {
+      throw new Error('invalid smartRegions');
+    }
+    const seen = new Set();
+    for (const code of patch.smartRegions) {
+      if (typeof code !== 'string' || !/^[A-Z]{2}$/.test(code) || seen.has(code)) {
+        throw new Error('invalid smartRegions');
+      }
+      seen.add(code);
+    }
+    patch.smartRegions = [...patch.smartRegions].sort();
+  }
   for (const key of ['dnsRemote', 'dnsLocal']) {
     if (!(key in patch)) continue;
     const value = reqStr(patch[key], key).trim();

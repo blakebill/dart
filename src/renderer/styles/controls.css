@@ -113,10 +113,17 @@ select[data-enhanced] {
   transform: rotate(180deg);
 }
 
-.ui-select-menu,
 .toast {
   -webkit-backdrop-filter: var(--raised-filter);
   backdrop-filter: var(--raised-filter);
+}
+
+.ui-select-menu,
+.node-context-menu {
+  border: 1px solid var(--menu-border);
+  color: var(--text);
+  background: var(--menu-surface);
+  box-shadow: var(--menu-shadow);
 }
 
 .ui-select-menu {
@@ -126,10 +133,7 @@ select[data-enhanced] {
   max-height: 280px;
   padding: 4px;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--menu-surface);
-  box-shadow: var(--panel-shadow);
+  border-radius: 8px;
   transform-origin: top center;
   animation: dropdownIn var(--motion-fast);
 }

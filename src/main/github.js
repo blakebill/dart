@@ -33,10 +33,9 @@ function compareTags(a, b) {
  * every git tag while the GitHub "latest release" endpoint does not.
  */
 function pickLatestTag(tags) {
-  const stable = (tags || []).filter((tag) => {
-    const value = String(tag || '');
-    return value && (!/[-+]/.test(value) || /-dart\.\d+$/.test(value));
-  });
+  const stable = (tags || []).filter((tag) =>
+    /^v?\d+\.\d+\.\d+(?:-dart\.\d+)?$/.test(String(tag || ''))
+  );
   if (!stable.length) return null;
   return stable.reduce((best, t) => (compareTags(t, best) > 0 ? t : best));
 }

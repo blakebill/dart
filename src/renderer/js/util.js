@@ -108,6 +108,14 @@
     return new Date(ts).toLocaleString(locale);
   };
 
+  // app:getState returns compact profile summaries, so hashing the complete
+  // list is cheap and automatically covers metadata added in future versions.
+  // Omitting fields here used to leave auto-update / proxy / User-Agent labels
+  // stale after a metadata-only edit whose updatedAt did not change.
+  App.subscriptionStateSignature = function subscriptionStateSignature(subs, activeSub) {
+    return JSON.stringify([activeSub || null, Array.isArray(subs) ? subs : []]);
+  };
+
   const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
   App.escapeHtml = function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);

@@ -64,6 +64,13 @@
     changed = setFieldValue($('#setDnsLocal'), s.dnsLocal || '') || changed;
     changed = setFieldValue($('#setDnsStrategy'), s.dnsStrategy || 'prefer_ipv4') || changed;
     changed = setFieldValue($('#setCoreType'), s.coreType || 'sing-box') || changed;
+    const smartRegions = Array.isArray(s.smartRegions) ? s.smartRegions : [];
+    const smartRegionsSummary = $('#smartRegionsSummary');
+    if (smartRegionsSummary) {
+      smartRegionsSummary.textContent = smartRegions.length
+        ? t('settings.smartRegionsCount', smartRegions.length)
+        : t('settings.smartRegionsAll');
+    }
     // Enhanced selects only need a refresh when an underlying value actually moved.
     if (changed && App.refreshSelects && App.currentTab === 'settings') App.refreshSelects();
   }
@@ -172,6 +179,7 @@
   });
 
   $('#coreManageBtn').addEventListener('click', () => App.openDialog('core'));
+  $('#smartRegionsBtn').addEventListener('click', () => App.openDialog('smart-regions'));
 
   // Open the project homepage.
   $('#homepageBtn').addEventListener('click', () => {

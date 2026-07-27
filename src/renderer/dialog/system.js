@@ -129,6 +129,96 @@
     });
   });
 
+  Dialog.register('smart-regions', async () => {
+    const data = await Dialog.call(api.getNodeRegions);
+    const regions = Array.isArray(data && data.regions) ? data.regions : [];
+    const saved = new Set(Array.isArray(data && data.selected) ? data.selected : []);
+    const defaultAll = saved.size === 0;
+    let regionDisplayNames = null;
+    try {
+      regionDisplayNames = new Intl.DisplayNames(
+        [document.documentElement.lang || 'zh-CN'],
+        { type: 'region' }
+      );
+    } catch (_) {
+      /* Fall back to ISO codes on older runtimes. */
+    }
+
+    Dialog.setView('settings.smartRegionsTitle', `
+      <div class="dialog-body dialog-flex">
+        <p class="hint" data-i18n="settings.smartRegionsDialogHint">${escapeHtml(t('settings.smartRegionsDialogHint'))}</p>
+        <div class="row dialog-selection-row">
+          <button id="dialogSmartRegionsAll" class="btn" data-i18n="settings.smartRegionsSelectAll">${escapeHtml(t('settings.smartRegionsSelectAll'))}</button>
+          <button id="dialogSmartRegionsClear" class="btn" data-i18n="settings.smartRegionsClear">${escapeHtml(t('settings.smartRegionsClear'))}</button>
+          <span id="dialogSmartRegionsStatus" class="hint grow" data-dialog-status></span>
+        </div>
+        <div id="dialogSmartRegionsList" class="smart-region-list dialog-result"></div>
+      </div>
+      ${Dialog.footer(`<button id="dialogSmartRegionsApply" class="btn primary" data-i18n="settings.apply">${escapeHtml(t('settings.apply'))}</button>`)}
+    `);
+
+    function regionLabel(code) {
+      if (code === 'ZZ') return t('settings.smartRegionsOther');
+      return regionDisplayNames ? (regionDisplayNames.of(code) || code) : code;
+    }
+
+    function checkedCodes() {
+      return [...document.querySelectorAll('#dialogSmartRegionsList input[type="checkbox"]:checked')]
+        .map((input) => input.value);
+    }
+
+    function updateStatus() {
+      const count = checkedCodes().length;
+      $('#dialogSmartRegionsStatus').textContent = count
+        ? t('settings.smartRegionsSelected', count, regions.length)
+        : t('settings.smartRegionsNeedOne');
+      $('#dialogSmartRegionsApply').disabled = count === 0;
+    }
+
+    const list = $('#dialogSmartRegionsList');
+    if (!regions.length) {
+      list.innerHTML = `<p class="hint">${escapeHtml(t('settings.smartRegionsEmpty'))}</p>`;
+    } else {
+      list.innerHTML = regions.map((item) => {
+        const code = String(item && item.code || '');
+        const count = Math.max(0, Number(item && item.count) || 0);
+        const checked = defaultAll || saved.has(code);
+        return `<label class="smart-region-item">
+          <input type="checkbox" value="${escapeHtml(code)}" ${checked ? 'checked' : ''}/>
+          <span class="smart-region-name">${escapeHtml(regionLabel(code))}</span>
+          <span class="hint">${escapeHtml(t('settings.smartRegionsNodes', count))}</span>
+        </label>`;
+      }).join('');
+    }
+
+    Dialog.bind('#dialogSmartRegionsList', 'change', updateStatus);
+    Dialog.bind('#dialogSmartRegionsAll', 'click', () => {
+      document.querySelectorAll('#dialogSmartRegionsList input[type="checkbox"]').forEach((input) => {
+        input.checked = true;
+      });
+      updateStatus();
+    });
+    Dialog.bind('#dialogSmartRegionsClear', 'click', () => {
+      document.querySelectorAll('#dialogSmartRegionsList input[type="checkbox"]').forEach((input) => {
+        input.checked = false;
+      });
+      updateStatus();
+    });
+    Dialog.bind('#dialogSmartRegionsApply', 'click', async () => {
+      await Dialog.runBusy($('#dialogSmartRegionsApply'), null, async () => {
+        const selected = checkedCodes();
+        if (!selected.length) return;
+        await Dialog.call(api.updateSettings, {
+          // Empty means unrestricted and automatically includes regions added by
+          // a later subscription refresh.
+          smartRegions: selected.length === regions.length ? [] : selected,
+        });
+        await Dialog.finish('state', t('settings.smartRegionsSaved'));
+      });
+    });
+    updateStatus();
+  });
+
   Dialog.register('geodata', async () => {
     Dialog.setView('settings.geoManageTitle', `
       <div class="dialog-body dialog-flex">

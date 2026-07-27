@@ -67,6 +67,26 @@ let recentLogs = [];
 let recentLogStart = 0;
 let recentLogChars = 0;
 let logSequence = 0;
+// The main process keeps the bounded history unconditionally, but only streams
+// each line over IPC while the Logs tab explicitly asks for it. Core trace/debug
+// output can be very chatty; sending it to an unopened lazy renderer is wasted.
+let recentLogTarget = null;
+
+function setRecentLogStreaming(target, enabled) {
+  if (enabled) {
+    if (
+      !target ||
+      state.mainWindow == null ||
+      state.mainWindow.webContents !== target ||
+      (typeof target.isDestroyed === 'function' && target.isDestroyed())
+    ) return false;
+    recentLogTarget = target;
+    return true;
+  }
+  // A stale renderer must not disable a newer window's active stream.
+  if (!target || recentLogTarget === target) recentLogTarget = null;
+  return false;
+}
 
 function sendLog(line) {
   line = String(line === undefined || line === null ? '' : line);
@@ -81,7 +101,9 @@ function sendLog(line) {
     recentLogs = recentLogs.slice(recentLogStart);
     recentLogStart = 0;
   }
-  sendToMain('singbox:log', entry);
+  if (state.mainWindow && state.mainWindow.webContents === recentLogTarget) {
+    sendToMain('singbox:log', entry);
+  }
 }
 
 function getRecentLogs() {
@@ -156,6 +178,7 @@ module.exports = {
   resourcesBinDir,
   sendToMain,
   sendLog,
+  setRecentLogStreaming,
   getRecentLogs,
   clearRecentLogs,
   sendStatus,

@@ -33,6 +33,8 @@
   let contextMenuEl = null;
   let contextMenuName = null;
   let contextMenuInvoker = null;
+  let regionDisplayNames = null;
+  let regionDisplayLanguage = '';
 
   function scheduleGroupPoll() {
     if (groupPollTimer) {
@@ -136,6 +138,77 @@
     return loadedNodeSub === App.state.activeSub ? nodeItems : [];
   }
 
+  function selectedSmartRegions() {
+    const regions = App.state.settings && App.state.settings.smartRegions;
+    return Array.isArray(regions)
+      ? regions.filter((code) => typeof code === 'string' && code)
+      : [];
+  }
+
+  function smartIsSelected() {
+    return (groupNow.proxy || App.state.selected || AUTO_GROUP) === SMART_GROUP;
+  }
+
+  function smartScopeState() {
+    const selected = selectedSmartRegions();
+    if (!selected.length) return { selected, effective: null, fallback: false };
+    if (loadedNodeSub !== (App.state.activeSub || null)) {
+      return { selected, effective: null, fallback: false };
+    }
+    const allowed = new Set(selected);
+    const hasMatch = activeNodes().some((node) => node && allowed.has(node.region));
+    return {
+      selected,
+      effective: hasMatch && smartIsSelected() ? allowed : null,
+      fallback: !hasMatch,
+    };
+  }
+
+  function regionLabel(code) {
+    if (code === 'ZZ') return t('nodes.smartRegionOther');
+    const language = document.documentElement.lang || 'zh-CN';
+    if (language !== regionDisplayLanguage) {
+      regionDisplayLanguage = language;
+      try {
+        regionDisplayNames = new Intl.DisplayNames([language], { type: 'region' });
+      } catch (_) {
+        regionDisplayNames = null;
+      }
+    }
+    if (!regionDisplayNames) return code;
+    try {
+      return regionDisplayNames.of(code) || code;
+    } catch (_) {
+      return code;
+    }
+  }
+
+  function smartScopeSummary(scope) {
+    if (!scope.selected.length) return t('nodes.smartScopeAll');
+    const labels = scope.selected.map(regionLabel);
+    const separator = regionDisplayLanguage.startsWith('en') ? ', ' : '、';
+    const visible = labels.slice(0, 3).join(separator);
+    const summary = labels.length > 3
+      ? t('nodes.smartScopeMore', visible, labels.length - 3)
+      : visible;
+    return scope.fallback ? t('nodes.smartScopeFallback', summary) : summary;
+  }
+
+  function renderSmartScope() {
+    const bar = $('#smartRegionScope');
+    if (!bar) return;
+    const visible = !!App.state.activeSub && smartIsSelected();
+    bar.hidden = !visible;
+    if (!visible) return;
+    const summary = smartScopeSummary(smartScopeState());
+    const value = $('#smartRegionScopeValue');
+    if (value) {
+      value.textContent = summary;
+      value.title = summary;
+    }
+    bar.title = t('nodes.smartScopeHint');
+  }
+
   function releaseNodes({ cancelTests = true } = {}) {
     hideNodeContextMenu();
     qualities.clear();
@@ -235,9 +308,7 @@
       return {
         kind: 'probing',
         label: t('nodes.quality.probing'),
-        title: t('nodes.quality.hint.probing', samples),
-        samples,
-        showSamples: samples > 0,
+        title: t('nodes.quality.hint.probing'),
       };
     }
     if (level === 'good' || level === 'mid' || level === 'bad') {
@@ -247,11 +318,11 @@
           ? t('nodes.quality.ok')
           : t('nodes.quality.weak');
       const title = level === 'good'
-        ? t('nodes.quality.hint.good', samples)
+        ? t('nodes.quality.hint.good')
         : level === 'mid'
-          ? t('nodes.quality.hint.ok', samples)
-          : t('nodes.quality.hint.weak', samples);
-      return { kind: level, label, title, samples, showSamples: samples > 0 };
+          ? t('nodes.quality.hint.ok')
+          : t('nodes.quality.hint.weak');
+      return { kind: level, label, title };
     }
     return null;
   }
@@ -259,15 +330,21 @@
   function qualityHtmlFor(name) {
     const info = qualityDisplay(name);
     if (!info) return '';
-    const meta = info.showSamples
-      ? `<span class="node-quality-n">·${escapeHtml(String(info.samples))}</span>`
-      : '';
-    return `<span class="node-quality ${escapeHtml(info.kind)}" title="${escapeHtml(info.title)}" aria-label="${escapeHtml(info.title)}">${escapeHtml(info.label)}${meta}</span>`;
+    return `<span class="node-quality ${escapeHtml(info.kind)}" title="${escapeHtml(info.title)}" aria-label="${escapeHtml(info.title)}">${escapeHtml(info.label)}</span>`;
   }
 
   /** Apply background Smart EWMA into the delay map so UI is not "label without ms". */
   function syncDelayFromQuality(name, value) {
     if (!name || !value || delays.get(name) === 'testing') return false;
+    // A failed current observation must not keep painting a stale, possibly
+    // green RTT beside the red "unavailable" stability label.
+    if (value.level === 'unavailable' || value.failed) {
+      if (delays.get(name) !== 'timeout') {
+        delays.set(name, 'timeout');
+        return true;
+      }
+      return false;
+    }
     if (Number.isFinite(value.ewma)) {
       const ms = Math.round(Number(value.ewma));
       if (delays.get(name) !== ms) {
@@ -275,11 +352,6 @@
         return true;
       }
       return false;
-    }
-    // Never succeeded and currently failing — same as a timed-out probe.
-    if ((value.level === 'unavailable' || value.failed) && delays.get(name) === undefined) {
-      delays.set(name, 'timeout');
-      return true;
     }
     return false;
   }
@@ -304,12 +376,6 @@
     qEl.setAttribute('aria-label', info.title);
     qEl.textContent = '';
     qEl.appendChild(document.createTextNode(info.label));
-    if (info.showSamples) {
-      const n = document.createElement('span');
-      n.className = 'node-quality-n';
-      n.textContent = '·' + String(info.samples);
-      qEl.appendChild(n);
-    }
   }
 
   async function refreshQualities() {
@@ -418,8 +484,14 @@
     return labels[key] || '';
   }
 
-  function nodeRowHtml(name, type, security, isNode, variant, cipher, transport, plugin) {
+  function nodeRowHtml(name, type, security, isNode, variant, cipher, transport, plugin, region, smartScope) {
     const active = isActiveNode(name);
+    const smartExcluded = !!(
+      isNode &&
+      smartScope &&
+      smartScope.effective &&
+      !smartScope.effective.has(region)
+    );
     const d = delays.get(name);
     const delayHtml =
       d !== undefined ? `<span class="node-delay ${delayClass(d)}">${delayText(d)}</span>` : '<span class="node-delay"></span>';
@@ -429,6 +501,9 @@
     if (isNode && groupNow.auto && name === groupNow.auto) tagHtml += '<span class="node-tag">⚡</span>';
     if (isNode && groupNow.smart && name === groupNow.smart) tagHtml += '<span class="node-tag">🧠</span>';
     if (isNode && groupNow.fallback && name === groupNow.fallback) tagHtml += '<span class="node-tag">🛟</span>';
+    if (smartExcluded) {
+      tagHtml += `<span class="node-tag node-tag-smart-excluded" title="${escapeHtml(t('nodes.smartExcludedHint'))}">${escapeHtml(t('nodes.smartExcluded'))}</span>`;
+    }
     const isOverride = !!(isNode && groupNow.override && name === groupNow.override);
     if (isOverride) {
       const groupLabel = groupNow.overrideGroup === AUTO_GROUP
@@ -464,7 +539,7 @@
       ? `<button type="button" class="node-test-btn" data-name="${safeName}" aria-label="${escapeHtml(t('nodes.test') + ': ' + name)}">${t('nodes.test')}</button>`
       : '';
     const activeHtml = active ? `<span class="node-active">✓ ${t('nodes.active')}</span>` : '';
-    return `<div class="node-item${active ? ' active' : ''}${isNode ? ' has-test' : ''}${isOverride ? ' is-override' : ''}" role="listitem" data-name="${safeName}" data-node="${isNode ? '1' : '0'}">
+    return `<div class="node-item${active ? ' active' : ''}${isNode ? ' has-test' : ''}${isOverride ? ' is-override' : ''}${smartExcluded ? ' smart-excluded' : ''}" role="listitem" data-name="${safeName}" data-node="${isNode ? '1' : '0'}">
       <button type="button" class="node-select-btn" data-select-name="${safeName}" aria-pressed="${String(active)}">
       <span class="node-top">
         <span class="node-identity"><span class="node-name">${safeName}</span>${tagHtml}</span>
@@ -499,6 +574,7 @@
       return;
     }
     const { start, end, startRow, endRow, totalRows } = virtualRange(list, nodeRows.length);
+    const smartScope = smartScopeState();
     let html = startRow
       ? `<div class="virtual-spacer" style="height:${startRow * VIRTUAL_NODE_ROW_HEIGHT}px"></div>`
       : '';
@@ -513,7 +589,9 @@
         n.variant,
         n.cipher,
         n.transport,
-        n.plugin
+        n.plugin,
+        n.region,
+        smartScope
       );
     }
     html += '</div>';
@@ -529,6 +607,7 @@
   function renderNodes() {
     const list = $('#nodeList');
     if (!list) return;
+    renderSmartScope();
     if (loadedNodeSub !== (App.state.activeSub || null)) {
       nodeRows = [];
       filteredNodeCount = 0;
@@ -757,6 +836,7 @@
     try {
       // Manual clicks always force a real probe (background Auto/Smart still cache).
       const ms = await api.testNodeDelay(name, { force: true });
+      if (!Number.isFinite(ms) || ms <= 0) throw new Error('timeout');
       if (delayRequests.get(name) === token) delays.set(name, ms);
     } catch (e) {
       if (delayRequests.get(name) === token) delays.set(name, 'timeout');
@@ -804,6 +884,7 @@
         try {
           const result = await api.testNodeDelay(name, { force: true });
           if (!run.cancelled && delayRequests.get(name) === token) {
+            if (!Number.isFinite(result) || result <= 0) throw new Error('timeout');
             delays.set(name, result);
             if (result < bestDelay) {
               bestDelay = result;
@@ -858,10 +939,12 @@
     });
   });
   $('#testAllBtn').addEventListener('click', testAll);
+  $('#smartRegionScope').addEventListener('click', () => App.openDialog('smart-regions'));
 
   App.loadNodes = loadNodes;
   App.releaseNodes = releaseNodes;
   App.renderNodes = renderNodes;
+  App.renderSmartScope = renderSmartScope;
   App.currentNodeName = currentNodeName;
   App.renderCurrentNode = renderCurrentNode;
   App.refreshGroupSelections = refreshGroupSelections;

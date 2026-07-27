@@ -518,6 +518,15 @@ test('Mihomo TUN mode emits tun configuration', () => {
   assert.strictEqual(cfg.dns['respect-rules'], true);
 });
 
+test('Mihomo races resolved IPs to avoid DIRECT address fallback stalls', () => {
+  const cfg = buildMihomoConfig([
+    { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' },
+  ], {
+    enableTun: false,
+  });
+  assert.strictEqual(cfg['tcp-concurrent'], true);
+});
+
 console.log('\nAuto format detection:');
 
 test('parseSubscriptionContent detects Clash', () => {
@@ -632,6 +641,27 @@ test('Smart groups are app-managed selectors', () => {
   const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
   assert.strictEqual(mihomoSmart.type, 'select');
   assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
+});
+
+test('Smart region preferences restrict both core groups and safely handle stale choices', () => {
+  const nodes = [
+    { type: 'trojan', name: '🇭🇰 HK-01', server: 'hk.example.com', port: 443, password: 'p' },
+    { type: 'trojan', name: 'US-01', server: 'us.example.com', port: 443, password: 'p' },
+    { type: 'trojan', name: 'Other', server: 'edge.example.net', port: 443, password: 'p' },
+  ];
+  const singbox = buildSingboxConfig(nodes, { smartRegions: ['HK', 'ZZ'] });
+  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
+  assert.deepStrictEqual(singboxSmart.outbounds, ['🇭🇰 HK-01', 'Other']);
+
+  const mihomo = buildMihomoConfig(nodes, { smartRegions: ['US'] });
+  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
+  assert.deepStrictEqual(mihomoSmart.proxies, ['US-01']);
+
+  const stale = buildSingboxConfig(nodes, { smartRegions: ['JP'] });
+  assert.deepStrictEqual(
+    stale.outbounds.find((outbound) => outbound.tag === '🧠 Smart').outbounds,
+    nodes.map((node) => node.name)
+  );
 });
 
 test('kernel Smart version fallback stays conservative for old Dart builds', () => {

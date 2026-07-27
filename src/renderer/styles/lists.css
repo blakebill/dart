@@ -215,12 +215,6 @@
   background: color-mix(in srgb, var(--text-faint) 10%, var(--field));
 }
 
-.node-quality-n {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  opacity: 0.72;
-}
-
 /* Cold-start / sparse samples: readable, intentionally uncolored. */
 .node-quality.probing {
   color: var(--text-dim);
@@ -268,13 +262,12 @@
 
 .node-context-menu {
   position: fixed;
-  z-index: 1000;
+  z-index: 1200;
   min-width: 180px;
   padding: 4px;
-  border: 1px solid var(--border-strong);
   border-radius: 8px;
-  background: var(--surface-raised, var(--surface));
-  box-shadow: var(--panel-shadow);
+  transform-origin: top left;
+  animation: dropdownIn var(--motion-fast);
 }
 
 .node-context-menu.hidden {

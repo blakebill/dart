@@ -188,6 +188,8 @@
     --surface-hover: Highlight;
     --field: Field;
     --menu-surface: Canvas;
+    --menu-border: ButtonBorder;
+    --menu-shadow: none;
     --border: ButtonBorder;
     --border-strong: CanvasText;
     --text: CanvasText;
@@ -209,6 +211,7 @@
   .panel,
   .card,
   .ui-select-menu,
+  .node-context-menu,
   .toast,
   .native-dialog-window {
     box-shadow: none;

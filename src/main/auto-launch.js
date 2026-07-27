@@ -7,6 +7,38 @@ const { spawnSync } = require('child_process');
 
 const AUTOSTART_TASK = 'Dart-AutoStart';
 
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function buildTaskXml(executable, user, silent = false) {
+  const argumentsXml = silent ? '<Arguments>--hidden</Arguments>' : '';
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Dart Network Control auto-start (elevated for TUN mode)</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${escapeXml(user)}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>${escapeXml(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>${escapeXml(executable)}</Command>${argumentsXml}</Exec></Actions>
+</Task>`;
+}
+
 function createAutoLaunchService(options) {
   const setRunItem = (enable, silent) => options.app.setLoginItemSettings({
     openAtLogin: !!enable,
@@ -42,39 +74,15 @@ function createAutoLaunchService(options) {
     return !result.error && result.status === 0;
   }
 
-  function taskXml() {
-    const escapeXml = (value) => String(value)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+  function taskXml(silent) {
     const user = `${process.env.USERDOMAIN || process.env.COMPUTERNAME || ''}\\${process.env.USERNAME || ''}`;
-    return `<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Dart Network Control auto-start (elevated for TUN mode)</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${escapeXml(user)}</UserId></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><UserId>${escapeXml(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>false</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>${escapeXml(process.execPath)}</Command></Exec></Actions>
-</Task>`;
+    return buildTaskXml(process.execPath, user, silent);
   }
 
-  function createTask() {
+  function createTask(silent) {
     const tmp = path.join(os.tmpdir(), `dart-autostart-${process.pid}.xml`);
     try {
-      fs.writeFileSync(tmp, '\ufeff' + taskXml(), { encoding: 'utf16le' });
+      fs.writeFileSync(tmp, '\ufeff' + taskXml(silent), { encoding: 'utf16le' });
       const ok = runSchtasks(['/create', '/tn', AUTOSTART_TASK, '/xml', tmp, '/f'], !options.isAdmin());
       options.log('[gui] autostart task ' + (ok ? '(re)created' : 'create failed'));
       return ok;
@@ -96,11 +104,11 @@ function createAutoLaunchService(options) {
     const wantTask = !!enable && !!options.getSettings().enableTun;
     if (wantTask) {
       if (options.isAdmin()) {
-        if (createTask()) setRunItem(false);
+        if (createTask(silent)) setRunItem(false);
         else setRunItem(enable, silent);
         return;
       }
-      if ((interactive && createTask()) || taskExists()) {
+      if ((interactive && createTask(silent)) || taskExists()) {
         setRunItem(false);
         return;
       }
@@ -126,4 +134,4 @@ function createAutoLaunchService(options) {
   return { apply };
 }
 
-module.exports = { createAutoLaunchService };
+module.exports = { buildTaskXml, createAutoLaunchService };

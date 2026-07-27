@@ -17,6 +17,7 @@ const DIALOG_SPECS = Object.freeze({
   'raw-profile': { width: 920, height: 700 },
   convert: { width: 920, height: 700 },
   core: { width: 700, height: 500 },
+  'smart-regions': { width: 620, height: 560 },
   geodata: { width: 720, height: 560 },
   uwp: { width: 780, height: 650 },
   route: { width: 760, height: 620 },

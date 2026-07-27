@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
+const { normalizeSmartRegions } = require('./node-region');
 
 const PROFILE_FIELDS = ['nodes', 'policyGroups', 'clashRules', 'clashRuleProviders'];
 const LEGACY_PROFILE_FIELDS = [...PROFILE_FIELDS, 'raw'];
@@ -43,6 +44,7 @@ const DEFAULT_SETTINGS = {
   ruleGroupSelections: {},
   testUrl: DEFAULT_TEST_URL,
   smartMode: 'balanced',
+  smartRegions: [],
 };
 
 function hasOwn(value, key) {
@@ -95,6 +97,17 @@ class Store {
     if (!['dark', 'light', 'system'].includes(next.theme)) {
       next.theme = 'system';
       changed = true;
+    }
+    if (hasOwn(next, 'smartRegions')) {
+      const regions = normalizeSmartRegions(next.smartRegions);
+      if (
+        !Array.isArray(next.smartRegions) ||
+        regions.length !== next.smartRegions.length ||
+        regions.some((region, index) => region !== next.smartRegions[index])
+      ) {
+        next.smartRegions = regions;
+        changed = true;
+      }
     }
     if (!changed) return;
     this.data = { ...this.data, settings: next };

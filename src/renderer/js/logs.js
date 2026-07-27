@@ -72,9 +72,11 @@
   let logFlushRaf = 0;
   let logLen = 0; // total kept text length across chunks
   let lastLogSequence = 0;
-  let historyLoaded = !(api && api.getRecentLogs);
+  let historyLoaded = true;
   let pendingLiveLogs = [];
   let clearGeneration = 0;
+  let streamGeneration = 0;
+  let streamEnabled = false;
 
   function scheduleLogFlush(delay = 200) {
     if (logFlushTimer || logFlushRaf || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
@@ -157,20 +159,53 @@
   }
 
   if (api && api.onLog) api.onLog((value) => {
+    if (!streamEnabled) return;
     if (!historyLoaded) pendingLiveLogs.push(value);
     else appendLog(value);
   });
-  if (!historyLoaded) {
+
+  async function setLogStreaming(enabled) {
+    const next = !!enabled;
+    if (!api || !api.setLogStreaming || !api.getRecentLogs) return false;
+    if (!next) {
+      if (!streamEnabled) return false;
+      streamEnabled = false;
+      streamGeneration++;
+      historyLoaded = true;
+      pendingLiveLogs = [];
+      api.setLogStreaming(false).catch(() => {});
+      return false;
+    }
+    if (streamEnabled) {
+      scheduleLogFlush(0);
+      return true;
+    }
+    streamEnabled = true;
+    historyLoaded = false;
+    pendingLiveLogs = [];
+    const generation = ++streamGeneration;
     const historyGeneration = clearGeneration;
-    api.getRecentLogs().then((snapshot) => {
-      if (historyGeneration !== clearGeneration) return;
-      for (const entry of snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : []) enqueueLog(entry);
-    }).catch(() => {}).finally(() => {
+    try {
+      // Subscribe first, then snapshot. Lines arriving between the two calls are
+      // buffered below and sequence-deduplicated after history is applied.
+      await api.setLogStreaming(true);
+      const snapshot = await api.getRecentLogs();
+      if (generation !== streamGeneration || !streamEnabled) return false;
+      if (historyGeneration === clearGeneration) {
+        for (const entry of snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : []) {
+          enqueueLog(entry);
+        }
+      }
+    } catch (_) {
+      /* the retained local buffer remains usable */
+    } finally {
+      if (generation !== streamGeneration || !streamEnabled) return;
       historyLoaded = true;
       for (const entry of pendingLiveLogs) enqueueLog(entry);
       pendingLiveLogs = [];
       scheduleLogFlush(0);
-    });
+    }
+    return true;
   }
 
   $('#logClear').addEventListener('click', () => {
@@ -191,4 +226,5 @@
   });
 
   App.flushLogs = () => scheduleLogFlush(0);
+  App.setLogStreaming = setLogStreaming;
 })();

@@ -163,8 +163,8 @@ if (!gotLock) {
       onExit: () => {
         stopTrafficStream();
         core.stopProxyGuard();
-        if (state.systemProxyOn) {
-          const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
+        const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
+        if (state.systemProxyOn || ownedServer) {
           if (ownedServer) {
             // Prefer the owned restore path so ProxyOverride is put back after a crash.
             const release = typeof core.disableOwnedSystemProxy === 'function'

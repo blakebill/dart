@@ -78,6 +78,20 @@ The three user modes adjust weighting rather than changing the model:
 - **Low latency**: reacts faster to a consistently quicker healthy node.
 - **Stability first**: gives stronger weight to jitter, failures, and dwell.
 
+## Region Scope
+
+The Settings view can restrict Smart to selected regions. Region codes are
+inferred locally from subscription node flags, common location labels, and
+country-code server domains; node endpoints are not sent to another service.
+The resulting allowlist is applied to the generated Smart group for both
+sing-box and mihomo, so runtime membership, background probes, selection, and
+force overrides all use the same candidate set.
+
+An empty allowlist means all regions. If a later subscription refresh renames
+every matching node, Smart temporarily falls back to all nodes instead of
+generating an empty group that cannot start. The saved preference remains in
+place and becomes active again when matching nodes return.
+
 ## Probe Scheduling
 
 Probe work is bounded:

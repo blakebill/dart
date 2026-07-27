@@ -98,18 +98,38 @@ function selectSmartTestBatch(input, current, cursor = 0, force = false, options
 
   const candidates = [];
   const picked = new Set();
+  const pickedFamilies = new Set();
   const recoveringNames = new Set(ranked.filter((row) => row.recovering).map((row) => row.name));
+  const familySource = options.familyForName;
+  const familyFor = (name) => {
+    if (familySource instanceof Map) return familySource.get(name) || `node:${name}`;
+    if (typeof familySource === 'function') return familySource(name) || `node:${name}`;
+    return `node:${name}`;
+  };
   let recoveryCount = 0;
   const take = (name) => {
-    if (!name || picked.has(name)) return;
-    if (!force && recoveringNames.has(name) && recoveryCount >= SMART_RECOVERY_SLOTS) return;
+    if (!name || picked.has(name)) return false;
+    if (!force && recoveringNames.has(name) && recoveryCount >= SMART_RECOVERY_SLOTS) return false;
     picked.add(name);
     candidates.push(name);
     if (recoveringNames.has(name)) recoveryCount++;
+    pickedFamilies.add(familyFor(name));
+    return true;
   };
 
   if (current && names.includes(current)) take(current);
 
+  // First cover distinct physical paths. Display regions are intentionally not
+  // used here: two differently named nodes can still share one endpoint, while
+  // nodes in the same country can traverse completely different routes.
+  for (const row of ranked) {
+    if (candidates.length >= target) break;
+    if (pickedFamilies.has(familyFor(row.name))) continue;
+    take(row.name);
+  }
+
+  // Then fill the bounded batch with the remaining highest-value probes so a
+  // large endpoint family is delayed, never starved.
   for (const row of ranked) {
     if (candidates.length >= target) break;
     take(row.name);

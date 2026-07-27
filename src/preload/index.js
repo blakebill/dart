@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('api', {
   getState: () => ipcRenderer.invoke('app:getState'),
   getNodes: () => ipcRenderer.invoke('nodes:get'),
   getRecentLogs: () => ipcRenderer.invoke('logs:get'),
+  setLogStreaming: (enabled) => ipcRenderer.invoke('logs:stream', { enabled: !!enabled }),
   clearRecentLogs: () => ipcRenderer.invoke('logs:clear'),
   coreStatus: () => ipcRenderer.invoke('core:status'),
 
@@ -65,6 +66,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   applyAutoCandidate: (name) => ipcRenderer.invoke('node:autoCandidate', { name }),
   getNodeQualities: () => ipcRenderer.invoke('node:qualities'),
+  getNodeRegions: () => ipcRenderer.invoke('node:regions'),
   /** Force Auto/Smart to pin a node until cleared (right-click override). */
   getNodeOverride: () => ipcRenderer.invoke('node:getOverride'),
   setNodeOverride: (name) => ipcRenderer.invoke('node:setOverride', { name }),

@@ -8,6 +8,13 @@ const { state, isDev, sendLog, setRecentLogStreaming } = require('./state');
 const isWin = process.platform === 'win32';
 const DEEP_SLEEP_DELAY_MS = 60_000;
 let deepSleepTimer = null;
+const plannedWindowDestruction = new WeakMap();
+
+function destroyWindow(win, reason) {
+  if (!win || win.isDestroyed()) return;
+  plannedWindowDestruction.set(win, String(reason || 'planned'));
+  win.destroy();
+}
 
 function clearDeepSleepTimer() {
   if (deepSleepTimer) clearTimeout(deepSleepTimer);
@@ -27,7 +34,7 @@ function scheduleDeepSleep(win) {
       // hidden renderer recovers Chromium DOM/JS memory without interrupting
       // networking; showMainWindow() recreates it on demand.
       state.mainWindow = null;
-      win.destroy();
+      destroyWindow(win, 'deep-sleep');
     }
   }, DEEP_SLEEP_DELAY_MS);
   if (deepSleepTimer.unref) deepSleepTimer.unref();
@@ -98,11 +105,16 @@ function createWindow(startHidden = false) {
     },
   });
   state.mainWindow = mainWindow;
+  // BrowserWindow.webContents throws "Object has been destroyed" once the
+  // native window is gone. Keep the original identity for closed-time cleanup
+  // instead of dereferencing the destroyed BrowserWindow in its closed event.
+  const rendererContents = mainWindow.webContents;
+  let wasVisible = false;
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html')).catch((error) => {
     sendLog('[gui] failed to load the main renderer: ' + error.message);
     try { dialog.showErrorBox('Dart window failed to load', error.message); } catch (_) {}
-    if (!mainWindow.isDestroyed()) mainWindow.destroy();
+    destroyWindow(mainWindow, 'load-failed');
   });
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -112,7 +124,10 @@ function createWindow(startHidden = false) {
   // the app lives in the tray until the user opens it (tray menu / relaunch).
   mainWindow.once('ready-to-show', () => {
     applyMica(mainWindow);
-    if (!startHidden) mainWindow.show();
+    if (!startHidden) {
+      wasVisible = true;
+      mainWindow.show();
+    }
     else scheduleDeepSleep(mainWindow);
   });
 
@@ -144,20 +159,33 @@ function createWindow(startHidden = false) {
   // background pages, but capping the frame rate makes the contract obvious and
   // catches edge cases where a stray repaint could still wake the GPU.
   mainWindow.on('hide', () => {
+    wasVisible = false;
     try { mainWindow.webContents.setFrameRate(1); } catch (_) { /* ignore */ }
     scheduleDeepSleep(mainWindow);
   });
   mainWindow.on('show', () => {
+    wasVisible = true;
     clearDeepSleepTimer();
     try { mainWindow.webContents.setFrameRate(60); } catch (_) { /* ignore */ }
     applyMica(mainWindow);
     clearTaskbarAttention();
   });
   mainWindow.on('closed', () => {
-    setRecentLogStreaming(mainWindow.webContents, false);
+    const destroyReason = plannedWindowDestruction.get(mainWindow) || 'unexpected';
+    plannedWindowDestruction.delete(mainWindow);
+    setRecentLogStreaming(rendererContents, false);
     if (state.mainWindow === mainWindow) {
       state.mainWindow = null;
       clearDeepSleepTimer();
+    }
+    if (destroyReason === 'unexpected' && wasVisible && !app.isQuitting) {
+      sendLog('[gui] visible main window closed unexpectedly; recreating it');
+      setTimeout(() => {
+        if (app.isQuitting || state.mainWindow) return;
+        try { createWindow(false); } catch (error) {
+          sendLog('[gui] failed to recreate the main window: ' + error.message);
+        }
+      }, 250);
     }
   });
 
@@ -189,4 +217,4 @@ function showMainWindow() {
   return win;
 }
 
-module.exports = { createWindow, showMainWindow, applyNativeThemeSource };
+module.exports = { createWindow, showMainWindow, applyNativeThemeSource, destroyWindow };

@@ -8,9 +8,9 @@
  * the main process, and vice versa. This pins the app's IPC contract, so a
  * refactor that moves handlers between files cannot silently drop one.
  *
- * NOTE: index.js installs uncaughtException/unhandledRejection handlers that
- * swallow errors, so every assertion here runs inside the explicit try/catch
- * below — a bare throw could otherwise vanish and fake a green run.
+ * NOTE: index.js installs process-level diagnostics. Every assertion here runs
+ * inside the explicit try/catch below so failures still produce a deterministic
+ * test exit instead of depending on Electron's lifecycle.
  */
 
 const assert = require('assert');
@@ -25,6 +25,9 @@ const zlib = require('zlib');
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-gui-test-'));
 const registered = [];
 const handlers = {};
+const appListeners = new Map();
+const appExitCodes = [];
+let crashReporterOptions = null;
 
 class FakeWebContents {
   constructor(owner) {
@@ -103,13 +106,21 @@ const electronStub = {
     getPath: () => tmpDir,
     getVersion: () => '0.0.0',
     whenReady: () => Promise.resolve(),
-    on: () => {},
+    on: (event, listener) => {
+      const listeners = appListeners.get(event) || [];
+      listeners.push(listener);
+      appListeners.set(event, listeners);
+    },
     requestSingleInstanceLock: () => true,
     releaseSingleInstanceLock: () => {},
     quit: () => {},
+    exit: (code) => { appExitCodes.push(code); },
     disableHardwareAcceleration: () => {},
     commandLine: { appendSwitch: () => {} },
     setLoginItemSettings: () => {},
+  },
+  crashReporter: {
+    start: (options) => { crashReporterOptions = options; },
   },
   BrowserWindow: FakeBrowserWindow,
   Tray: FakeTray,
@@ -195,6 +206,20 @@ async function main() {
   assert.ok(handoffScript.includes("'D:\\Work Files\\Dart'"));
   assert.ok(handoffScript.includes("'--dev'"));
   console.log('✓ elevated relaunch waits for clean shutdown before starting its replacement');
+
+  assert.strictEqual(crashReporterOptions.uploadToServer, false);
+  assert.strictEqual(crashReporterOptions.ignoreSystemCrashHandler, false);
+  assert.strictEqual((appListeners.get('render-process-gone') || []).length, 1);
+  assert.strictEqual((appListeners.get('child-process-gone') || []).length, 1);
+  const rejectionHandler = process.listeners('unhandledRejection').at(-1);
+  const exitsBeforeRejection = appExitCodes.length;
+  rejectionHandler(new Error('recoverable test rejection'));
+  assert.strictEqual(appExitCodes.length, exitsBeforeRejection, 'an async rejection terminated the whole app');
+  assert.ok(
+    fs.readFileSync(path.join(tmpDir, 'crash.log'), 'utf-8').includes('recoverable test rejection'),
+    'async rejection was not persisted for diagnosis'
+  );
+  console.log('✓ native crashes and recoverable async failures leave local diagnostics');
 
   const fromMain = [...new Set(registered)].sort();
   const fromPreload = preloadChannels();
@@ -350,7 +375,11 @@ async function main() {
   assert.strictEqual(state.mainWindow, reopenedWindow);
   reopenedWindow.emit('ready-to-show');
   assert.strictEqual(reopenedWindow.shown, true);
-  console.log('✓ a released tray renderer is recreated on demand');
+  reopenedWindow.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.ok(state.mainWindow && state.mainWindow !== reopenedWindow);
+  assert.strictEqual(state.mainWindow.closed, false);
+  console.log('✓ released and unexpectedly closed renderers are recreated safely');
 
   // ---- Regression: adding a subscription must never steal the active profile ----
   // Legacy stores (pre-profiles) have subscriptions but no activeSub; the core

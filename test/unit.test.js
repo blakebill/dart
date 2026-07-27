@@ -3027,8 +3027,34 @@ test('hidden tray windows release their renderer and recreate on demand', () => 
   assert.ok(windowMain.includes('state.mainWindow = null'));
   assert.ok(windowMain.includes('win.destroy()'));
   assert.ok(windowMain.includes('function showMainWindow()'));
+  assert.ok(windowMain.includes('const rendererContents = mainWindow.webContents'));
+  assert.ok(windowMain.includes("destroyWindow(win, 'deep-sleep')"));
+  assert.ok(windowMain.includes("destroyReason === 'unexpected' && wasVisible && !app.isQuitting"));
+  const closedHandler = windowMain.slice(
+    windowMain.indexOf("mainWindow.on('closed'"),
+    windowMain.indexOf("mainWindow.on('maximize'")
+  );
+  assert.ok(closedHandler.includes('setRecentLogStreaming(rendererContents, false)'));
+  assert.ok(!closedHandler.includes('setRecentLogStreaming(mainWindow.webContents'));
   assert.ok(trayMain.includes("const { showMainWindow } = require('./window')"));
   assert.ok(trayMain.includes("click: showMainWindow"));
+});
+
+test('background failures remain diagnosable without terminating the desktop process', () => {
+  const indexMain = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf-8');
+  const coreMain = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  assert.ok(indexMain.includes("app.setPath('crashDumps', crashDumps)"));
+  assert.ok(indexMain.includes('uploadToServer: false'));
+  assert.ok(indexMain.includes("app.on('render-process-gone'"));
+  assert.ok(indexMain.includes("app.on('child-process-gone'"));
+  assert.ok(indexMain.includes(
+    "process.on('unhandledRejection', (reason) => recordCrash('unhandled rejection', reason))"
+  ));
+  assert.ok(!indexMain.includes(
+    "process.on('unhandledRejection', (reason) => handleFatalError"
+  ));
+  assert.ok(coreMain.includes('setInterval(autoUpdateTick, 60000)'));
+  assert.ok(coreMain.includes("automatic update pass failed: "));
 });
 
 test('main surfaces avoid diagonal highlights and repeated backdrop filters', () => {

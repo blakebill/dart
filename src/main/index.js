@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, dialog } = require('electron');
+const { app, crashReporter, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -24,6 +24,9 @@ function configureUserDataDir() {
     }
     if (!fs.existsSync(desired)) fs.mkdirSync(desired, { recursive: true });
     if (typeof app.setPath === 'function') app.setPath('userData', desired);
+    const crashDumps = path.join(desired, 'CrashDumps');
+    if (!fs.existsSync(crashDumps)) fs.mkdirSync(crashDumps, { recursive: true });
+    if (typeof app.setPath === 'function') app.setPath('crashDumps', crashDumps);
   } catch (_) {
     /* fall back to Electron's default userData path */
   }
@@ -53,7 +56,7 @@ if (process.platform !== 'win32') {
 const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
 const { CoreManager } = require('./singbox');
-const { createWindow, showMainWindow } = require('./window');
+const { createWindow, showMainWindow, destroyWindow } = require('./window');
 const { createTray } = require('./tray');
 const { stopTrafficStream } = require('./traffic');
 const core = require('./core-control');
@@ -64,12 +67,20 @@ const uwp = require('./uwp');
 const { isWindowsAdmin } = require('./admin');
 const { cleanupTunAdapters } = require('./tun-adapter');
 
-// Record fatal main-process failures before cleanup. Network request objects
-// handle their own operational errors; reaching this boundary means process
-// invariants can no longer be trusted and the app must not keep proxying.
+function diagnosticDetail(value) {
+  if (value && typeof value.stack === 'string') return value.stack;
+  if (value && typeof value.message === 'string') return value.message;
+  if (value && typeof value === 'object') {
+    try { return JSON.stringify(value); } catch (_) {}
+  }
+  return String(value);
+}
+
+// Persist failures and unexpected process exits with enough bounded context to
+// distinguish the GUI, renderer, Electron child, and selected core.
 function recordCrash(kind, err) {
   try {
-    sendLog(`[gui] ${kind}: ${(err && err.message) || String(err)}`);
+    sendLog(`[gui] ${kind}: ${diagnosticDetail(err)}`);
   } catch (_) {
     /* in-app logging is best-effort */
   }
@@ -82,11 +93,81 @@ function recordCrash(kind, err) {
         try { fs.renameSync(file, file + '.old'); } catch (_) { fs.truncateSync(file, 0); }
       }
     } catch (_) {}
-    const detail = (err && err.stack) || (err && err.message) || String(err);
-    fs.appendFileSync(file, `[${new Date().toISOString()}] ${kind}: ${detail}\n`);
+    const coreType = state.singbox && typeof state.singbox.getCoreType === 'function'
+      ? state.singbox.getCoreType()
+      : 'unknown';
+    const memory = process.memoryUsage();
+    const context = [
+      `app=${typeof app.getVersion === 'function' ? app.getVersion() : 'unknown'}`,
+      `electron=${process.versions.electron || 'unknown'}`,
+      `core=${coreType}`,
+      `uptime=${Math.round(process.uptime())}s`,
+      `rss=${Math.round(memory.rss / 1024 / 1024)}MB`,
+    ].join(' ');
+    fs.appendFileSync(
+      file,
+      `[${new Date().toISOString()}] ${kind} (${context}): ${diagnosticDetail(err)}\n`
+    );
   } catch (_) {
     /* disk logging is best-effort */
   }
+}
+
+// Crashpad catches native main/renderer/GPU failures that JavaScript handlers
+// and Windows Event Viewer do not reliably expose for an unsigned desktop app.
+// Dumps stay local under %APPDATA%\Dart\CrashDumps and are never uploaded.
+try {
+  if (crashReporter && typeof crashReporter.start === 'function') {
+    crashReporter.start({
+      productName: 'Dart Network Control',
+      uploadToServer: false,
+      ignoreSystemCrashHandler: false,
+      globalExtra: {
+        dartVersion: typeof app.getVersion === 'function' ? app.getVersion() : 'unknown',
+        platform: process.platform,
+      },
+    });
+  }
+} catch (error) {
+  recordCrash('native crash reporter setup failed', error);
+}
+
+const SESSION_MARKER_NAME = 'active-session.json';
+let sessionMarkerFile = null;
+
+function beginSessionDiagnostics(coreType) {
+  try {
+    sessionMarkerFile = path.join(app.getPath('userData'), SESSION_MARKER_NAME);
+    try {
+      const previous = JSON.parse(fs.readFileSync(sessionMarkerFile, 'utf-8'));
+      recordCrash('previous session ended unexpectedly', previous);
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) {
+        recordCrash('previous session marker could not be read', error);
+      }
+    }
+    const marker = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      version: typeof app.getVersion === 'function' ? app.getVersion() : 'unknown',
+      electron: process.versions.electron || 'unknown',
+      coreType: coreType || 'unknown',
+    };
+    // A direct synchronous write is deliberate: Windows rename cannot replace
+    // the prior marker atomically. A truncated marker is harmless and will be
+    // replaced at the next start.
+    fs.writeFileSync(sessionMarkerFile, JSON.stringify(marker), 'utf-8');
+  } catch (error) {
+    recordCrash('session diagnostics setup failed', error);
+  }
+}
+
+function finishSessionDiagnostics() {
+  if (!sessionMarkerFile) return;
+  try { fs.unlinkSync(sessionMarkerFile); } catch (error) {
+    if (error.code !== 'ENOENT') recordCrash('session diagnostics cleanup failed', error);
+  }
+  sessionMarkerFile = null;
 }
 
 let fatalExitStarted = false;
@@ -111,7 +192,50 @@ function handleFatalError(kind, error) {
   });
 }
 process.on('uncaughtException', (error) => handleFatalError('uncaught exception', error));
-process.on('unhandledRejection', (reason) => handleFatalError('unhandled rejection', reason));
+// A rejected background network/IPC promise does not imply corrupted process
+// invariants. Record it for diagnosis, but do not turn a recoverable async error
+// into an unexplained full-app exit.
+process.on('unhandledRejection', (reason) => recordCrash('unhandled rejection', reason));
+
+let rendererRecoveryStarted = false;
+app.on('render-process-gone', (_event, webContents, details) => {
+  if (app.isQuitting || (details && details.reason === 'clean-exit')) return;
+  recordCrash('renderer process gone', details);
+  const win = state.mainWindow;
+  if (
+    rendererRecoveryStarted ||
+    !win ||
+    !webContents ||
+    win.webContents !== webContents
+  ) return;
+  rendererRecoveryStarted = true;
+  const restoreVisible = typeof win.isVisible !== 'function' || win.isVisible();
+  state.mainWindow = null;
+  try {
+    destroyWindow(win, 'renderer-process-gone');
+  } catch (_) {}
+  setTimeout(() => {
+    rendererRecoveryStarted = false;
+    if (app.isQuitting || state.mainWindow) return;
+    try {
+      createWindow(!restoreVisible);
+      if (restoreVisible) {
+        const zh = !state.store || (state.store.getSettings().language || 'zh') === 'zh';
+        notify(
+          zh ? '界面已恢复' : 'Interface restored',
+          zh ? '界面进程异常退出，Dart 已自动重新载入。' : 'The renderer exited unexpectedly and was reloaded.'
+        );
+      }
+    } catch (error) {
+      recordCrash('renderer recovery failed', error);
+    }
+  }, 250);
+});
+
+app.on('child-process-gone', (_event, details) => {
+  if (app.isQuitting || (details && details.reason === 'clean-exit')) return;
+  recordCrash('Electron child process gone', details);
+});
 
 async function applyPendingUwpLoopback() {
   const pending = state.store.get('pendingUwpLoopbackSids');
@@ -160,7 +284,7 @@ if (!gotLock) {
       runtimeDir,
       coreType: settings.coreType,
       onLog: sendLog,
-      onExit: () => {
+      onExit: (code, signal) => {
         stopTrafficStream();
         core.stopProxyGuard();
         const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
@@ -201,6 +325,12 @@ if (!gotLock) {
         // alert the user — the proxy is now down, which is easy to miss when
         // the app is sitting in the tray.
         if (!state.coreStopping && !app.isQuitting) {
+          recordCrash('core exited unexpectedly', {
+            coreType: state.singbox.getCoreType(),
+            coreLabel: state.singbox.coreLabel,
+            code,
+            signal,
+          });
           cleanupTunAdapters(sendLog).catch(() => {});
           const zh = (state.store.getSettings().language || 'zh') === 'zh';
           notify(
@@ -210,6 +340,7 @@ if (!gotLock) {
         }
       },
     });
+    beginSessionDiagnostics(settings.coreType);
     registerIpc();
     // Sync the OS login-item state with the saved setting.
     try {
@@ -267,8 +398,11 @@ if (!gotLock) {
       } catch (error) {
         recordCrash('shutdown cleanup failed', error);
       } finally {
+        finishSessionDiagnostics();
         app.quit();
       }
+    } else {
+      finishSessionDiagnostics();
     }
   });
 
@@ -281,6 +415,7 @@ if (!gotLock) {
   // so we never wipe a proxy the user set themselves.
   app.on('session-end', () => {
     try {
+      finishSessionDiagnostics();
       const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
       state.systemProxyOn = false;
       state.systemProxyServer = null;

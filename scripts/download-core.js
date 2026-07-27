@@ -31,6 +31,8 @@ const SINGBOX_DIR = path.join(BIN_DIR, 'singbox');
 const MIHOMO_DIR = path.join(BIN_DIR, 'mihomo');
 const DART_SINGBOX_REPO = 'blakebill/sing-box';
 const DART_MIHOMO_REPO = 'blakebill/mihomo';
+const DART_RELEASE_PATTERN = /^v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-dart\.([1-9]\d*)$/;
+const BASE_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 
 function requestHeaders(extra = {}) {
   const headers = { 'User-Agent': 'dart-build', ...extra };
@@ -129,16 +131,72 @@ function detectArch() {
   return process.arch === 'arm64' ? 'arm64' : 'amd64';
 }
 
-async function release(repo, versionEnv, normalizeVersion = (value) => value) {
-  const requestedVersion = (process.env[versionEnv] || '').trim();
-  const version = requestedVersion ? normalizeVersion(requestedVersion.replace(/^v/, '')) : '';
-  if (!version) {
-    console.log(`Resolving latest ${repo} release...`);
-    return getJson(`https://api.github.com/repos/${repo}/releases/latest`);
+function parseDartReleaseTag(value) {
+  const match = String(value || '').trim().match(DART_RELEASE_PATTERN);
+  if (!match) return null;
+  return {
+    tag: `v${match[1]}-dart.${match[2]}`,
+    version: `${match[1]}-dart.${match[2]}`,
+    base: match[1],
+    baseParts: match[1].split('.').map(Number),
+    revision: Number(match[2]),
+  };
+}
+
+function compareDartReleaseVersions(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a.baseParts[i] !== b.baseParts[i]) return a.baseParts[i] - b.baseParts[i];
   }
-  const tag = version.startsWith('v') ? version : 'v' + version;
-  console.log(`Resolving ${repo} release ${tag}...`);
-  return getJson(`https://api.github.com/repos/${repo}/releases/tags/${tag}`);
+  return a.revision - b.revision;
+}
+
+function selectStableDartRelease(releases, requestedVersion = '') {
+  const requested = String(requestedVersion || '').trim().replace(/^v/, '');
+  const requestedFull = parseDartReleaseTag(requested);
+  if (requested && !requestedFull && !BASE_VERSION_PATTERN.test(requested)) {
+    throw new Error(
+      `invalid Dart core version ${requested}; expected X.Y.Z or X.Y.Z-dart.N`
+    );
+  }
+  const requestedBase = requestedFull ? requestedFull.base : requested;
+  const candidates = (Array.isArray(releases) ? releases : [])
+    .filter((candidate) => candidate && candidate.draft !== true && candidate.prerelease !== true)
+    .map((releaseInfo) => ({ releaseInfo, parsed: parseDartReleaseTag(releaseInfo.tag_name) }))
+    .filter(({ parsed }) =>
+      parsed &&
+      (!requestedBase || parsed.base === requestedBase) &&
+      (!requestedFull || parsed.version === requestedFull.version)
+    )
+    .sort((a, b) => compareDartReleaseVersions(a.parsed, b.parsed));
+  if (!candidates.length) {
+    const suffix = requested ? ` matching ${requested}` : '';
+    throw new Error(`no stable Dart release found${suffix}`);
+  }
+  return candidates[candidates.length - 1].releaseInfo;
+}
+
+async function release(repo, versionEnv) {
+  const requested = String(process.env[versionEnv] || '').trim().replace(/^v/, '');
+  const requestedFull = parseDartReleaseTag(requested);
+  if (requested && !requestedFull && !BASE_VERSION_PATTERN.test(requested)) {
+    throw new Error(
+      `invalid ${versionEnv} value ${requested}; expected X.Y.Z or X.Y.Z-dart.N`
+    );
+  }
+  if (requestedFull) {
+    console.log(`Resolving exact ${repo} release ${requestedFull.tag}...`);
+    const exact = await getJson(
+      `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(requestedFull.tag)}`
+    );
+    return selectStableDartRelease([exact], requestedFull.version);
+  }
+
+  const label = requested || 'latest';
+  console.log(`Resolving stable ${repo} release (${label})...`);
+  const releases = await getJson(`https://api.github.com/repos/${repo}/releases?per_page=100`);
+  const selected = selectStableDartRelease(releases, requested);
+  console.log(`Resolved ${repo} to ${selected.tag_name}`);
+  return selected;
 }
 
 function cleanDir(dir) {
@@ -289,18 +347,16 @@ function validateMihomoGeoData(dir, binName) {
   }
 }
 
-async function bundleSingBox(goos, arch) {
-  cleanDir(SINGBOX_DIR);
+async function bundleSingBox(goos, arch, outputDir = SINGBOX_DIR) {
+  cleanDir(outputDir);
   const binName = goos === 'windows' ? 'sing-box.exe' : 'sing-box';
-  const rel = await release(DART_SINGBOX_REPO, 'SINGBOX_VERSION', (version) =>
-    /-dart\.\d+$/.test(version) ? version : `${version}-dart.1`
-  );
+  const rel = await release(DART_SINGBOX_REPO, 'SINGBOX_VERSION');
   const tag = rel.tag_name;
   if (!tag) throw new Error('could not resolve sing-box release tag');
   const ver = String(tag).replace(/^v/, '');
   const ext = goos === 'windows' ? 'zip' : 'tar.gz';
   const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
-  const archivePath = path.join(SINGBOX_DIR, fileName);
+  const archivePath = path.join(outputDir, fileName);
   const releaseAsset = (rel.assets || []).find((asset) => asset.name === fileName);
   if (!releaseAsset || !releaseAsset.browser_download_url) {
     throw new Error('sing-box release does not contain ' + fileName);
@@ -314,21 +370,22 @@ async function bundleSingBox(goos, arch) {
   await verifyFileSha256(archivePath, digest, fileName);
   console.log('Verified sing-box SHA-256:', digest);
   console.log('Extracting sing-box...');
-  if (goos === 'windows') extractZip(archivePath, SINGBOX_DIR);
-  else extractTarGz(archivePath, SINGBOX_DIR);
+  if (goos === 'windows') extractZip(archivePath, outputDir);
+  else extractTarGz(archivePath, outputDir);
 
-  const innerDir = findFile(SINGBOX_DIR, (name) => name === binName);
+  const innerDir = findFile(outputDir, (name) => name === binName);
   if (!innerDir) throw new Error('sing-box binary not found after extraction');
   const root = path.dirname(innerDir);
   for (const f of fs.readdirSync(root)) {
     if (f === binName || /\.(dll|so|dylib)$/i.test(f)) {
-      const target = path.join(SINGBOX_DIR, f);
-      fs.copyFileSync(path.join(root, f), target);
+      const source = path.join(root, f);
+      const target = path.join(outputDir, f);
+      if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
       if (goos !== 'windows' && f === binName) fs.chmodSync(target, 0o755);
     }
   }
-  for (const entry of fs.readdirSync(SINGBOX_DIR, { withFileTypes: true })) {
-    if (entry.isDirectory()) fs.rmSync(path.join(SINGBOX_DIR, entry.name), { recursive: true, force: true });
+  for (const entry of fs.readdirSync(outputDir, { withFileTypes: true })) {
+    if (entry.isDirectory()) fs.rmSync(path.join(outputDir, entry.name), { recursive: true, force: true });
   }
   fs.unlinkSync(archivePath);
 
@@ -342,7 +399,7 @@ async function bundleSingBox(goos, arch) {
     const commitInfo = await getJson(`https://api.github.com/repos/SagerNet/${rs.repo}/commits/rule-set`);
     const commit = String(commitInfo.sha || '');
     if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error('could not pin SagerNet/' + rs.repo + ' rule-set commit');
-    const dest = path.join(SINGBOX_DIR, rs.file);
+    const dest = path.join(outputDir, rs.file);
     await downloadFirst(geoDataUrls(rs.repo, rs.file, commit), dest, validSrs);
     const fileDigest = await sha256File(dest);
     meta[rs.file] = { updatedAt: Date.now() };
@@ -357,8 +414,8 @@ async function bundleSingBox(goos, arch) {
       binaryPath: `singbox/${rs.file}`,
     });
   }
-  fs.writeFileSync(path.join(SINGBOX_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
-  console.log('sing-box bundle ready in', SINGBOX_DIR);
+  fs.writeFileSync(path.join(outputDir, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
+  console.log('sing-box bundle ready in', outputDir);
   return [{
     type: 'application',
     name: 'sing-box',
@@ -373,32 +430,28 @@ async function bundleSingBox(goos, arch) {
 
 function mihomoAsset(rel, goos, arch) {
   const ext = goos === 'windows' ? 'zip' : 'gz';
-  const assets = rel.assets || [];
-  const candidates = assets
-    .map((a) => ({ name: a.name || '', url: a.browser_download_url || '', sha256: assetSha256(a) }))
-    .filter((a) =>
-      path.basename(a.name) === a.name &&
-      !/[\\/]/.test(a.name) &&
-      /mihomo/i.test(a.name) &&
-      a.name.toLowerCase().includes(goos) &&
-      a.name.toLowerCase().includes(arch) &&
-      new RegExp(`\\.${ext}$`, 'i').test(a.name) &&
-      a.url
-    )
-    .sort((a, b) => Number(/compatible|go\d+/i.test(a.name)) - Number(/compatible|go\d+/i.test(b.name)));
-  if (candidates[0]) return candidates[0];
   const tag = String(rel.tag_name || '').replace(/^v/, '');
   const name = `mihomo-${goos}-${arch}-v${tag}.${ext}`;
-  return { name, url: `https://github.com/${DART_MIHOMO_REPO}/releases/download/v${tag}/${name}`, sha256: null };
+  const releaseAsset = (rel.assets || []).find((candidate) =>
+    candidate &&
+    candidate.name === name &&
+    candidate.browser_download_url
+  );
+  if (!releaseAsset) throw new Error('mihomo release does not contain canonical asset ' + name);
+  return {
+    name,
+    url: releaseAsset.browser_download_url,
+    sha256: assetSha256(releaseAsset),
+  };
 }
 
-async function bundleMihomo(goos, arch) {
-  cleanDir(MIHOMO_DIR);
+async function bundleMihomo(goos, arch, outputDir = MIHOMO_DIR) {
+  cleanDir(outputDir);
   const binName = goos === 'windows' ? 'mihomo.exe' : 'mihomo';
   const rel = await release(DART_MIHOMO_REPO, 'MIHOMO_VERSION');
   if (!rel.tag_name) throw new Error('could not resolve mihomo release tag');
   const asset = mihomoAsset(rel, goos, arch);
-  const archivePath = path.join(MIHOMO_DIR, asset.name);
+  const archivePath = path.join(outputDir, asset.name);
   if (!asset.sha256) throw new Error('mihomo release asset has no SHA-256 digest: ' + asset.name);
 
   console.log('Downloading mihomo core:', asset.url);
@@ -408,28 +461,28 @@ async function bundleMihomo(goos, arch) {
   console.log('Extracting mihomo...');
   if (/\.gz$/i.test(asset.name) && !/\.tar\.gz$/i.test(asset.name)) {
     const data = zlib.gunzipSync(fs.readFileSync(archivePath));
-    fs.writeFileSync(path.join(MIHOMO_DIR, binName), data);
-    if (goos !== 'windows') fs.chmodSync(path.join(MIHOMO_DIR, binName), 0o755);
+    fs.writeFileSync(path.join(outputDir, binName), data);
+    if (goos !== 'windows') fs.chmodSync(path.join(outputDir, binName), 0o755);
   } else if (goos === 'windows') {
-    extractZip(archivePath, MIHOMO_DIR);
-    const found = findFile(MIHOMO_DIR, (name) =>
+    extractZip(archivePath, outputDir);
+    const found = findFile(outputDir, (name) =>
       name.toLowerCase() === binName.toLowerCase() || (/^mihomo/i.test(name) && /\.exe$/i.test(name))
     );
     if (!found) throw new Error('mihomo binary not found after extraction');
-    if (path.resolve(found) !== path.resolve(path.join(MIHOMO_DIR, binName))) {
-      fs.copyFileSync(found, path.join(MIHOMO_DIR, binName));
+    if (path.resolve(found) !== path.resolve(path.join(outputDir, binName))) {
+      fs.copyFileSync(found, path.join(outputDir, binName));
     }
   } else {
-    extractTarGz(archivePath, MIHOMO_DIR);
-    const found = findFile(MIHOMO_DIR, (name) => name === binName || (/^mihomo/i.test(name) && !/\.(gz|zip|txt|md)$/i.test(name)));
+    extractTarGz(archivePath, outputDir);
+    const found = findFile(outputDir, (name) => name === binName || (/^mihomo/i.test(name) && !/\.(gz|zip|txt|md)$/i.test(name)));
     if (!found) throw new Error('mihomo binary not found after extraction');
-    if (path.resolve(found) !== path.resolve(path.join(MIHOMO_DIR, binName))) {
-      fs.copyFileSync(found, path.join(MIHOMO_DIR, binName));
+    if (path.resolve(found) !== path.resolve(path.join(outputDir, binName))) {
+      fs.copyFileSync(found, path.join(outputDir, binName));
     }
-    fs.chmodSync(path.join(MIHOMO_DIR, binName), 0o755);
+    fs.chmodSync(path.join(outputDir, binName), 0o755);
   }
-  for (const entry of fs.readdirSync(MIHOMO_DIR, { withFileTypes: true })) {
-    if (entry.isDirectory()) fs.rmSync(path.join(MIHOMO_DIR, entry.name), { recursive: true, force: true });
+  for (const entry of fs.readdirSync(outputDir, { withFileTypes: true })) {
+    if (entry.isDirectory()) fs.rmSync(path.join(outputDir, entry.name), { recursive: true, force: true });
   }
   fs.unlinkSync(archivePath);
 
@@ -445,7 +498,7 @@ async function bundleMihomo(goos, arch) {
     }
     await downloadFirst(
       [geoAsset.browser_download_url, ...mihomoGeoDataUrls(file).slice(1)],
-      path.join(MIHOMO_DIR, file),
+      path.join(outputDir, file),
       async (downloaded) => {
         if (!validGeo(downloaded)) return false;
         await verifyFileSha256(downloaded, geoDigest, file);
@@ -464,9 +517,9 @@ async function bundleMihomo(goos, arch) {
       binaryPath: `mihomo/${file}`,
     });
   }
-  validateMihomoGeoData(MIHOMO_DIR, binName);
-  fs.writeFileSync(path.join(MIHOMO_DIR, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
-  console.log('mihomo bundle ready in', MIHOMO_DIR);
+  validateMihomoGeoData(outputDir, binName);
+  fs.writeFileSync(path.join(outputDir, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
+  console.log('mihomo bundle ready in', outputDir);
   return [{
     type: 'application',
     name: 'mihomo',
@@ -479,17 +532,11 @@ async function bundleMihomo(goos, arch) {
   }, ...dataComponents];
 }
 
-async function main() {
-  const goos = detectOs();
-  const arch = detectArch();
-  fs.mkdirSync(BIN_DIR, { recursive: true });
-  const components = [
-    await bundleSingBox(goos, arch),
-    await bundleMihomo(goos, arch),
-  ].flat();
+async function createBundleManifest(bundleRoot, bundledComponents) {
+  const components = [...bundledComponents];
   const files = [];
   for (const folder of ['singbox', 'mihomo']) {
-    const dir = path.join(BIN_DIR, folder);
+    const dir = path.join(bundleRoot, folder);
     for (const name of fs.readdirSync(dir).sort()) {
       const file = path.join(dir, name);
       const stat = fs.statSync(file);
@@ -498,14 +545,82 @@ async function main() {
     }
   }
   fs.writeFileSync(
-    path.join(BIN_DIR, 'manifest.json'),
+    path.join(bundleRoot, 'manifest.json'),
     JSON.stringify({ schemaVersion: 1, components, files }, null, 2) + '\n',
     'utf-8'
   );
-  console.log('Bundled cores and GeoData in', BIN_DIR);
 }
 
-main().catch((err) => {
-  console.error('Failed to download bundled cores:', err.message);
-  process.exit(1);
-});
+function installStagedBundle(stageRoot, binDir) {
+  const names = ['singbox', 'mihomo', 'manifest.json'];
+  const backupDir = path.join(stageRoot, '.previous');
+  const installed = [];
+  const backedUp = [];
+  fs.mkdirSync(backupDir, { recursive: true });
+  try {
+    for (const name of names) {
+      const target = path.join(binDir, name);
+      if (!fs.existsSync(target)) continue;
+      fs.renameSync(target, path.join(backupDir, name));
+      backedUp.push(name);
+    }
+    for (const name of names) {
+      const staged = path.join(stageRoot, name);
+      if (!fs.existsSync(staged)) throw new Error('staged bundle is missing ' + name);
+      fs.renameSync(staged, path.join(binDir, name));
+      installed.push(name);
+    }
+  } catch (error) {
+    for (const name of installed.reverse()) {
+      fs.rmSync(path.join(binDir, name), { recursive: true, force: true });
+    }
+    for (const name of backedUp.reverse()) {
+      const backup = path.join(backupDir, name);
+      if (fs.existsSync(backup)) fs.renameSync(backup, path.join(binDir, name));
+    }
+    throw error;
+  }
+  fs.rmSync(backupDir, { recursive: true, force: true });
+}
+
+async function buildCoreBundle(options = {}) {
+  const binDir = options.binDir || BIN_DIR;
+  const goos = options.goos || detectOs();
+  const arch = options.arch || detectArch();
+  const singBoxBundler = options.bundleSingBox || bundleSingBox;
+  const mihomoBundler = options.bundleMihomo || bundleMihomo;
+  fs.mkdirSync(binDir, { recursive: true });
+  const stageRoot = fs.mkdtempSync(path.join(binDir, '.core-bundle-'));
+  try {
+    const components = [
+      await singBoxBundler(goos, arch, path.join(stageRoot, 'singbox')),
+      await mihomoBundler(goos, arch, path.join(stageRoot, 'mihomo')),
+    ].flat();
+    await createBundleManifest(stageRoot, components);
+    installStagedBundle(stageRoot, binDir);
+  } finally {
+    fs.rmSync(stageRoot, { recursive: true, force: true });
+  }
+  console.log('Bundled cores and GeoData in', binDir);
+}
+
+async function main() {
+  await buildCoreBundle();
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Failed to download bundled cores:', err.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  buildCoreBundle,
+  compareDartReleaseVersions,
+  createBundleManifest,
+  installStagedBundle,
+  mihomoAsset,
+  parseDartReleaseTag,
+  selectStableDartRelease,
+};

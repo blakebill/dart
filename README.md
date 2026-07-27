@@ -132,7 +132,7 @@ Bundled cores are stored under `resources/bin/` and copied into the writable run
 ### Source Layout
 
 ```text
-singbox-gui/
+dart/
 ├── package.json                 # Scripts, dependencies, and electron-builder config
 ├── bin/                         # Downloaded cores and GeoData; ignored by Git
 ├── build/                       # Icons and NSIS installer configuration

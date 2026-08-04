@@ -209,6 +209,10 @@ async function captureCoreDialogScenario(scenario) {
     backgroundColor: '#f3f8fb',
     resizable: false,
     webPreferences: {
+      offscreen: {
+        useSharedTexture: false,
+        deviceScaleFactor: 1,
+      },
       preload: DIALOG_PRELOAD,
       contextIsolation: true,
       nodeIntegration: false,
@@ -217,13 +221,50 @@ async function captureCoreDialogScenario(scenario) {
     },
   });
   try {
+    await configureViewport(window, scenario);
     await window.loadFile(DIALOG_ENTRY, { query: { 'visual-test': '1' } });
     await waitForCoreDialog(window);
+    await assertViewportSize(window, scenario);
     await assertCoreDialogLayout(window);
-    return await window.webContents.capturePage();
+    return await captureViewport(window);
   } finally {
+    if (window.webContents.debugger.isAttached()) window.webContents.debugger.detach();
     window.destroy();
   }
+}
+
+async function configureViewport(window, scenario) {
+  await window.loadURL('about:blank');
+  window.webContents.debugger.attach('1.3');
+  await window.webContents.debugger.sendCommand('Emulation.setDeviceMetricsOverride', {
+    width: scenario.width,
+    height: scenario.height,
+    deviceScaleFactor: 1,
+    mobile: false,
+    screenWidth: scenario.width,
+    screenHeight: scenario.height,
+  });
+}
+
+async function assertViewportSize(window, scenario) {
+  const { width, height } = await window.webContents.executeJavaScript(
+    '({ width: window.innerWidth, height: window.innerHeight })',
+    true,
+  );
+  if (width !== scenario.width || height !== scenario.height) {
+    throw new Error(
+      `viewport ${width}x${height}, expected ${scenario.width}x${scenario.height}; `
+      + 'the deterministic visual-test viewport was not applied',
+    );
+  }
+}
+
+async function captureViewport(window) {
+  const result = await window.webContents.debugger.sendCommand('Page.captureScreenshot', {
+    format: 'png',
+    fromSurface: true,
+  });
+  return nativeImage.createFromBuffer(Buffer.from(result.data, 'base64'));
 }
 
 async function captureScenario(scenario) {
@@ -239,6 +280,10 @@ async function captureScenario(scenario) {
     backgroundColor,
     resizable: false,
     webPreferences: {
+      offscreen: {
+        useSharedTexture: false,
+        deviceScaleFactor: 1,
+      },
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -246,6 +291,7 @@ async function captureScenario(scenario) {
     },
   });
   try {
+    await configureViewport(window, scenario);
     await window.loadFile(ENTRY, {
       query: {
         'visual-test': '1',
@@ -256,9 +302,11 @@ async function captureScenario(scenario) {
       },
     });
     await waitForFixture(window, readyToken);
+    await assertViewportSize(window, scenario);
     await assertLayout(window, scenario);
-    return await window.webContents.capturePage();
+    return await captureViewport(window);
   } finally {
+    if (window.webContents.debugger.isAttached()) window.webContents.debugger.detach();
     window.destroy();
   }
 }

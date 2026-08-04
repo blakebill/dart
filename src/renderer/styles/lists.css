@@ -117,6 +117,33 @@
   padding-bottom: 3px;
 }
 
+.node-list > .hint:only-child {
+  display: flex;
+  min-height: 220px;
+  margin: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.node-list > .hint:only-child::before {
+  display: block;
+  width: 38px;
+  height: 38px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  content: "\E774";
+  font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
+  font-size: 17px;
+  line-height: 38px;
+}
+
 #tab-rules .rule-list {
   min-height: 120px;
   max-height: calc(100vh - 190px);
@@ -162,8 +189,10 @@
   padding: 8px 10px;
   gap: 4px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-raised);
+  border-radius: 11px;
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--accent) 5%, transparent), transparent 48%),
+    var(--surface-raised);
   cursor: pointer;
   transition: border-color var(--motion-standard), background-color var(--motion-standard), transform var(--motion-standard), box-shadow var(--motion-standard);
 }
@@ -299,8 +328,10 @@
 }
 
 .node-item:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border-strong));
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--accent) 9%, transparent), transparent 48%),
+    var(--surface-hover);
   transform: translateY(-1px);
   box-shadow: var(--panel-shadow);
 }
@@ -308,7 +339,7 @@
 .node-item.active {
   border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
   background: var(--accent-soft);
-  box-shadow: inset 3px 0 0 var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent), var(--panel-shadow);
 }
 
 .node-top,

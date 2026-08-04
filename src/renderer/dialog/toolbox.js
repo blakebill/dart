@@ -122,7 +122,7 @@
     let result = null;
     toolView('toolbox.configTitle', 'toolbox.configHint', `
       <div class="row tool-actions dialog-commandbar">
-        <button id="configCheckRun" class="btn primary" data-i18n="toolbox.validateBoth">${escapeHtml(t('toolbox.validateBoth'))}</button>
+        <button id="configCheckRun" class="btn primary" data-i18n="toolbox.validateMihomo">${escapeHtml(t('toolbox.validateMihomo'))}</button>
       </div>
       <div id="configCheckResult" class="tool-result">${emptyResult()}</div>
     `);
@@ -136,38 +136,37 @@
           `${result.source.truncated ? ' · ' + escapeHtml(t('toolbox.truncated')) : ''}</summary>` +
           `<pre>${escapeHtml(result.source.preview)}</pre></details>`;
       }
-      for (const item of result.results || []) {
-        const validation = item.validation || {};
-        const summary = item.summary;
-        html += `<section class="tool-section"><div class="tool-section-head"><h4>${escapeHtml(item.coreType)}</h4>${statusBadge(validation.status)}</div>`;
-        if (summary) {
-          html += '<div class="tool-metrics">';
-          html += resultRow(t('toolbox.configFormat'), `${result.source.format || '-'} → ${summary.format}`);
-          html += resultRow(t('toolbox.configNodes'), `${summary.sourceNodes} → ${summary.generatedNodes}${summary.droppedNodes ? ' (-' + summary.droppedNodes + ')' : ''}`, summary.droppedNodes ? 'warn' : 'pass');
-          html += resultRow(t('toolbox.configRules'), `${summary.sourceRules} → ${summary.generatedRules}`);
-          html += resultRow(t('toolbox.configTun'), summary.tun ? t('state.on') : t('state.off'));
-          html += resultRow(t('toolbox.configDns'), summary.dns ? t('state.on') : t('state.off'));
-          html += resultRow(t('toolbox.configSize'), `${fmtBytes(summary.bytes)} · ${summary.lines} ${t('toolbox.lines')}`);
-          html += '</div>';
-        }
-        const location = validation.location || {};
-        const where = [
-          location.path,
-          location.line ? t('toolbox.line', location.line) : '',
-          location.column ? t('toolbox.column', location.column) : '',
-        ].filter(Boolean).join(' · ');
-        html += `<div class="tool-validation ${escapeHtml(validation.status || 'missing')}"><b>${escapeHtml(where || t('toolbox.validationOutput'))}</b><pre>${escapeHtml(validation.message || '-')}</pre></div>`;
-        if (item.preview) {
-          html += `<details class="tool-preview"><summary>${escapeHtml(t('toolbox.generatedPreview', item.coreType))}${item.truncated ? ' · ' + escapeHtml(t('toolbox.truncated')) : ''}</summary><pre>${escapeHtml(item.preview)}</pre></details>`;
-        }
-        html += '</section>';
+      const item = result.result || {};
+      const validation = item.validation || {};
+      const summary = item.summary;
+      html += `<section class="tool-section"><div class="tool-section-head"><h4>Mihomo</h4>${statusBadge(validation.status)}</div>`;
+      if (summary) {
+        html += '<div class="tool-metrics">';
+        html += resultRow(t('toolbox.configFormat'), `${result.source.format || '-'} → ${summary.format}`);
+        html += resultRow(t('toolbox.configNodes'), `${summary.sourceNodes} → ${summary.generatedNodes}${summary.droppedNodes ? ' (-' + summary.droppedNodes + ')' : ''}`, summary.droppedNodes ? 'warn' : 'pass');
+        html += resultRow(t('toolbox.configRules'), `${summary.sourceRules} → ${summary.generatedRules}`);
+        html += resultRow(t('toolbox.configTun'), summary.tun ? t('state.on') : t('state.off'));
+        html += resultRow(t('toolbox.configDns'), summary.dns ? t('state.on') : t('state.off'));
+        html += resultRow(t('toolbox.configSize'), `${fmtBytes(summary.bytes)} · ${summary.lines} ${t('toolbox.lines')}`);
+        html += '</div>';
       }
+      const location = validation.location || {};
+      const where = [
+        location.path,
+        location.line ? t('toolbox.line', location.line) : '',
+        location.column ? t('toolbox.column', location.column) : '',
+      ].filter(Boolean).join(' · ');
+      html += `<div class="tool-validation ${escapeHtml(validation.status || 'missing')}"><b>${escapeHtml(where || t('toolbox.validationOutput'))}</b><pre>${escapeHtml(validation.message || '-')}</pre></div>`;
+      if (item.preview) {
+        html += `<details class="tool-preview"><summary>${escapeHtml(t('toolbox.generatedPreview', 'Mihomo'))}${item.truncated ? ' · ' + escapeHtml(t('toolbox.truncated')) : ''}</summary><pre>${escapeHtml(item.preview)}</pre></details>`;
+      }
+      html += '</section>';
       $('#configCheckResult').innerHTML = html;
     }
 
     Dialog.bind('#configCheckRun', 'click', async () => {
       await Dialog.runBusy($('#configCheckRun'), 'toolbox.validating', async () => {
-        result = await Dialog.call(api.checkAllConfigs);
+        result = await Dialog.call(api.checkMihomoConfig);
         render();
       });
     });

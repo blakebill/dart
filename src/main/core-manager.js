@@ -14,6 +14,7 @@ const github = require('./github');
 const { getCoreAdapter, hasCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { verifyFileSha256 } = require('./integrity');
 const { uniqueSibling, replaceFileSync, replaceFileBatchSync, writeJsonAtomicSync } = require('./file-utils');
+const { cleanupRetiredCoreArtifacts } = require('./retired-core-cleanup');
 
 const CORE_START_MIN_ALIVE_MS = 600;
 const CORE_START_MAX_WAIT_MS = 8000;
@@ -40,7 +41,7 @@ function probeLocalPort(port, timeoutMs = 250) {
   });
 }
 
-/** Local ports from a generated sing-box or mihomo config. */
+/** Local ports from a generated Mihomo config. */
 function listenPortsFromConfig(config) {
   if (!config || typeof config !== 'object') return [];
   const ports = new Set();
@@ -50,15 +51,7 @@ function listenPortsFromConfig(config) {
   };
   const mixed = Number(config['mixed-port']);
   addPort(mixed);
-  if (Array.isArray(config.inbounds)) {
-    for (const inbound of config.inbounds) {
-      if (inbound && inbound.type === 'mixed') addPort(inbound.listen_port);
-    }
-  }
-
-  const controller = config['external-controller'] ||
-    (config.experimental && config.experimental.clash_api &&
-      config.experimental.clash_api.external_controller);
+  const controller = config['external-controller'];
   const rawController = String(controller || '').trim();
   if (rawController) {
     try {
@@ -165,24 +158,6 @@ function runCapturedProcess(command, args, options = {}) {
   });
 }
 
-/**
- * Candidate download URLs for a rule-set file, in priority order.
- *
- * raw.githubusercontent.com is the canonical source but is unreliable from
- * mainland China even through some proxy nodes (slow, rate-limited, or it
- * returns an error/redirect page that fails .srs validation). jsDelivr serves
- * the same repo@branch over a CDN that is far more reachable, so its mirrors
- * are used as fallbacks. Each URL is still attempted proxy-first then direct.
- */
-function geoDataUrls(repo, file) {
-  return [
-    `https://raw.githubusercontent.com/SagerNet/${repo}/rule-set/${file}`,
-    `https://cdn.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
-    `https://fastly.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
-    `https://gcore.jsdelivr.net/gh/SagerNet/${repo}@rule-set/${file}`,
-  ];
-}
-
 function mihomoGeoDataUrls(file) {
   return [
     `https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${file}`,
@@ -222,21 +197,6 @@ function parseCoreVersion(output) {
   const text = String(output || '');
   const match = text.match(/version\s+v?(\S+)/i) || text.match(/\bv?(\d+\.\d+\.\d+(?:[-.\w]*)?)/);
   return match ? match[1] : null;
-}
-
-function baseVersionParts(version) {
-  const match = String(version || '').match(/^v?(\d+)\.(\d+)\.(\d+)/);
-  return match ? match.slice(1).map(Number) : null;
-}
-
-function compareBaseVersions(left, right) {
-  const a = baseVersionParts(left);
-  const b = baseVersionParts(right);
-  if (!a || !b) return null;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return 0;
 }
 
 function validMihomoGeoFile(filePath, knownStat = null) {
@@ -304,7 +264,7 @@ class CoreManager {
     this.runtimeDir = opts.runtimeDir;
     this.onLog = opts.onLog || (() => {});
     this.onExit = opts.onExit || (() => {});
-    this.coreType = opts.coreType || 'sing-box';
+    this.coreType = 'mihomo';
     this.proc = null;
     this._coreDownloadPromise = null;
     this._coreDownloadController = null;
@@ -312,11 +272,10 @@ class CoreManager {
     this._versionRequests = new Map();
     this._fileValidationCache = new Map();
     this._mihomoValidationPromise = null;
-    this._bundledSingBoxPatchPromise = null;
-    this._bundledSingBoxPatchChecked = false;
     if (!fs.existsSync(this.runtimeDir)) {
       fs.mkdirSync(this.runtimeDir, { recursive: true });
     }
+    cleanupRetiredCoreArtifacts(this.runtimeDir, this.onLog);
     this._migrateLegacyLayout();
   }
 
@@ -495,83 +454,6 @@ class CoreManager {
     return parseCoreVersion(output);
   }
 
-  /** Replace an older official sing-box runtime override with the bundled Dart build. */
-  ensureBundledSingBoxPatch() {
-    if (this._bundledSingBoxPatchChecked || this.getCoreType() !== 'sing-box') return Promise.resolve(false);
-    if (this._bundledSingBoxPatchPromise) return this._bundledSingBoxPatchPromise;
-    this._bundledSingBoxPatchPromise = this._ensureBundledSingBoxPatch()
-      .catch((error) => {
-        this.onLog('[gui] bundled sing-box upgrade skipped: ' + error.message);
-        return false;
-      })
-      .then((changed) => {
-        this._bundledSingBoxPatchChecked = true;
-        return changed;
-      })
-      .finally(() => { this._bundledSingBoxPatchPromise = null; });
-    return this._bundledSingBoxPatchPromise;
-  }
-
-  async _ensureBundledSingBoxPatch() {
-    if (this.proc) return false;
-    const runtimeBin = this.resolveBinaryPath('sing-box');
-    const bundledBin = this.resolveBundledBinaryPath('sing-box');
-    if (!runtimeBin || !bundledBin || path.resolve(runtimeBin) === path.resolve(bundledBin)) {
-      return false;
-    }
-
-    let runtimeVersion;
-    let bundledVersion;
-    try {
-      [runtimeVersion, bundledVersion] = await Promise.all([
-        this._probeCoreVersion(runtimeBin, 'sing-box'),
-        this._probeCoreVersion(bundledBin, 'sing-box'),
-      ]);
-    } catch (_) {
-      return false;
-    }
-    const comparison = compareBaseVersions(bundledVersion, runtimeVersion);
-    if (
-      !runtimeVersion ||
-      /-dart\.\d+$/i.test(runtimeVersion) ||
-      !/-dart\.\d+$/i.test(bundledVersion) ||
-      comparison === null ||
-      comparison < 0
-    ) return false;
-
-    const staged = uniqueSibling(runtimeBin, 'bundled-patch');
-    try {
-      await fs.promises.copyFile(bundledBin, staged);
-      if (process.platform !== 'win32') await fs.promises.chmod(staged, fs.statSync(bundledBin).mode);
-      replaceFileSync(staged, runtimeBin);
-      this.invalidateVersionCache();
-      this.onLog(`[gui] upgraded sing-box ${runtimeVersion} to bundled ${bundledVersion}`);
-      return true;
-    } finally {
-      try { await fs.promises.unlink(staged); } catch (_) {}
-    }
-  }
-
-  /**
-   * Resolve the directory that holds the bundled rule-sets (geoip-cn.srs).
-   * Prefers a user-downloaded copy, then the bundled one. Returns null if none,
-   * in which case the converter falls back to remote rule-sets.
-   */
-  resolveRuleSetDir() {
-    this.ensureSingBoxGeoData();
-    const dirs = [
-      this.coreDir('sing-box'),
-      path.join(this.runtimeDir, 'bin'), // legacy fallback
-      ...this.resourceDirs('sing-box'),
-    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
-    for (const d of dirs) {
-      if (this._validSrs(path.join(d, 'geoip-cn.srs')) && this._validSrs(path.join(d, 'geosite-cn.srs'))) {
-        return d;
-      }
-    }
-    return null;
-  }
-
   _copyIfMissing(src, dest, validate = null) {
     try {
       if (!src || !fs.existsSync(src) || fs.existsSync(dest)) return;
@@ -587,55 +469,15 @@ class CoreManager {
   }
 
   _migrateLegacyLayout() {
-    const singboxDir = this.ensureCoreDir('sing-box');
     const mihomoDir = this.ensureCoreDir('mihomo');
     const legacyBin = path.join(this.runtimeDir, 'bin');
     const exe = process.platform === 'win32' ? '.exe' : '';
-    this._copyIfMissing(path.join(legacyBin, 'sing-box' + exe), path.join(singboxDir, 'sing-box' + exe));
-    this._copyIfMissing(path.join(this.runtimeDir, 'sing-box' + exe), path.join(singboxDir, 'sing-box' + exe));
     this._copyIfMissing(path.join(legacyBin, 'mihomo' + exe), path.join(mihomoDir, 'mihomo' + exe));
     this._copyIfMissing(path.join(this.runtimeDir, 'mihomo' + exe), path.join(mihomoDir, 'mihomo' + exe));
-    this._copyIfMissing(path.join(this.runtimeDir, 'config.json'), path.join(singboxDir, 'config.json'));
     this._copyIfMissing(path.join(this.runtimeDir, 'config.yaml'), path.join(mihomoDir, 'config.yaml'));
     this._copyIfMissing(path.join(this.runtimeDir, 'mihomo-geodata-meta.json'), path.join(mihomoDir, 'geodata-meta.json'));
-
     for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
       this._copyIfMissing(path.join(this.runtimeDir, file), path.join(mihomoDir, file), this._validGeoFile);
-    }
-    try {
-      for (const name of fs.readdirSync(legacyBin)) {
-        if (
-          name === 'geodata-meta.json' ||
-          /\.srs$/i.test(name) ||
-          /^rp-[a-f0-9]+\.json$/i.test(name)
-        ) {
-          this._copyIfMissing(path.join(legacyBin, name), path.join(singboxDir, name));
-        }
-      }
-    } catch (_) {
-      /* no legacy bin */
-    }
-  }
-
-  /** A rule-set file is usable only if it exists, is non-empty, and starts with the SRS magic. */
-  _validSrs(p) {
-    try {
-      const stat = fs.statSync(p);
-      if (stat.size < 8) return false;
-      const cacheKey = `srs:${p}:${statFingerprint(stat)}`;
-      if (this._fileValidationCache.has(cacheKey)) return this._fileValidationCache.get(cacheKey);
-      const fd = fs.openSync(p, 'r');
-      const buf = Buffer.alloc(3);
-      try {
-        fs.readSync(fd, buf, 0, 3, 0);
-      } finally {
-        fs.closeSync(fd);
-      }
-      const valid = buf.toString('latin1') === 'SRS';
-      this._rememberFileValidation(cacheKey, valid);
-      return valid;
-    } catch (e) {
-      return false;
     }
   }
 
@@ -798,38 +640,6 @@ class CoreManager {
     return promise;
   }
 
-  ensureSingBoxGeoData() {
-    const dir = this.ensureCoreDir('sing-box');
-    const sources = [
-      ...this.resourceDirs('sing-box'),
-      path.join(this.runtimeDir, 'bin'),
-      this.resourcesDir,
-    ].filter((d, i, arr) => d && arr.indexOf(d) === i);
-    let ready = true;
-    for (const file of ['geoip-cn.srs', 'geosite-cn.srs']) {
-      const dest = path.join(dir, file);
-      if (this._validSrs(dest)) continue;
-      ready = false;
-      if (fs.existsSync(dest)) {
-        try {
-          fs.unlinkSync(dest);
-          this.onLog('[gui] removed invalid sing-box geodata: ' + dest);
-        } catch (_) {}
-      }
-      for (const srcDir of sources) {
-        const src = path.join(srcDir, file);
-        if (!this._validSrs(src)) continue;
-        try {
-          fs.copyFileSync(src, dest);
-          ready = true;
-          this.onLog('[gui] restored sing-box geodata from bundled file: ' + file);
-          break;
-        } catch (_) {}
-      }
-    }
-    return ready && ['geoip-cn.srs', 'geosite-cn.srs'].every((file) => this._validSrs(path.join(dir, file)));
-  }
-
   ensureMihomoGeoData() {
     const dir = this.ensureCoreDir('mihomo');
     const sources = [
@@ -967,8 +777,7 @@ class CoreManager {
       this.onLog(line);
     };
     const handleData = (stream, buf) => {
-      // sing-box emits ANSI color escape codes (e.g. "\x1b[36mINFO\x1b[0m").
-      // Strip them so the log view shows plain text instead of garbage.
+      // Strip ANSI color codes so the log view always receives plain text.
       const lines = stripAnsi(remainders[stream] + decoders[stream].write(buf)).split(/\r?\n/);
       remainders[stream] = lines.pop() || '';
       for (const line of lines) emitLogLine(line);
@@ -1209,14 +1018,6 @@ class CoreManager {
     return installed;
   }
 
-  /**
-   * Download/refresh the geoip-cn / geosite-cn rule-sets into the singbox core
-   * folder so the bundled (or stale) geodata can be updated from within the app.
-   */
-  async updateGeoData(onProgress = () => {}, proxyPort = 0) {
-    return getCoreAdapter(this.getCoreType()).updateGeoData(this, onProgress, proxyPort);
-  }
-
   async _downloadAndInstallGeoFiles(dir, files, options) {
     const { proxyPort, onProgress, validator, updateLabel, successLabel } = options;
     const staged = [];
@@ -1266,31 +1067,6 @@ class CoreManager {
         try { fs.unlinkSync(entry.source); } catch (_) {}
       }
     }
-  }
-
-  async _updateSingBoxGeoData(onProgress, proxyPort) {
-    const binDir = this.ensureCoreDir('sing-box');
-    const files = [
-      { file: 'geoip-cn.srs', urls: geoDataUrls('sing-geoip', 'geoip-cn.srs') },
-      { file: 'geosite-cn.srs', urls: geoDataUrls('sing-geosite', 'geosite-cn.srs') },
-    ];
-    await this._downloadAndInstallGeoFiles(binDir, files, {
-      proxyPort,
-      onProgress,
-      validator: (file) => this._validSrs(file),
-      updateLabel: 'Updating geodata',
-      successLabel: 'geodata source OK',
-    });
-    const meta = this.geoMeta('sing-box');
-    const updatedAt = Date.now();
-    for (const f of files) meta[f.file] = { updatedAt };
-    try {
-      writeJsonAtomicSync(this.geoMetaPath('sing-box'), meta);
-    } catch (e) {
-      /* non-fatal */
-    }
-    this.onLog('[gui] GeoData updated in ' + binDir);
-    return binDir;
   }
 
   updateMihomoGeoData(onProgress = () => {}, proxyPort = 0) {
@@ -1449,4 +1225,4 @@ class CoreManager {
   }
 }
 
-module.exports = { CoreManager, geoDataUrls };
+module.exports = { CoreManager };

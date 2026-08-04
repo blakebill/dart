@@ -3,7 +3,6 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const yaml = require('js-yaml');
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 
 const {
@@ -17,30 +16,28 @@ const {
   clearRecentLogs,
   sendStatus,
   coreStatusInfo,
+  liveWebContents,
 } = require('./state');
 const core = require('./core-control');
 const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
 const { AppUpdateController } = require('./app-update-controller');
 const { getCoreAdapter } = require('./core-adapters');
-const { buildMihomoConfig, buildSingboxConfig } = require('./converter');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
 const { notify } = require('./notify');
 const toolbox = require('./toolbox');
 const dialogWindows = require('./dialog-window');
+const { registerConnectionsIpc } = require('./connections-ipc');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 const { detectNodeRegion, nodeRegionSummary, normalizeSmartRegions } = require('./node-region');
 const validation = require('./ipc-validation');
 const {
   CORE_CONFIG_SETTINGS,
-  MAX_IPC_CONNECTIONS,
   SETTING_KEYS,
   VALID_CRS_FORMATS,
   VALID_MODES,
-  VALID_SUBSCRIPTION_UA_MODES,
   VALID_TARGETS,
-  recentConnections,
   reqAutoUpdateMinutes,
   reqBoolean,
   reqConfigText,
@@ -51,18 +48,21 @@ const {
 } = validation;
 
 function senderWindow(event) {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  if (!win || win !== state.mainWindow || win.isDestroyed()) throw new Error('invalid window');
+  const sender = event && event.sender;
+  const win = sender && BrowserWindow.fromWebContents(sender);
+  if (!win || win !== state.mainWindow || liveWebContents(win) !== sender) {
+    throw new Error('invalid window');
+  }
   return win;
 }
 
 async function rollbackSettingsAfterFailure(previous, wasRunning, originalError) {
   try {
     state.store.updateSettings(previous);
-    state.singbox.setCoreType(previous.coreType || 'sing-box');
+    state.coreManager.setCoreType('mihomo');
     try { require('./window').applyNativeThemeSource(); } catch (_) {}
     try { core.applyAutoLaunch(previous.autoLaunch, previous.silentStart); } catch (_) {}
-    if (wasRunning && !state.singbox.isRunning()) await core.startCore();
+    if (wasRunning && !state.coreManager.isRunning()) await core.startCore();
     sendStatus();
   } catch (recoveryError) {
     originalError.recoveryError = recoveryError;
@@ -76,7 +76,7 @@ async function rollbackProfileSelection(previousActive, previousSelected, wasRun
     if (restore) await restore();
     state.store.set('activeSub', previousActive);
     state.store.set('selected', previousSelected);
-    if (wasRunning && !state.singbox.isRunning()) await core.startCore();
+    if (wasRunning && !state.coreManager.isRunning()) await core.startCore();
     sendStatus();
   } catch (recoveryError) {
     originalError.recoveryError = recoveryError;
@@ -92,7 +92,7 @@ async function rollbackMutationAfterFailure(restore, wasRunning, originalError, 
   } catch (error) {
     recoveryError = error;
   }
-  if (wasRunning && !state.singbox.isRunning()) {
+  if (wasRunning && !state.coreManager.isRunning()) {
     try {
       await core.startCore();
     } catch (error) {
@@ -107,53 +107,14 @@ async function rollbackMutationAfterFailure(restore, wasRunning, originalError, 
   throw originalError;
 }
 
-function customRuleFileSnapshot(id) {
-  const target = path.join(state.singbox.ensureCoreDir('sing-box'), core.customRuleSetFileName(id));
-  if (!fs.existsSync(target)) return { target, backup: null };
-  const backup = uniqueSibling(target, 'edit-backup');
-  fs.copyFileSync(target, backup);
-  return { target, backup };
-}
-
-function restoreCustomRuleFile(snapshot) {
-  if (!snapshot) return;
-  if (snapshot.backup && fs.existsSync(snapshot.backup)) {
-    replaceFileSync(snapshot.backup, snapshot.target);
-    snapshot.backup = null;
-    return;
-  }
-  try { fs.unlinkSync(snapshot.target); } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-}
-
-function discardCustomRuleFileSnapshot(snapshot) {
-  if (!snapshot || !snapshot.backup) return;
-  try { fs.unlinkSync(snapshot.backup); } catch (_) {}
-  snapshot.backup = null;
-}
-
-function purgeCustomRuleBinaries() {
-  let removed = 0;
-  for (const dir of new Set([state.singbox.ensureCoreDir('sing-box'), path.join(runtimeDir, 'bin')])) {
-    let names;
-    try { names = fs.readdirSync(dir); } catch (_) { continue; }
-    for (const name of names) {
-      if (!/^custom-[A-Za-z0-9_-]+\.srs$/.test(name)) continue;
-      try { fs.unlinkSync(path.join(dir, name)); removed += 1; } catch (_) {}
-    }
-  }
-  return removed;
-}
-
 let pendingBackup = null;
 let appUpdateController = null;
 let coreUpdateTask = null;
 
 async function cancelPendingUpdates() {
   if (appUpdateController) appUpdateController.cancel();
-  if (state.singbox && typeof state.singbox.cancelCoreDownload === 'function') {
-    state.singbox.cancelCoreDownload();
+  if (state.coreManager && typeof state.coreManager.cancelCoreDownload === 'function') {
+    state.coreManager.cancelCoreDownload();
   }
   const pending = [appUpdateController && appUpdateController.task, coreUpdateTask].filter(Boolean);
   if (pending.length) await Promise.allSettled(pending);
@@ -181,34 +142,12 @@ async function readBackupDocument(file) {
   };
 }
 
-/** Remove decorative built-in group emoji from standalone converted files. */
-function plainConversionLabels(value) {
-  if (typeof value === 'string') {
-    return value
-      .replace(/🚀 Proxy/g, 'Dart Proxy')
-      .replace(/♻️ Auto/g, 'Dart Auto')
-      .replace(/🧠 Smart/g, 'Dart Smart')
-      .replace(/🛟 Fallback/g, 'Dart Fallback');
-  }
-  if (Array.isArray(value)) return value.map(plainConversionLabels);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plainConversionLabels(item)]));
-  }
-  return value;
-}
-
 function subscriptionResult(sub) {
   return {
     id: sub.id,
     name: sub.name || '',
-    format: sub.format || 'unknown',
-    userAgentMode: subscriptionUserAgentMode(sub.userAgentMode),
     nodeCount: Array.isArray(sub.nodes) ? sub.nodes.length : Math.max(0, Number(sub.nodeCount) || 0),
   };
-}
-
-function subscriptionUserAgentMode(value) {
-  return VALID_SUBSCRIPTION_UA_MODES.includes(value) ? value : 'auto';
 }
 
 function sameSettingValue(left, right) {
@@ -240,10 +179,6 @@ function mergeFetchedSubscription(latest, result, { replaceRaw = false } = {}) {
   };
   if (replaceRaw || result.raw) next.raw = result.raw || '';
   return next;
-}
-
-function subscriptionFetchOptions(extra = {}) {
-  return { coreType: state.store.getSettings().coreType, ...extra };
 }
 
 function currentRuleSetForUpdate(id, sourceKey, token = null) {
@@ -299,6 +234,7 @@ function nodeResult(node) {
 function registerIpc() {
   state.cancelPendingUpdates = cancelPendingUpdates;
   const toolContext = { state, core, proxy, isAdmin: isWindowsAdmin };
+  registerConnectionsIpc({ ipcMain, state, core, requireMainWindow: senderWindow });
   ipcMain.handle('app:getState', async () => {
     const status = await coreStatusInfo();
     const activeSub = core.getActiveSubId();
@@ -309,8 +245,6 @@ function registerIpc() {
         id: s.id,
         name: s.name,
         url: s.url,
-        format: s.format,
-        userAgentMode: subscriptionUserAgentMode(s.userAgentMode),
         autoUpdateMinutes: s.autoUpdateMinutes || 0,
         updateViaProxy: !!s.updateViaProxy,
         updatedAt: s.updatedAt || 0,
@@ -327,8 +261,8 @@ function registerIpc() {
   ipcMain.handle('logs:get', () => getRecentLogs());
   ipcMain.handle('logs:stream', (event, { enabled } = {}) => {
     reqBoolean(enabled, 'enabled');
-    const win = senderWindow(event);
-    return setRecentLogStreaming(win.webContents, enabled);
+    senderWindow(event);
+    return setRecentLogStreaming(event.sender, enabled);
   });
   ipcMain.handle('logs:clear', () => {
     clearRecentLogs();
@@ -360,14 +294,9 @@ function registerIpc() {
   });
 
   // Add/update a subscription (fetch and parse).
-  ipcMain.handle('sub:add', async (_e, { name, url, userAgentMode = 'auto' }) => {
+  ipcMain.handle('sub:add', async (_e, { name, url }) => {
     reqUrl(url, 'url');
-    reqEnum(userAgentMode, VALID_SUBSCRIPTION_UA_MODES, 'userAgentMode');
-    const result = await subscription.fetchSubscription(
-      url,
-      sendLog,
-      subscriptionFetchOptions({ userAgentMode })
-    );
+    const result = await subscription.fetchSubscription(url, sendLog);
     if (!result.nodes.length) {
       throw new Error('no nodes parsed (format: ' + result.format + ')');
     }
@@ -376,7 +305,6 @@ function registerIpc() {
       name: name || new URL(url).hostname,
       url,
       format: result.format,
-      userAgentMode,
       nodes: result.nodes,
       policyGroups: result.policyGroups || [],
       clashRules: result.rules || [],
@@ -411,10 +339,7 @@ function registerIpc() {
       const result = await subscription.fetchSubscription(
         sourceUrl,
         sendLog,
-        subscriptionFetchOptions({
-          proxyPort,
-          userAgentMode: subscriptionUserAgentMode(sub.userAgentMode),
-        })
+        { proxyPort }
       );
       if (!result.nodes.length) {
         throw new Error('no nodes parsed (format: ' + result.format + ')');
@@ -425,7 +350,7 @@ function registerIpc() {
         const configChanged = (latest.configHash || subscription.configFingerprint(latest)) !== next.configHash;
         const shouldRestart = configChanged && id === core.getActiveSubId();
         const previous = shouldRestart ? state.store.getSubscription(id, { includeRaw: true }) : null;
-        const wasRunning = shouldRestart && state.singbox.isRunning();
+        const wasRunning = shouldRestart && state.coreManager.isRunning();
         state.store.upsertSubscription(next);
         // Apply the active profile's new node list to a running core; otherwise
         // the Clash API keeps serving outbounds the UI no longer shows.
@@ -454,7 +379,7 @@ function registerIpc() {
     if (!removed) throw new Error('config not found');
     const previousActive = core.getActiveSubId();
     const previousSelected = state.store.get('selected');
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     core.cancelRemoteUpdate('subscription', id);
     state.store.removeSubscription(id);
     const subs = state.store.listSubscriptions();
@@ -487,7 +412,7 @@ function registerIpc() {
     const previousActive = core.getActiveSubId();
     if (id === previousActive) return id;
     const previousSelected = state.store.get('selected');
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     state.store.set('activeSub', id);
     state.store.set('selected', null); // reset node selection for the new profile
     try {
@@ -498,33 +423,27 @@ function registerIpc() {
     return id;
   }));
 
-  // Edit subscription metadata. A URL or User-Agent mode change re-fetches the
-  // source immediately so the stored format matches the selected request mode.
+  // A URL change re-fetches immediately so stored nodes match the new source.
   ipcMain.handle('sub:edit', async (_e, {
-    id, name, url, autoUpdateMinutes, updateViaProxy, userAgentMode,
+    id, name, url, autoUpdateMinutes, updateViaProxy,
   }) => {
     reqStr(id, 'id');
     if (autoUpdateMinutes !== undefined) reqAutoUpdateMinutes(autoUpdateMinutes);
     if (updateViaProxy !== undefined) reqBoolean(updateViaProxy, 'updateViaProxy');
-    if (userAgentMode !== undefined) reqEnum(userAgentMode, VALID_SUBSCRIPTION_UA_MODES, 'userAgentMode');
     const original = state.store.getSubscription(id);
     if (!original) throw new Error('config not found');
     // Imported profiles legitimately have an empty URL; validate only when set.
     if (url) reqUrl(url, 'url');
     const sourceUrl = original.url;
     const requestedUrl = url !== undefined ? url : sourceUrl;
-    const originalUserAgentMode = subscriptionUserAgentMode(original.userAgentMode);
-    const requestedUserAgentMode = userAgentMode !== undefined ? userAgentMode : originalUserAgentMode;
     const urlChanged = requestedUrl !== sourceUrl;
-    const userAgentModeChanged = requestedUserAgentMode !== originalUserAgentMode;
-    const sourceChanged = urlChanged || userAgentModeChanged;
+    const sourceChanged = urlChanged;
     const token = sourceChanged ? core.beginRemoteUpdate('subscription', id) : null;
     const applyEdits = (sub) => {
       if (name !== undefined) sub.name = name;
       if (url !== undefined) sub.url = url;
       if (autoUpdateMinutes !== undefined) sub.autoUpdateMinutes = autoUpdateMinutes;
       if (updateViaProxy !== undefined) sub.updateViaProxy = updateViaProxy;
-      if (userAgentMode !== undefined) sub.userAgentMode = userAgentMode;
       return sub;
     };
     try {
@@ -536,7 +455,7 @@ function registerIpc() {
         fetched = await subscription.fetchSubscription(
           requestedUrl,
           sendLog,
-          subscriptionFetchOptions({ proxyPort, userAgentMode: requestedUserAgentMode })
+          { proxyPort }
         );
         if (!fetched.nodes.length) throw new Error('no nodes parsed from the selected subscription format');
       }
@@ -549,7 +468,7 @@ function registerIpc() {
           (latest.configHash || subscription.configFingerprint(latest)) !== sub.configHash;
         const shouldRestart = configChanged && sub.id === core.getActiveSubId();
         const previous = shouldRestart ? state.store.getSubscription(id, { includeRaw: true }) : null;
-        const wasRunning = shouldRestart && state.singbox.isRunning();
+        const wasRunning = shouldRestart && state.coreManager.isRunning();
         state.store.upsertSubscription(sub);
         core.rescheduleAutoUpdate();
         // A URL change replaced the node list — apply it if this is the live profile.
@@ -613,7 +532,7 @@ function registerIpc() {
     if (!sub) throw new Error('config not found');
     const raw = sub.raw || null;
     return {
-      raw: raw ? subscription.formatSubscriptionForEditing(raw, sub.userAgentMode) : null,
+      raw: raw ? subscription.formatSubscriptionForEditing(raw) : null,
     };
   });
   ipcMain.handle('sub:saveRaw', async (_e, { id, content }) => {
@@ -639,7 +558,7 @@ function registerIpc() {
         configHash: subscription.configFingerprint(result),
       };
       const configChanged = (previous.configHash || subscription.configFingerprint(previous)) !== sub.configHash;
-      const wasRunning = state.singbox.isRunning();
+      const wasRunning = state.coreManager.isRunning();
       // A manual source edit is authoritative. Invalidate an older network
       // refresh before committing so its late response cannot overwrite this.
       core.cancelRemoteUpdate('subscription', id);
@@ -660,58 +579,6 @@ function registerIpc() {
     });
   });
 
-  // Bidirectional standalone conversion (no save, no run). Auto mode converts
-  // sing-box input to Clash and every other supported source to sing-box.
-  ipcMain.handle('convert:preview', (_e, { content, target = 'auto' }) => {
-    reqConfigText(content);
-    reqEnum(target, ['auto', 'sing-box', 'clash'], 'conversion target');
-    const result = subscription.parseSubscriptionContent(content);
-    if (!result.nodes.length) throw new Error('no nodes parsed');
-    const settings = state.store.getSettings();
-    const outputTarget = target === 'auto'
-      ? (result.format === 'singbox' ? 'clash' : 'sing-box')
-      : target;
-    if (outputTarget === 'clash') {
-      const config = plainConversionLabels(buildMihomoConfig(result.nodes, {
-        ...settings,
-        clashRules: result.rules || [],
-        policyGroups: result.policyGroups || [],
-        ruleProviders: result.ruleProviders || {},
-      }));
-      return {
-        text: yaml.dump(config, { lineWidth: -1, noRefs: true }),
-        nodeCount: result.nodes.length,
-        format: result.format,
-        target: 'clash',
-      };
-    }
-    const config = plainConversionLabels(buildSingboxConfig(result.nodes, {
-      ...settings,
-      ruleSetDir: state.singbox.resolveRuleSetDir(),
-      clashRules: result.rules || [],
-      policyGroups: result.policyGroups || [],
-    }));
-    return { config, nodeCount: result.nodes.length, format: result.format, target: 'sing-box' };
-  });
-
-  // Export the active core's generated config to a file.
-  ipcMain.handle('convert:export', async (event) => {
-    const adapter = getCoreAdapter(state.singbox.getCoreType());
-    await adapter.prepareStart(state.singbox);
-    const { config } = await core.buildCurrentConfigAsync();
-    // The per-run API secret is runtime-only; keep it out of shared exports.
-    if (config.experimental && config.experimental.clash_api) {
-      delete config.experimental.clash_api.secret;
-    }
-    if (adapter.sanitizeExport) adapter.sanitizeExport(config);
-    const { canceled, filePath } = await dialog.showSaveDialog(dialogWindows.ownerWindow(event), {
-      ...adapter.exportDialog,
-    });
-    if (canceled || !filePath) return null;
-    await writeAtomicText(filePath, adapter.serializeConfig(config, { pretty: true }));
-    return filePath;
-  });
-
   ipcMain.handle('settings:update', (_e, input) => core.queueConfigMutation(async () => {
     let patch = input;
     patch = Object.fromEntries(
@@ -723,9 +590,7 @@ function registerIpc() {
       Object.entries(patch).filter(([key, value]) => !sameSettingValue(value, previous[key]))
     );
     if (!Object.keys(patch).length) return previous;
-    const coreTypeChanged = Object.prototype.hasOwnProperty.call(patch, 'coreType') &&
-      patch.coreType !== (previous.coreType || 'sing-box');
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     let configChanged = [...CORE_CONFIG_SETTINGS].some(
       (key) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== previous[key]
     );
@@ -734,17 +599,14 @@ function registerIpc() {
     // App-managed Smart weights are live model state. Only a runtime that
     // accepts the kernel `mode` field needs a config rebuild for this change.
     if (smartModeChanged && wasRunning) {
-      const runningCoreType = state.singbox.getCoreType();
+      const runningCoreType = state.coreManager.getCoreType();
       let meta = core.getKernelSmartMeta();
-      // Config validation can probe both cores and leave the shared capability
-      // snapshot pointing at the other one. Never let that diagnostic side
-      // effect decide whether the actually running core must restart.
       if (!meta || meta.coreType !== runningCoreType) {
         meta = await core.resolveKernelSmart(runningCoreType);
       }
       if (meta && meta.kernelSmartMode) configChanged = true;
     }
-    if (configChanged && state.singbox.isCoreDownloadInProgress()) {
+    if (configChanged && state.coreManager.isCoreDownloadInProgress()) {
       throw new Error('wait for the core update to finish before changing core settings');
     }
     const settings = state.store.updateSettings(patch);
@@ -754,14 +616,6 @@ function registerIpc() {
       try {
         themeResolved = require('./window').applyNativeThemeSource();
       } catch (_) { /* ignore */ }
-    }
-    if (coreTypeChanged) {
-      try {
-        state.singbox.setCoreType(settings.coreType);
-        sendStatus();
-      } catch (error) {
-        return rollbackSettingsAfterFailure(previous, wasRunning, error);
-      }
     }
     // The login item carries the --hidden flag when silent start is on, and on
     // Windows the auto-launch mechanism depends on whether TUN is on (elevated
@@ -816,7 +670,7 @@ function registerIpc() {
   ipcMain.handle('node:delay', async (_e, input) => {
     const { name, force = false } = input && typeof input === 'object' ? input : {};
     reqStr(name, 'name');
-    if (!state.singbox.isRunning()) throw new Error('core not running');
+    if (!state.coreManager.isRunning()) throw new Error('core not running');
     try {
       // Explicit UI tests pass force so a click always re-probes; Auto/Smart keep the cache.
       return { ok: true, delay: await core.testNodeDelay(name, { force: !!force }) };
@@ -827,7 +681,7 @@ function registerIpc() {
 
   ipcMain.handle('node:autoCandidate', async (_e, { name }) => {
     reqStr(name, 'name');
-    if (!state.singbox.isRunning()) throw new Error('core not running');
+    if (!state.coreManager.isRunning()) throw new Error('core not running');
     const active = core.getActiveSubscription();
     const validNames = new Set(
       ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean)
@@ -853,7 +707,7 @@ function registerIpc() {
     const info = core.getManagedNodeOverrideInfo();
     const override = info.override;
     const overrideGroup = info.group;
-    if (!state.singbox.isRunning()) {
+    if (!state.coreManager.isRunning()) {
       return { proxy: null, auto: null, smart: null, fallback: null, override, overrideGroup };
     }
     const current = async (name) => {
@@ -887,7 +741,7 @@ function registerIpc() {
       ...((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean),
     ]);
     if (!validNames.has(name)) throw new Error('node is not part of the active config');
-    if (state.singbox.isRunning()) {
+    if (state.coreManager.isRunning()) {
       try {
         await core.setClashSelector(name);
       } catch (e) {
@@ -904,7 +758,7 @@ function registerIpc() {
   // otherwise computed from the generated config. The renderer shows live
   // rules when present, so the config route is only built when needed.
   ipcMain.handle('rules:get', async () => {
-    const running = state.singbox.isRunning();
+    const running = state.coreManager.isRunning();
     let live = null;
     if (running) {
       try {
@@ -928,70 +782,13 @@ function registerIpc() {
     return core.setRuleGroupSelection(group, outbound);
   });
 
-  // Live connections from the Clash API.
-  ipcMain.handle('connections:get', async () => {
-    if (!state.singbox.isRunning()) return { running: false, connections: [], up: 0, down: 0 };
-    try {
-      const d = await core.clashApi('GET', '/connections');
-      const all = Array.isArray(d.connections) ? d.connections : [];
-      const recent = recentConnections(all, MAX_IPC_CONNECTIONS)
-        .map((c) => {
-          const m = c.metadata || {};
-          return {
-            id: c.id,
-            start: c.start,
-            upload: c.upload || 0,
-            download: c.download || 0,
-            rule: c.rule || '',
-            chains: Array.isArray(c.chains) ? c.chains : [],
-            metadata: {
-              host: m.host || '',
-              destinationIP: m.destinationIP || '',
-              destinationPort: m.destinationPort || '',
-              network: m.network || '',
-            },
-          };
-        });
-      return {
-        running: true,
-        connections: recent,
-        totalConnections: all.length,
-        up: d.uploadTotal || 0,
-        down: d.downloadTotal || 0,
-      };
-    } catch (e) {
-      return {
-        running: state.singbox.isRunning(),
-        connections: [],
-        up: 0,
-        down: 0,
-        error: String(e && e.message || e || 'Clash API unavailable'),
-      };
-    }
-  });
-
-  // Close a single connection by its Clash API id.
-  ipcMain.handle('connections:close', async (_e, { id }) => {
-    if (state.singbox.isRunning() && typeof id === 'string' && id) {
-      await core.clashApi('DELETE', '/connections/' + encodeURIComponent(id));
-    }
-    return true;
-  });
-
-  ipcMain.handle('connections:closeAll', async () => {
-    if (state.singbox.isRunning()) {
-      await core.clashApi('DELETE', '/connections');
-    }
-    return true;
-  });
-
   // Rule-set management: report status of each routing rule-set.
   ipcMain.handle('ruleset:list', async () => {
-    const adapter = getCoreAdapter(state.singbox.getCoreType());
+    const adapter = getCoreAdapter(state.coreManager.getCoreType());
     const items = adapter.ruleSetItems;
     const dirs = [
-      { loc: 'updated', dir: state.singbox.coreDir(adapter.id) },
-      ...state.singbox.resourceDirs(adapter.id).map((dir) => ({ loc: 'bundled', dir })),
+      { loc: 'updated', dir: state.coreManager.coreDir(adapter.id) },
+      ...state.coreManager.resourceDirs(adapter.id).map((dir) => ({ loc: 'bundled', dir })),
       // Legacy fallback for users upgrading from the shared runtime layout.
       ...adapter.legacyGeoDirs(runtimeDir, resourcesBinDir),
     ].filter((d, i, arr) => d.dir && arr.findIndex((x) => x.dir === d.dir) === i);
@@ -1014,7 +811,7 @@ function registerIpc() {
             found = {
               location: d.loc,
               size: st.size,
-              valid: adapter.validateGeoFile(state.singbox, p),
+              valid: adapter.validateGeoFile(state.coreManager, p),
               mtime: st.mtimeMs,
               dir: d.dir,
             };
@@ -1108,14 +905,11 @@ function registerIpc() {
     const fmt = format ? reqEnum(format, VALID_CRS_FORMATS, 'format') : core.detectCustomRuleSetFormat(url);
     const tgt = target ? reqEnum(target, VALID_TARGETS, 'target') : 'proxy';
     let c = { id: crypto.randomUUID(), name: name || url, url, format: fmt, target: tgt, enabled: true };
-    const snapshot = customRuleFileSnapshot(c.id);
-    let processed = false;
     try {
       c = await core.processCustomRuleSet(c);
-      processed = true;
       return await core.queueConfigMutation(async () => {
         let committed = false;
-        const wasRunning = state.singbox.isRunning();
+        const wasRunning = state.coreManager.isRunning();
         try {
           state.store.upsertCustomRuleSet(c);
           committed = true;
@@ -1124,7 +918,6 @@ function registerIpc() {
           return sanitizeCrs(c);
         } catch (error) {
           const restore = () => {
-            restoreCustomRuleFile(snapshot);
             if (committed) state.store.removeCustomRuleSet(c.id);
             core.rescheduleAutoUpdate();
           };
@@ -1136,12 +929,7 @@ function registerIpc() {
         }
       });
     } catch (error) {
-      if (!processed) {
-        try { restoreCustomRuleFile(snapshot); } catch (recoveryError) { error.recoveryError = recoveryError; }
-      }
       throw error;
-    } finally {
-      discardCustomRuleFileSnapshot(snapshot);
     }
   }));
   ipcMain.handle('customrs:edit', (_e, payload) => core.queueCustomRuleMutation(async () => {
@@ -1163,23 +951,18 @@ function registerIpc() {
     const sourceChanged = (url !== undefined && url !== c.url) ||
       nextFormat !== core.normalizeCustomRuleSetFormat(c.format, c.url);
     const targetChanged = target !== undefined && target !== c.target;
-    // Binary .srs content is independent of its outbound target. Inline rules
-    // embed that target and therefore need to be parsed again.
-    const reprocess = sourceChanged || (targetChanged && c.kind === 'inline');
+    const reprocess = sourceChanged || targetChanged;
     if (url !== undefined) c.url = url;
     c.format = nextFormat;
     if (target !== undefined) c.target = target;
     const configChanged = sourceChanged || targetChanged || (c.enabled !== false) !== (original.enabled !== false);
     const token = reprocess ? core.beginRemoteUpdate('rule-set', id) : null;
-    const snapshot = reprocess ? customRuleFileSnapshot(id) : null;
     let processedRule = null;
-    let prepared = !reprocess;
     try {
       if (reprocess) {
         processedRule = await core.processCustomRuleSet(c, {
           beforeCommit: () => currentRuleSetForUpdate(id, sourceKey, token),
         });
-        prepared = true;
       }
       return await core.queueConfigMutation(async () => {
         const latest = currentRuleSetForUpdate(id, sourceKey, token);
@@ -1191,20 +974,16 @@ function registerIpc() {
         desired.format = c.format;
         if (target !== undefined) desired.target = c.target;
         c = processedRule ? core.mergeProcessedCustomRuleSet(desired, processedRule) : desired;
-        const wasRunning = state.singbox.isRunning();
+        const wasRunning = state.coreManager.isRunning();
         let committed = false;
         try {
           state.store.upsertCustomRuleSet(c);
           committed = true;
-          if (c.kind !== 'ruleset' && snapshot) {
-            try { fs.unlinkSync(snapshot.target); } catch (_) {}
-          }
           core.rescheduleAutoUpdate();
           if (configChanged) await core.restartIfRunning();
           return sanitizeCrs(c);
         } catch (error) {
           const restore = () => {
-            restoreCustomRuleFile(snapshot);
             if (committed) state.store.upsertCustomRuleSet(latest);
             core.rescheduleAutoUpdate();
           };
@@ -1216,13 +995,9 @@ function registerIpc() {
         }
       });
     } catch (error) {
-      if (!prepared) {
-        try { restoreCustomRuleFile(snapshot); } catch (recoveryError) { error.recoveryError = recoveryError; }
-      }
       throw error;
     } finally {
       if (token) core.finishRemoteUpdate('rule-set', id, token);
-      discardCustomRuleFileSnapshot(snapshot);
     }
   }));
   ipcMain.handle('customrs:refresh', (_e, { id }) => core.queueCustomRuleMutation(async () => {
@@ -1231,29 +1006,22 @@ function registerIpc() {
     if (!current) throw new Error('rule-set not found');
     const sourceKey = core.customRuleSetSourceKey(current);
     const token = core.beginRemoteUpdate('rule-set', id);
-    const snapshot = customRuleFileSnapshot(id);
-    let prepared = false;
     try {
       const processed = await core.processCustomRuleSet(current, {
         beforeCommit: () => currentRuleSetForUpdate(id, sourceKey, token),
       });
-      prepared = true;
       return await core.queueConfigMutation(async () => {
         const latest = currentRuleSetForUpdate(id, sourceKey, token);
         const c = core.mergeProcessedCustomRuleSet(latest, processed);
-        const wasRunning = state.singbox.isRunning();
+        const wasRunning = state.coreManager.isRunning();
         let committed = false;
         try {
           state.store.upsertCustomRuleSet(c);
           committed = true;
-          if (c.kind !== 'ruleset') {
-            try { fs.unlinkSync(snapshot.target); } catch (_) {}
-          }
           await core.restartIfRunning();
           return sanitizeCrs(c);
         } catch (error) {
           const restore = () => {
-            restoreCustomRuleFile(snapshot);
             if (committed) state.store.upsertCustomRuleSet(latest);
           };
           if (committed) {
@@ -1264,13 +1032,9 @@ function registerIpc() {
         }
       });
     } catch (error) {
-      if (!prepared) {
-        try { restoreCustomRuleFile(snapshot); } catch (recoveryError) { error.recoveryError = recoveryError; }
-      }
       throw error;
     } finally {
       core.finishRemoteUpdate('rule-set', id, token);
-      discardCustomRuleFileSnapshot(snapshot);
     }
   }));
   ipcMain.handle('customrs:remove', (_e, { id }) => core.queueCustomRuleMutation(async () => {
@@ -1278,12 +1042,9 @@ function registerIpc() {
       reqStr(id, 'id');
       const current = state.store.getCustomRuleSet(id);
       if (!current) throw new Error('rule-set not found');
-      const snapshot = customRuleFileSnapshot(id);
-      const wasRunning = state.singbox.isRunning();
+      const wasRunning = state.coreManager.isRunning();
       core.cancelRemoteUpdate('rule-set', id);
       state.store.removeCustomRuleSet(id);
-      try { fs.unlinkSync(snapshot.target); } catch (_) {}
-      try { fs.unlinkSync(path.join(runtimeDir, 'bin', core.customRuleSetFileName(id))); } catch (_) {}
       try {
         core.rescheduleAutoUpdate();
         await core.restartIfRunning();
@@ -1291,7 +1052,6 @@ function registerIpc() {
       } catch (error) {
         return rollbackMutationAfterFailure(
           () => {
-            restoreCustomRuleFile(snapshot);
             state.store.upsertCustomRuleSet(current);
             core.rescheduleAutoUpdate();
           },
@@ -1299,8 +1059,6 @@ function registerIpc() {
           error,
           'remote rules after remove failure'
         );
-      } finally {
-        discardCustomRuleFileSnapshot(snapshot);
       }
     });
   }));
@@ -1323,7 +1081,7 @@ function registerIpc() {
     const tgt = target ? reqEnum(target, VALID_TARGETS, 'target') : 'proxy';
     const lr = { id: crypto.randomUUID(), name: name || '', matchType, values: vals, target: tgt, enabled: true };
     const previous = state.store.get('localRules') || [];
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     state.store.set('localRules', [...previous, lr]);
     try {
       await core.restartIfRunning();
@@ -1358,7 +1116,7 @@ function registerIpc() {
     if (enabled !== undefined) lr.enabled = enabled;
     list[idx] = lr;
     const configChanged = [matchType, values, target, enabled].some((value) => value !== undefined);
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     state.store.set('localRules', list);
     if (configChanged) {
       try {
@@ -1379,7 +1137,7 @@ function registerIpc() {
     const previous = state.store.get('localRules') || [];
     if (!previous.some((x) => x.id === id)) throw new Error('local rule not found');
     const list = previous.filter((x) => x.id !== id);
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     state.store.set('localRules', list);
     try {
       await core.restartIfRunning();
@@ -1401,7 +1159,7 @@ function registerIpc() {
     return toolbox.inspectRoute(value, toolContext);
   });
   ipcMain.handle('tools:networkDiagnostics', () => toolbox.networkDiagnostics(toolContext));
-  ipcMain.handle('tools:configCheck', () => toolbox.checkAllConfigs(toolContext));
+  ipcMain.handle('tools:configCheck', () => toolbox.checkMihomoConfig(toolContext));
   ipcMain.handle('tools:portCheck', (_e, { ports }) => toolbox.inspectPorts(ports, toolContext));
   ipcMain.handle('tools:dnsCompare', (_e, { host }) => {
     reqStr(host, 'host');
@@ -1458,7 +1216,7 @@ function registerIpc() {
       pendingBackup = null;
       throw new Error('backup selection expired; select the file again');
     }
-    if (state.singbox.isCoreDownloadInProgress()) {
+    if (state.coreManager.isCoreDownloadInProgress()) {
       throw new Error('wait for the core update to finish before restoring a backup');
     }
     const selected = pendingBackup;
@@ -1467,21 +1225,7 @@ function registerIpc() {
       pendingBackup = null;
       throw new Error('backup file changed after selection; select it again');
     }
-    const restored = {
-      ...loaded.normalized,
-      // Backups intentionally omit downloaded .srs files. Never let restored
-      // metadata attach to an unrelated stale file that happens to share its id.
-      customRuleSets: loaded.normalized.customRuleSets.map((item) => item.kind === 'ruleset'
-        ? {
-            ...item,
-            kind: null,
-            count: null,
-            updatedAt: 0,
-            autoUpdateLastAttemptAt: 0,
-            error: null,
-          }
-        : item),
-    };
+    const restored = loaded.normalized;
     const currentSettings = state.store.getSettings();
     const knownSettings = new Set(Object.keys(currentSettings));
     restored.settings = Object.fromEntries(
@@ -1491,7 +1235,7 @@ function registerIpc() {
 
     return core.queueCustomRuleMutation(() => core.queueConfigMutation(async () => {
       const before = toolbox.validateBackupDocument(toolbox.buildBackup(state.store, app.getVersion()));
-      const wasRunning = state.singbox.isRunning();
+      const wasRunning = state.coreManager.isRunning();
       core.cancelAllRemoteUpdates();
       if (wasRunning) await core.stopCore(true);
       const apply = (data) => {
@@ -1505,7 +1249,7 @@ function registerIpc() {
       const activate = (data) => {
         apply(data);
         const settings = state.store.getSettings();
-        state.singbox.setCoreType(settings.coreType);
+        state.coreManager.setCoreType(settings.coreType);
         core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
         core.rescheduleAutoUpdate();
       };
@@ -1514,8 +1258,6 @@ function registerIpc() {
         // Also invalidate a manual update that may have started while the backup
         // data was being written. Any later request starts against restored data.
         core.cancelAllRemoteUpdates();
-        const removed = purgeCustomRuleBinaries();
-        if (removed) sendLog(`[gui] removed ${removed} stale custom rule-set file(s) after backup restore`);
       } catch (error) {
         core.cancelAllRemoteUpdates();
         pendingBackup = null;
@@ -1570,11 +1312,11 @@ function registerIpc() {
   // Toggle TUN mode. On Windows without admin rights, offer to restart elevated.
   ipcMain.handle('tun:set', (_e, { enable }) => core.queueConfigMutation(async () => {
     reqBoolean(enable, 'enable');
-    if (state.singbox.isCoreDownloadInProgress()) {
+    if (state.coreManager.isCoreDownloadInProgress()) {
       throw new Error('wait for the core update to finish before changing TUN mode');
     }
     const previous = state.store.getSettings();
-    const wasRunning = state.singbox.isRunning();
+    const wasRunning = state.coreManager.isRunning();
     state.store.updateSettings({ enableTun: !!enable });
     if (enable && process.platform === 'win32' && !(await isWindowsAdmin())) {
       try {
@@ -1632,15 +1374,14 @@ function registerIpc() {
   });
 
   ipcMain.handle('core:check', () => core.queueConfigMutation(async () => {
-    const coreType = state.singbox.getCoreType();
-    await getCoreAdapter(coreType).prepareStart(state.singbox);
+    const coreType = state.coreManager.getCoreType();
+    await getCoreAdapter(coreType).prepareStart(state.coreManager);
     const { config } = await core.buildCurrentConfigAsync(coreType);
-    await state.singbox.checkConfigFor(coreType, config);
+    await state.coreManager.checkConfigFor(coreType, config);
     return true;
   }));
 
-  // Download either core. The active core can keep serving the download when
-  // installing the other one; an active target is stopped only for extraction.
+  // Download and install Mihomo.
   ipcMain.handle('core:download', (_event, payload = {}) => {
     if (coreUpdateTask) return Promise.reject(new Error('core update already in progress'));
     let task;
@@ -1651,20 +1392,20 @@ function registerIpc() {
     if (version && !/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
       throw new Error('invalid version');
     }
-    const selectedCoreType = state.singbox.getCoreType();
+    const selectedCoreType = state.coreManager.getCoreType();
     const coreType = payload.coreType === undefined
       ? selectedCoreType
-      : reqEnum(payload.coreType, ['sing-box', 'mihomo'], 'coreType');
+      : reqEnum(payload.coreType, ['mihomo'], 'coreType');
     const source = payload.source === undefined
       ? 'custom'
       : reqEnum(payload.source, ['custom', 'official'], 'source');
-    const target = path.join(state.singbox.ensureCoreDir(coreType), state.singbox.binNameFor(coreType));
+    const target = path.join(state.coreManager.ensureCoreDir(coreType), state.coreManager.binNameFor(coreType));
     let restartAfterInstall = false;
     let backup = null;
     let installedPath = null;
     let installError = null;
     try {
-      installedPath = await state.singbox.downloadCore(
+      installedPath = await state.coreManager.downloadCore(
         version,
         (progress) => {
           sendToMain('core:downloadProgress', progress);
@@ -1675,10 +1416,10 @@ function registerIpc() {
           source,
           proxyPort: core.currentProxyPort(),
           beforeInstall: async () => {
-            if (state.singbox.getCoreType() !== selectedCoreType) {
+            if (state.coreManager.getCoreType() !== selectedCoreType) {
               throw new Error('core type changed during update; retry the update');
             }
-            if (coreType === selectedCoreType && state.singbox.isRunning()) {
+            if (coreType === selectedCoreType && state.coreManager.isRunning()) {
               restartAfterInstall = true;
               sendLog('[gui] stopping core to install the update...');
               await core.stopCore(undefined, { allowDuringCoreUpdate: true });
@@ -1703,7 +1444,7 @@ function registerIpc() {
       try {
         replaceFileSync(backup, target);
         backup = null;
-        state.singbox.invalidateVersionCache();
+        state.coreManager.invalidateVersionCache();
         sendLog('[gui] restored the previous core after an interrupted install');
       } catch (recoveryError) {
         installError.recoveryError = recoveryError;
@@ -1712,7 +1453,7 @@ function registerIpc() {
     }
 
     let restartError = null;
-    if (restartAfterInstall && !state.singbox.isRunning()) {
+    if (restartAfterInstall && !state.coreManager.isRunning()) {
       try {
         await core.startCore();
         sendLog('[gui] core restarted after update');
@@ -1734,7 +1475,7 @@ function registerIpc() {
             if (error.code !== 'ENOENT') throw error;
           }
         }
-        state.singbox.invalidateVersionCache();
+        state.coreManager.invalidateVersionCache();
         await core.startCore();
         rolledBack = true;
         sendLog('[gui] core update failed to start and was rolled back');
@@ -1789,12 +1530,12 @@ function registerIpc() {
 
   // Open the folder that holds the core binary in the OS file manager.
   ipcMain.handle('core:openFolder', async () => {
-    const bin = state.singbox.resolveBinaryPath();
+    const bin = state.coreManager.resolveBinaryPath();
     if (bin) {
       shell.showItemInFolder(bin);
       return true;
     }
-    const dir = state.singbox.ensureCoreDir();
+    const dir = state.coreManager.ensureCoreDir();
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const error = await shell.openPath(dir);
     if (error) throw new Error(error);
@@ -1808,7 +1549,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('app:openClashApi', async () => {
-    if (!state.singbox.isRunning()) {
+    if (!state.coreManager.isRunning()) {
       throw new Error('start the core first — the panel is served by the core at /ui');
     }
     const settings = state.store.getSettings();

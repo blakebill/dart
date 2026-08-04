@@ -1,0 +1,50 @@
+.log-level-filter {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--surface-muted) 74%, transparent);
+}
+
+.log-level-btn {
+  min-width: 42px;
+  min-height: 28px;
+  padding: 0 9px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  border-radius: calc(var(--radius-control) - 3px);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast),
+    background var(--motion-fast),
+    box-shadow var(--motion-fast);
+}
+
+.log-level-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.log-level-btn.active {
+  color: var(--accent);
+  background: var(--surface-raised);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+.log-level-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.log-box[data-level-filter='debug'] .log-entry:not([data-level='debug']),
+.log-box[data-level-filter='info'] .log-entry:not([data-level='info']),
+.log-box[data-level-filter='warning'] .log-entry:not([data-level='warning']),
+.log-box[data-level-filter='error'] .log-entry:not([data-level='error']) {
+  display: none;
+}

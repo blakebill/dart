@@ -5,7 +5,7 @@
  *
  * Parses common proxy share links (vmess:// vless:// trojan:// ss:// hysteria2:// tuic:// ...)
  * into a unified internal "node object" structure, which is later turned into
- * sing-box outbounds by the converter.
+ * Mihomo proxies by the converter.
  *
  * Internal node object shape (kept close to Clash proxy fields for unified handling):
  * {

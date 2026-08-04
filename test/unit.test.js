@@ -6,6 +6,7 @@
  */
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -26,10 +27,16 @@ const {
   SmartShadowEvaluator,
   defaultVariantSpecs,
 } = require('../src/main/smart-shadow-evaluator');
+const {
+  SmartFeedbackSampler,
+  selectSmartFeedbackInterval,
+} = require('../src/main/smart-feedback-sampler');
+const { createSmartShadowService } = require('../src/main/smart-shadow-service');
 const { KernelDialFeedback } = require('../src/main/kernel-dial-feedback');
 const { detectNodeRegion, normalizeSmartRegions, smartRegionMembers } = require('../src/main/node-region');
 const { nodeFingerprint } = require('../src/main/subscription');
 const { ManagedAutoSelection } = require('../src/main/managed-auto-selection');
+const { connectionRows, registerConnectionsIpc } = require('../src/main/connections-ipc');
 
 let passed = 0;
 const pendingTests = [];
@@ -166,7 +173,7 @@ test('Smart selection smooths RTT and ignores insignificant improvements', () =>
     switchConfirmRounds: 2,
   });
   const choose = (current, measurements, now) => model.choose({
-    contextKey: 'sing-box:profile-a', names: ['a', 'b'], current, measurements, now,
+    contextKey: 'mihomo:profile-a', names: ['a', 'b'], current, measurements, now,
   });
   assert.strictEqual(choose('a', [{ name: 'a', delay: 100 }, { name: 'b', delay: 90 }], 1000), 'a');
   // One-shot low probe (and the jitter it creates) is not enough to flip.
@@ -433,6 +440,26 @@ test('Smart selection fails over, cools repeated failures, and bounds memory', (
     ],
   });
   assert.strictEqual(steady.qualities(['y'], 2000).y.level, 'good');
+  // Standby Smart can revisit a node much less often than the 15-minute
+  // selection half-life. UI maturity uses its own wider evidence window so
+  // sparse background probes still finish instead of staying "probing" forever.
+  const standby = new SmartSelectionModel();
+  for (let index = 0; index < 6; index++) {
+    standby.choose({
+      contextKey: 'standby',
+      names: ['idle-node'],
+      current: 'idle-node',
+      now: 1000 + index * 25 * 60_000,
+      measurements: [{ name: 'idle-node', delay: 90 }],
+    });
+  }
+  const standbyState = standby.peek('idle-node');
+  assert.ok(standbyState.effectiveSamples < 4.5);
+  assert.ok(standbyState.stabilitySamples >= 4.5);
+  assert.strictEqual(
+    standby.qualities(['idle-node'], 1000 + 6 * 25 * 60_000)['idle-node'].level,
+    'good'
+  );
   // A failed node is "unavailable"; a few lucky re-tests must not go green.
   const recovering = new SmartSelectionModel();
   recovering.choose({
@@ -447,6 +474,36 @@ test('Smart selection fails over, cools repeated failures, and bounds memory', (
   const recoveringLevel = recovering.qualities(['z'], 2500).z.level;
   assert.ok(['probing', 'bad', 'mid', 'unavailable'].includes(recoveringLevel));
   assert.notStrictEqual(recoveringLevel, 'good');
+});
+
+test('standby Smart matures a 100-node profile without increasing idle probe cadence', () => {
+  const names = Array.from({ length: 100 }, (_, index) => `standby-${index}`);
+  const model = new SmartSelectionModel();
+  let cursor = 0;
+  const idleIntervalMs = 4 * 60_000;
+  const rounds = 8 * 60 / 4;
+  for (let round = 0; round < rounds; round++) {
+    const now = 1000 + round * idleIntervalMs;
+    const batch = selectSmartTestBatch(names, names[0], cursor, false, { model, now });
+    cursor = batch.nextCursor;
+    model.choose({
+      contextKey: 'standby-large',
+      names,
+      current: names[0],
+      now,
+      measurements: batch.candidates.map((name, index) => ({
+        name,
+        delay: 80 + index % 7,
+      })),
+    });
+  }
+  const qualities = model.qualities(names, 1000 + rounds * idleIntervalMs);
+  assert.strictEqual(
+    Object.values(qualities).filter((quality) => (
+      quality.level === 'unknown' || quality.level === 'probing'
+    )).length,
+    0
+  );
 });
 
 test('managed Auto scheduler uses fast interval when active and idle when standby', async () => {
@@ -511,7 +568,7 @@ test('managed Auto never treats a zero timeout as the fastest node', async () =>
 test('Smart selection isolates history by core and active profile', () => {
   const model = new SmartSelectionModel();
   model.choose({
-    contextKey: 'sing-box:a', names: ['a'], current: 'a', now: 1000,
+    contextKey: 'mihomo:a', names: ['a'], current: 'a', now: 1000,
     measurements: [{ name: 'a', delay: 50 }],
   });
   assert.strictEqual(model.snapshot().nodes.size, 1);
@@ -2045,7 +2102,7 @@ test('native dialog renderers reference only declared i18n keys', () => {
 
 test('zh labels keep config terminology', () => {
   const { zh } = loadDict();
-  assert.strictEqual(zh['subs.title'], '📡 配置');
+  assert.strictEqual(zh['subs.title'], '配置');
   assert.strictEqual(zh['subs.add'], '添加配置');
   assert.strictEqual(zh['subs.listTitle'], '配置列表');
   assert.strictEqual(zh['rulegroups.section'], '策略组');
@@ -2054,11 +2111,6 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
   assert.strictEqual(zh['rulegroups.targetSource'], '选择出站');
-  assert.strictEqual(zh['subs.userAgent'], '请求 UA');
-  assert.strictEqual(zh['subs.userAgentAuto'], '自动（跟随内核）');
-  assert.strictEqual(zh['subs.userAgentTag'], 'UA {0}');
-  assert.strictEqual(zh['subs.sourceFormat'], '来源 {0}');
-  assert.strictEqual(zh['subs.formatFlow'], '来源 {0} → {1}');
 });
 
 test('static HTML fallbacks keep config terminology', () => {
@@ -2069,30 +2121,16 @@ test('static HTML fallbacks keep config terminology', () => {
   for (const stale of ['静默启动（', '桌面通知（', '硬件加速（', '启用 IPv6（']) {
     assert.ok(!html.includes(stale), `settings fallback still has parenthetical hint: ${stale}`);
   }
-  assert.ok(html.includes('id="subUserAgent"'), 'add-config User-Agent selector is missing');
-  assert.ok(html.includes('id="editUserAgent"'), 'edit-config User-Agent selector is missing');
-  assert.ok(html.includes('自动（跟随内核）'), 'automatic download format does not explain core following');
-});
-
-test('config list distinguishes downloaded source format from runtime core', () => {
-  const subscriptions = fs.readFileSync(
-    path.join(__dirname, '..', 'src', 'renderer', 'js', 'subs.js'),
-    'utf-8'
-  );
-  const main = fs.readFileSync(
-    path.join(__dirname, '..', 'src', 'renderer', 'js', 'main.js'),
-    'utf-8'
-  );
-  assert.ok(subscriptions.includes("t('subs.sourceFormat', sourceFormat)"));
-  assert.ok(subscriptions.includes("t('subs.formatFlow', sourceFormat, runtimeFormat)"));
-  assert.ok(subscriptions.includes('sourceIsNative'));
-  assert.ok(subscriptions.includes("coreType === 'mihomo' ? 'Mihomo' : 'sing-box'"));
-  assert.ok(main.includes('subscriptionTargetChanged'), 'core switches leave the displayed runtime target stale');
+  assert.ok(!html.includes('id="subUserAgent"'), 'retired add-config User-Agent selector remains');
+  assert.ok(!html.includes('id="editUserAgent"'), 'retired edit-config User-Agent selector remains');
+  assert.ok(!html.includes('请求 UA'), 'retired User-Agent label remains');
 });
 
 test('rule-set page is folded into rules and native geodata management', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
   const dialogs = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'dialog', 'system.js'), 'utf-8');
+  const settings = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'settings.js'), 'utf-8');
+  const rulesets = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rulesets.js'), 'utf-8');
   const rules = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rules.js'), 'utf-8');
   assert.ok(!html.includes('data-tab="ruleset"'), 'standalone rule-set nav is still present');
   assert.ok(!html.includes('id="tab-ruleset"'), 'standalone rule-set tab is still present');
@@ -2105,8 +2143,192 @@ test('rule-set page is folded into rules and native geodata management', () => {
   assert.ok(html.indexOf('id="crsList"') > html.indexOf('id="lrList"'), 'remote rules should follow local rules');
   assert.ok(html.includes('id="geoManageBtn"'), 'GeoData management launcher is missing');
   assert.ok(dialogs.includes("Dialog.register('geodata'"), 'native GeoData dialog is missing');
+  assert.ok(settings.includes("$('#geoManageBtn').addEventListener('click'"), 'GeoData launcher is not bound by the always-loaded settings module');
+  assert.ok(!rulesets.includes("$('#geoManageBtn')"), 'lazy rules module still owns the GeoData launcher');
   assert.ok(rules.includes('const sourceTargets = new Set(info.sourceTargets || [])'));
   assert.ok(rules.includes("if (sel.value === 'source') delete next[g]"));
+});
+
+test('Smart feedback pacing reacts to evidence and deep idle boundaries', () => {
+  assert.strictEqual(selectSmartFeedbackInterval({ active: true, idleForMs: 0 }), 3_000);
+  assert.strictEqual(selectSmartFeedbackInterval({ active: false, idleForMs: 119_999 }), 12_000);
+  assert.strictEqual(selectSmartFeedbackInterval({ active: false, idleForMs: 120_000 }), 30_000);
+  assert.strictEqual(selectSmartFeedbackInterval({ active: false, idleForMs: 120_000 }, 1), 3_000);
+  assert.strictEqual(selectSmartFeedbackInterval(null, NaN), 12_000);
+});
+
+test('Smart shadow service bounds work and never exposes raw routing identities', () => {
+  const shadowDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-shadow-service-'));
+  const configured = [];
+  const rounds = [];
+  const events = [];
+  let identityCalls = 0;
+  const evaluator = {
+    configure(value) { configured.push(value); return null; },
+    recordRound(value) { rounds.push(value); return null; },
+    observeConnection(value, now) { events.push({ value, now }); return true; },
+    snapshot() { return { version: 1, configured, rounds, events }; },
+    restore() {},
+  };
+  const service = createSmartShadowService({
+    evaluator,
+    getHistoryDirectory: () => shadowDir,
+    getActiveContextKey: () => 'profile-id:https://private.example/probe',
+    getModelConfig: () => ({ mode: 'balanced', baseOptions: {}, legacyOptions: {} }),
+    resolveNodeIdentity: (name) => {
+      identityCalls++;
+      return `secret-endpoint:${name}`;
+    },
+    getNetworkIdentity: () => 'private-network-fingerprint',
+    options: { maxPending: 2, batchDelayMs: 60_000 },
+  });
+
+  assert.strictEqual(service.recordRound({
+    names: ['Tokyo A'],
+    current: 'Tokyo A',
+    measurements: [{ name: 'Tokyo A', delay: 50 }],
+    productionPick: 'Tokyo A',
+    now: 1,
+  }), true);
+  assert.strictEqual(service.observeConnection({ name: 'Tokyo A', kind: 'traffic' }, 2), true);
+  assert.strictEqual(service.recordRound({
+    names: ['Tokyo A'],
+    current: 'Tokyo A',
+    measurements: [{ name: 'Tokyo A', delay: 48 }],
+    productionPick: 'Tokyo A',
+    now: 3,
+  }), true);
+  assert.strictEqual(service.flush({ drain: true }), 2);
+  assert.strictEqual(rounds.length, 2);
+  assert.strictEqual(events.length, 0, 'connection evidence was not dropped first at the queue bound');
+  const replayPayload = JSON.stringify({ configured, rounds });
+  for (const secret of [
+    'Tokyo A',
+    'secret-endpoint',
+    'profile-id',
+    'private.example',
+    'private-network-fingerprint',
+  ]) {
+    assert.ok(!replayPayload.includes(secret), `shadow replay leaked ${secret}`);
+  }
+  assert.strictEqual(service.close(), true);
+  const persistedReplay = fs.readFileSync(
+    path.join(shadowDir, 'smart-shadow-history.json'),
+    'utf-8'
+  );
+  for (const secret of ['Tokyo A', 'secret-endpoint', 'profile-id', 'private.example']) {
+    assert.ok(!persistedReplay.includes(secret), `persisted shadow history leaked ${secret}`);
+  }
+  const callsAtClose = identityCalls;
+  assert.strictEqual(service.recordRound({ names: ['late'] }), false);
+  assert.strictEqual(service.observeConnection({ name: 'late', kind: 'traffic' }), false);
+  assert.strictEqual(identityCalls, callsAtClose, 'closed service still resolved node identities');
+  fs.rmSync(shadowDir, { recursive: true, force: true });
+});
+
+test('Smart shadow service discards queued rounds after the Smart mode changes', () => {
+  let mode = 'balanced';
+  const rounds = [];
+  const service = createSmartShadowService({
+    evaluator: {
+      configure: () => null,
+      recordRound: (value) => { rounds.push(value); return null; },
+      observeConnection: () => false,
+      snapshot: () => ({}),
+      restore: () => {},
+    },
+    getActiveContextKey: () => 'same-profile',
+    getModelConfig: () => ({ mode, baseOptions: {}, legacyOptions: {} }),
+    getScopeKey: () => mode,
+    options: { batchDelayMs: 60_000 },
+  });
+  service.recordRound({ names: ['node-a'], measurements: [] });
+  mode = 'stable';
+  assert.strictEqual(service.flush({ drain: true }), 1);
+  assert.strictEqual(rounds.length, 0);
+  service.close();
+});
+
+test('Smart feedback sampler never overlaps a stopped and restarted harvest', async () => {
+  const timers = [];
+  let harvestCalls = 0;
+  let resolveFirst;
+  const setTimer = (callback, delay) => {
+    const timer = {
+      callback,
+      delay,
+      cleared: false,
+      unrefCalled: false,
+      unref() { this.unrefCalled = true; },
+    };
+    timers.push(timer);
+    return timer;
+  };
+  const sampler = new SmartFeedbackSampler({
+    harvest: () => {
+      harvestCalls++;
+      if (harvestCalls === 1) {
+        return new Promise((resolve) => { resolveFirst = resolve; });
+      }
+      return 1;
+    },
+    getActivity: () => ({ active: false, idleForMs: 120_000 }),
+    shouldRun: () => true,
+    setTimer,
+    clearTimer: (timer) => { timer.cleared = true; },
+  });
+
+  assert.strictEqual(sampler.start(), true);
+  assert.strictEqual(sampler.start(), false);
+  assert.strictEqual(timers.length, 1);
+  assert.strictEqual(timers[0].delay, 0);
+  assert.strictEqual(timers[0].unrefCalled, true);
+  const firstTick = timers[0].callback();
+  await Promise.resolve();
+  assert.strictEqual(harvestCalls, 1);
+  assert.strictEqual(sampler.wake(), false);
+
+  sampler.stop();
+  assert.strictEqual(sampler.start(), true);
+  assert.strictEqual(timers.length, 1, 'restart overlapped an in-flight harvest');
+  resolveFirst(0);
+  await firstTick;
+  assert.strictEqual(timers.length, 2);
+  assert.strictEqual(timers[1].delay, 0, 'restart did not resume immediately');
+
+  await timers[1].callback();
+  assert.strictEqual(harvestCalls, 2);
+  assert.strictEqual(timers[2].delay, 3_000, 'fresh evidence did not select active pacing');
+  sampler.stop();
+  assert.strictEqual(timers[2].cleared, true);
+});
+
+test('Smart feedback sampler deactivates when runtime eligibility changes mid-flight', async () => {
+  const timers = [];
+  let eligible = true;
+  let release;
+  const sampler = new SmartFeedbackSampler({
+    harvest: () => new Promise((resolve) => { release = resolve; }),
+    getActivity: () => ({ active: false, idleForMs: 0 }),
+    shouldRun: () => eligible,
+    setTimer: (callback, delay) => {
+      const timer = { callback, delay, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: () => {},
+  });
+  sampler.start();
+  const tick = timers[0].callback();
+  await Promise.resolve();
+  eligible = false;
+  release(0);
+  await tick;
+  assert.strictEqual(timers.length, 1, 'ineligible sampler scheduled another tick');
+  eligible = true;
+  assert.strictEqual(sampler.start(), true, 'sampler could not restart after eligibility returned');
+  assert.strictEqual(timers[1].delay, 0);
+  sampler.close();
 });
 
 console.log('\nRenderer modules:');
@@ -2129,12 +2351,25 @@ const SHARED_STYLE_SRCS = [
   'styles/tools.css',
   'styles/motion.css',
 ];
+const MAIN_STYLE_SRCS = [
+  'style.css',
+  'styles/surfaces.css',
+  'styles/dashboard.css',
+  'styles/controls.css',
+  'styles/lists.css',
+  'styles/workspaces.css',
+  'styles/logs.css',
+  'styles/configs.css',
+  'styles/tools.css',
+  'styles/motion.css',
+  'styles/polish.css',
+];
 function stylesheetRefs(html) {
   return [...html.matchAll(/<link rel="stylesheet" href="([^"]+)"/g)]
     .map((match) => match[1].split('?')[0]);
 }
 function readRendererCss() {
-  return SHARED_STYLE_SRCS
+  return MAIN_STYLE_SRCS
     .map((src) => fs.readFileSync(path.join(rendererDir, src), 'utf-8'))
     .join('\n');
 }
@@ -2156,17 +2391,17 @@ test('every main and dialog script points to an existing file', () => {
 test('shared stylesheets exist and preserve their cascade order', () => {
   const mainStyles = stylesheetRefs(indexHtml);
   const dialogStyles = stylesheetRefs(dialogHtml);
-  assert.deepStrictEqual(mainStyles, SHARED_STYLE_SRCS);
+  assert.deepStrictEqual(mainStyles, MAIN_STYLE_SRCS);
   assert.deepStrictEqual(dialogStyles.slice(0, SHARED_STYLE_SRCS.length), SHARED_STYLE_SRCS);
   assert.strictEqual(dialogStyles[dialogStyles.length - 1], 'dialog/dialog.css');
-  for (const src of [...SHARED_STYLE_SRCS, 'dialog/dialog.css']) {
+  for (const src of [...new Set([...MAIN_STYLE_SRCS, ...SHARED_STYLE_SRCS]), 'dialog/dialog.css']) {
     assert.ok(fs.existsSync(path.join(rendererDir, src)), `missing stylesheet: ${src}`);
   }
   assert.ok(!readRendererCss().includes('@import'), 'shared CSS should load in parallel without @import');
 });
 
 test('shared CSS stays split into reviewable modules', () => {
-  const lineCounts = Object.fromEntries(SHARED_STYLE_SRCS.map((src) => {
+  const lineCounts = Object.fromEntries(MAIN_STYLE_SRCS.map((src) => {
     const css = fs.readFileSync(path.join(rendererDir, src), 'utf-8');
     return [src, css.split('\n').length];
   }));
@@ -2179,6 +2414,8 @@ test('shared CSS stays split into reviewable modules', () => {
 test('module load order: util.js first of the js/ modules, main.js last', () => {
   const mods = scriptSrcs.filter((s) => s.startsWith('js/'));
   assert.strictEqual(mods[0], 'js/util.js');
+  assert.ok(mods.indexOf('js/ui-state.js') > mods.indexOf('js/util.js'));
+  assert.ok(mods.indexOf('js/ui-state.js') < mods.indexOf('js/main.js'));
   assert.strictEqual(mods[mods.length - 1], 'js/main.js');
 });
 
@@ -2296,7 +2533,7 @@ test('all secondary workflows are registered in the native dialog host', () => {
     .map((file) => fs.readFileSync(path.join(rendererDir, 'dialog', file), 'utf-8'))
     .join('\n');
   const types = [
-    'local-rule', 'remote-rule', 'raw-profile', 'convert', 'core', 'geodata', 'uwp',
+    'local-rule', 'remote-rule', 'raw-profile', 'core', 'geodata', 'uwp',
     'route', 'diagnostics', 'config-check', 'ports', 'backup', 'dns',
   ];
   for (const type of types) {
@@ -2314,7 +2551,7 @@ test('all six diagnostic tools launch through the native dialog host', () => {
   const tools = [
     ['route', 'route', 'inspectRoute'],
     ['diag', 'diagnostics', 'runNetworkDiagnostics'],
-    ['configCheck', 'config-check', 'checkAllConfigs'],
+    ['configCheck', 'config-check', 'checkMihomoConfig'],
     ['port', 'ports', 'inspectPorts'],
     ['backup', 'backup', 'exportBackup'],
     ['dns', 'dns', 'compareDns'],
@@ -2328,23 +2565,18 @@ test('all six diagnostic tools launch through the native dialog host', () => {
   assert.strictEqual((dialogTools.match(/dialog-commandbar/g) || []).length, tools.length);
 });
 
-test('conversion UI exposes both output directions without decorative emoji', () => {
-  const { zh, en } = loadDict();
-  const editorDialogs = fs.readFileSync(path.join(rendererDir, 'dialog', 'editors.js'), 'utf-8');
-  for (const target of ['auto', 'sing-box', 'clash']) {
-    assert.ok(editorDialogs.includes(`data-convert-target="${target}"`), `missing conversion target: ${target}`);
-  }
-  assert.ok(!/[🚀♻️🔄]/u.test(zh['convert.title']));
-  assert.ok(!/[🚀♻️🔄]/u.test(en['convert.title']));
-  assert.strictEqual(zh['convert.targetSingbox'], 'Sing-Box');
-  assert.strictEqual(en['convert.targetSingbox'], 'Sing-Box');
-  assert.ok(editorDialogs.includes('content: output'), 'save must import the converted output');
-  const css = readRendererCss();
-  const dialogCss = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
-  assert.ok(css.includes('grid-template-columns: repeat(3, minmax(72px, auto))'));
-  assert.ok(css.includes('width: auto'));
-  assert.ok(dialogCss.includes('.dialog-convert-input'));
-  assert.ok(dialogCss.includes('.dialog-convert-output'));
+test('standalone config conversion is removed and config checking is Mihomo-only', () => {
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'src', 'preload', 'index.js'), 'utf-8');
+  const ipc = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc.js'), 'utf-8');
+  const toolbox = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'toolbox.js'), 'utf-8');
+  const dialogs = fs.readFileSync(path.join(rendererDir, 'dialog', 'editors.js'), 'utf-8');
+  assert.ok(!indexHtml.includes('id="convertOpen"'));
+  assert.ok(!dialogs.includes("Dialog.register('convert'"));
+  assert.ok(!preload.includes('convertPreview:'));
+  assert.ok(!preload.includes('exportConfig:'));
+  assert.ok(!ipc.includes("ipcMain.handle('convert:"));
+  assert.ok(toolbox.includes('async function checkMihomoConfig'));
+  assert.ok(!toolbox.includes('listCoreAdapters'));
 });
 
 test('UWP list scrolls independently while its actions stay fixed', () => {
@@ -2355,6 +2587,19 @@ test('UWP list scrolls independently while its actions stay fixed', () => {
   assert.ok(list.includes('overflow: auto'));
   assert.ok(list.includes('flex: 1'));
   assert.ok(css.includes('.dialog-footer'));
+});
+
+test('core manager dialog keeps one section divider and compact actions', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
+  const systemDialogs = fs.readFileSync(path.join(rendererDir, 'dialog', 'system.js'), 'utf-8');
+  const dialogWindow = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
+  assert.ok(systemDialogs.includes('dialog-core-path-row'));
+  assert.ok(systemDialogs.includes('btn dialog-core-folder'));
+  assert.ok(systemDialogs.includes('id="dialogCoreUpdate" class="btn primary"'));
+  assert.match(css, /\.dialog-core-path-row\s*\{[^}]*border-bottom:\s*1px solid var\(--border\)/s);
+  assert.match(css, /\.dialog-core-body \.dialog-feature-status\s*\{[^}]*border-top:\s*0/s);
+  assert.match(css, /\.dialog-core-folder\s*\{[^}]*width:\s*auto/s);
+  assert.ok(dialogWindow.includes("core: { width: 560, height: 420 }"));
 });
 
 test('tray uses app-derived stopped and running icon assets', () => {
@@ -2392,6 +2637,163 @@ test('escapeHtml neutralizes every HTML metacharacter', () => {
   assert.ok(!/[<>"']/.test(App.escapeHtml('<script>"\'</script>')));
 });
 
+test('renderer store, events and router preserve the legacy App boundary while exposing explicit services', () => {
+  const App = loadRendererUtil();
+  let stateChanges = 0;
+  const unsubscribe = App.store.subscribe(() => { stateChanges++; });
+  App.store.patch('settings', { language: 'zh' });
+  assert.strictEqual(App.state.settings.language, 'zh');
+  App.state = { subscriptions: [], settings: { theme: 'dark' }, status: {} };
+  assert.strictEqual(App.store.getSnapshot().settings.theme, 'dark');
+  unsubscribe();
+  App.store.patch('settings', { language: 'en' });
+  assert.strictEqual(stateChanges, 2);
+
+  let eventPayload = null;
+  const off = App.events.on('fixture', (value) => { eventPayload = value; });
+  App.events.emit('fixture', 42);
+  off();
+  assert.strictEqual(eventPayload, 42);
+
+  let routedTo = null;
+  App.showTab = (tab) => { routedTo = tab; };
+  App.router.go('nodes');
+  assert.strictEqual(routedTo, 'nodes');
+  assert.ok(Object.prototype.hasOwnProperty.call(App.services, 'api'));
+});
+
+test('shared UI primitives own actionable empty states', () => {
+  const ui = fs.readFileSync(path.join(rendererDir, 'js', 'ui.js'), 'utf-8');
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  assert.ok(ui.includes('function renderEmptyState('));
+  assert.ok(ui.includes('replaceChildren(emptyState(options))'));
+  assert.ok(nodes.includes('App.ui.renderEmptyState'));
+  assert.ok(conns.includes('ui.renderEmptyState'));
+  assert.ok(nodes.includes('App.router.go'));
+  assert.ok(conns.includes("router.go('dashboard')"));
+});
+
+test('connections controller keeps global App access in its compatibility adapter only', () => {
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const controllerStart = conns.indexOf('function createConnectionsController(');
+  const adapterStart = conns.indexOf('  const App = window.App;');
+  assert.ok(controllerStart >= 0 && adapterStart > controllerStart);
+  assert.ok(!/\bApp\./.test(conns.slice(controllerStart, adapterStart)));
+  assert.ok(conns.includes('api: App.services.api'));
+  assert.ok(conns.includes('App.factories.createConnectionsController'));
+  assert.ok(conns.includes('Object.freeze({ activate, deactivate, load, clear, render })'));
+  assert.ok(conns.includes('App.activateConnections = controller.activate'));
+  assert.ok(conns.includes('App.deactivateConnections = controller.deactivate'));
+});
+
+test('connections controller renews a rejected or revoked visibility lease', async () => {
+  const source = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const element = () => ({
+    addEventListener() {},
+    classList: { add() {}, remove() {} },
+    setAttribute() {},
+    removeAttribute() {},
+    appendChild() {},
+    clientHeight: 480,
+    scrollTop: 0,
+    textContent: '',
+    innerHTML: '',
+  });
+  const adapterElements = {
+    connList: element(),
+    connStats: element(),
+    connClose: element(),
+  };
+  const App = {
+    currentTab: 'conns',
+    services: { api: {} },
+    factories: {},
+    ui: { renderEmptyState() {} },
+    uiState: { restoreScroll() {} },
+    router: { go() {} },
+    $: (selector) => adapterElements[String(selector).replace(/^#/, '')],
+    fmtBytes: String,
+    escapeHtml: String,
+    call: (fn, ...args) => fn(...args),
+    toast() {},
+  };
+  const timers = [];
+  vm.runInNewContext(source, {
+    window: { App, i18n: { t: (key) => key }, addEventListener() {} },
+    document: { hidden: false },
+    setTimeout: (callback, delay) => {
+      const timer = { callback, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => { if (timer) timer.cleared = true; },
+  });
+
+  let leaseCalls = 0;
+  const controller = App.factories.createConnectionsController({
+    api: {
+      setConnectionsVisible: async () => ++leaseCalls > 1,
+      getConnections: async () => ({
+        running: true,
+        paused: true,
+        connections: [],
+        totalConnections: 0,
+      }),
+    },
+    elements: { list: element(), stats: element(), closeAll: element() },
+    ui: { renderEmptyState() {} },
+    router: { go() {} },
+    translate: (key) => key,
+    formatBytes: String,
+    escape: String,
+    invoke: (fn, ...args) => fn(...args),
+    notify() {},
+    isActive: () => true,
+    isHidden: () => false,
+    nextFrame: async () => {},
+  });
+
+  await controller.activate();
+  assert.strictEqual(leaseCalls, 1);
+  await controller.activate();
+  assert.strictEqual(leaseCalls, 2, 'normal false response left the local lease stuck true');
+  await controller.activate();
+  assert.strictEqual(leaseCalls, 3, 'paused snapshot did not force lease renewal');
+  controller.deactivate();
+});
+
+test('design tokens and visual regression fixtures are versioned contracts', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  const design = fs.readFileSync(path.join(__dirname, '..', 'docs', 'DESIGN.md'), 'utf-8');
+  const visual = fs.readFileSync(path.join(__dirname, 'visual-regression.js'), 'utf-8');
+  const fixtures = fs.readFileSync(path.join(rendererDir, 'js', 'visual-fixtures.js'), 'utf-8');
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8'));
+  for (const token of [
+    '--space-1', '--space-6', '--radius-control', '--radius-panel',
+    '--field-width', '--font-page-title',
+  ]) {
+    assert.ok(css.includes(token), `missing design token ${token}`);
+  }
+  assert.ok(design.includes('npm run test:visual'));
+  assert.ok(pkg.scripts['test:visual']);
+  assert.ok(pkg.scripts['test:visual:update']);
+  assert.ok(visual.includes('MAX_CHANGED_PIXEL_RATIO'));
+  assert.ok(visual.includes('dashboard vertical overflow'));
+  assert.ok(fixtures.includes("params.get('visual-test') !== '1'"));
+  const baselines = fs.readdirSync(path.join(__dirname, 'visual-baselines'))
+    .filter((name) => name.endsWith('.png'))
+    .sort();
+  const expectedBaselines = [...visual.matchAll(/\{ name: '([^']+)'/g)]
+    .map((match) => `${match[1]}.png`)
+    .sort();
+  assert.deepStrictEqual(baselines, expectedBaselines);
+  for (const name of baselines) {
+    const png = fs.readFileSync(path.join(__dirname, 'visual-baselines', name));
+    assert.strictEqual(png.slice(1, 4).toString('ascii'), 'PNG');
+  }
+});
+
 test('subscription renderer signature tracks metadata-only changes', () => {
   const App = loadRendererUtil();
   const subscriptions = [{
@@ -2401,14 +2803,12 @@ test('subscription renderer signature tracks metadata-only changes', () => {
     nodeCount: 2,
     autoUpdateMinutes: 0,
     updateViaProxy: false,
-    userAgentMode: 'auto',
     userInfo: { upload: 1, download: 2, total: 10, expire: 20 },
   }];
   const before = App.subscriptionStateSignature(subscriptions, 'airport-a');
   for (const patch of [
     { autoUpdateMinutes: 60 },
     { updateViaProxy: true },
-    { userAgentMode: 'clash' },
     { userInfo: { upload: 1, download: 3, total: 10, expire: 20 } },
   ]) {
     const changed = [{ ...subscriptions[0], ...patch }];
@@ -2431,7 +2831,7 @@ test('external-input fields stay HTML-escaped in the renderer templates', () => 
     ['js/dashboard.js', 'escapeHtml(s.name)'],
     ['js/nodes.js', 'escapeHtml(name)'],
     ['js/conns.js', 'escapeHtml(target)'],
-    ['js/conns.js', 'escapeHtml(connectionLabel(c.rule))'],
+    ['js/conns.js', 'escapeHtml(connectionLabel(connection.rule))'],
     ['js/conns.js', 'escapeHtml(chains)'],
     ['js/rules.js', 'escapeHtml(it.payload)'],
     ['js/rules.js', 'escapeHtml(it.id)'],
@@ -2470,6 +2870,7 @@ test('renderer modules parse and every App.* member used is defined somewhere', 
 test('large live lists use bounded virtual windows', () => {
   const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
   const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const ui = fs.readFileSync(path.join(rendererDir, 'js', 'ui.js'), 'utf-8');
   const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
   const css = readRendererCss();
   assert.ok(nodes.includes('VIRTUAL_NODE_ROW_HEIGHT'));
@@ -2477,8 +2878,9 @@ test('large live lists use bounded virtual windows', () => {
   assert.ok(nodes.includes('node-grid-window'));
   assert.ok(conns.includes('VIRTUAL_CONNECTION_ROW_HEIGHT'));
   assert.ok(conns.includes("window.addEventListener('resize'"), 'connection virtualization must follow window resizing');
-  assert.ok(conns.includes("list.classList.add('is-empty')"));
-  assert.ok(conns.includes("list.classList.remove('is-empty')"));
+  assert.ok(conns.includes('ui.renderEmptyState'));
+  assert.ok(ui.includes("container.classList.add('is-empty')"));
+  assert.ok(conns.includes("elements.list.classList.remove('is-empty')"));
   assert.ok(rules.includes('VIRTUAL_RULE_ROW_HEIGHT'));
   for (const code of [nodes, conns, rules]) assert.ok(code.includes('virtual-spacer'));
   assert.ok(css.includes('.virtual-spacer'));
@@ -2496,14 +2898,26 @@ test('large live lists use bounded virtual windows', () => {
 
 test('background renderer work is bounded to visible and useful content', () => {
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const uiState = fs.readFileSync(path.join(rendererDir, 'js', 'ui-state.js'), 'utf-8');
   const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
   const editors = fs.readFileSync(path.join(rendererDir, 'dialog', 'editors.js'), 'utf-8');
   const logs = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
   const settings = fs.readFileSync(path.join(rendererDir, 'js', 'settings.js'), 'utf-8');
   const ipcValidation = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'ipc-validation.js'), 'utf-8');
   assert.ok(ipcValidation.includes('MAX_IPC_CONNECTIONS = 300'));
-  assert.ok(main.includes('function connectionPollDelay(data)'));
-  assert.ok(main.includes('data.totalConnections > shown ? 5000 : 3000'));
+  assert.ok(conns.includes('function pollDelay(data)'));
+  assert.ok(conns.includes('data.totalConnections > shown ? 5000 : 3000'));
+  assert.ok(conns.includes('if (!await setViewVisible(true))'));
+  assert.ok(conns.includes('void setViewVisible(false)'));
+  assert.ok(conns.includes('function activate()'));
+  assert.ok(conns.includes('function deactivate()'));
+  assert.ok(uiState.includes("UI_STATE_KEY = 'dart-light-ui-state-v1'"));
+  assert.ok(uiState.includes('function capture()'));
+  assert.ok(uiState.includes('function restoreControls()'));
+  assert.ok(uiState.includes("details[id][open]"));
+  assert.ok(uiState.includes('if (saveTimer) clearTimeout(saveTimer)'));
+  assert.ok(uiState.includes('if (getCurrentTab() !== tab) return'));
   assert.ok(charts.includes('function isCanvasVisible()'));
   assert.ok(charts.includes('canvas.getClientRects().length > 0'));
   assert.ok(editors.includes('RAW_FORMAT_LIMIT = 4 * 1024 * 1024'));
@@ -2511,12 +2925,226 @@ test('background renderer work is bounded to visible and useful content', () => 
   assert.ok(!main.includes("if ($('#logAutoScroll').checked) box.scrollTop = box.scrollHeight"));
   assert.ok(logs.includes("if (drained && $('#logAutoScroll').checked)"));
   assert.ok(logs.includes('for (const entry of pendingLiveLogs) enqueueLog(entry)'));
+  assert.ok(logs.includes('App.waitForLogDrain = waitForLogDrain'));
+  assert.ok(main.includes('App.waitForLogDrain ? App.waitForLogDrain()'));
   assert.ok(main.includes("previousTab === 'logs' && tab !== 'logs'"));
   assert.ok(main.includes("window.addEventListener('pagehide'"));
   assert.ok(main.includes('App.setLogStreaming(false)'));
   assert.ok(main.includes('App.setLogStreaming(true)'));
   assert.ok(settings.includes('function changedSettingsPatch(candidate)'));
   assert.ok(settings.includes("if (!Object.keys(patch).length)"));
+  assert.ok(indexHtml.includes('id="mainContent"'));
+});
+
+test('main-process background work is paced and bounded', () => {
+  const mainDir = path.join(__dirname, '..', 'src', 'main');
+  const core = fs.readFileSync(path.join(mainDir, 'core-control.js'), 'utf-8');
+  const sampler = fs.readFileSync(path.join(mainDir, 'smart-feedback-sampler.js'), 'utf-8');
+  const shadow = fs.readFileSync(path.join(mainDir, 'smart-shadow-service.js'), 'utf-8');
+  const traffic = fs.readFileSync(path.join(mainDir, 'traffic.js'), 'utf-8');
+  assert.ok(sampler.includes('activeMs: 3_000'));
+  assert.ok(sampler.includes('idleMs: 12_000'));
+  assert.ok(sampler.includes('deepIdleMs: 30_000'));
+  assert.ok(sampler.includes('selectSmartFeedbackInterval(activity, eventCount'));
+  assert.ok(core.includes('new SmartFeedbackSampler({'));
+  assert.ok(core.includes('smartFeedbackSampler.start()'));
+  assert.ok(core.includes('smartFeedbackSampler.wake()'));
+  assert.ok(core.includes('smartFeedbackSampler.stop()'));
+  assert.ok(core.includes('managedSmartSelection.setActive(false)'));
+  assert.ok(shadow.includes('batchSize: 24'));
+  assert.ok(shadow.includes('maxPending: 256'));
+  assert.ok(shadow.includes('setImmediate(() =>'));
+  assert.ok(core.includes('smartShadowService.close()'));
+  assert.ok(traffic.includes('TRAY_TOOLTIP_MIN_INTERVAL_MS = 2_500'));
+  assert.ok(traffic.includes('TRAY_TOOLTIP_MAX_STALE_MS = 10_000'));
+  assert.ok(traffic.includes('rateChangedMeaningfully(lastTrayRates.up, up)'));
+  assert.ok(traffic.includes('setTrafficActivityListener'));
+});
+
+test('connection IPC invalidates native and renderer visibility leases', async () => {
+  const handlers = {};
+  const contents = { isDestroyed: () => false };
+  class WindowStub extends EventEmitter {
+    constructor() {
+      super();
+      this.visible = true;
+      this.minimized = false;
+    }
+    isDestroyed() { return false; }
+    isVisible() { return this.visible; }
+    isMinimized() { return this.minimized; }
+  }
+  const win = new WindowStub();
+  const event = { sender: contents };
+  const state = { coreManager: { isRunning: () => true } };
+  const core = { clashApi: async () => ({ connections: [] }) };
+  registerConnectionsIpc({
+    ipcMain: { handle: (name, handler) => { handlers[name] = handler; } },
+    state,
+    core,
+    requireMainWindow: (candidate) => {
+      if (!candidate || candidate.sender !== contents) throw new Error('invalid window');
+      return win;
+    },
+  });
+
+  assert.strictEqual((await handlers['connections:get'](event)).paused, true);
+  assert.strictEqual(await handlers['connections:setVisible'](event, { visible: true }), true);
+  core.clashApi = async () => { throw new Error('summary unavailable'); };
+  const failedSummary = await handlers['connections:summary'](event);
+  assert.match(failedSummary.error, /summary unavailable/);
+  const failedRows = await handlers['connections:get'](event);
+  assert.match(failedRows.error, /summary unavailable/);
+
+  let releaseNative;
+  core.clashApi = () => new Promise((resolve) => { releaseNative = resolve; });
+  const nativePending = handlers['connections:get'](event);
+  win.visible = false;
+  win.emit('hide');
+  win.visible = true;
+  releaseNative({ connections: [{ id: 'stale-native' }] });
+  assert.strictEqual((await nativePending).paused, true);
+
+  await handlers['connections:setVisible'](event, { visible: true });
+  let releaseRenderer;
+  core.clashApi = () => new Promise((resolve) => { releaseRenderer = resolve; });
+  const rendererPending = handlers['connections:get'](event);
+  await handlers['connections:setVisible'](event, { visible: false });
+  await handlers['connections:setVisible'](event, { visible: true });
+  releaseRenderer({ connections: [{ id: 'stale-renderer' }] });
+  assert.strictEqual((await rendererPending).paused, true);
+
+  win.visible = false;
+  assert.strictEqual(await handlers['connections:setVisible'](event, { visible: true }), false);
+  win.visible = true;
+  await assert.rejects(
+    handlers['connections:close']({ sender: {} }, { id: 'x' }),
+    /invalid window/
+  );
+});
+
+test('connection IPC rows keep bounded primitive fields', () => {
+  const rows = connectionRows({
+    connections: [
+      null,
+      {
+        id: 'x'.repeat(2_000),
+        start: 's'.repeat(500),
+        upload: -1,
+        download: '25',
+        chains: Array(30).fill('c'.repeat(300)),
+        rule: 'r'.repeat(500),
+        metadata: { host: 'h'.repeat(2_000), destinationPort: 443, network: 'tcp' },
+      },
+    ],
+    uploadTotal: Infinity,
+    downloadTotal: '50',
+  });
+  assert.strictEqual(rows.totalConnections, 2);
+  const bounded = rows.connections.find((row) => row.metadata.host);
+  assert.strictEqual(bounded.id, '');
+  assert.strictEqual(bounded.start.length, 128);
+  assert.strictEqual(bounded.upload, 0);
+  assert.strictEqual(bounded.download, 25);
+  assert.strictEqual(bounded.chains.length, 16);
+  assert.strictEqual(bounded.chains[0].length, 256);
+  assert.strictEqual(bounded.rule.length, 256);
+  assert.strictEqual(bounded.metadata.host.length, 1024);
+  assert.strictEqual(rows.up, 0);
+  assert.strictEqual(rows.down, 50);
+});
+
+test('light renderer snapshots keep only bounded navigation state', () => {
+  const uiState = fs.readFileSync(path.join(rendererDir, 'js', 'ui-state.js'), 'utf-8');
+  const start = uiState.indexOf('  function cleanUiState(value) {');
+  const end = uiState.indexOf('\n\n  function createLightUiState', start);
+  assert.ok(start >= 0 && end > start);
+  const sandbox = {
+    RESTORABLE_TABS: new Set([
+      'dashboard', 'subs', 'nodes', 'rules', 'conns', 'tools', 'logs', 'settings',
+    ]),
+    TAB_SCROLL_TARGETS: { nodes: ['nodeList'], rules: ['ruleList'], conns: ['connList'], logs: ['logBox'] },
+    FILTER_IDS: ['nodeFilter', 'ruleFilter'],
+  };
+  const context = {
+    ...sandbox,
+    input: {
+      tab: 'invalid',
+      scroll: { nodes: { mainContent: 20, nodeList: 99_999_999, unknown: 4 } },
+      filters: { nodeFilter: 'x'.repeat(400), secret: 'discard' },
+      expanded: ['safe-panel', '../unsafe', 'a'.repeat(80)],
+      connections: [{ id: 'must-not-survive' }],
+      nodes: [{ name: 'must-not-survive' }],
+    },
+    result: null,
+  };
+  vm.runInNewContext(`${uiState.slice(start, end)}\nresult = cleanUiState(input);`, context);
+  const result = JSON.parse(JSON.stringify(context.result));
+  assert.strictEqual(result.tab, 'dashboard');
+  assert.deepStrictEqual(result.scroll, {
+    nodes: { mainContent: 20, nodeList: 10_000_000 },
+  });
+  assert.strictEqual(result.filters.nodeFilter.length, 256);
+  assert.deepStrictEqual(result.expanded, ['safe-panel']);
+  assert.ok(!('connections' in result));
+  assert.ok(!('nodes' in result));
+});
+
+test('light UI state preserves lazy-list offsets until a usable render', () => {
+  const source = fs.readFileSync(path.join(rendererDir, 'js', 'ui-state.js'), 'utf-8');
+  const timers = [];
+  let stored = JSON.stringify({
+    version: 1,
+    tab: 'conns',
+    scroll: { conns: { mainContent: 0, connList: 500 } },
+    filters: {},
+    expanded: [],
+  });
+  const elements = {
+    mainContent: { scrollTop: 0, scrollHeight: 600, clientHeight: 600 },
+    connList: { scrollTop: 0, scrollHeight: 100, clientHeight: 100 },
+  };
+  const App = { currentTab: 'conns', factories: {}, visualTest: false };
+  vm.runInNewContext(source, {
+    window: { App },
+    document: {
+      getElementById: (id) => elements[id] || null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+    },
+    localStorage: {
+      getItem: () => stored,
+      setItem: (_key, value) => { stored = value; },
+    },
+    setTimeout: (callback, delay) => {
+      const timer = { callback, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => { if (timer) timer.cleared = true; },
+  });
+
+  App.uiState.scheduleSave();
+  timers[0].callback();
+  assert.strictEqual(JSON.parse(stored).scroll.conns.connList, 500);
+
+  elements.connList.scrollHeight = 1_000;
+  App.uiState.restoreScroll('conns');
+  assert.strictEqual(elements.connList.scrollTop, 500);
+  elements.connList.scrollTop = 240;
+  App.uiState.capture();
+  assert.strictEqual(JSON.parse(stored).scroll.conns.connList, 240);
+
+  // Leaving and releasing the list in the same renderer must re-arm pending
+  // restoration instead of overwriting the new offset with zero.
+  elements.connList.scrollTop = 0;
+  elements.connList.scrollHeight = 100;
+  App.uiState.restoreScroll('conns', { force: true });
+  App.uiState.capture();
+  assert.strictEqual(JSON.parse(stored).scroll.conns.connList, 240);
+  elements.connList.scrollHeight = 1_000;
+  App.uiState.restoreScroll('conns');
+  assert.strictEqual(elements.connList.scrollTop, 240);
 });
 
 test('idle traffic samples do not repaint unchanged charts or re-query labels', () => {
@@ -2550,6 +3178,14 @@ test('idle traffic samples do not repaint unchanged charts or re-query labels', 
   };
   const traffic = makeCanvas();
   const mini = makeCanvas();
+  const makeToggle = () => ({
+    attributes: {},
+    listeners: {},
+    addEventListener(type, handler) { this.listeners[type] = handler; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  });
+  const upToggle = makeToggle();
+  const downToggle = makeToggle();
   const elements = new Map([
     ['#trafficChart', traffic],
     ['#miniTraffic', mini],
@@ -2557,6 +3193,8 @@ test('idle traffic samples do not repaint unchanged charts or re-query labels', 
     ['#trafficDown', { textContent: '' }],
     ['#trafficUpTotal', { textContent: '' }],
     ['#trafficDownTotal', { textContent: '' }],
+    ['#trafficUpToggle', upToggle],
+    ['#trafficDownToggle', downToggle],
     ['#miniUp', { textContent: '' }],
     ['#miniDown', { textContent: '' }],
   ]);
@@ -2594,6 +3232,13 @@ test('idle traffic samples do not repaint unchanged charts or re-query labels', 
   assert.strictEqual(mini.counts.clears, 1);
   assert.strictEqual(queries, initialQueries);
 
+  const beforeToggle = traffic.counts.clears;
+  upToggle.listeners.click();
+  assert.strictEqual(upToggle.attributes['aria-pressed'], 'false');
+  assert.strictEqual(traffic.counts.clears, beforeToggle + 1);
+  upToggle.listeners.click();
+  assert.strictEqual(upToggle.attributes['aria-pressed'], 'true');
+
   // A real sample still paints, and zero samples continue painting only until
   // that point has aged out of the 60-second history.
   chartApp.trafficChart.push(1024, 0);
@@ -2610,6 +3255,7 @@ test('log streaming resumes from history without gaps or duplicate live lines', 
   const timers = [];
   const logBox = {
     children: [],
+    dataset: {},
     appendChild(child) { this.children.push(child); },
     removeChild(child) { this.children.splice(this.children.indexOf(child), 1); },
     get firstChild() { return this.children[0] || null; },
@@ -2702,6 +3348,10 @@ test('log streaming resumes from history without gaps or duplicate live lines', 
   assert.strictEqual((output.match(/history-one/g) || []).length, 1);
   assert.strictEqual((output.match(/history-two/g) || []).length, 1);
   assert.strictEqual((output.match(/live-three/g) || []).length, 1);
+  assert.ok(output.includes('data-level="info"'));
+  assert.strictEqual(logApp.setLogLevelFilter('warning'), 'warning');
+  assert.strictEqual(logBox.dataset.levelFilter, 'warning');
+  assert.strictEqual(logApp.setLogLevelFilter('unknown'), 'all');
 
   await logApp.setLogStreaming(false);
   liveLog({ sequence: 4, line: 'missed-four' });
@@ -2712,11 +3362,11 @@ test('log streaming resumes from history without gaps or duplicate live lines', 
   assert.deepStrictEqual(streamCalls, [true, false, true]);
 });
 
-test('node, connection and log workspaces use a direct full-height canvas', () => {
+test('node, connection and log workspaces use a unified full-height surface', () => {
   const css = readRendererCss();
   const workspace = css.slice(css.indexOf('.live-workspace.active {'), css.indexOf('h1 {'));
   assert.ok(workspace.includes('height: 100%'));
-  assert.ok(workspace.includes('.live-workspace > .workspace-commandbar'));
+  assert.ok(css.includes('.live-data-surface > .workspace-commandbar'));
   const connList = css.slice(css.indexOf('#tab-conns .conn-list'), css.indexOf('.conn-list.is-empty'));
   assert.ok(connList.includes('flex: 1'));
   assert.ok(connList.includes('border: 0'));
@@ -2727,12 +3377,18 @@ test('node, connection and log workspaces use a direct full-height canvas', () =
     const start = indexHtml.indexOf(`<section class="tab live-workspace" id="${id}"`);
     assert.ok(start >= 0, `${id} must use the live workspace layout`);
     const section = indexHtml.slice(start, indexHtml.indexOf('</section>', start));
-    assert.ok(section.includes('workspace-commandbar'), `${id} must expose a direct command bar`);
+    assert.ok(section.includes('workspace-commandbar'), `${id} must expose a command bar`);
+    assert.ok(section.includes('live-data-surface'), `${id} must use the unified data surface`);
     assert.ok(!section.includes('class="panel'), `${id} must not have an outer panel`);
   }
+  const logSection = indexHtml.slice(
+    indexHtml.indexOf('<section class="tab live-workspace" id="tab-logs"'),
+    indexHtml.indexOf('</section>', indexHtml.indexOf('<section class="tab live-workspace" id="tab-logs"'))
+  );
+  assert.ok(logSection.includes('class="log-workspace-surface live-data-surface"'));
 });
 
-test('config, rule and tool pages use unframed canvas sections', () => {
+test('config, rule and tool pages use grouped canvas sections without outer panels', () => {
   const css = readRendererCss();
   for (const id of ['tab-subs', 'tab-rules', 'tab-tools']) {
     const start = indexHtml.indexOf(`<section class="tab canvas-page" id="${id}"`);
@@ -2740,15 +3396,33 @@ test('config, rule and tool pages use unframed canvas sections', () => {
     const section = indexHtml.slice(start, indexHtml.indexOf('</section>', start));
     assert.ok(!section.includes('class="panel'), `${id} must not have an outer panel`);
   }
-  assert.ok(indexHtml.includes('class="workspace-section"'));
+  assert.ok(/class="[^"]*\bworkspace-section\b/.test(indexHtml));
   assert.ok(indexHtml.includes('class="tool-list"'));
   const sectionStyle = css.slice(css.indexOf('.canvas-page > .workspace-section'), css.indexOf('.cards {'));
-  assert.ok(sectionStyle.includes('border-bottom: 1px solid var(--border)'));
-  assert.ok(!sectionStyle.includes('background:'));
-  assert.ok(!sectionStyle.includes('box-shadow:'));
+  assert.ok(sectionStyle.includes('border: 1px solid var(--border)'));
+  assert.ok(sectionStyle.includes('background: color-mix(in srgb, var(--surface) 68%, transparent)'));
+  assert.ok(sectionStyle.includes('border-radius: 12px'));
+  assert.ok(sectionStyle.includes('box-shadow: var(--panel-shadow)'));
   const toolStyle = css.slice(css.indexOf('.tool-list {'), css.indexOf('.setting-row {'));
-  assert.ok(toolStyle.includes('border-top: 1px solid var(--border)'));
-  assert.ok(!toolStyle.includes('box-shadow:'));
+  assert.ok(toolStyle.includes('grid-template-columns: repeat(3, minmax(0, 1fr))'));
+  assert.ok(toolStyle.includes('.tool-list .tool-card'));
+  assert.ok(toolStyle.includes('box-shadow: var(--panel-shadow)'));
+  assert.ok(toolStyle.includes('-webkit-line-clamp: 2'));
+  assert.ok(toolStyle.includes(".tool-card[data-tool='route']::before { content: \"\\E816\"; }"));
+  const rulesStart = indexHtml.indexOf('<section class="tab canvas-page" id="tab-rules"');
+  const rulesEnd = indexHtml.indexOf('</section>', rulesStart);
+  const rulesSection = indexHtml.slice(rulesStart, rulesEnd);
+  assert.ok(rulesSection.indexOf('rule-browser-section') < rulesSection.indexOf('rule-compact-section'));
+  assert.ok(css.includes('#ruleGroupList {'));
+  assert.ok(css.includes('max-height: 300px'));
+  assert.ok(css.includes('grid-template-columns: minmax(120px, 1fr) 172px'));
+  assert.ok(css.includes('.rule-group-item .rule-group-name'));
+  assert.ok(css.includes('#tab-rules #lrList > .hint:only-child::before'));
+  assert.ok(css.includes('#tab-rules #crsList > .hint:only-child::before'));
+  assert.ok(css.includes('content: "\\E8A5"'));
+  assert.ok(css.includes('content: "\\E753"'));
+  const rulesRenderer = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
+  assert.ok(rulesRenderer.includes('class="sub-name rule-group-name"'));
 });
 
 test('config activation state keeps a stable action width', () => {
@@ -2759,12 +3433,41 @@ test('config activation state keeps a stable action width', () => {
   assert.ok(activationStyle.includes('width: 72px'));
 });
 
+test('config workspace separates labeled entry fields, profile facts and action groups', () => {
+  const subs = fs.readFileSync(path.join(rendererDir, 'js', 'subs.js'), 'utf-8');
+  const css = readRendererCss();
+  assert.ok(indexHtml.includes('class="config-field config-name-field"'));
+  assert.ok(indexHtml.includes('class="config-field config-url-field"'));
+  assert.ok(!indexHtml.includes('config-ua-field'));
+  assert.ok(indexHtml.includes('id="subListSummary"'));
+  assert.ok(subs.includes('class="sub-facts"'));
+  assert.ok(subs.includes('class="sub-actions-primary"'));
+  assert.ok(subs.includes('class="sub-actions-secondary"'));
+  assert.ok(css.includes('#tab-subs .sub-item {'));
+  assert.ok(css.includes('grid-template-columns: minmax(0, 1fr) auto'));
+});
+
+test('label-control settings rows keep text inputs and selects aligned', () => {
+  const css = readRendererCss();
+  assert.ok(css.includes('#tab-settings .setting-row > .input'));
+  assert.ok(css.includes('#tab-settings .setting-row > .ui-select'));
+  assert.ok(css.includes('width: min(100%, var(--field-width))'));
+  assert.ok(css.includes('#subEditPanel .setting-row > .input'));
+  const dialogCss = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
+  assert.ok(dialogCss.includes('.dialog-body > .setting-row > .input'));
+  assert.ok(dialogCss.includes('.dialog-body > .setting-row > .ui-select'));
+  assert.ok(dialogCss.includes('width: min(100%, 260px)'));
+});
+
 test('live log surface stays translucent without a redundant blur layer', () => {
   const css = readRendererCss();
   assert.ok(css.includes('--log-surface: rgba(22, 22, 25, 0.68)'));
   assert.ok(css.includes('--log-surface: rgba(255, 255, 255, 0.58)'));
-  const logStyle = css.slice(css.indexOf('#tab-logs .log-box'), css.indexOf('.log-time'));
+  const logStyle = css.slice(css.indexOf('.log-workspace-surface {'), css.indexOf('.log-time'));
   assert.ok(logStyle.includes('background: var(--log-surface)'));
+  assert.ok(logStyle.includes('border-bottom: 1px solid var(--border)'));
+  assert.ok(logStyle.includes('box-shadow: none'));
+  assert.ok(logStyle.includes('background: transparent'));
   assert.ok(!logStyle.includes('backdrop-filter'));
 });
 
@@ -2836,6 +3539,7 @@ test('dashboard status cards expose current node latency and click actions', () 
   const css = readRendererCss();
   assert.ok(indexHtml.includes('id="dashNode"'));
   assert.ok(indexHtml.includes('id="dashDelay"'));
+  assert.ok(indexHtml.includes('id="dashConnections"'));
   assert.ok(indexHtml.includes('data-dash-action="power"'));
   assert.ok(indexHtml.includes('data-dash-action="proxy"'));
   assert.ok(indexHtml.includes('data-dash-action="nodes"'));
@@ -2844,6 +3548,9 @@ test('dashboard status cards expose current node latency and click actions', () 
   assert.ok(dash.includes("nodeEl.className = 'card-value'"));
   assert.ok(!css.includes('.card-value-sm'));
   assert.ok(dash.includes("action === 'testDelay'"));
+  assert.ok(dash.includes("action === 'connections'"));
+  assert.ok(dash.includes('App.loadDashboardConnections = loadDashboardConnections'));
+  assert.ok(main.includes('scheduleDashboardStats(delay = 5000)'));
   assert.ok(main.includes('App.showTab = showTab'));
   assert.ok(
     main.includes('else if (subsChanged && App.renderDashboard) App.renderDashboard()'),
@@ -2853,9 +3560,12 @@ test('dashboard status cards expose current node latency and click actions', () 
 
 test('dashboard traffic chart is compact and tracks session totals with switch toggles', () => {
   const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
+  const dashboard = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
   const css = readRendererCss();
   assert.ok(indexHtml.includes('id="trafficUpTotal"'));
   assert.ok(indexHtml.includes('id="trafficDownTotal"'));
+  assert.ok(indexHtml.includes('id="trafficUpToggle"'));
+  assert.ok(indexHtml.includes('id="trafficDownToggle"'));
   assert.ok(indexHtml.includes('role="switch"'));
   assert.ok(indexHtml.includes('id="quickProxy"'));
   assert.ok(indexHtml.includes('id="quickTun"'));
@@ -2872,9 +3582,32 @@ test('dashboard traffic chart is compact and tracks session totals with switch t
   assert.ok(!indexHtml.includes('setClashApi'));
   assert.ok(charts.includes('upTotalEl'));
   assert.ok(charts.includes('sessionUp'));
+  assert.ok(charts.includes("bindSeriesToggle(upToggle, 'up')"));
+  assert.ok(charts.includes("bindSeriesToggle(downToggle, 'down')"));
+  assert.ok(dashboard.includes('const visible = subs.slice(0, 2)'));
+  assert.ok(dashboard.includes("t('usage.more', hidden)"));
   assert.ok(css.includes('height: 120px'));
   assert.ok(css.includes('.switch-track'));
   assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+});
+
+test('dashboard insight modules follow their visual information density', () => {
+  const css = readRendererCss();
+  const quickIndex = indexHtml.indexOf('class="panel dashboard-quick"');
+  const qualityIndex = indexHtml.indexOf('class="panel dashboard-quality"');
+  const eventsIndex = indexHtml.indexOf('class="panel dashboard-events"');
+  assert.ok(quickIndex >= 0 && quickIndex < qualityIndex && qualityIndex < eventsIndex);
+  const insights = css.slice(css.indexOf('.dashboard-insights {'), css.indexOf('.dashboard-insights > .panel'));
+  assert.ok(insights.includes('"quick quick"'));
+  assert.ok(insights.includes('"quality events"'));
+  assert.ok(css.includes('grid-template-columns: repeat(4, minmax(0, 1fr))'));
+});
+
+test('node latency updates invalidate the shared dashboard quality summary', () => {
+  const nodesJs = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const mainJs = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  assert.ok(nodesJs.includes("typeof App.renderDashboardQuality === 'function'"));
+  assert.ok(mainJs.includes("} else if (tab === 'dashboard') {\n      App.renderDashboard();"));
 });
 
 test('settings isolates Smart features before DNS and removes obsolete controls', () => {
@@ -2887,8 +3620,15 @@ test('settings isolates Smart features before DNS and removes obsolete controls'
   const dnsIndex = indexHtml.indexOf('data-i18n="settings.dnsSection"');
   assert.ok(languageIndex >= 0 && englishIndex > languageIndex && englishIndex < chineseIndex);
   assert.ok(featureIndex >= 0 && featureIndex < dnsIndex);
-  assert.ok(indexHtml.includes('id="saveFeatures"'));
-  assert.ok(settings.includes("$('#saveFeatures').addEventListener"));
+  assert.ok(indexHtml.includes('id="setDnsOverride"'));
+  assert.ok(indexHtml.includes('id="saveAllSettings"'));
+  assert.ok(indexHtml.includes('id="settingsDirtyState"'));
+  assert.ok(settings.includes("$('#saveAllSettings').addEventListener"));
+  assert.ok(settings.includes('function settingsCandidate()'));
+  assert.ok(settings.includes('function updateDirtyState()'));
+  assert.ok(!indexHtml.includes('id="saveSettings"'));
+  assert.ok(!indexHtml.includes('id="saveFeatures"'));
+  assert.ok(!indexHtml.includes('id="saveDns"'));
   assert.ok(!indexHtml.includes('setTestConcurrency'));
   assert.ok(!settings.includes('testConcurrency'));
   assert.ok(!indexHtml.includes('setClashApi'));
@@ -2922,14 +3662,14 @@ test('dynamic first-paint regions reserve dimensions to limit layout shift', () 
   assert.ok(css.includes('min-height: 28px'));
 });
 
-test('light theme uses quiet system surfaces and lightweight dashboard cards', () => {
+test('light theme preserves Mica while keeping surfaces and text distinct', () => {
   const css = readRendererCss();
   assert.ok(css.includes('--bg: transparent'));
   assert.ok(css.includes('--sidebar: transparent'));
-  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.62)'));
+  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.74)'));
   assert.ok(css.includes('--raised-filter: blur(22px) saturate(1.16)'));
   assert.ok(!css.includes('--surface-filter'));
-  assert.ok(css.includes('--text-faint: #6e6e6e'));
+  assert.ok(css.includes('--text-faint: #68737f'));
   assert.ok(css.includes('--panel-shadow:'));
   assert.ok(css.includes('.rule-proxy.geodata-status'));
 });
@@ -3160,50 +3900,6 @@ const {
   selectStableDartRelease,
 } = require('../scripts/download-core');
 
-test('core adapters own paths, commands, formats and release assets', () => {
-  assert.deepStrictEqual(listCoreAdapters().map((adapter) => adapter.id), ['sing-box', 'mihomo']);
-  assert.strictEqual(normalizeCoreType('unknown'), 'sing-box');
-  const singBox = getCoreAdapter('sing-box');
-  const mihomo = getCoreAdapter('mihomo');
-  assert.deepStrictEqual(singBox.checkArgs('config.json'), ['check', '-c', 'config.json']);
-  assert.deepStrictEqual(mihomo.checkArgs('config.yaml', '/work'), ['-t', '-f', 'config.yaml', '-d', '/work']);
-  // Runtime writes stay compact; pretty-print is opt-in for human exports.
-  assert.strictEqual(singBox.serializeConfig({ log: { level: 'info' } }), '{"log":{"level":"info"}}');
-  assert.ok(singBox.serializeConfig({ log: { level: 'info' } }, { pretty: true }).includes('\n'));
-  assert.ok(mihomo.serializeConfig({ mode: 'rule' }).includes('mode: rule'));
-  assert.strictEqual(singBox.configFormat, 'JSON');
-  assert.strictEqual(singBox.repo, 'blakebill/sing-box');
-  assert.strictEqual(singBox.repoFor('official'), 'SagerNet/sing-box');
-  assert.strictEqual(singBox.releaseTag('1.13.14'), 'v1.13.14-dart.1');
-  assert.strictEqual(singBox.releaseTag('v1.13.14-dart.2'), 'v1.13.14-dart.2');
-  assert.strictEqual(singBox.releaseTag('v1.13.14-dart.2', 'official'), 'v1.13.14');
-  assert.strictEqual(mihomo.configFormat, 'YAML');
-  assert.strictEqual(mihomo.repoFor('official'), 'MetaCubeX/mihomo');
-  assert.strictEqual(singBox.routeEntries({ route: { rules: [{}] } })[0].kind, 'sing-box');
-  assert.strictEqual(mihomo.routeEntries({ rules: ['MATCH,DIRECT'] })[0].kind, 'clash');
-  assert.deepStrictEqual(
-    singBox.summarizeConfig({ outbounds: [{ type: 'trojan' }, { type: 'direct' }], route: { rules: [{}] } }),
-    { generatedNodes: 1, generatedRules: 1, tun: false }
-  );
-  assert.strictEqual(
-    mihomo.dnsPath({ dns: { nameserver: ['https://dns.example/dns-query'] } }, { enableTun: true }, false).server,
-    'https://dns.example/dns-query'
-  );
-  const digest = 'a'.repeat(64);
-  const asset = mihomo.releaseAsset('1.2.3', 'windows', 'amd64', {
-    assets: [{
-      name: 'mihomo-windows-amd64-v1.2.3.zip',
-      browser_download_url: 'https://example.com/mihomo.zip',
-      digest: 'sha256:' + digest,
-    }],
-  });
-  assert.strictEqual(asset.sha256, digest);
-  const officialFallback = singBox.releaseAsset('1.13.14', 'windows', 'amd64', null, 'official');
-  assert.ok(officialFallback.url.includes('SagerNet/sing-box/releases/download/v1.13.14/'));
-  assert.strictEqual(mihomo.modeChangeNeedsRestart('rule', 'block'), true);
-  assert.strictEqual(singBox.modeChangeNeedsRestart('rule', 'block'), false);
-});
-
 test('SHA-256 metadata accepts GitHub digests and standard manifests', () => {
   const a = 'a'.repeat(64);
   const b = 'b'.repeat(64);
@@ -3242,44 +3938,41 @@ test('release inputs keep prerelease versions and select only stable Dart cores'
   assert.throws(() => selectStableDartRelease(releases, '1.19.30'), /no stable Dart release/);
 });
 
-test('core bundling stages changes and restores prior installs after failures', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-bundle-'));
-  const binDir = path.join(root, 'bin');
-  fs.mkdirSync(path.join(binDir, 'singbox'), { recursive: true });
-  fs.mkdirSync(path.join(binDir, 'mihomo'), { recursive: true });
-  fs.writeFileSync(path.join(binDir, 'singbox', 'old.txt'), 'old-singbox');
-  fs.writeFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'old-mihomo');
-  fs.writeFileSync(path.join(binDir, 'manifest.json'), '{"old":true}');
+test('core registry exposes Mihomo only', () => {
+  assert.deepStrictEqual(listCoreAdapters().map((adapter) => adapter.id), ['mihomo']);
+  assert.strictEqual(normalizeCoreType('mihomo'), 'mihomo');
+  assert.strictEqual(normalizeCoreType('removed-core'), 'mihomo');
+  const adapter = getCoreAdapter('mihomo');
+  assert.strictEqual(adapter.configFormat, 'YAML');
+  assert.strictEqual(adapter.repo, 'blakebill/mihomo');
+  assert.deepStrictEqual(adapter.checkArgs('config.yaml', 'C:/runtime'), ['-t', '-f', 'config.yaml', '-d', 'C:/runtime']);
+});
 
-  await assert.rejects(
-    buildCoreBundle({
-      binDir,
-      goos: 'windows',
-      arch: 'amd64',
-      bundleSingBox: async (_goos, _arch, outputDir) => {
-        fs.mkdirSync(outputDir, { recursive: true });
-        fs.writeFileSync(path.join(outputDir, 'sing-box.exe'), 'staged');
-        return [];
-      },
-      bundleMihomo: async () => {
-        throw new Error('simulated Mihomo download failure');
-      },
-    }),
-    /simulated Mihomo download failure/
-  );
-  assert.strictEqual(fs.readFileSync(path.join(binDir, 'singbox', 'old.txt'), 'utf-8'), 'old-singbox');
-  assert.strictEqual(fs.readFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'utf-8'), 'old-mihomo');
-  assert.deepStrictEqual(
-    fs.readdirSync(binDir).filter((name) => name.startsWith('.core-bundle-')),
-    []
-  );
-
-  const stage = fs.mkdtempSync(path.join(root, 'install-stage-'));
-  fs.mkdirSync(path.join(stage, 'singbox'));
-  fs.writeFileSync(path.join(stage, 'singbox', 'new.txt'), 'new');
-  assert.throws(() => installStagedBundle(stage, binDir), /staged bundle is missing mihomo/);
-  assert.strictEqual(fs.readFileSync(path.join(binDir, 'singbox', 'old.txt'), 'utf-8'), 'old-singbox');
-  assert.strictEqual(fs.readFileSync(path.join(binDir, 'mihomo', 'old.txt'), 'utf-8'), 'old-mihomo');
+test('core bundle installs only Mihomo and its manifest', async () => {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-mihomo-bundle-'));
+  await buildCoreBundle({
+    binDir,
+    goos: 'windows',
+    arch: 'amd64',
+    bundleMihomo: async (_goos, _arch, outputDir) => {
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.writeFileSync(path.join(outputDir, 'mihomo.exe'), 'test-binary');
+      return [{
+        type: 'application',
+        name: 'mihomo',
+        version: '1.0.0',
+        repository: 'https://github.com/blakebill/mihomo',
+        license: 'GPL-3.0-only',
+        asset: 'mihomo.zip',
+        assetSha256: 'a'.repeat(64),
+        binaryPath: 'mihomo/mihomo.exe',
+      }];
+    },
+  });
+  assert.ok(fs.existsSync(path.join(binDir, 'mihomo', 'mihomo.exe')));
+  const manifest = JSON.parse(fs.readFileSync(path.join(binDir, 'manifest.json'), 'utf-8'));
+  assert.deepStrictEqual(manifest.components.map((item) => item.name), ['mihomo']);
+  assert.deepStrictEqual(manifest.files.map((item) => item.path), ['mihomo/mihomo.exe']);
 });
 
 test('operation coordinator supersedes stale work and closes atomically', () => {
@@ -3292,25 +3985,6 @@ test('operation coordinator supersedes stale work and closes atomically', () => 
   assert.strictEqual(coordinator.beginRemote('config', 'a', { background: true }), null);
   coordinator.close();
   assert.throws(() => coordinator.assertOpen(), /shutting down/);
-});
-
-test('release SBOM includes bundled cores and immutable file hashes', () => {
-  const digest = 'c'.repeat(64);
-  const sbom = addBundledComponents({ components: [] }, {
-    components: [{
-      type: 'application',
-      name: 'sing-box',
-      version: '1.2.3',
-      repository: 'https://github.com/blakebill/sing-box',
-      license: 'GPL-3.0-or-later',
-      asset: 'sing-box.zip',
-      assetSha256: 'd'.repeat(64),
-      binaryPath: 'singbox/sing-box.exe',
-    }],
-    files: [{ path: 'singbox/sing-box.exe', sha256: digest }],
-  });
-  assert.strictEqual(sbom.components[0].hashes[0].content, digest);
-  assert.match(sbom.components[0]['bom-ref'], /^pkg:github\/blakebill\/sing-box@1\.2\.3#/);
 });
 
 test('release workflow pins actions and isolates write permission to publishing', () => {
@@ -3326,7 +4000,7 @@ test('release workflow pins actions and isolates write permission to publishing'
   assert.ok(workflow.includes('release-metadata.js --version-from-tag "$TAG"'));
   const versionStep = workflow.match(/- name: Sync package version to release tag([\s\S]*?)\n\s+- name:/);
   assert.ok(versionStep && !versionStep[1].includes('TAG="${{ inputs.tag }}"'));
-  const coreDownloadStep = workflow.match(/- name: Download bundled cores and GeoData([\s\S]*?)\n\s+- name:/);
+  const coreDownloadStep = workflow.match(/- name: Download bundled Mihomo and GeoData([\s\S]*?)\n\s+- name:/);
   assert.ok(coreDownloadStep && !coreDownloadStep[1].includes('GITHUB_TOKEN'));
   assert.ok(workflow.includes('release/SHA256SUMS.txt'));
   assert.ok(workflow.includes('release/sbom.cdx.json'));
@@ -3401,27 +4075,6 @@ test('route targets normalize URLs, domains and IP literals', () => {
   assert.strictEqual(toolbox.normalizeTarget('1.1.1.1').ipVersion, 4);
   assert.strictEqual(toolbox.normalizeTarget('[2001:db8::1]').ipVersion, 6);
   assert.throws(() => toolbox.normalizeTarget('bad host'), /invalid/);
-});
-
-test('CIDR and common Clash/sing-box route rules match correctly', () => {
-  assert.strictEqual(toolbox.cidrContains('10.20.30.40', '10.0.0.0/8'), true);
-  assert.strictEqual(toolbox.cidrContains('11.20.30.40', '10.0.0.0/8'), false);
-  assert.strictEqual(toolbox.cidrContains('2001:db8::7', '2001:db8::/32'), true);
-  const target = toolbox.normalizeTarget('https://api.example.com:443');
-  assert.strictEqual(toolbox.matchClashRule('DOMAIN-SUFFIX,example.com,Proxy', target, []), true);
-  assert.strictEqual(toolbox.matchClashRule('DST-PORT,80,Proxy', target, []), false);
-  assert.strictEqual(toolbox.matchClashRule('IP-CIDR,1.1.1.0/24,Proxy', target, []), null);
-  assert.strictEqual(toolbox.matchClashRule('RULE-SET,private,Proxy', target, []), null);
-  assert.strictEqual(toolbox.matchSingboxRule({ domain_suffix: ['example.com'], port: [443] }, target, [], 'rule'), true);
-  assert.strictEqual(toolbox.matchSingboxRule({ ip_cidr: ['1.1.1.0/24'] }, target, [], 'rule'), null);
-  assert.strictEqual(toolbox.matchSingboxRule({ ip_is_private: false }, target, [], 'rule'), null);
-  assert.strictEqual(toolbox.matchSingboxRule({ protocol: 'dns' }, target, [], 'rule'), null);
-  assert.strictEqual(toolbox.matchSingboxRule({
-    type: 'logical', mode: 'or', rules: [{ domain_suffix: ['invalid.test'] }, { domain_suffix: ['example.com'] }],
-  }, target, [], 'rule'), true);
-  assert.strictEqual(toolbox.matchSingboxRule({
-    type: 'logical', mode: 'and', rules: [{ domain_suffix: ['example.com'] }, { port: [80] }],
-  }, target, [], 'rule'), false);
 });
 
 test('port input is deduplicated and bounded', () => {
@@ -3501,41 +4154,64 @@ test('config validation errors expose common line, column and object paths', () 
   );
 });
 
-test('backup validation preserves supported data and rejects duplicate config ids', () => {
-  const store = {
-    getSettings: () => ({ coreType: 'mihomo', mixedPort: 7890 }),
-    getSubscriptions: () => [{
-      id: 'profile-a',
-      name: 'A',
-      userAgentMode: 'sing-box',
-      nodes: [{ name: 'node-a' }],
-      policyGroups: [{ name: 'Source', type: 'select', members: ['node-a'] }],
-    }],
-    get: (key) => ({ activeSub: 'profile-a', selected: 'node-a', customRuleSets: [{ id: 'rule-a' }], localRules: [] }[key]),
-  };
-  const document = toolbox.buildBackup(store, '0.8.0');
-  const normalized = toolbox.validateBackupDocument(document);
-  assert.strictEqual(normalized.activeSub, 'profile-a');
-  assert.strictEqual(normalized.subscriptions[0].userAgentMode, 'sing-box');
-  assert.strictEqual(normalized.subscriptions[0].policyGroups[0].name, 'Source');
-  assert.strictEqual(toolbox.backupSummary(document, normalized).nodes, 1);
-  document.data.subscriptions.push({ id: 'profile-a' });
-  assert.throws(() => toolbox.validateBackupDocument(document), /duplicate config id/);
-  document.data.subscriptions.pop();
-  document.data.customRuleSets.push({ id: 'rule-a', target: 'proxy' });
-  assert.throws(() => toolbox.validateBackupDocument(document), /duplicate remote rule id/);
-  document.data.customRuleSets.pop();
-  document.data.localRules.push({ id: 'local-a', matchType: 'made-up', values: [] });
-  assert.throws(() => toolbox.validateBackupDocument(document), /local rule type is invalid/);
-  document.data.localRules.pop();
-  document.data.subscriptions[0].userAgentMode = 'surge';
-  assert.throws(() => toolbox.validateBackupDocument(document), /User-Agent mode is invalid/);
-  document.data.subscriptions[0].userAgentMode = 'sing-box';
-  document.data.subscriptions[0].policyGroups[0].members = 'node-a';
-  assert.throws(() => toolbox.validateBackupDocument(document), /policy groups are invalid/);
+test('config checker builds and validates only the Mihomo runtime config', async () => {
+  const calls = [];
+  const result = await toolbox.checkMihomoConfig({
+    state: {
+      store: {
+        getSubscription: () => ({
+          name: 'Profile',
+          format: 'clash',
+          raw: 'proxies: []',
+          nodes: [{ name: 'a' }],
+          clashRules: ['MATCH,DIRECT'],
+        }),
+      },
+      coreManager: {
+        validateMihomoGeoData: async () => true,
+        isCoreInstalled: (type) => type === 'mihomo',
+        checkConfigFor: async (type) => {
+          calls.push(type);
+          return { output: 'configuration is valid' };
+        },
+      },
+    },
+    core: {
+      getActiveSubId: () => 'profile-a',
+      buildCurrentConfigAsync: async (type) => {
+        calls.push(type);
+        return {
+          config: {
+            proxies: [{ name: 'a', type: 'ss' }],
+            'proxy-groups': [],
+            rules: ['MATCH,DIRECT'],
+          },
+        };
+      },
+    },
+  });
+  assert.deepStrictEqual(calls, ['mihomo', 'mihomo']);
+  assert.strictEqual(result.result.coreType, 'mihomo');
+  assert.strictEqual(result.result.validation.status, 'pass');
 });
 
-console.log('\nVersioning:');
+test('legacy backups discard the retired subscription User-Agent preference', () => {
+  const normalized = toolbox.validateBackupDocument({
+    kind: 'dart-network-control-backup',
+    schemaVersion: 1,
+    appVersion: '0.9.7',
+    data: {
+      settings: {},
+      subscriptions: [{ id: 'profile-a', name: 'Legacy', userAgentMode: 'clash' }],
+      activeSub: 'profile-a',
+      selected: null,
+      customRuleSets: [],
+      localRules: [],
+    },
+  });
+  assert.strictEqual(normalized.activeSub, 'profile-a');
+  assert.ok(!Object.prototype.hasOwnProperty.call(normalized.subscriptions[0], 'userAgentMode'));
+});
 
 test('package.json and package-lock.json agree on the version', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8'));
@@ -3655,10 +4331,10 @@ test('downloaded app updates must be plausible PE installers', () => {
 
 console.log('\nStore:');
 
-const { Store } = require('../src/main/store');
+const { Store, STORE_SCHEMA_VERSION } = require('../src/main/store');
 
 test('store writes are atomic: tmp files never survive and data round-trips', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.set('subscriptions', [{ id: 'a', name: 'profile-a' }]);
   assert.ok(!fs.existsSync(path.join(dir, 'config.json.tmp')), 'tmp file left behind');
@@ -3667,7 +4343,7 @@ test('store writes are atomic: tmp files never survive and data round-trips', ()
 });
 
 test('store recovers a corrupt index and never deletes payloads without one', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-recovery-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-recovery-'));
   const store = new Store(dir);
   store.upsertSubscription({ id: 'profile-a', name: 'Recover me', nodes: [{ name: 'node-a' }] });
   fs.writeFileSync(path.join(dir, 'config.json'), '{broken primary', 'utf-8');
@@ -3687,7 +4363,7 @@ test('store recovers a corrupt index and never deletes payloads without one', ()
 });
 
 test('a valid backup remains usable when the corrupt primary cannot be repaired', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-readonly-recovery-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-readonly-recovery-'));
   const primary = path.join(dir, 'config.json');
   const backup = primary + '.bak';
   fs.writeFileSync(primary, '{broken primary', 'utf-8');
@@ -3708,7 +4384,7 @@ test('a valid backup remains usable when the corrupt primary cannot be repaired'
 });
 
 test('store fallback mode merges metadata-only updates instead of erasing payloads', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-fallback-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-fallback-'));
   const store = new Store(dir);
   store._profileStorageEnabled = false;
   store._ruleStorageEnabled = false;
@@ -3732,7 +4408,7 @@ test('store fallback mode merges metadata-only updates instead of erasing payloa
 });
 
 test('legacy duplicate or missing record ids are repaired without dropping records', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-ids-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-ids-'));
   fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
     subscriptions: [
       { id: 'duplicate', name: 'A', nodes: [{ name: 'a' }] },
@@ -3753,8 +4429,52 @@ test('legacy duplicate or missing record ids are repaired without dropping recor
   assert.strictEqual(new Set(ruleSets.map((item) => item.id)).size, 2);
 });
 
+test('invalid legacy collection entries are removed from disk during startup repair', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-invalid-records-'));
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
+    subscriptions: [null, [], 'invalid', { id: 'profile-a', name: 'Valid', nodes: [{ name: 'node-a' }] }],
+    customRuleSets: [false, [], { id: 'rules-a', name: 'Valid rules', kind: 'inline', rules: [] }],
+  }), 'utf-8');
+
+  const store = new Store(dir);
+  assert.strictEqual(store.listSubscriptions().length, 1);
+  assert.strictEqual(store.listCustomRuleSets().length, 1);
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
+  assert.ok(persisted.subscriptions.every((record) => record && typeof record === 'object' && !Array.isArray(record)));
+  assert.ok(persisted.customRuleSets.every((record) => record && typeof record === 'object' && !Array.isArray(record)));
+  assert.strictEqual(new Store(dir).listSubscriptions()[0].name, 'Valid');
+});
+
+test('payload-only subscription updates preserve existing source metadata', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-partial-payload-'));
+  const store = new Store(dir);
+  store.upsertSubscription({
+    id: 'profile-a',
+    name: 'Stable name',
+    url: 'https://example.com/config',
+    autoUpdateMinutes: 60,
+    updateViaProxy: true,
+    nodes: [{ name: 'old-node' }],
+    raw: 'old-source',
+  });
+
+  store.upsertSubscription({
+    id: 'profile-a',
+    nodes: [{ name: 'new-node' }],
+    raw: 'new-source',
+  });
+
+  const profile = new Store(dir).getSubscription('profile-a', { includeRaw: true });
+  assert.strictEqual(profile.name, 'Stable name');
+  assert.strictEqual(profile.url, 'https://example.com/config');
+  assert.strictEqual(profile.autoUpdateMinutes, 60);
+  assert.strictEqual(profile.updateViaProxy, true);
+  assert.strictEqual(profile.nodes[0].name, 'new-node');
+  assert.strictEqual(profile.raw, 'new-source');
+});
+
 test('settings merge defaults with stored values', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.updateSettings({
     mixedPort: 1234,
@@ -3767,6 +4487,7 @@ test('settings merge defaults with stored values', () => {
   assert.strictEqual(s.mixedPort, 1234);
   assert.strictEqual(s.clashApiPort, 9090); // default still present
   assert.strictEqual(s.theme, 'system');
+  assert.strictEqual(s.enableDnsOverride, false);
   assert.strictEqual(s.testUrl, 'http://www.gstatic.com/generate_204');
   const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
   assert.strictEqual(persisted.settings.testUrl, 'http://www.gstatic.com/generate_204');
@@ -3775,8 +4496,183 @@ test('settings merge defaults with stored values', () => {
   assert.ok(!Object.prototype.hasOwnProperty.call(persisted.settings, 'enableClashApi'));
 });
 
+test('versioned migration preserves the earliest selection shape and is idempotent', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-versioned-'));
+  const legacy = {
+    subscriptions: [{
+      id: 'profile-a',
+      name: 'Legacy profile',
+      userAgentMode: 'clash',
+      nodes: [{ name: 'legacy-node' }],
+      raw: 'legacy-source',
+    }],
+    settings: {
+      mixedPort: 17890,
+      clashApiPort: 19090,
+      enableTun: true,
+      enableClashApi: true,
+      autoSetSystemProxy: false,
+      autoLaunch: true,
+      language: 'en',
+    },
+    selected: { subId: 'profile-a', nodeName: 'legacy-node' },
+  };
+  const sourceText = JSON.stringify(legacy, null, 2);
+  fs.writeFileSync(path.join(dir, 'config.json'), sourceText, 'utf-8');
+
+  const originalWriteConfigData = Store.prototype._writeConfigData;
+  let startupCommits = 0;
+  Store.prototype._writeConfigData = function countStartupCommit(data) {
+    startupCommits += 1;
+    return originalWriteConfigData.call(this, data);
+  };
+  let store;
+  try {
+    store = new Store(dir);
+  } finally {
+    Store.prototype._writeConfigData = originalWriteConfigData;
+  }
+
+  assert.strictEqual(startupCommits, 1, 'startup repairs were committed in separate disk writes');
+  assert.strictEqual(store.get('activeSub'), 'profile-a');
+  assert.strictEqual(store.get('selected'), 'legacy-node');
+  assert.strictEqual(store.getSettings().mixedPort, 17890);
+  assert.strictEqual(store.getSettings().enableTun, true);
+  assert.strictEqual(store.getSettings().enableDnsOverride, false);
+  assert.strictEqual(store.getSettings().autoSetSystemProxy, false);
+  const migratedProfile = store.getSubscription('profile-a', { includeRaw: true });
+  assert.strictEqual(migratedProfile.raw, 'legacy-source');
+  assert.ok(!Object.prototype.hasOwnProperty.call(migratedProfile, 'userAgentMode'));
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
+  assert.strictEqual(persisted.schemaVersion, STORE_SCHEMA_VERSION);
+  assert.strictEqual(persisted.settings.enableDnsOverride, false);
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted.subscriptions[0], 'userAgentMode'));
+  assert.strictEqual(
+    fs.readFileSync(path.join(dir, 'config.json.migration.bak'), 'utf-8'),
+    sourceText,
+    'pre-migration rollback snapshot did not preserve the original index'
+  );
+
+  const originalWriteAtomic = Store.prototype._writeAtomic;
+  const rewritten = [];
+  Store.prototype._writeAtomic = function trackIdempotentWrites(file, text) {
+    rewritten.push(file);
+    return originalWriteAtomic.call(this, file, text);
+  };
+  try {
+    const reloaded = new Store(dir);
+    assert.strictEqual(reloaded.get('selected'), 'legacy-node');
+  } finally {
+    Store.prototype._writeAtomic = originalWriteAtomic;
+  }
+  assert.deepStrictEqual(rewritten, [], 'an already-migrated store rewrote files at startup');
+});
+
+test('store migration removes retired core update clocks', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-retired-core-'));
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
+    schemaVersion: 2,
+    subscriptions: [],
+    customRuleSets: [],
+    settings: { coreType: 'mihomo' },
+    geoUpdatedAt_singbox: 123,
+    geoAttemptedAt_singbox: 456,
+  }), 'utf-8');
+
+  const store = new Store(dir);
+  assert.strictEqual(store.get('geoUpdatedAt_singbox'), undefined);
+  assert.strictEqual(store.get('geoAttemptedAt_singbox'), undefined);
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf-8'));
+  assert.strictEqual(persisted.schemaVersion, STORE_SCHEMA_VERSION);
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted, 'geoUpdatedAt_singbox'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(persisted, 'geoAttemptedAt_singbox'));
+});
+
+test('a failed migration snapshot leaves the legacy index untouched for retry', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-migration-failure-'));
+  const legacy = {
+    subscriptions: [{
+      id: 'profile-a',
+      name: 'Legacy',
+      nodes: [{ name: 'legacy-node' }],
+    }],
+    settings: { mixedPort: 17890 },
+    selected: { subId: 'profile-a', nodeName: 'legacy-node' },
+  };
+  const configFile = path.join(dir, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify(legacy), 'utf-8');
+  const originalWriteAtomic = Store.prototype._writeAtomic;
+  Store.prototype._writeAtomic = function failMigrationSnapshot(file, text) {
+    if (file === configFile + '.migration.bak') throw new Error('simulated snapshot failure');
+    return originalWriteAtomic.call(this, file, text);
+  };
+  let inMemory;
+  try {
+    inMemory = new Store(dir);
+  } finally {
+    Store.prototype._writeAtomic = originalWriteAtomic;
+  }
+  assert.strictEqual(inMemory.get('selected'), 'legacy-node');
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(configFile, 'utf-8')), legacy);
+
+  const retried = new Store(dir);
+  assert.strictEqual(retried.get('selected'), 'legacy-node');
+  assert.strictEqual(
+    JSON.parse(fs.readFileSync(configFile, 'utf-8')).schemaVersion,
+    STORE_SCHEMA_VERSION
+  );
+});
+
+test('v0.8 split profiles retain legacy inline raw content', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-v08-'));
+  const profileDir = path.join(dir, 'profiles');
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({
+    subscriptions: [{
+      id: 'profile-a',
+      name: 'Split profile',
+      dataFile: 'profile-a.json',
+      nodeCount: 1,
+    }],
+    settings: { mixedPort: 7890, clashApiPort: 9090 },
+    selected: 'node-a',
+  }), 'utf-8');
+  fs.writeFileSync(path.join(profileDir, 'profile-a.json'), JSON.stringify({
+    nodes: [{ name: 'node-a' }],
+    raw: 'legacy-v08-source',
+  }), 'utf-8');
+
+  const store = new Store(dir);
+  const profile = store.getSubscription('profile-a', { includeRaw: true });
+  assert.strictEqual(profile.nodes[0].name, 'node-a');
+  assert.strictEqual(profile.raw, 'legacy-v08-source');
+  assert.ok(!Object.prototype.hasOwnProperty.call(
+    JSON.parse(fs.readFileSync(path.join(profileDir, 'profile-a.json'), 'utf-8')),
+    'raw'
+  ));
+  assert.strictEqual(
+    new Store(dir).getSubscription('profile-a', { includeRaw: true }).raw,
+    'legacy-v08-source'
+  );
+});
+
+test('unchanged store updates do not rewrite the index or its recovery mirror', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-noop-'));
+  const store = new Store(dir);
+  store.updateSettings({ language: 'en' });
+  const originalWriteAtomic = store._writeAtomic;
+  const writes = [];
+  store._writeAtomic = function trackNoopWrite(file, text) {
+    writes.push(file);
+    return originalWriteAtomic.call(this, file, text);
+  };
+  store.updateSettings({ language: 'en' });
+  store.updateValues({ lastRunning: false });
+  assert.deepStrictEqual(writes, []);
+});
+
 test('theme migration defaults incomplete configs to system and preserves explicit choices', () => {
-  const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-theme-'));
+  const missingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-theme-'));
   const missingStore = new Store(missingDir);
   missingStore.updateSettings({ theme: 'light' });
   const missingFile = path.join(missingDir, 'config.json');
@@ -3787,14 +4683,14 @@ test('theme migration defaults incomplete configs to system and preserves explic
   assert.strictEqual(migrated.getSettings().theme, 'system');
   assert.strictEqual(JSON.parse(fs.readFileSync(missingFile, 'utf-8')).settings.theme, 'system');
 
-  const explicitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-theme-'));
+  const explicitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-theme-'));
   const explicitStore = new Store(explicitDir);
   explicitStore.updateSettings({ theme: 'dark' });
   assert.strictEqual(new Store(explicitDir).getSettings().theme, 'dark');
 });
 
 test('large subscription payloads migrate to independent profile files', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const legacy = {
     subscriptions: [{
       id: 'profile-a',
@@ -3824,7 +4720,7 @@ test('large subscription payloads migrate to independent profile files', () => {
 });
 
 test('profile payloads load on demand with a bounded cache', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   for (let i = 0; i < 5; i++) {
     store.upsertSubscription({
@@ -3845,7 +4741,7 @@ test('profile payloads load on demand with a bounded cache', () => {
 });
 
 test('repeated payload updates do not retain retired digest entries', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   for (let index = 0; index < 30; index++) {
     store.upsertSubscription({
@@ -3862,7 +4758,7 @@ test('repeated payload updates do not retain retired digest entries', () => {
 });
 
 test('subscription metadata edits do not hydrate or rewrite profile payloads', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.upsertSubscription({
     id: 'profile-a', name: 'Old name', nodes: [{ name: 'node-a' }], raw: 'raw-a',
@@ -3882,7 +4778,7 @@ test('subscription metadata edits do not hydrate or rewrite profile payloads', (
 });
 
 test('profile mutations remain all-or-nothing when the config index write fails', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.upsertSubscription({
     id: 'profile-a',
@@ -3911,7 +4807,7 @@ test('profile mutations remain all-or-nothing when the config index write fails'
 });
 
 test('bulk payload staging removes files when a later stage fails', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-stage-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-stage-'));
   const store = new Store(dir);
   const profileDir = path.join(dir, 'profiles');
   const ruleDir = path.join(dir, 'remote-rules');
@@ -3942,7 +4838,7 @@ test('bulk payload staging removes files when a later stage fails', () => {
 });
 
 test('payload backups self-heal corrupt primaries and startup removes orphan stages', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.upsertSubscription({ id: 'profile-a', name: 'Old', nodes: [{ name: 'old-node' }] });
   store.upsertSubscription({ id: 'profile-a', name: 'New', nodes: [{ name: 'new-node' }] });
@@ -3961,7 +4857,7 @@ test('payload backups self-heal corrupt primaries and startup removes orphan sta
 });
 
 test('raw subscriptions and remote rule payloads stay outside config.json', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.upsertSubscription({
     id: 'profile-a',
@@ -3991,7 +4887,7 @@ test('raw subscriptions and remote rule payloads stay outside config.json', () =
 });
 
 test('single remote rule mutations preserve peers and roll back failed commits', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'singbox-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
   store.upsertCustomRuleSet({
     id: 'rules-a', name: 'A', kind: 'inline', target: 'proxy',
@@ -4044,6 +4940,58 @@ test('Windows proxy registry parsing requires exact field values', () => {
   assert.strictEqual(proxy.proxyServerMatches(server, '127.0.0.1:7890'), true);
   assert.strictEqual(proxy.proxyServerMatches(server, '127.0.0.1:789'), false);
   assert.strictEqual(proxy.proxyServerMatches(server, '127.0.0.1:78900'), false);
+  const snapshot = proxy.proxyRegistrySnapshot(`${enabled}${server}`);
+  assert.deepStrictEqual(snapshot.enable, { exists: true, value: '0x1' });
+  assert.deepStrictEqual(snapshot.server, { exists: true, value: '127.0.0.1:7890' });
+  assert.deepStrictEqual(snapshot.override, { exists: false, value: null });
+});
+
+test('system proxy polling reads all registry values with one reg.exe query', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'proxy.js'), 'utf-8');
+  const start = source.indexOf('async function readProxyRegistrySnapshot');
+  const end = source.indexOf('function writeRegistrySetting', start);
+  const implementation = source.slice(start, end);
+  assert.strictEqual((implementation.match(/runReg\(/g) || []).length, 1);
+  assert.ok(implementation.includes("runReg(['query', REG_PATH])"));
+  assert.ok(!implementation.includes("'/v'"));
+});
+
+test('interrupted system proxy recovery only accepts the exact saved registry state', () => {
+  const proxy = require('../src/main/proxy');
+  const restore = {
+    enable: { exists: true, value: '0x1' },
+    server: { exists: true, value: 'corp.example:8080' },
+    override: { exists: true, value: '<local>;intranet.example' },
+  };
+  const interrupted = {
+    enable: { exists: true, value: '0x0' },
+    server: { exists: true, value: 'CORP.EXAMPLE:8080' },
+    override: { exists: true, value: '<LOCAL>;INTRANET.EXAMPLE' },
+  };
+  assert.strictEqual(proxy.registrySettingEnabled(restore.enable), true);
+  assert.strictEqual(proxy.registrySettingEnabled(interrupted.enable), false);
+  assert.strictEqual(proxy.isInterruptedProxyApply(interrupted, restore), true);
+  assert.strictEqual(proxy.isInterruptedProxyApply({
+    ...interrupted,
+    server: { exists: true, value: 'another.example:8080' },
+  }, restore), false);
+  assert.strictEqual(proxy.isInterruptedProxyApply({
+    ...interrupted,
+    override: { exists: false, value: null },
+  }, restore), false);
+});
+
+test('system proxy ownership is persisted before the first registry mutation', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'proxy.js'), 'utf-8');
+  const start = source.indexOf('async function enableSystemProxy');
+  const end = source.indexOf('function beginShutdown', start);
+  const implementation = source.slice(start, end);
+  assert.ok(implementation.indexOf('options.beforeApply(snapshot)') >= 0);
+  assert.ok(
+    implementation.indexOf('options.beforeApply(snapshot)') <
+      implementation.indexOf("writeRegistrySetting('ProxyEnable'"),
+    'registry changed before its recovery snapshot was persisted'
+  );
 });
 
 test('Windows TUN lifecycle owns Dart names and removes legacy adapters', () => {
@@ -4077,102 +5025,9 @@ test('system DNS diagnostics use the OS resolver path', () => {
   assert.ok(!implementation.includes('dns.promises.resolve6'));
 });
 
-test('selected cores use independent runtime folders', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const { CoreManager } = require('../src/main/singbox');
-  const ext = process.platform === 'win32' ? '.exe' : '';
-  const fakeDat = Buffer.alloc(2048);
-  for (let i = 0; i < fakeDat.length; i++) fakeDat[i] = (i * 31) & 0xff;
-  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'bin', 'sing-box' + ext), 'legacy-singbox');
-  fs.writeFileSync(path.join(dir, 'bin', 'mihomo' + ext), 'legacy-mihomo');
-  fs.writeFileSync(path.join(dir, 'geoip.dat'), fakeDat);
-  const mgr = new CoreManager({ runtimeDir: dir });
-
-  assert.strictEqual(mgr.coreDir('sing-box'), path.join(dir, 'singbox'));
-  assert.strictEqual(mgr.coreDir('mihomo'), path.join(dir, 'mihomo'));
-  assert.ok(fs.existsSync(path.join(dir, 'singbox', 'sing-box' + ext)), 'sing-box was not migrated');
-  assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'mihomo' + ext)), 'mihomo was not migrated');
-  assert.ok(fs.existsSync(path.join(dir, 'mihomo', 'geoip.dat')), 'mihomo GeoData was not migrated');
-  assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'singbox', 'sing-box' + ext));
-  assert.strictEqual(mgr.resolveBinaryPath('mihomo'), path.join(dir, 'mihomo', 'mihomo' + ext));
-  assert.strictEqual(mgr.configPath, path.join(dir, 'singbox', 'config.json'));
-
-  mgr.setCoreType('mihomo');
-  assert.strictEqual(mgr.resolveBinaryPath(), path.join(dir, 'mihomo', 'mihomo' + ext));
-  assert.strictEqual(mgr.configPath, path.join(dir, 'mihomo', 'config.yaml'));
-  assert.ok(mgr._coreEnv().SAFE_PATHS.split(path.delimiter).includes(path.join(dir, 'ui')));
-});
-
-test('bundled Dart sing-box replaces a compatible official runtime override once', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
-  const { CoreManager } = require('../src/main/singbox');
-  const binName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
-  const runtimeBin = path.join(dir, 'singbox', binName);
-  const bundledBin = path.join(resources, 'singbox', binName);
-  fs.mkdirSync(path.dirname(runtimeBin), { recursive: true });
-  fs.mkdirSync(path.dirname(bundledBin), { recursive: true });
-  fs.writeFileSync(runtimeBin, 'official');
-  fs.writeFileSync(bundledBin, 'dart');
-
-  const logs = [];
-  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources, onLog: (line) => logs.push(line) });
-  let probes = 0;
-  mgr._probeCoreVersion = async (bin) => {
-    probes++;
-    return bin === bundledBin ? '1.13.14-dart.1' : '1.13.14';
-  };
-  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), true);
-  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), false);
-  assert.strictEqual(fs.readFileSync(runtimeBin, 'utf-8'), 'dart');
-  assert.strictEqual(probes, 2);
-  assert.ok(logs.some((line) => line.includes('1.13.14-dart.1')));
-});
-
-test('bundled Dart sing-box never downgrades a newer runtime core', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
-  const { CoreManager } = require('../src/main/singbox');
-  const binName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
-  const runtimeBin = path.join(dir, 'singbox', binName);
-  const bundledBin = path.join(resources, 'singbox', binName);
-  fs.mkdirSync(path.dirname(runtimeBin), { recursive: true });
-  fs.mkdirSync(path.dirname(bundledBin), { recursive: true });
-  fs.writeFileSync(runtimeBin, 'newer-official');
-  fs.writeFileSync(bundledBin, 'older-dart');
-
-  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources });
-  mgr._probeCoreVersion = async (bin) => bin === bundledBin ? '1.13.14-dart.1' : '1.14.0';
-  assert.strictEqual(await mgr.ensureBundledSingBoxPatch(), false);
-  assert.strictEqual(fs.readFileSync(runtimeBin, 'utf-8'), 'newer-official');
-});
-
-test('sing-box geodata self-heals invalid writable rule-sets from bundled files', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-resources-'));
-  const bundled = path.join(resources, 'singbox');
-  const writable = path.join(dir, 'singbox');
-  const srs = Buffer.concat([Buffer.from('SRS'), Buffer.alloc(16, 1)]);
-  fs.mkdirSync(bundled, { recursive: true });
-  fs.mkdirSync(writable, { recursive: true });
-  fs.writeFileSync(path.join(bundled, 'geoip-cn.srs'), srs);
-  fs.writeFileSync(path.join(bundled, 'geosite-cn.srs'), srs);
-  fs.writeFileSync(path.join(writable, 'geoip-cn.srs'), Buffer.from('<html>blocked</html>'));
-  fs.writeFileSync(path.join(writable, 'geosite-cn.srs'), Buffer.alloc(1));
-
-  const { CoreManager } = require('../src/main/singbox');
-  const mgr = new CoreManager({ runtimeDir: dir, resourcesDir: resources });
-
-  assert.strictEqual(mgr.ensureSingBoxGeoData(), true);
-  assert.strictEqual(mgr.resolveRuleSetDir(), writable);
-  assert.ok(mgr._validSrs(path.join(writable, 'geoip-cn.srs')), 'geoip-cn.srs was not restored');
-  assert.ok(mgr._validSrs(path.join(writable, 'geosite-cn.srs')), 'geosite-cn.srs was not restored');
-});
-
 test('mihomo geodata validation cache survives restarts and follows core changes', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
-  const { CoreManager } = require('../src/main/singbox');
+  const { CoreManager } = require('../src/main/core-manager');
   const mgr = new CoreManager({ runtimeDir: dir, coreType: 'mihomo' });
   const coreDir = mgr.ensureCoreDir('mihomo');
   const bin = path.join(coreDir, process.platform === 'win32' ? 'mihomo.exe' : 'mihomo');
@@ -4194,6 +5049,94 @@ test('mihomo geodata validation cache survives restarts and follows core changes
   assert.strictEqual(mgr.mihomoGeoDataReady(), true, 'cached validation avoids spawning the fake core');
   fs.appendFileSync(bin, '-updated');
   assert.notStrictEqual(mgr._mihomoGeoDataKey(coreDir, bin), key, 'a core update invalidates the cache key');
+});
+
+test('retired core cleanup is isolated, idempotent, and preserves Mihomo files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-retired-core-'));
+  const legacyDir = path.join(dir, 'singbox');
+  const legacyBin = path.join(dir, 'bin');
+  const mihomoDir = path.join(dir, 'mihomo');
+  fs.mkdirSync(legacyDir);
+  fs.mkdirSync(legacyBin);
+  fs.mkdirSync(mihomoDir);
+  fs.writeFileSync(path.join(legacyDir, 'sing-box.exe'), 'old-core');
+  fs.writeFileSync(path.join(legacyBin, 'geoip-cn.srs'), 'old-rules');
+  fs.writeFileSync(path.join(legacyBin, 'rp-0123456789abcdef.json'), '{}');
+  fs.writeFileSync(path.join(legacyBin, 'mihomo.exe'), 'current-core');
+  fs.writeFileSync(path.join(dir, 'config.json'), '{}');
+  fs.writeFileSync(path.join(mihomoDir, 'config.yaml'), 'mode: rule');
+
+  const { CLEANUP_MARKER, cleanupRetiredCoreArtifacts } = require('../src/main/retired-core-cleanup');
+  const first = cleanupRetiredCoreArtifacts(dir);
+  assert.strictEqual(first.completed, true);
+  assert.strictEqual(first.skipped, false);
+  assert.ok(first.removed >= 4);
+  assert.ok(!fs.existsSync(legacyDir));
+  assert.ok(!fs.existsSync(path.join(legacyBin, 'geoip-cn.srs')));
+  assert.ok(!fs.existsSync(path.join(legacyBin, 'rp-0123456789abcdef.json')));
+  assert.ok(!fs.existsSync(path.join(dir, 'config.json')));
+  assert.ok(fs.existsSync(path.join(legacyBin, 'mihomo.exe')));
+  assert.ok(fs.existsSync(path.join(mihomoDir, 'config.yaml')));
+  assert.ok(fs.existsSync(path.join(dir, CLEANUP_MARKER)));
+
+  const second = cleanupRetiredCoreArtifacts(dir);
+  assert.strictEqual(second.completed, true);
+  assert.strictEqual(second.skipped, true);
+  assert.strictEqual(second.removed, 0);
+});
+
+test('retired core cleanup leaves no marker after a failure and retries later', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-retired-core-retry-'));
+  const target = path.join(dir, 'config.json');
+  fs.writeFileSync(target, '{}');
+  const { CLEANUP_MARKER, cleanupRetiredCoreArtifacts } = require('../src/main/retired-core-cleanup');
+  const originalRmSync = fs.rmSync;
+  fs.rmSync = function failLockedLegacyConfig(file, options) {
+    if (file === target) {
+      const error = new Error('simulated locked legacy config');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return originalRmSync.call(this, file, options);
+  };
+  const logs = [];
+  let first;
+  try {
+    first = cleanupRetiredCoreArtifacts(dir, (line) => logs.push(line));
+  } finally {
+    fs.rmSync = originalRmSync;
+  }
+  assert.strictEqual(first.completed, false);
+  assert.ok(fs.existsSync(target));
+  assert.ok(!fs.existsSync(path.join(dir, CLEANUP_MARKER)));
+  assert.ok(logs.some((line) => line.includes('retry on next start')));
+
+  const second = cleanupRetiredCoreArtifacts(dir);
+  assert.strictEqual(second.completed, true);
+  assert.ok(!fs.existsSync(target));
+  assert.ok(fs.existsSync(path.join(dir, CLEANUP_MARKER)));
+});
+
+test('CoreManager applies retired artifact cleanup during startup', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-startup-cleanup-'));
+  const retiredDir = path.join(dir, 'sing-box');
+  fs.mkdirSync(retiredDir);
+  fs.writeFileSync(path.join(retiredDir, 'sing-box.exe'), 'old-core');
+  const { CoreManager } = require('../src/main/core-manager');
+  const manager = new CoreManager({ runtimeDir: dir });
+  assert.ok(!fs.existsSync(retiredDir));
+  assert.ok(fs.existsSync(manager.ensureCoreDir('mihomo')));
+});
+
+test('Windows installer removes stale packaged core resources after upgrade', () => {
+  const installer = fs.readFileSync(path.join(__dirname, '..', 'build', 'installer.nsh'), 'utf-8');
+  const start = installer.indexOf('!macro customInstall');
+  const migration = installer.slice(start);
+  assert.ok(start >= 0);
+  assert.ok(migration.includes('resources\\bin\\singbox'));
+  assert.ok(migration.includes('resources\\bin\\sing-box'));
+  assert.ok(migration.includes('resources\\bin\\sing-box.exe'));
+  assert.ok(migration.includes('resources\\bin\\*.srs'));
 });
 
 Promise.all(pendingTests).then(() => {

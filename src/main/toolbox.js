@@ -8,7 +8,7 @@ const os = require('os');
 const tls = require('tls');
 const { execFile } = require('child_process');
 
-const { getCoreAdapter, listCoreAdapters } = require('./core-adapters');
+const { getCoreAdapter } = require('./core-adapters');
 const fetch = require('./fetch');
 
 const MAX_ERROR_TEXT = 16 * 1024;
@@ -81,7 +81,7 @@ function withDiagnosticMode(context, mode, operation) {
   return queueDiagnostic(async () => {
     const settings = context.state.store.getSettings();
     const proxyPort = context.core.currentProxyPort();
-    if (!context.state.singbox.isRunning() || !proxyPort) return operation(0, false);
+    if (!context.state.coreManager.isRunning() || !proxyPort) return operation(0, false);
 
     let runtimeMode = settings.clashMode || 'rule';
     const modeRevision = typeof context.core.getModeRevision === 'function'
@@ -126,7 +126,7 @@ function withDiagnosticMode(context, mode, operation) {
 }
 
 async function withMihomoGlobalSelector(context, operation) {
-  const manager = context.state.singbox;
+  const manager = context.state.coreManager;
   if (!manager || typeof manager.getCoreType !== 'function' || manager.getCoreType() !== 'mihomo') {
     return operation();
   }
@@ -355,65 +355,6 @@ function matchClashRule(rule, target, addresses) {
   }
 }
 
-function arrayValue(value) {
-  return Array.isArray(value) ? value : value === undefined ? [] : [value];
-}
-
-const SINGBOX_RULE_KEYS = new Set([
-  'action', 'outbound', 'invert', 'type', 'mode', 'rules', 'clash_mode',
-  'domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'ip_is_private',
-  'port', 'protocol', 'rule_set',
-]);
-
-function matchSingboxRule(rule, target, addresses, clashMode) {
-  if (!rule || typeof rule !== 'object') return false;
-  if (rule.type === 'logical') {
-    const results = arrayValue(rule.rules).map((child) => matchSingboxRule(child, target, addresses, clashMode));
-    if (!results.length) return false;
-    const result = String(rule.mode).toLowerCase() === 'or'
-      ? (results.includes(true) ? true : results.includes(null) ? null : false)
-      : (results.includes(false) ? false : results.includes(null) ? null : true);
-    return result === null ? null : rule.invert ? !result : result;
-  }
-  if (rule.action && rule.action !== 'reject' && !rule.outbound) return false;
-  const checks = [];
-  if (rule.clash_mode !== undefined) checks.push(String(rule.clash_mode).toLowerCase() === String(clashMode).toLowerCase());
-  if (rule.domain !== undefined) checks.push(arrayValue(rule.domain).some((v) => target.host === String(v).toLowerCase()));
-  if (rule.domain_suffix !== undefined) checks.push(arrayValue(rule.domain_suffix).some((v) => domainSuffixMatch(target.host, v)));
-  if (rule.domain_keyword !== undefined) checks.push(arrayValue(rule.domain_keyword).some((v) => target.host.includes(String(v).toLowerCase())));
-  if (rule.ip_cidr !== undefined) checks.push(addresses.length
-    ? addresses.some((address) => arrayValue(rule.ip_cidr).some((cidr) => cidrContains(address, cidr)))
-    : null);
-  if (rule.ip_is_private !== undefined) checks.push(addresses.length ? addresses.some(isPrivateIp) === !!rule.ip_is_private : null);
-  if (rule.port !== undefined) checks.push(target.port !== null && arrayValue(rule.port).map(Number).includes(target.port));
-  if (rule.protocol !== undefined) checks.push(null);
-  if (rule.rule_set !== undefined) checks.push(null);
-  if (Object.keys(rule).some((key) => !SINGBOX_RULE_KEYS.has(key))) checks.push(null);
-  if (!checks.length) return false;
-  if (checks.includes(false)) return rule.invert ? true : false;
-  if (checks.includes(null)) return null;
-  return rule.invert ? false : true;
-}
-
-function describeSingboxRule(rule) {
-  if (rule.type === 'logical') {
-    return {
-      type: 'LOGICAL',
-      payload: `${String(rule.mode || 'and').toUpperCase()} (${arrayValue(rule.rules).length})`,
-      target: rule.action === 'reject' ? 'REJECT' : String(rule.outbound || rule.action || ''),
-      raw: rule,
-    };
-  }
-  const fields = ['clash_mode', 'domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'ip_is_private', 'rule_set', 'port'];
-  const field = fields.find((key) => rule[key] !== undefined) || 'rule';
-  return {
-    type: field.replace(/_/g, '-').toUpperCase(),
-    payload: arrayValue(rule[field]).map(String).join(', '),
-    target: rule.action === 'reject' ? 'REJECT' : String(rule.outbound || rule.action || ''),
-    raw: rule,
-  };
-}
-
 async function resolveHost(target) {
   if (target.ipVersion) return { addresses: [target.host], error: null };
   try {
@@ -434,7 +375,7 @@ function modePolicy(mode) {
 async function resolveOutboundChain(policy, context) {
   const normalized = /^(DIRECT|REJECT)$/i.test(policy || '') ? String(policy).toUpperCase() : String(policy || '🚀 Proxy');
   const chain = [normalized];
-  if (!context.state.singbox.isRunning() || /^(DIRECT|REJECT)$/.test(normalized)) return chain;
+  if (!context.state.coreManager.isRunning() || /^(DIRECT|REJECT)$/.test(normalized)) return chain;
   let current = normalized;
   for (let i = 0; i < 8; i++) {
     try {
@@ -464,7 +405,7 @@ async function inspectRoute(value, context) {
   const built = await context.core.buildCurrentConfigAsync();
   const { config } = built;
   let settings = built.settings;
-  if (context.state.singbox.isRunning()) {
+  if (context.state.coreManager.isRunning()) {
     try {
       const runtime = await context.core.clashApi('GET', '/configs');
       const runtimeMode = String(runtime && runtime.mode || '').toLowerCase();
@@ -478,11 +419,8 @@ async function inspectRoute(value, context) {
   const forcedPolicy = modePolicy(settings.clashMode);
   let source = 'generated';
   let entries = [];
-  // Mihomo exposes structured Clash rules. sing-box flattens route rules into
-  // `DEFAULT: field=value` entries, which cannot be matched reliably; its
-  // generated config below retains the original structured matcher fields.
   const adapter = getCoreAdapter(settings.coreType);
-  if (!forcedPolicy && adapter.supportsLiveRuleInspection && context.state.singbox.isRunning()) {
+  if (!forcedPolicy && adapter.supportsLiveRuleInspection && context.state.coreManager.isRunning()) {
     try {
       const live = await context.core.clashApi('GET', '/rules');
       if (Array.isArray(live.rules) && live.rules.length) {
@@ -505,10 +443,8 @@ async function inspectRoute(value, context) {
   } else {
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index];
-      const normalized = entry.kind === 'clash' ? normalizeClashRule(entry.rule) : describeSingboxRule(entry.rule);
-      const result = entry.kind === 'clash'
-        ? matchClashRule(entry.rule, target, resolved.addresses)
-        : matchSingboxRule(entry.rule, target, resolved.addresses, settings.clashMode);
+      const normalized = normalizeClashRule(entry.rule);
+      const result = matchClashRule(entry.rule, target, resolved.addresses);
       if (result === null) {
         if (unresolved.length < 8) unresolved.push({ index, type: normalized.type, payload: normalized.payload });
         continue;
@@ -520,7 +456,7 @@ async function inspectRoute(value, context) {
       }
     }
   }
-  if (!policy) policy = settings.coreType === 'sing-box' ? ((config.route || {}).final || '🚀 Proxy') : '🚀 Proxy';
+  if (!policy) policy = '🚀 Proxy';
   if (!matched) matched = { type: 'FINAL', payload: '', target: policy, index: entries.length };
   const chain = await resolveOutboundChain(policy, context);
   return {
@@ -605,8 +541,8 @@ function parsePorts(value) {
 async function inspectPorts(value, context) {
   const ports = parsePorts(value);
   const settings = context.state.store.getSettings();
-  const running = context.state.singbox.isRunning();
-  const corePid = context.state.singbox.proc && context.state.singbox.proc.pid;
+  const running = context.state.coreManager.isRunning();
+  const corePid = context.state.coreManager.proc && context.state.coreManager.proc.pid;
   return Promise.all(ports.map(async (port) => {
     const probe = await tcpProbe('127.0.0.1', port);
     const owner = probe.open ? await portOwner(port) : null;
@@ -979,12 +915,12 @@ async function externalIp(proxyPort) {
 }
 
 function tunInterfaces() {
-  return Object.keys(os.networkInterfaces()).filter((name) => /(?:^|\b)(?:utun|tun|wintun|mihomo|sing-box|dart|meta)/i.test(name));
+  return Object.keys(os.networkInterfaces()).filter((name) => /(?:^|\b)(?:utun|tun|wintun|mihomo|dart|meta)/i.test(name));
 }
 
 async function networkDiagnostics(context) {
   const settings = context.state.store.getSettings();
-  const running = context.state.singbox.isRunning();
+  const running = context.state.coreManager.isRunning();
   const server = `127.0.0.1:${settings.mixedPort}`;
   const dnsCheck = running && settings.enableTun
     ? queueDiagnostic(() => querySystemDns('www.gstatic.com'))
@@ -1012,9 +948,9 @@ async function networkDiagnostics(context) {
 
   const checks = [];
   const add = (id, status, detail, durationMs = null, data = null) => checks.push({ id, status, detail, durationMs, data });
-  const installed = context.state.singbox.isCoreInstalled();
-  const version = installed ? await context.state.singbox.getCoreVersion().catch(() => null) : null;
-  add('coreInstalled', installed ? 'pass' : 'fail', installed ? `${context.state.singbox.coreLabel} ${version ? 'v' + version : ''}`.trim() : 'core not installed');
+  const installed = context.state.coreManager.isCoreInstalled();
+  const version = installed ? await context.state.coreManager.getCoreVersion().catch(() => null) : null;
+  add('coreInstalled', installed ? 'pass' : 'fail', installed ? `${context.state.coreManager.coreLabel} ${version ? 'v' + version : ''}`.trim() : 'core not installed');
   add('coreRunning', running ? 'pass' : 'warn', running ? 'running' : 'stopped');
   add('mixedPort', running ? (mixed.open ? 'pass' : 'fail') : (mixed.open ? 'warn' : 'skip'), mixed.open ? `127.0.0.1:${settings.mixedPort} listening` : `127.0.0.1:${settings.mixedPort} closed`, mixed.durationMs);
   add('apiPort', running ? (apiPort.open ? 'pass' : 'fail') : 'skip', apiPort.open ? `127.0.0.1:${settings.clashApiPort} listening` : `127.0.0.1:${settings.clashApiPort} closed`, apiPort.durationMs);
@@ -1061,7 +997,9 @@ function configSummary(coreType, config, sourceNodes, sourceRules, text) {
     sourceRules,
     generatedRules: summary.generatedRules,
     tun: summary.tun,
-    dns: !!config.dns,
+    dns: typeof adapter.dnsOverrideEnabled === 'function'
+      ? adapter.dnsOverrideEnabled(config)
+      : !!config.dns,
     bytes: Buffer.byteLength(text),
     lines: text.split('\n').length,
   };
@@ -1078,41 +1016,47 @@ function extractErrorLocation(message) {
   return { line, column, path: pathMatch ? pathMatch[1] : null };
 }
 
-async function checkAllConfigs(context) {
+async function checkMihomoConfig(context) {
   const active = context.state.store.getSubscription(context.core.getActiveSubId(), { includeRaw: true });
   const sourceNodes = active && Array.isArray(active.nodes) ? active.nodes.length : 0;
   const sourceRules = active && Array.isArray(active.clashRules) ? active.clashRules.length : 0;
   const sourceText = active && typeof active.raw === 'string' ? active.raw : '';
-  const results = [];
-  for (const adapter of listCoreAdapters()) {
-    const coreType = adapter.id;
-    try {
-      await adapter.prepareStart(context.state.singbox);
-      const { config } = await context.core.buildCurrentConfigAsync(coreType);
-      const text = configText(coreType, config);
-      const installed = context.state.singbox.isCoreInstalled(coreType);
-      let validation = { status: 'missing', message: coreType + ' core not installed', location: null };
-      if (installed) {
-        try {
-          const checked = await context.state.singbox.checkConfigFor(coreType, config);
-          validation = { status: 'pass', message: checked.output || 'configuration is valid', location: null };
-        } catch (error) {
-          const message = errorText(error);
-          validation = { status: 'fail', message, location: extractErrorLocation(message) };
-        }
+  const coreType = 'mihomo';
+  const adapter = getCoreAdapter(coreType);
+  let checkedConfig;
+  try {
+    await adapter.prepareStart(context.state.coreManager);
+    const { config } = await context.core.buildCurrentConfigAsync(coreType);
+    const text = configText(coreType, config);
+    const installed = context.state.coreManager.isCoreInstalled(coreType);
+    let validation = { status: 'missing', message: 'Mihomo core not installed', location: null };
+    if (installed) {
+      try {
+        const checked = await context.state.coreManager.checkConfigFor(coreType, config);
+        validation = { status: 'pass', message: checked.output || 'configuration is valid', location: null };
+      } catch (error) {
+        const message = errorText(error);
+        validation = { status: 'fail', message, location: extractErrorLocation(message) };
       }
-      results.push({
-        coreType,
-        installed,
-        validation,
-        summary: configSummary(coreType, config, sourceNodes, sourceRules, text),
-        preview: text.slice(0, MAX_CONFIG_PREVIEW),
-        truncated: text.length > MAX_CONFIG_PREVIEW,
-      });
-    } catch (error) {
-      const message = errorText(error);
-      results.push({ coreType, installed: context.state.singbox.isCoreInstalled(coreType), validation: { status: 'fail', message, location: extractErrorLocation(message) }, summary: null, preview: '', truncated: false });
     }
+    checkedConfig = {
+      coreType,
+      installed,
+      validation,
+      summary: configSummary(coreType, config, sourceNodes, sourceRules, text),
+      preview: text.slice(0, MAX_CONFIG_PREVIEW),
+      truncated: text.length > MAX_CONFIG_PREVIEW,
+    };
+  } catch (error) {
+    const message = errorText(error);
+    checkedConfig = {
+      coreType,
+      installed: context.state.coreManager.isCoreInstalled(coreType),
+      validation: { status: 'fail', message, location: extractErrorLocation(message) },
+      summary: null,
+      preview: '',
+      truncated: false,
+    };
   }
   return {
     source: {
@@ -1123,7 +1067,7 @@ async function checkAllConfigs(context) {
       preview: sourceText.slice(0, MAX_CONFIG_PREVIEW),
       truncated: sourceText.length > MAX_CONFIG_PREVIEW,
     },
-    results,
+    result: checkedConfig,
   };
 }
 
@@ -1167,9 +1111,6 @@ function validateBackupDocument(document) {
       throw new Error('backup contains an invalid or duplicate config id');
     }
     ids.add(sub.id);
-    if (sub.userAgentMode !== undefined && !['auto', 'sing-box', 'clash'].includes(sub.userAgentMode)) {
-      throw new Error('backup config User-Agent mode is invalid');
-    }
     if (sub.nodes !== undefined && !Array.isArray(sub.nodes)) throw new Error('backup config nodes are invalid');
     if (Array.isArray(sub.nodes)) {
       nodeCount += sub.nodes.length;
@@ -1199,9 +1140,9 @@ function validateBackupDocument(document) {
     }
     ruleIds.add(item.id);
     if (item.target !== undefined && !['proxy', 'direct', 'reject'].includes(item.target)) throw new Error('backup remote rule target is invalid');
-    if (item.format !== undefined && !['clash', 'sing-box'].includes(item.format)) throw new Error('backup remote rule format is invalid');
-    if (item.kind !== undefined && !['inline', 'ruleset'].includes(item.kind)) throw new Error('backup remote rule kind is invalid');
-    if (item.rules !== undefined && (!Array.isArray(item.rules) || item.rules.length > 100000 || item.rules.some((rule) => !isPlainObject(rule)))) {
+    if (item.format !== undefined && item.format !== 'clash') throw new Error('backup remote rule format is invalid');
+    if (item.kind !== undefined && item.kind !== 'inline') throw new Error('backup remote rule kind is invalid');
+    if (item.rules !== undefined && (!Array.isArray(item.rules) || item.rules.length > 100000 || item.rules.some((rule) => typeof rule !== 'string'))) {
       throw new Error('backup remote rule payload is invalid');
     }
   }
@@ -1220,9 +1161,14 @@ function validateBackupDocument(document) {
     }
   }
   const activeSub = ids.has(data.activeSub) ? data.activeSub : subscriptions[0] ? subscriptions[0].id : null;
+  const normalizedSubscriptions = subscriptions.map((sub) => {
+    const normalized = { ...sub };
+    delete normalized.userAgentMode;
+    return normalized;
+  });
   return {
-    settings: { ...data.settings },
-    subscriptions,
+    settings: { ...data.settings, coreType: 'mihomo' },
+    subscriptions: normalizedSubscriptions,
     activeSub,
     selected: typeof data.selected === 'string' ? data.selected : null,
     customRuleSets,
@@ -1239,7 +1185,7 @@ function backupSummary(document, normalized) {
     nodes: nodeCount,
     remoteRules: normalized.customRuleSets.length,
     localRules: normalized.localRules.length,
-    coreType: normalized.settings.coreType || 'sing-box',
+    coreType: 'mihomo',
   };
 }
 
@@ -1247,7 +1193,6 @@ module.exports = {
   normalizeTarget,
   cidrContains,
   matchClashRule,
-  matchSingboxRule,
   parsePorts,
   buildDnsQuery,
   parseDnsMessage,
@@ -1259,7 +1204,7 @@ module.exports = {
   inspectPorts,
   dnsComparison,
   networkDiagnostics,
-  checkAllConfigs,
+  checkMihomoConfig,
   buildBackup,
   validateBackupDocument,
   backupSummary,

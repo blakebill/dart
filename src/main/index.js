@@ -53,9 +53,9 @@ configureUserDataDir();
 if (process.platform !== 'win32') {
   app.disableHardwareAcceleration();
 }
-const { state, runtimeDir, resourcesBinDir, sendLog, sendStatus } = require('./state');
+const { state, runtimeDir, resourcesBinDir, liveWebContents, sendLog, sendStatus } = require('./state');
 const { Store } = require('./store');
-const { CoreManager } = require('./singbox');
+const { CoreManager } = require('./core-manager');
 const { createWindow, showMainWindow, destroyWindow } = require('./window');
 const { createTray } = require('./tray');
 const { stopTrafficStream } = require('./traffic');
@@ -93,8 +93,8 @@ function recordCrash(kind, err) {
         try { fs.renameSync(file, file + '.old'); } catch (_) { fs.truncateSync(file, 0); }
       }
     } catch (_) {}
-    const coreType = state.singbox && typeof state.singbox.getCoreType === 'function'
-      ? state.singbox.getCoreType()
+    const coreType = state.coreManager && typeof state.coreManager.getCoreType === 'function'
+      ? state.coreManager.getCoreType()
       : 'unknown';
     const memory = process.memoryUsage();
     const context = [
@@ -179,7 +179,7 @@ function handleFatalError(kind, error) {
   setImmediate(async () => {
     const hardExit = setTimeout(() => app.exit(1), 8000);
     try {
-      if (state.singbox) await core.cleanup();
+      if (state.coreManager) await core.cleanup();
     } catch (cleanupError) {
       recordCrash('fatal cleanup failed', cleanupError);
       const ownedServer = state.systemProxyServer ||
@@ -206,7 +206,7 @@ app.on('render-process-gone', (_event, webContents, details) => {
     rendererRecoveryStarted ||
     !win ||
     !webContents ||
-    win.webContents !== webContents
+    liveWebContents(win) !== webContents
   ) return;
   rendererRecoveryStarted = true;
   const restoreVisible = typeof win.isVisible !== 'function' || win.isVisible();
@@ -279,7 +279,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     state.store = new Store(app.getPath('userData'));
     const settings = state.store.getSettings();
-    state.singbox = new CoreManager({
+    state.coreManager = new CoreManager({
       resourcesDir: resourcesBinDir,
       runtimeDir,
       coreType: settings.coreType,
@@ -301,7 +301,7 @@ if (!gotLock) {
                 }
                 // A new core may have started while the registry operation was
                 // queued. Do not clear the ownership state of that newer run.
-                if (!state.singbox.isRunning() && state.systemProxyServer === ownedServer) {
+                if (!state.coreManager.isRunning() && state.systemProxyServer === ownedServer) {
                   state.systemProxyOn = false;
                   state.systemProxyServer = null;
                 }
@@ -326,8 +326,8 @@ if (!gotLock) {
         // the app is sitting in the tray.
         if (!state.coreStopping && !app.isQuitting) {
           recordCrash('core exited unexpectedly', {
-            coreType: state.singbox.getCoreType(),
-            coreLabel: state.singbox.coreLabel,
+            coreType: state.coreManager.getCoreType(),
+            coreLabel: state.coreManager.coreLabel,
             code,
             signal,
           });
@@ -335,7 +335,7 @@ if (!gotLock) {
           const zh = (state.store.getSettings().language || 'zh') === 'zh';
           notify(
             zh ? '内核已停止' : 'Core stopped',
-            zh ? '内核意外退出，代理可能已失效。' : `${state.singbox.coreLabel} exited unexpectedly; the proxy may be down.`
+            zh ? '内核意外退出，代理可能已失效。' : `${state.coreManager.coreLabel} exited unexpectedly; the proxy may be down.`
           );
         }
       },
@@ -364,7 +364,7 @@ if (!gotLock) {
 
     // Auto-resume: if the core was running at last quit, start it again so the
     // user does not have to click Start every time they open the app.
-    if (state.store.get('lastRunning') && state.singbox.isCoreInstalled()) {
+    if (state.store.get('lastRunning') && state.coreManager.isCoreInstalled()) {
       // Core recovery is a main-process responsibility: a renderer load error
       // must not leave a tray-started app silently offline.
       healDone

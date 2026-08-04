@@ -13,7 +13,20 @@ const { state, sendToMain } = require('./state');
 let trafficReq = null;
 let trafficRetryTimer = null;
 const MAX_TRAFFIC_BUFFER = 64 * 1024;
+const TRAFFIC_ACTIVE_RATE = 256;
+const TRAFFIC_ACTIVE_WINDOW_MS = 12_000;
+const TRAY_TOOLTIP_MIN_INTERVAL_MS = 2_500;
+const TRAY_TOOLTIP_MAX_STALE_MS = 10_000;
+const TRAY_TOOLTIP_MIN_RATE_DELTA = 1024;
+const TRAY_TOOLTIP_RATE_DELTA_RATIO = 0.15;
 let lastTrayTooltip = '';
+let lastTrayTooltipAt = 0;
+let lastTrayRates = { up: 0, down: 0 };
+let trafficStreamStartedAt = 0;
+let lastTrafficSampleAt = 0;
+let lastTrafficActiveAt = 0;
+let lastTrafficRate = 0;
+let trafficActivityListener = null;
 
 // Human-readable rate for the tray tooltip (e.g. "1.2 MB/s", "840 KB/s").
 function fmtRate(n) {
@@ -29,16 +42,71 @@ function fmtRate(n) {
 
 // Show the live throughput on the tray icon's tooltip, so it's visible even
 // when the window is hidden in the tray (pairs with silent start).
-function updateTrayTooltip(up, down) {
+function normalizeRate(value) {
+  const rate = Number(value);
+  return Number.isFinite(rate) && rate > 0 ? rate : 0;
+}
+
+function rateChangedMeaningfully(previous, next) {
+  if (previous === next) return false;
+  if (previous === 0 || next === 0) return true;
+  const delta = Math.abs(next - previous);
+  return delta >= TRAY_TOOLTIP_MIN_RATE_DELTA &&
+    delta / Math.max(previous, next) >= TRAY_TOOLTIP_RATE_DELTA_RATIO;
+}
+
+function updateTrayTooltip(up, down, now = Date.now()) {
   if (!state.tray || (state.tray.isDestroyed && state.tray.isDestroyed())) return;
+  up = normalizeRate(up);
+  down = normalizeRate(down);
   const tooltip = `Dart Network Control\n↑ ${fmtRate(up)}   ↓ ${fmtRate(down)}`;
   if (tooltip === lastTrayTooltip) return;
+  const elapsed = Math.max(0, now - lastTrayTooltipAt);
+  if (lastTrayTooltip) {
+    if (elapsed < TRAY_TOOLTIP_MIN_INTERVAL_MS) return;
+    if (
+      elapsed < TRAY_TOOLTIP_MAX_STALE_MS &&
+      !rateChangedMeaningfully(lastTrayRates.up, up) &&
+      !rateChangedMeaningfully(lastTrayRates.down, down)
+    ) return;
+  }
   try {
     state.tray.setToolTip(tooltip);
     lastTrayTooltip = tooltip;
+    lastTrayTooltipAt = now;
+    lastTrayRates = { up, down };
   } catch (_) {
     /* tray may be gone during shutdown */
   }
+}
+
+function noteTrafficSample(up, down, now = Date.now()) {
+  const rate = normalizeRate(up) + normalizeRate(down);
+  const wasActive = lastTrafficActiveAt > 0 &&
+    now - lastTrafficActiveAt <= TRAFFIC_ACTIVE_WINDOW_MS;
+  lastTrafficSampleAt = now;
+  lastTrafficRate = rate;
+  if (rate >= TRAFFIC_ACTIVE_RATE) {
+    lastTrafficActiveAt = now;
+    if (!wasActive && trafficActivityListener) {
+      try { trafficActivityListener(); } catch (_) { /* advisory */ }
+    }
+  }
+}
+
+function getTrafficActivity(now = Date.now()) {
+  const reference = lastTrafficActiveAt || trafficStreamStartedAt || lastTrafficSampleAt || now;
+  const idleForMs = Math.max(0, now - reference);
+  return {
+    active: lastTrafficActiveAt > 0 && idleForMs <= TRAFFIC_ACTIVE_WINDOW_MS,
+    idleForMs,
+    rate: lastTrafficRate,
+    sampleAgeMs: lastTrafficSampleAt > 0 ? Math.max(0, now - lastTrafficSampleAt) : Infinity,
+  };
+}
+
+function setTrafficActivityListener(listener) {
+  trafficActivityListener = typeof listener === 'function' ? listener : null;
 }
 
 function startTrafficStream() {
@@ -46,11 +114,12 @@ function startTrafficStream() {
   const settings = state.store.getSettings();
   // Runs whenever the core is up (independent of window visibility) so the tray
   // tooltip keeps showing live speed while minimized.
-  if (!state.singbox || !state.singbox.isRunning()) return;
+  if (!state.coreManager || !state.coreManager.isRunning()) return;
+  trafficStreamStartedAt = Date.now();
   let req;
   let retryScheduled = false;
   const retry = () => {
-    if (retryScheduled || trafficReq !== req || !state.singbox || !state.singbox.isRunning()) return;
+    if (retryScheduled || trafficReq !== req || !state.coreManager || !state.coreManager.isRunning()) return;
     retryScheduled = true;
     trafficRetryTimer = setTimeout(() => {
       trafficRetryTimer = null;
@@ -85,12 +154,13 @@ function startTrafficStream() {
             const t = JSON.parse(line);
             const up = t.up || 0;
             const down = t.down || 0;
+            noteTrafficSample(up, down);
             updateTrayTooltip(up, down);
             const windowVisible = state.mainWindow &&
               (typeof state.mainWindow.isDestroyed !== 'function' || !state.mainWindow.isDestroyed()) &&
               (typeof state.mainWindow.isVisible !== 'function' || state.mainWindow.isVisible()) &&
               (typeof state.mainWindow.isMinimized !== 'function' || !state.mainWindow.isMinimized());
-            if (windowVisible) sendToMain('singbox:traffic', { up, down });
+            if (windowVisible) sendToMain('core:traffic', { up, down });
           } catch (_) {
             /* ignore malformed line */
           }
@@ -111,6 +181,12 @@ function startTrafficStream() {
 
 function stopTrafficStream() {
   lastTrayTooltip = '';
+  lastTrayTooltipAt = 0;
+  lastTrayRates = { up: 0, down: 0 };
+  trafficStreamStartedAt = 0;
+  lastTrafficSampleAt = 0;
+  lastTrafficActiveAt = 0;
+  lastTrafficRate = 0;
   if (trafficRetryTimer) {
     clearTimeout(trafficRetryTimer);
     trafficRetryTimer = null;
@@ -121,4 +197,9 @@ function stopTrafficStream() {
   }
 }
 
-module.exports = { startTrafficStream, stopTrafficStream };
+module.exports = {
+  startTrafficStream,
+  stopTrafficStream,
+  getTrafficActivity,
+  setTrafficActivityListener,
+};

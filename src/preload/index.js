@@ -42,10 +42,6 @@ contextBridge.exposeInMainWorld('api', {
   getSubRaw: (payload) => ipcRenderer.invoke('sub:getRaw', payload),
   saveSubRaw: (payload) => ipcRenderer.invoke('sub:saveRaw', payload),
 
-  // Conversion
-  convertPreview: (payload) => ipcRenderer.invoke('convert:preview', payload),
-  exportConfig: () => ipcRenderer.invoke('convert:export'),
-
   // Settings
   updateSettings: (patch) => ipcRenderer.invoke('settings:update', patch),
   /** Apply store theme to nativeTheme and return { preference, dark, effective }. */
@@ -80,6 +76,8 @@ contextBridge.exposeInMainWorld('api', {
   getRules: () => ipcRenderer.invoke('rules:get'),
   getRuleGroups: () => ipcRenderer.invoke('rules:groups'),
   setRuleGroupOutbound: (group, outbound) => ipcRenderer.invoke('rules:setGroupOutbound', { group, outbound }),
+  setConnectionsVisible: (visible) => ipcRenderer.invoke('connections:setVisible', { visible: !!visible }),
+  getConnectionSummary: () => ipcRenderer.invoke('connections:summary'),
   getConnections: () => ipcRenderer.invoke('connections:get'),
   closeAllConnections: () => ipcRenderer.invoke('connections:closeAll'),
   closeConnection: (id) => ipcRenderer.invoke('connections:close', { id }),
@@ -98,7 +96,7 @@ contextBridge.exposeInMainWorld('api', {
   // Diagnostics and maintenance toolbox
   inspectRoute: (payload) => ipcRenderer.invoke('tools:routeInspect', payload),
   runNetworkDiagnostics: () => ipcRenderer.invoke('tools:networkDiagnostics'),
-  checkAllConfigs: () => ipcRenderer.invoke('tools:configCheck'),
+  checkMihomoConfig: () => ipcRenderer.invoke('tools:configCheck'),
   inspectPorts: (payload) => ipcRenderer.invoke('tools:portCheck', payload),
   compareDns: (payload) => ipcRenderer.invoke('tools:dnsCompare', payload),
   saveToolReport: (payload) => ipcRenderer.invoke('tools:saveReport', payload),
@@ -140,13 +138,13 @@ contextBridge.exposeInMainWorld('api', {
   // Event subscriptions
   onLog: (cb) => {
     const handler = (_e, line) => cb(line);
-    ipcRenderer.on('singbox:log', handler);
-    return () => ipcRenderer.removeListener('singbox:log', handler);
+    ipcRenderer.on('core:log', handler);
+    return () => ipcRenderer.removeListener('core:log', handler);
   },
   onStatus: (cb) => {
     const handler = (_e, status) => cb(status);
-    ipcRenderer.on('singbox:status', handler);
-    return () => ipcRenderer.removeListener('singbox:status', handler);
+    ipcRenderer.on('core:status', handler);
+    return () => ipcRenderer.removeListener('core:status', handler);
   },
   onDownloadProgress: (cb) => {
     const handler = (_e, p) => cb(p);
@@ -155,8 +153,8 @@ contextBridge.exposeInMainWorld('api', {
   },
   onTraffic: (cb) => {
     const handler = (_e, sample) => cb(sample);
-    ipcRenderer.on('singbox:traffic', handler);
-    return () => ipcRenderer.removeListener('singbox:traffic', handler);
+    ipcRenderer.on('core:traffic', handler);
+    return () => ipcRenderer.removeListener('core:traffic', handler);
   },
   onSubsChanged: (cb) => {
     const handler = () => cb();

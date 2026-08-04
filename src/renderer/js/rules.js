@@ -37,9 +37,11 @@
   function renderRuleWindow() {
     const list = $('#ruleList');
     if (!visibleRuleItems.length) {
+      list.classList.add('is-empty');
       list.innerHTML = `<p class="hint">${t('rules.empty')}</p>`;
       return;
     }
+    list.classList.remove('is-empty');
     const visible = Math.ceil((list.clientHeight || 480) / VIRTUAL_RULE_ROW_HEIGHT);
     const start = Math.max(0, Math.floor(list.scrollTop / VIRTUAL_RULE_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
     const end = Math.min(visibleRuleItems.length, start + visible + VIRTUAL_OVERSCAN * 2);
@@ -62,7 +64,7 @@
     renderRuleWindow();
   }
 
-  // Describe a sing-box route rule object compactly as { type, payload }.
+  // Describe a generated rule compactly as { type, payload }.
   function describeRule(r) {
     const join = (v) => [].concat(v).join(', ');
     if (r.protocol) return { type: 'protocol', payload: join(r.protocol) };
@@ -226,7 +228,7 @@
         }
         div.innerHTML = `
           <div class="sub-info">
-            <div class="sub-name">${escapeHtml(g)}</div>
+            <strong class="sub-name rule-group-name" title="${escapeHtml(g)}">${escapeHtml(g)}</strong>
           </div>
           <div class="sub-actions rule-group-actions">
             <select class="input small" data-role="mode" data-group="${escapeHtml(g)}"
@@ -402,6 +404,7 @@
     ruleGroupsReady = false;
     ruleItems = [];
     visibleRuleItems = [];
+    $('#ruleList').classList.remove('is-empty');
     $('#ruleList').textContent = '';
     $('#ruleCount').textContent = '';
     $('#lrList').textContent = '';

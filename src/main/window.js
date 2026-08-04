@@ -3,7 +3,7 @@
 const path = require('path');
 const { app, BrowserWindow, nativeTheme, dialog } = require('electron');
 
-const { state, isDev, sendLog, setRecentLogStreaming } = require('./state');
+const { state, isDev, liveWebContents, sendLog, setRecentLogStreaming } = require('./state');
 
 const isWin = process.platform === 'win32';
 const DEEP_SLEEP_DELAY_MS = 60_000;
@@ -190,9 +190,9 @@ function createWindow(startHidden = false) {
   });
 
   const sendMaximized = () => {
-    if (!mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('window:maximized', mainWindow.isMaximized());
-    }
+    const contents = liveWebContents(mainWindow);
+    if (!contents) return;
+    try { contents.send('window:maximized', mainWindow.isMaximized()); } catch (_) {}
   };
   mainWindow.on('maximize', sendMaximized);
   mainWindow.on('unmaximize', sendMaximized);

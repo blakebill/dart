@@ -253,60 +253,6 @@ function clashPolicyGroups(input, nodes = []) {
   return normalizePolicyGroups(groups, nodeNames);
 }
 
-function singboxPolicyGroups(outbounds, nodes = []) {
-  const groups = [];
-  for (const outbound of Array.isArray(outbounds) ? outbounds : []) {
-    const type = String(outbound && outbound.type || '').toLowerCase();
-    if (type !== 'selector' && type !== 'urltest') continue;
-    groups.push({
-      name: outbound.tag,
-      type: outbound.type,
-      members: outbound.outbounds,
-      default: outbound.default,
-      url: outbound.url,
-      interval: outbound.interval,
-      idleTimeout: outbound.idle_timeout,
-      tolerance: outbound.tolerance,
-      interrupt: outbound.interrupt_exist_connections,
-    });
-    if (groups.length >= MAX_POLICY_GROUP_INPUTS) break;
-  }
-  return normalizePolicyGroups(groups, nodes);
-}
-
-function singboxPolicyOutbounds(groups, defaultUrl, defaultInterval) {
-  return (groups || []).map((group) => {
-    if (group.type === 'select') {
-      return {
-        type: 'selector',
-        tag: group.name,
-        outbounds: group.members,
-        ...(group.default ? { default: group.default } : {}),
-        ...(group.interrupt !== undefined ? { interrupt_exist_connections: group.interrupt } : {}),
-      };
-    }
-    // Clash intervals are often large (e.g. 3600). sing-box requires
-    // interval <= idle_timeout; a fixed 30m idle would FATAL on start.
-    const intervalSec = Math.max(1, Number(group.interval) || Number(defaultInterval) || 60);
-    const idleSec = Math.max(
-      Math.max(1, Number(group.idleTimeout) || 30 * 60),
-      intervalSec
-    );
-    return {
-      type: 'urltest',
-      tag: group.name,
-      outbounds: group.members,
-      url: group.url || defaultUrl,
-      interval: `${intervalSec}s`,
-      tolerance: group.tolerance !== undefined
-        ? group.tolerance
-        : group.type === 'fallback' ? 10000 : 50,
-      idle_timeout: `${idleSec}s`,
-      interrupt_exist_connections: group.interrupt === true,
-    };
-  });
-}
-
 function mihomoPolicyGroups(groups, defaultUrl, defaults = {}) {
   return (groups || []).map((group) => {
     const type = group.type === 'url-test' ? 'url-test' : group.type;
@@ -331,7 +277,5 @@ function mihomoPolicyGroups(groups, defaultUrl, defaults = {}) {
 module.exports = {
   normalizePolicyGroups,
   clashPolicyGroups,
-  singboxPolicyGroups,
-  singboxPolicyOutbounds,
   mihomoPolicyGroups,
 };

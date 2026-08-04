@@ -12,10 +12,6 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      singbox_version:
-        description: 'sing-box core version to bundle (empty = latest)'
-        required: false
-        default: ''
       mihomo_version:
         description: 'mihomo core version to bundle (empty = latest)'
         required: false
@@ -104,7 +100,7 @@ jobs:
             core.info(`Deleted ${stale.length} old artifact(s).`);
 
       - name: Run self-tests
-        run: npm test
+        run: npm run test:all
 
       - name: Sync package version to release tag
         # The installer file name (Dart.Setup.<version>.exe) is derived
@@ -144,12 +140,11 @@ jobs:
           echo "Setting package.json version to $VERSION (from tag $TAG)"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-      - name: Download bundled cores and GeoData
+      - name: Download bundled Mihomo and GeoData
         env:
-          SINGBOX_VERSION: ${{ github.event.inputs.singbox_version }}
           MIHOMO_VERSION: ${{ github.event.inputs.mihomo_version }}
-          SINGBOX_OS: windows
-          SINGBOX_ARCH: amd64
+          MIHOMO_OS: windows
+          MIHOMO_ARCH: amd64
         run: npm run fetch-core
 
       - name: Build Windows installer

@@ -11,6 +11,7 @@ const LEGACY_PROFILE_FIELDS = [...PROFILE_FIELDS, 'raw'];
 const RULESET_FIELDS = ['rule', 'rules'];
 const LEGACY_DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
 const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
+const STORE_SCHEMA_VERSION = 4;
 // Only the active/most recently inspected profile needs to remain hydrated.
 // Profiles can contain thousands of full node objects, so retaining a second
 // one has a much larger cost than re-reading it on the uncommon profile switch.
@@ -32,13 +33,14 @@ const DEFAULT_SETTINGS = {
   silentStart: false,
   notifications: true,
   enableIpv6: true,
+  enableDnsOverride: false,
   dnsRemote: 'https://1.1.1.1/dns-query',
   dnsLocal: 'https://223.5.5.5/dns-query',
   dnsStrategy: 'prefer_ipv4',
   language: 'zh',
   theme: 'system',
   clashMode: 'rule',
-  coreType: 'sing-box',
+  coreType: 'mihomo',
   useBuiltinRules: false,
   ruleOverrides: {},
   ruleGroupSelections: {},
@@ -51,6 +53,10 @@ function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value || {}, key);
 }
 
+function isRecord(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
 class Store {
   constructor(dir, name = 'config.json') {
     this.dir = dir;
@@ -58,17 +64,177 @@ class Store {
     this.profileDir = path.join(dir, 'profiles');
     this.ruleSetDir = path.join(dir, 'remote-rules');
     this.recoveryMarker = path.join(dir, '.payload-recovery-needed');
+    this.migrationBackup = this.file + '.migration.bak';
     this._profileCache = new Map();
     this._profileDigests = new Map();
     this._rawDigests = new Map();
     this._ruleDigests = new Map();
     this._profileStorageEnabled = true;
     this._ruleStorageEnabled = true;
+    this._configDigest = null;
+    this._backupDigest = null;
+    this._loadedText = null;
+    this._startupRepairing = true;
+    this._startupDirty = false;
+    this._migrationSourceText = null;
+    this._migrationBackupReady = false;
     this._preserveOrphanPayloads = fs.existsSync(this.recoveryMarker);
     this.data = this._load();
+    this._migrateStoreSchema();
+    this._repairIndexShape();
     this._migrateSettingsDefaults();
     this._prepareSubscriptions();
     this._prepareCustomRuleSets();
+    this._finishStartupRepair();
+  }
+
+  _storedSchemaVersion() {
+    const version = this.data && this.data.schemaVersion;
+    return Number.isInteger(version) && version >= 0 ? version : 0;
+  }
+
+  /**
+   * Upgrade the small config index in explicit, idempotent steps. Large inline
+   * payload migration is still handled by the preparation methods below so a
+   * blocked profile directory can safely fall back to the legacy in-memory form.
+   */
+  _migrateStoreSchema() {
+    let version = this._storedSchemaVersion();
+    if (version >= STORE_SCHEMA_VERSION) return;
+    this._migrationSourceText = this._loadedText || JSON.stringify(this.data, null, 2);
+    let next = { ...this.data };
+
+    if (version < 1) {
+      // The earliest releases documented selected as { subId, nodeName } while
+      // later releases store only the node name plus activeSub. Preserve both
+      // pieces instead of treating the old object as corrupt and clearing it.
+      if (isRecord(next.selected)) {
+        const legacySelection = next.selected;
+        next.selected = typeof legacySelection.nodeName === 'string' && legacySelection.nodeName
+          ? legacySelection.nodeName
+          : null;
+        if (
+          (next.activeSub === null || next.activeSub === undefined) &&
+          typeof legacySelection.subId === 'string' &&
+          legacySelection.subId
+        ) {
+          next.activeSub = legacySelection.subId;
+        }
+      }
+      version = 1;
+      next.schemaVersion = version;
+    }
+
+    if (version < 2) {
+      const settings = isRecord(next.settings) ? { ...next.settings } : {};
+      if (typeof settings.enableDnsOverride !== 'boolean') settings.enableDnsOverride = false;
+      next.settings = settings;
+      version = 2;
+      next.schemaVersion = version;
+    }
+
+    if (version < 3) {
+      // Remove update clocks for the retired core without coupling that
+      // historical detail to the current runtime manager.
+      delete next.geoUpdatedAt_singbox;
+      delete next.geoAttemptedAt_singbox;
+      version = 3;
+      next.schemaVersion = version;
+    }
+
+    if (version < 4) {
+      // Request UA selection was retired with the Mihomo-only downloader.
+      // Remove the obsolete per-profile preference without touching sources.
+      if (Array.isArray(next.subscriptions)) {
+        next.subscriptions = next.subscriptions.map((sub) => {
+          if (!isRecord(sub) || !hasOwn(sub, 'userAgentMode')) return sub;
+          const cleaned = { ...sub };
+          delete cleaned.userAgentMode;
+          return cleaned;
+        });
+      }
+      version = 4;
+      next.schemaVersion = version;
+    }
+
+    this.data = next;
+    this._queueConfigWrite();
+  }
+
+  _queueConfigWrite() {
+    if (this._startupRepairing) {
+      this._startupDirty = true;
+      return;
+    }
+    this._writeConfig();
+  }
+
+  _finishStartupRepair() {
+    this._startupRepairing = false;
+    if (!this._startupDirty) return;
+    try {
+      this._writeConfig();
+    } catch (_) {
+      // In-memory repair remains usable for this run. If even the rollback
+      // snapshot cannot be committed, leave the legacy index untouched and
+      // retry the idempotent migration on the next launch.
+    }
+  }
+
+  _ensureMigrationBackup() {
+    if (this._migrationSourceText === null || this._migrationBackupReady) return;
+    // Keep one bounded, self-contained pre-migration snapshot. The normal .bak
+    // mirrors the new index and may point at split payload files, so it cannot
+    // serve as a downgrade/rollback copy of an inline legacy config.
+    this._writeAtomicIfChanged(this.migrationBackup, this._migrationSourceText);
+    this._migrationBackupReady = true;
+  }
+
+  _repairIndexShape() {
+    const next = { ...this.data };
+    let changed = false;
+    const replace = (key, value) => {
+      next[key] = value;
+      changed = true;
+    };
+
+    if (!isRecord(next.settings)) replace('settings', {});
+
+    if (!Array.isArray(next.localRules)) {
+      replace('localRules', []);
+    } else {
+      const valid = next.localRules.filter(isRecord);
+      if (valid.length !== next.localRules.length) replace('localRules', valid);
+    }
+
+    for (const key of ['activeSub', 'selected', 'ownedSystemProxyServer']) {
+      if (next[key] !== null && typeof next[key] !== 'string') replace(key, null);
+    }
+    if (typeof next.lastRunning !== 'boolean') replace('lastRunning', false);
+    if (next.ownedSystemProxyRestore !== null && !isRecord(next.ownedSystemProxyRestore)) {
+      replace('ownedSystemProxyRestore', null);
+    }
+
+    if (next.pendingUwpLoopbackSids !== null) {
+      if (!Array.isArray(next.pendingUwpLoopbackSids)) {
+        replace('pendingUwpLoopbackSids', null);
+      } else {
+        const valid = [...new Set(next.pendingUwpLoopbackSids.filter(
+          (sid) => typeof sid === 'string' && /^S-1-15-2-[0-9-]+$/i.test(sid)
+        ))];
+        if (
+          valid.length !== next.pendingUwpLoopbackSids.length ||
+          valid.some((sid, index) => sid !== next.pendingUwpLoopbackSids[index])
+        ) replace('pendingUwpLoopbackSids', valid);
+      }
+    }
+
+    if (!changed) return;
+    this.data = next;
+    try { this._queueConfigWrite(); } catch (_) {
+      // The repaired in-memory shape still prevents startup crashes on a
+      // temporarily read-only disk.
+    }
   }
 
   _migrateSettingsDefaults() {
@@ -76,6 +242,12 @@ class Store {
     if (!settings) return;
     const next = { ...settings };
     let changed = false;
+    // 0.9.7+ is Mihomo-only. Existing dual-core installations must not retain
+    // a removed runtime identifier in their persisted settings.
+    if (next.coreType !== 'mihomo') {
+      next.coreType = 'mihomo';
+      changed = true;
+    }
     if (next.testUrl === LEGACY_DEFAULT_TEST_URL) {
       next.testUrl = DEFAULT_TEST_URL;
       changed = true;
@@ -98,6 +270,53 @@ class Store {
       next.theme = 'system';
       changed = true;
     }
+    for (const key of [
+      'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
+      'notifications', 'enableIpv6', 'enableDnsOverride', 'useBuiltinRules',
+    ]) {
+      if (typeof next[key] !== 'boolean') {
+        next[key] = DEFAULT_SETTINGS[key];
+        changed = true;
+      }
+    }
+    for (const [key, allowed] of Object.entries({
+      coreType: ['mihomo'],
+      logLevel: ['trace', 'debug', 'info', 'warn', 'error'],
+      dnsStrategy: ['prefer_ipv4', 'prefer_ipv6', 'ipv4_only', 'ipv6_only'],
+      language: ['zh', 'en'],
+      clashMode: ['rule', 'global', 'direct', 'block'],
+      smartMode: ['balanced', 'latency', 'stable'],
+    })) {
+      if (!allowed.includes(next[key])) {
+        next[key] = DEFAULT_SETTINGS[key];
+        changed = true;
+      }
+    }
+    for (const key of ['mixedPort', 'clashApiPort']) {
+      if (!Number.isInteger(next[key]) || next[key] < 1 || next[key] > 65535) {
+        next[key] = DEFAULT_SETTINGS[key];
+        changed = true;
+      }
+    }
+    if (next.mixedPort === next.clashApiPort) {
+      next.mixedPort = DEFAULT_SETTINGS.mixedPort;
+      next.clashApiPort = DEFAULT_SETTINGS.clashApiPort;
+      changed = true;
+    }
+    for (const key of ['dnsRemote', 'dnsLocal', 'testUrl']) {
+      if (typeof next[key] !== 'string' || !next[key].trim()) {
+        next[key] = DEFAULT_SETTINGS[key];
+        changed = true;
+      }
+    }
+    if (!isRecord(next.ruleOverrides)) {
+      next.ruleOverrides = {};
+      changed = true;
+    }
+    if (!isRecord(next.ruleGroupSelections)) {
+      next.ruleGroupSelections = {};
+      changed = true;
+    }
     if (hasOwn(next, 'smartRegions')) {
       const regions = normalizeSmartRegions(next.smartRegions);
       if (
@@ -111,7 +330,7 @@ class Store {
     }
     if (!changed) return;
     this.data = { ...this.data, settings: next };
-    try { this._writeConfig(); } catch (_) {
+    try { this._queueConfigWrite(); } catch (_) {
       // Keep the migrated value in memory if a read-only disk prevents repair.
     }
   }
@@ -125,16 +344,26 @@ class Store {
         const text = fs.readFileSync(candidate, 'utf-8');
         const data = JSON.parse(text);
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid config index');
+        const digest = this._digest(text);
+        this._loadedText = text;
         if (candidate === backup) {
           // The backup is already a valid committed index. A read-only disk or
           // transient antivirus lock may prevent self-healing the primary, but
           // must not turn that valid backup into a "corrupt" file and reset the
           // whole store to defaults.
-          try { this._writeAtomic(this.file, text); } catch (_) {
+          this._backupDigest = digest;
+          try {
+            this._writeAtomic(this.file, text);
+            this._configDigest = digest;
+          } catch (_) {
             this._preserveOrphanPayloads = true;
           }
         } else {
-          try { this._writeAtomic(backup, text); } catch (_) {}
+          this._configDigest = digest;
+          try {
+            this._writeAtomicIfChanged(backup, text);
+            this._backupDigest = digest;
+          } catch (_) {}
         }
         return data;
       } catch (_) {
@@ -156,6 +385,7 @@ class Store {
 
   _defaults() {
     return {
+      schemaVersion: STORE_SCHEMA_VERSION,
       subscriptions: [],
       settings: { ...DEFAULT_SETTINGS },
       selected: null,
@@ -229,7 +459,11 @@ class Store {
   _subscriptionMetadata(sub, payload, files = {}) {
     const metadata = {};
     for (const [key, value] of Object.entries(sub || {})) {
-      if (!LEGACY_PROFILE_FIELDS.includes(key) && !['dataFile', 'rawFile', 'nodeCount'].includes(key)) {
+      if (
+        key !== 'userAgentMode' &&
+        !LEGACY_PROFILE_FIELDS.includes(key) &&
+        !['dataFile', 'rawFile', 'nodeCount'].includes(key)
+      ) {
         metadata[key] = value;
       }
     }
@@ -283,13 +517,33 @@ class Store {
     }
   }
 
+  _writeAtomicIfChanged(file, text) {
+    try {
+      if (fs.readFileSync(file, 'utf-8') === text) return false;
+    } catch (_) {
+      // A missing/unreadable mirror needs to be replaced.
+    }
+    this._writeAtomic(file, text);
+    return true;
+  }
+
   _writeConfigData(data) {
     const text = JSON.stringify(data, null, 2);
-    this._writeAtomic(this.file, text);
+    const digest = this._digest(text);
+    this._ensureMigrationBackup();
+    if (this._configDigest !== digest || !fs.existsSync(this.file)) {
+      this._writeAtomic(this.file, text);
+      this._configDigest = digest;
+    }
     // Mirror the committed index. Payload files are versioned separately, so
     // this current-state copy can recover a corrupted primary without pointing
     // at files that have already been retired.
-    try { this._writeAtomic(this.file + '.bak', text); } catch (_) {}
+    if (this._backupDigest !== digest || !fs.existsSync(this.file + '.bak')) {
+      try {
+        this._writeAtomic(this.file + '.bak', text);
+        this._backupDigest = digest;
+      } catch (_) {}
+    }
   }
 
   _writeConfig() {
@@ -471,11 +725,14 @@ class Store {
     const records = Array.isArray(this.data.subscriptions) ? this.data.subscriptions : [];
     const metadata = [];
     const seenIds = new Set();
-    let changed = false;
+    let changed = !Array.isArray(this.data.subscriptions);
     try {
       for (let index = 0; index < records.length; index++) {
         const record = records[index];
-        if (!record || typeof record !== 'object') continue;
+        if (!record || typeof record !== 'object' || Array.isArray(record)) {
+          changed = true;
+          continue;
+        }
         const id = this._recordId(record.id, 'legacy-profile', index, seenIds);
         const normalized = id === record.id ? record : { ...record, id };
         if (normalized !== record) changed = true;
@@ -508,7 +765,7 @@ class Store {
         }
       }
       this.data = { ...this.data, subscriptions: metadata };
-      if (changed) this._writeConfig();
+      if (changed) this._queueConfigWrite();
       const active = new Set(metadata.flatMap((meta) => [meta.dataFile, meta.rawFile].filter(Boolean)));
       if (!this._preserveOrphanPayloads) this._cleanupPayloadDir(this.profileDir, active, ['json', 'raw']);
       this._pruneDigests(this._profileDigests, active);
@@ -524,10 +781,13 @@ class Store {
     const records = Array.isArray(this.data.customRuleSets) ? this.data.customRuleSets : [];
     const metadata = [];
     const seenIds = new Set();
-    let changed = false;
+    let changed = !Array.isArray(this.data.customRuleSets);
     try {
       records.forEach((record, index) => {
-        if (!record || typeof record !== 'object') return;
+        if (!record || typeof record !== 'object' || Array.isArray(record)) {
+          changed = true;
+          return;
+        }
         const id = this._recordId(record.id, 'legacy-rule', index, seenIds);
         const normalized = id === record.id ? record : { ...record, id };
         const external = this._validPayloadFile(normalized.payloadFile, 'json') &&
@@ -548,7 +808,7 @@ class Store {
         }
       });
       this.data = { ...this.data, customRuleSets: metadata };
-      if (changed) this._writeConfig();
+      if (changed) this._queueConfigWrite();
       const active = new Set(metadata.map((meta) => meta.payloadFile).filter(Boolean));
       if (!this._preserveOrphanPayloads) this._cleanupPayloadDir(this.ruleSetDir, active, ['json']);
       this._pruneDigests(this._ruleDigests, active);
@@ -597,10 +857,11 @@ class Store {
     if (!this._profileStorageEnabled) {
       const list = [...(this.data.subscriptions || [])];
       const index = list.findIndex((sub) => sub.id === subscription.id);
-      if (index >= 0) list[index] = { ...list[index], ...subscription };
-      else list.push(subscription);
+      const next = index >= 0 ? { ...list[index], ...subscription } : subscription;
+      if (index >= 0) list[index] = next;
+      else list.push(next);
       this._commitData({ ...this.data, subscriptions: list });
-      return subscription;
+      return next;
     }
 
     const list = this.data.subscriptions || [];
@@ -651,7 +912,13 @@ class Store {
           rawFile = null;
         }
       }
-      const meta = this._subscriptionMetadata(subscription, payload, {
+      // A payload-only patch must not erase metadata such as the source URL,
+      // update interval or display name. Most callers pass a complete profile,
+      // but recovery/migration code is allowed to update only nodes or raw.
+      const metadataSource = currentMeta
+        ? { ...this._publicMetadata(currentMeta, true), ...subscription }
+        : subscription;
+      const meta = this._subscriptionMetadata(metadataSource, payload, {
         dataFile: profileStage.file,
         rawFile,
       });
@@ -930,6 +1197,18 @@ class Store {
     this._commitData({ ...this.data, [key]: value });
   }
 
+  /** Commit a small group of index values in one atomic replacement. */
+  updateValues(patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new Error('store patch must be an object');
+    }
+    if (hasOwn(patch, 'subscriptions') || hasOwn(patch, 'customRuleSets')) {
+      throw new Error('payload collections must use their dedicated store methods');
+    }
+    this._commitData({ ...this.data, ...patch });
+    return patch;
+  }
+
   getSettings() {
     return { ...DEFAULT_SETTINGS, ...(this.data.settings || {}) };
   }
@@ -941,4 +1220,4 @@ class Store {
   }
 }
 
-module.exports = { Store };
+module.exports = { Store, STORE_SCHEMA_VERSION };

@@ -8,7 +8,68 @@
 
   // Renderer-wide state, replaced wholesale by refresh() in main.js — always
   // reference it as App.state, never capture the object in a local.
-  App.state = { subscriptions: [], settings: {}, status: {} };
+  // New modules consume explicit service, state, event and routing boundaries.
+  // App.state remains as a compatibility property while older modules migrate.
+  let rendererState = { subscriptions: [], settings: {}, status: {} };
+  const stateSubscribers = new Set();
+  App.store = Object.freeze({
+    getSnapshot: () => rendererState,
+    replace(nextState) {
+      const previous = rendererState;
+      rendererState = nextState && typeof nextState === 'object'
+        ? nextState
+        : { subscriptions: [], settings: {}, status: {} };
+      for (const listener of [...stateSubscribers]) listener(rendererState, previous);
+      return rendererState;
+    },
+    patch(section, patch) {
+      const current = rendererState[section];
+      return this.replace({
+        ...rendererState,
+        [section]: current && typeof current === 'object'
+          ? { ...current, ...(patch || {}) }
+          : patch,
+      });
+    },
+    subscribe(listener) {
+      if (typeof listener !== 'function') return () => {};
+      stateSubscribers.add(listener);
+      return () => stateSubscribers.delete(listener);
+    },
+  });
+  Object.defineProperty(App, 'state', {
+    configurable: false,
+    enumerable: true,
+    get: () => rendererState,
+    set: (value) => App.store.replace(value),
+  });
+
+  App.createEventBus = function createEventBus() {
+    const listeners = new Map();
+    return Object.freeze({
+      on(type, listener) {
+        if (typeof listener !== 'function') return () => {};
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(listener);
+        return () => listeners.get(type)?.delete(listener);
+      },
+      emit(type, detail) {
+        for (const listener of [...(listeners.get(type) || [])]) listener(detail);
+      },
+      clear(type) {
+        if (type === undefined) listeners.clear();
+        else listeners.delete(type);
+      },
+    });
+  };
+  App.events = App.createEventBus();
+  App.services = Object.freeze({ api: window.api || null });
+  App.router = Object.freeze({
+    go(tab) {
+      if (typeof App.showTab === 'function') App.showTab(tab);
+    },
+  });
+  App.factories = {};
   // Session-only latency results keyed by node name. Profile changes clear this
   // map in main.js; closing the renderer naturally discards it without I/O.
   // Values: number (ms) | 'timeout' | 'testing'.
@@ -110,7 +171,7 @@
 
   // app:getState returns compact profile summaries, so hashing the complete
   // list is cheap and automatically covers metadata added in future versions.
-  // Omitting fields here used to leave auto-update / proxy / User-Agent labels
+  // Omitting fields here used to leave auto-update and proxy labels
   // stale after a metadata-only edit whose updatedAt did not change.
   App.subscriptionStateSignature = function subscriptionStateSignature(subs, activeSub) {
     return JSON.stringify([activeSub || null, Array.isArray(subs) ? subs : []]);

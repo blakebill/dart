@@ -43,7 +43,7 @@ function createTray() {
 
 function updateTrayMenu() {
   if (!state.tray) return;
-  const running = state.singbox && state.singbox.isRunning();
+  const running = state.coreManager && state.coreManager.isRunning();
   updateTrayIcon(!!running);
   // While running, the traffic stream keeps the tooltip showing live speed;
   // reset it to the plain name once stopped so it doesn't show stale numbers.

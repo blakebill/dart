@@ -11,7 +11,9 @@
 
   function renderSubs() {
     const list = $('#subList');
+    const summary = $('#subListSummary');
     list.innerHTML = '';
+    if (summary) summary.textContent = t('subs.profileCount', App.state.subscriptions.length);
     if (App.state.subscriptions.length === 0) {
       list.innerHTML = `<p class="hint">${t('subs.empty')}</p>`;
       return;
@@ -20,10 +22,14 @@
       const div = document.createElement('div');
       div.className = 'sub-item';
       let traffic = '';
+      let usagePercent = null;
       if (sub.userInfo) {
         const u = sub.userInfo;
         const used = (u.upload || 0) + (u.download || 0);
         traffic = t('subs.used', fmtBytes(used), fmtBytes(u.total));
+        if (Number.isFinite(u.total) && u.total > 0) {
+          usagePercent = Math.max(0, Math.min(100, used / u.total * 100));
+        }
         if (u.expire) {
           const locale = getLang() === 'en' ? 'en-US' : 'zh-CN';
           traffic += ' · ' + t('subs.expire', new Date(u.expire * 1000).toLocaleDateString(locale));
@@ -33,37 +39,40 @@
       const auInfo = au > 0 ? t('subs.autoUpdateInfo', au) : t('subs.autoUpdateNone');
       const isActive = sub.id === App.state.activeSub;
       if (isActive) div.classList.add('active');
-      const sourceFormat = escapeHtml(
-        { clash: 'Clash', singbox: 'sing-box', links: 'Links' }[sub.format] || sub.format || '-'
-      );
-      const coreType = (App.state.settings && App.state.settings.coreType) ||
-        (App.state.status && App.state.status.coreType) || 'sing-box';
-      const runtimeFormat = coreType === 'mihomo' ? 'Mihomo' : 'sing-box';
-      const sourceIsNative = (sub.format === 'singbox' && coreType === 'sing-box') ||
-        (sub.format === 'clash' && coreType === 'mihomo');
-      const formatSummary = sourceIsNative
-        ? t('subs.sourceFormat', sourceFormat)
-        : t('subs.formatFlow', sourceFormat, runtimeFormat);
       const id = escapeHtml(sub.id);
-      const viaProxy = sub.updateViaProxy ? ' · ' + t('subs.viaProxyTag') : '';
-      const userAgentMode = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
-      const userAgentLabel = userAgentMode === 'clash' ? 'Clash' : userAgentMode;
-      const userAgentTag = userAgentMode === 'auto' ? '' : ' · ' + t('subs.userAgentTag', userAgentLabel);
+      const viaProxy = sub.updateViaProxy ? t('subs.viaProxyTag') : '';
       const actionLabel = (label) => escapeHtml(`${label}: ${sub.name}`);
-      // Two meta lines: profile facts on top, traffic quota (when known) below.
-      const trafficLine = traffic ? `<div class="sub-meta">${traffic}</div>` : '';
+      const nodeCount = Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length;
+      const facts = [
+        t('subs.nodes', nodeCount),
+        auInfo,
+        viaProxy,
+      ].filter(Boolean).map((fact) => `<span class="sub-fact">${escapeHtml(fact)}</span>`).join('');
+      const trafficLine = traffic ? `
+        <div class="sub-usage">
+          <div class="sub-usage-copy">${escapeHtml(traffic)}</div>
+          ${usagePercent === null ? '' : `<div class="sub-usage-track" aria-hidden="true"><span style="width:${usagePercent.toFixed(2)}%"></span></div>`}
+        </div>` : '';
       div.innerHTML = `
         <div class="sub-info">
-          <div class="sub-name">${escapeHtml(sub.name)}${isActive ? ' ✓' : ''}</div>
-          <div class="sub-meta">${t('subs.nodes', Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length)} · ${formatSummary} · ${auInfo}${viaProxy}${userAgentTag} · ${t('subs.updatedAt', fmtDate(sub.updatedAt))}</div>
+          <div class="sub-title-line">
+            <div class="sub-name">${escapeHtml(sub.name)}</div>
+            ${isActive ? `<span class="sub-active-badge">${escapeHtml(t('subs.enabled'))}</span>` : ''}
+          </div>
+          <div class="sub-facts">${facts}</div>
+          <div class="sub-meta">${escapeHtml(t('subs.updatedAt', fmtDate(sub.updatedAt)))}</div>
           ${trafficLine}
         </div>
         <div class="sub-actions">
-          <button type="button" class="btn sub-activate-btn ${isActive ? 'success' : ''}" data-act="activate" data-id="${id}" aria-label="${actionLabel(isActive ? t('subs.enabled') : t('subs.enable'))}" ${isActive ? 'disabled' : ''}>${isActive ? t('subs.enabled') : t('subs.enable')}</button>
-          <button type="button" class="btn" data-act="update" data-id="${id}" aria-label="${actionLabel(t('subs.update'))}">${t('subs.update')}</button>
-          <button type="button" class="btn" data-act="edit" data-id="${id}" aria-label="${actionLabel(t('subs.edit'))}">${t('subs.edit')}</button>
-          <button type="button" class="btn" data-act="editraw" data-id="${id}" aria-label="${actionLabel(t('subs.editRaw'))}">${t('subs.editRaw')}</button>
-          <button type="button" class="btn danger" data-act="remove" data-id="${id}" aria-label="${actionLabel(t('subs.remove'))}">${t('subs.remove')}</button>
+          <div class="sub-actions-primary">
+            <button type="button" class="btn sub-activate-btn ${isActive ? 'success' : ''}" data-act="activate" data-id="${id}" aria-label="${actionLabel(isActive ? t('subs.enabled') : t('subs.enable'))}" ${isActive ? 'disabled' : ''}>${isActive ? t('subs.enabled') : t('subs.enable')}</button>
+            <button type="button" class="btn primary-soft" data-act="update" data-id="${id}" aria-label="${actionLabel(t('subs.update'))}">${t('subs.update')}</button>
+          </div>
+          <div class="sub-actions-secondary">
+            <button type="button" class="btn" data-act="edit" data-id="${id}" aria-label="${actionLabel(t('subs.edit'))}">${t('subs.edit')}</button>
+            <button type="button" class="btn" data-act="editraw" data-id="${id}" aria-label="${actionLabel(t('subs.editRaw'))}">${t('subs.editRaw')}</button>
+            <button type="button" class="btn danger-quiet" data-act="remove" data-id="${id}" aria-label="${actionLabel(t('subs.remove'))}">${t('subs.remove')}</button>
+          </div>
         </div>`;
       list.appendChild(div);
     }
@@ -114,7 +123,6 @@
     $('#editName').value = sub.name || '';
     $('#editUrl').value = sub.url || '';
     $('#editAutoUpdate').value = String(sub.autoUpdateMinutes || 0);
-    $('#editUserAgent').value = ['sing-box', 'clash'].includes(sub.userAgentMode) ? sub.userAgentMode : 'auto';
     $('#editViaProxy').checked = !!sub.updateViaProxy;
     $('#subEditPanel').classList.remove('hidden');
     $('#subEditPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -125,16 +133,14 @@
     const url = $('#subUrl').value.trim();
     if (!url) return toast(t('toast.needUrl'), true);
     const name = $('#subName').value.trim();
-    const userAgentMode = $('#subUserAgent').value;
     const btn = $('#subAddBtn');
     btn.disabled = true;
     btn.textContent = t('subs.fetching');
     try {
-      const sub = await call(api.addSubscription, { name, url, userAgentMode });
+      const sub = await call(api.addSubscription, { name, url });
       toast(t('toast.subAdded', sub.name, sub.nodeCount));
       $('#subUrl').value = '';
       $('#subName').value = '';
-      $('#subUserAgent').value = 'auto';
       await App.refresh();
     } catch (_) {
       /* call() already showed the error */
@@ -159,7 +165,6 @@
         name: $('#editName').value.trim(),
         url: $('#editUrl').value.trim(),
         autoUpdateMinutes: parseInt($('#editAutoUpdate').value, 10) || 0,
-        userAgentMode: $('#editUserAgent').value,
         updateViaProxy: $('#editViaProxy').checked,
       });
       toast(t('settings.saved'));

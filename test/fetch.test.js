@@ -174,24 +174,24 @@ async function main() {
     const subscription = require('../src/main/subscription');
     const originalGetBufferWithFallback = fetch.getBufferWithFallback;
     let attempts = 0;
-    fetch.getBufferWithFallback = async () => {
+    const fallbackLogs = [];
+    const fallbackLogger = (line) => fallbackLogs.push(line);
+    fetch.getBufferWithFallback = async (_url, options) => {
       attempts += 1;
+      assert.strictEqual(options.log, fallbackLogger);
       throw new Error('network unreachable');
     };
     try {
-      await assert.rejects(subscription.fetchSubscription('https://example.invalid/sub'), /network unreachable/);
+      await assert.rejects(
+        subscription.fetchSubscription('https://example.invalid/sub', fallbackLogger),
+        /network unreachable/
+      );
       assert.strictEqual(attempts, 1, 'network errors were repeated for every User-Agent');
     } finally {
       fetch.getBufferWithFallback = originalGetBufferWithFallback;
     }
     console.log('✓ subscription network failures stop before User-Agent retries');
 
-    const nativeConfig = JSON.stringify({
-      outbounds: [{
-        type: 'trojan', tag: 'native-node', server: 'native.example.com',
-        server_port: 443, password: 'secret',
-      }],
-    });
     const clashConfig = [
       'proxies:',
       '  - name: clash-node',
@@ -204,134 +204,19 @@ async function main() {
     try {
       fetch.getBufferWithFallback = async (_url, options) => {
         requestedAgents.push(options.headers['User-Agent']);
-        return { body: Buffer.from(nativeConfig), headers: {} };
-      };
-      const native = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'sing-box' }
-      );
-      assert.strictEqual(native.format, 'singbox');
-      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        const ua = options.headers['User-Agent'];
-        requestedAgents.push(ua);
-        return {
-          body: Buffer.from(ua.startsWith('sing-box/') ? 'format unavailable' : clashConfig),
-          headers: {},
-        };
-      };
-      const fallback = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'sing-box' }
-      );
-      assert.strictEqual(fallback.format, 'clash');
-      assert.deepStrictEqual(requestedAgents.slice(0, 2), ['sing-box/1.13.0', 'mihomo/1.18.10']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        requestedAgents.push(options.headers['User-Agent']);
         return { body: Buffer.from(clashConfig), headers: {} };
       };
-      const mihomo = await subscription.fetchSubscription(
+      const result = await subscription.fetchSubscription(
         'https://example.invalid/sub',
         () => {},
         { coreType: 'mihomo' }
       );
-      assert.strictEqual(mihomo.format, 'clash');
+      assert.strictEqual(result.format, 'clash');
       assert.deepStrictEqual(requestedAgents, ['mihomo/1.18.10']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        const ua = options.headers['User-Agent'];
-        requestedAgents.push(ua);
-        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
-        return { body: Buffer.from(ua === 'mihomo/1.18.10' ? encodedLinks : clashConfig), headers: {} };
-      };
-      const autoMihomo = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'mihomo' }
-      );
-      assert.strictEqual(autoMihomo.format, 'clash');
-      assert.deepStrictEqual(requestedAgents, ['mihomo/1.18.10', 'clash-verge/v2.0.2']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        const ua = options.headers['User-Agent'];
-        requestedAgents.push(ua);
-        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
-        return { body: Buffer.from(ua.startsWith('sing-box/') ? encodedLinks : clashConfig), headers: {} };
-      };
-      const autoSingboxFallback = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'sing-box' }
-      );
-      assert.strictEqual(autoSingboxFallback.format, 'clash');
-      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0', 'mihomo/1.18.10']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        const ua = options.headers['User-Agent'];
-        requestedAgents.push(ua);
-        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
-        return { body: Buffer.from(ua.startsWith('clash-verge/') ? encodedLinks : clashConfig), headers: {} };
-      };
-      const forcedClash = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'sing-box', userAgentMode: 'clash' }
-      );
-      assert.strictEqual(forcedClash.format, 'clash');
-      assert.deepStrictEqual(requestedAgents.slice(0, 2), ['clash-verge/v2.0.2', 'ClashforWindows/0.20.39']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        requestedAgents.push(options.headers['User-Agent']);
-        return { body: Buffer.from(nativeConfig), headers: {} };
-      };
-      const forcedSingbox = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'mihomo', userAgentMode: 'sing-box' }
-      );
-      assert.strictEqual(forcedSingbox.format, 'singbox');
-      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        requestedAgents.push(options.headers['User-Agent']);
-        return { body: Buffer.from('format unavailable'), headers: {} };
-      };
-      const unavailable = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'mihomo', userAgentMode: 'sing-box' }
-      );
-      assert.strictEqual(unavailable.nodes.length, 0);
-      assert.deepStrictEqual(requestedAgents, ['sing-box/1.13.0']);
-
-      requestedAgents.length = 0;
-      fetch.getBufferWithFallback = async (_url, options) => {
-        requestedAgents.push(options.headers['User-Agent']);
-        const encodedLinks = Buffer.from('trojan://secret@links.example.com:443#link-node').toString('base64');
-        return { body: Buffer.from(encodedLinks), headers: {} };
-      };
-      const linksOnly = await subscription.fetchSubscription(
-        'https://example.invalid/sub',
-        () => {},
-        { coreType: 'mihomo' }
-      );
-      assert.strictEqual(linksOnly.format, 'links');
-      assert.strictEqual(linksOnly.nodes.length, 1);
     } finally {
       fetch.getBufferWithFallback = originalGetBufferWithFallback;
     }
-    console.log('✓ subscription requests support automatic fallback and pinned User-Agent ecosystems');
+    console.log('✓ subscription requests use the Mihomo User-Agent and Clash format');
   } finally {
     await new Promise((resolve) => tunnelInspectionProxy.close(resolve));
     await new Promise((resolve) => proxyServer.close(resolve));

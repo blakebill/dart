@@ -143,6 +143,13 @@ body.native-dialog-body {
   margin: 0;
 }
 
+.dialog-body > .setting-row > .input,
+.dialog-body > .setting-row > .ui-select {
+  width: min(100%, 260px);
+  max-width: 260px;
+  flex: 0 1 260px;
+}
+
 .dialog-progress {
   margin-top: 14px;
 }
@@ -197,6 +204,65 @@ body.native-dialog-body .toast {
   color: var(--text-dim);
 }
 
+.dialog-core-body {
+  gap: 0 !important;
+  overflow: auto !important;
+}
+
+.dialog-core-body > .setting-row {
+  height: 52px;
+  min-height: 52px;
+  padding-block: 4px;
+  gap: 16px;
+}
+
+.dialog-core-body > .setting-row > strong,
+.dialog-core-body > .setting-row > .input,
+.dialog-core-body > .setting-row > .ui-select {
+  width: min(100%, 180px);
+  max-width: 180px;
+  flex: 0 1 180px;
+  align-self: center;
+}
+
+.dialog-core-body > .setting-row > strong {
+  padding-inline: 1px;
+}
+
+.dialog-core-body .dialog-core-folder {
+  min-width: 84px;
+  width: auto;
+  flex: none;
+  align-self: center;
+  padding-inline: 12px;
+}
+
+.dialog-core-body .setting-label {
+  justify-content: center;
+}
+
+.dialog-core-body .dialog-core-path-row {
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog-core-body .dialog-progress {
+  margin: 10px 0 2px;
+}
+
+.dialog-core-body .dialog-feature-status {
+  margin-top: 0;
+  padding-top: 14px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-top: 0;
+}
+
+.dialog-core-body .dialog-feature-detail {
+  flex: none;
+}
+
 .dialog-result {
   min-height: 160px;
   flex: 1;
@@ -242,17 +308,6 @@ body.native-dialog-body .toast {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.dialog-convert-input {
-  min-height: 150px;
-  flex: 0 1 38%;
-}
-
-.dialog-convert-output {
-  min-height: 150px;
-  flex: 1 1 42%;
-  overflow: auto;
 }
 
 .dialog-editor-wrap {

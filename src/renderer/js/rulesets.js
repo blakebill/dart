@@ -1,13 +1,10 @@
 'use strict';
-// Remote rules on the Rules tab, plus GeoData status management in Settings.
+// Remote rules on the Rules tab.
 (function () {
   const App = window.App;
   const { $, toast, call, escapeHtml } = App;
   const api = window.api;
   const { t } = window.i18n;
-
-  const geoManageBtn = $('#geoManageBtn');
-  if (geoManageBtn) geoManageBtn.addEventListener('click', () => App.openDialog('geodata'));
 
   // ---------- Remote rules ----------
   let customRuleSetsReady = false;
@@ -41,9 +38,9 @@
       return;
     }
     const tgt = { proxy: t('customrs.targetProxy'), direct: t('customrs.targetDirect'), reject: t('customrs.targetReject') };
-    const fmt = { clash: 'Clash', 'sing-box': 'sing-box' };
+    const fmt = { clash: 'Clash' };
     for (const it of items) {
-      const cnt = it.kind === 'ruleset' ? t('customrs.srs') : t('customrs.rules', it.count || 0);
+      const cnt = it.kind === 'inline' ? t('customrs.rules', it.count || 0) : '—';
       const au = parseInt(it.autoUpdateMinutes || 0, 10);
       const auInfo = au > 0 ? ' · ' + t('subs.autoUpdateInfo', au) : '';
       const formatLabel = escapeHtml(fmt[it.format] || it.format || '');

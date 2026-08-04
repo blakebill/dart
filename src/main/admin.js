@@ -74,7 +74,7 @@ function buildElevatedLauncherCommand(exe, args, pid = process.pid) {
     '-Verb RunAs -WindowStyle Hidden -ErrorAction Stop';
 }
 
-/** Relaunch the whole app elevated (UAC). sing-box then inherits admin for TUN. */
+/** Relaunch the whole app elevated (UAC). Mihomo then inherits admin for TUN. */
 function relaunchElevated() {
   if (process.platform !== 'win32') {
     return { ok: false, error: 'only supported on Windows' };

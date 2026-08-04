@@ -80,6 +80,7 @@
     const ctx = canvas.getContext('2d');
     const {
       size, upEl, downEl, upTotalEl, downTotalEl,
+      upToggle = null, downToggle = null,
       fill = false, lineWidth = 2, fallbackW = 0, fallbackH = 0, axes = null,
     } = opts;
     const up = new Array(size).fill(0);
@@ -89,6 +90,8 @@
     let lastUp = 0;
     let lastDown = 0;
     let activeSamples = 0;
+    let showUp = true;
+    let showDown = true;
     const pad = fill ? 8 : 2;
     const base = fill ? 4 : 1;
     // Resolve the six chart labels once. Traffic arrives every second, so
@@ -207,10 +210,13 @@
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, W, H);
       const p = plotRect(W, H);
-      const top = Math.max(1, ...up, ...down) * 1.25; // headroom above the peak
+      const visibleValues = [1];
+      if (showUp) visibleValues.push(...up);
+      if (showDown) visibleValues.push(...down);
+      const top = Math.max(...visibleValues) * 1.25; // headroom above the visible peak
       if (axes === 'outer') drawOuterAxes(p, top);
-      series(down, palette.green, p, top);
-      series(up, palette.accent, p, top);
+      if (showDown) series(down, palette.green, p, top);
+      if (showUp) series(up, palette.accent, p, top);
       if (axes === 'inner') drawInnerAxes(p, top);
     }
 
@@ -269,6 +275,19 @@
         draw();
       });
     });
+
+    function bindSeriesToggle(selector, kind) {
+      const button = selector ? $(selector) : null;
+      if (!button) return;
+      button.addEventListener('click', () => {
+        if (kind === 'up') showUp = !showUp;
+        else showDown = !showDown;
+        button.setAttribute('aria-pressed', String(kind === 'up' ? showUp : showDown));
+        draw();
+      });
+    }
+    bindSeriesToggle(upToggle, 'up');
+    bindSeriesToggle(downToggle, 'down');
     return { push, reset, draw };
   }
 
@@ -280,6 +299,8 @@
     downEl: '#trafficDown',
     upTotalEl: '#trafficUpTotal',
     downTotalEl: '#trafficDownTotal',
+    upToggle: '#trafficUpToggle',
+    downToggle: '#trafficDownToggle',
     fill: true,
     axes: 'outer',
     lineWidth: 2,

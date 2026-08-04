@@ -84,7 +84,7 @@ The Settings view can restrict Smart to selected regions. Region codes are
 inferred locally from subscription node flags, common location labels, and
 country-code server domains; node endpoints are not sent to another service.
 The resulting allowlist is applied to the generated Smart group for both
-sing-box and mihomo, so runtime membership, background probes, selection, and
+Mihomo, so runtime membership, background probes, selection, and
 force overrides all use the same candidate set.
 
 An empty allowlist means all regions. If a later subscription refresh renames

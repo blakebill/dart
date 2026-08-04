@@ -6,14 +6,17 @@ const http = require('http');
 
 const { state, runtimeDir, resourcesBinDir, sendToMain, sendLog, sendStatus, refreshTray } = require('./state');
 const { isWindowsAdmin, isWindowsAdminSync, ensureAdminForTun } = require('./admin');
-const { startTrafficStream, stopTrafficStream } = require('./traffic');
 const {
-  buildRoute,
-  ruleListToSingboxRule,
+  startTrafficStream,
+  stopTrafficStream,
+  getTrafficActivity,
+  setTrafficActivityListener,
+} = require('./traffic');
+const { SmartFeedbackSampler } = require('./smart-feedback-sampler');
+const {
+  ruleListToClashRules,
+  routeObjectToClashRules,
   extractRuleGroups,
-  extractGeoCategories,
-  extractRuleSetRefs,
-  parseRuleList,
   coreSupportsKernelSmart,
   prepareSourcePolicyGroups,
   applySourceGroupSelections,
@@ -21,7 +24,6 @@ const {
   sourcePicksForWiredGroup,
 } = require('./converter');
 const { normalizePolicyGroups } = require('./policy-groups');
-const { geoDataUrls } = require('./singbox');
 const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { ManagedAutoSelection } = require('./managed-auto-selection');
 const {
@@ -31,7 +33,7 @@ const {
   hostnameFromUrl,
 } = require('./smart-selection');
 const { SmartProbeSignalWeights, buildSmartProbeFamilies } = require('./smart-probe-signals');
-const { SmartShadowEvaluator } = require('./smart-shadow-evaluator');
+const { createSmartShadowService } = require('./smart-shadow-service');
 const { KernelDialFeedback } = require('./kernel-dial-feedback');
 const { OperationCoordinator } = require('./operation-coordinator');
 const { createAutoLaunchService } = require('./auto-launch');
@@ -43,7 +45,7 @@ const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
 const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('./delay');
 const { smartRegionMembers } = require('./node-region');
 const os = require('os');
-const { uniqueSibling, replaceFileSync, writeJsonAtomicSync } = require('./file-utils');
+const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
 /**
  * Core control: everything that drives the selected proxy core — building the
@@ -66,10 +68,6 @@ const SMART_INTERVAL_URGENT_MS = 30_000;
 const SMART_INTERVAL_NORMAL_MS = 60_000;
 const SMART_INTERVAL_RELAXED_MS = 150_000;
 const SMART_INTERVAL_OVERRIDE_MS = 90_000;
-const SMART_FEEDBACK_INTERVAL_MS = 3_000;
-const SMART_SHADOW_PERSIST_DELAY_MS = 60_000;
-const SMART_SHADOW_MAX_FILE_BYTES = 2 * 1024 * 1024;
-const SMART_SHADOW_HISTORY_FILE = 'smart-shadow-history.json';
 // Secondary latency URL for Smart dual-probe (A4) — same 204 style as gstatic.
 const SMART_SECONDARY_TEST_URL = 'http://cp.cloudflare.com/generate_204';
 const OVERRIDE_FAIL_CLEAR_STREAK = 2;
@@ -111,7 +109,7 @@ function queueConfigMutation(operation) {
   return operations.queue('config', operation);
 }
 
-/** Keep binary rule-set file snapshots ordered without blocking other downloads. */
+/** Keep remote rule-list mutations ordered without blocking other downloads. */
 function queueCustomRuleMutation(operation) {
   return operations.queue('custom-rules', operation);
 }
@@ -172,7 +170,7 @@ function panelUiInfo() {
 
 /** The local proxy port to tunnel rule-set downloads through (0 = direct). */
 function currentProxyPort() {
-  return state.singbox && state.singbox.isRunning() ? state.store.getSettings().mixedPort || 0 : 0;
+  return state.coreManager && state.coreManager.isRunning() ? state.store.getSettings().mixedPort || 0 : 0;
 }
 
 /** Exact endpoint Dart persisted before changing the Windows proxy registry. */
@@ -197,13 +195,15 @@ function forgetSystemProxyOwnership(expectedServer = null) {
   if (!state.store) return false;
   const current = persistedSystemProxyOwnership();
   if (expectedServer && current && current !== expectedServer) return false;
-  state.store.set(SYSTEM_PROXY_OWNER_KEY, null);
-  try {
-    const restore = state.store.get(SYSTEM_PROXY_RESTORE_KEY);
-    if (!expectedServer || !restore || !restore.ownedServer || restore.ownedServer === expectedServer) {
-      state.store.set(SYSTEM_PROXY_RESTORE_KEY, null);
-    }
-  } catch (_) {}
+  const restore = state.store.get(SYSTEM_PROXY_RESTORE_KEY);
+  const clearRestore = !expectedServer || !restore || !restore.ownedServer || restore.ownedServer === expectedServer;
+  const patch = { [SYSTEM_PROXY_OWNER_KEY]: null };
+  if (clearRestore) patch[SYSTEM_PROXY_RESTORE_KEY] = null;
+  if (typeof state.store.updateValues === 'function') state.store.updateValues(patch);
+  else {
+    // Compatibility for lightweight test/legacy store implementations.
+    for (const [key, value] of Object.entries(patch)) state.store.set(key, value);
+  }
   return true;
 }
 
@@ -211,67 +211,76 @@ function forgetSystemProxyOwnership(expectedServer = null) {
 async function disableOwnedSystemProxy(server) {
   if (!server) return false;
   const restore = persistedSystemProxyRestore(server);
-  return proxy.disableSystemProxyIfOurs(server, restore ? { restore } : {});
+  return proxy.disableSystemProxyIfOurs(
+    server,
+    restore ? { restore, restoreInterrupted: true } : {}
+  );
 }
 
-/** Persist ownership first, so a crash after the registry write is recoverable. */
+/** Persist ownership + restore data before the first registry write. */
 async function enableOwnedSystemProxy(port) {
   if (process.platform !== 'win32') return false;
   const server = `127.0.0.1:${port}`;
   const alreadyOwned = persistedSystemProxyOwnership() === server;
   const existingRestore = alreadyOwned ? state.store.get(SYSTEM_PROXY_RESTORE_KEY) : null;
-  state.store.set(SYSTEM_PROXY_OWNER_KEY, server);
+  const validExistingRestore = !!(
+    existingRestore &&
+    existingRestore.ownedServer === server &&
+    existingRestore.enable &&
+    existingRestore.server &&
+    existingRestore.override
+  );
+  let ownershipPrepared = false;
+  const persistOwnership = (snapshot) => {
+    const restore = validExistingRestore ? existingRestore : {
+      ownedServer: server,
+      enable: snapshot.enable,
+      server: snapshot.server,
+      override: snapshot.override,
+    };
+    const patch = {
+      [SYSTEM_PROXY_OWNER_KEY]: server,
+      [SYSTEM_PROXY_RESTORE_KEY]: restore,
+    };
+    if (typeof state.store.updateValues === 'function') state.store.updateValues(patch);
+    else {
+      for (const [key, value] of Object.entries(patch)) state.store.set(key, value);
+    }
+    ownershipPrepared = true;
+  };
   try {
-    const enabled = await proxy.enableSystemProxy('127.0.0.1', port);
+    const enabled = await proxy.enableSystemProxy('127.0.0.1', port, {
+      beforeApply: persistOwnership,
+    });
     if (!enabled || enabled.ok === false) {
-      forgetSystemProxyOwnership(server);
+      if (ownershipPrepared) forgetSystemProxyOwnership(server);
       return false;
     }
-    // Keep the pre-Dart registry snapshot so disable can restore ProxyOverride.
-    // Re-asserting an endpoint we already own must not overwrite that snapshot
-    // with Dart's own ProxyOverride as if it were the user's original bypass list.
-    if (enabled.restore && !(
-      existingRestore &&
-      existingRestore.ownedServer === server &&
-      existingRestore.enable &&
-      existingRestore.server &&
-      existingRestore.override
-    )) {
-      try {
-        state.store.set(SYSTEM_PROXY_RESTORE_KEY, {
-          ownedServer: server,
-          enable: enabled.restore.enable,
-          server: enabled.restore.server,
-          override: enabled.restore.override,
-        });
-      } catch (error) {
-        sendLog('[gui] failed to persist system proxy restore snapshot: ' + error.message);
-      }
-    }
+    // Compatibility with a proxy implementation that predates beforeApply.
+    if (!ownershipPrepared && enabled.restore) persistOwnership(enabled.restore);
     state.systemProxyOn = true;
     state.systemProxyServer = server;
     return true;
   } catch (error) {
-    try { forgetSystemProxyOwnership(server); } catch (recoveryError) { error.recoveryError = recoveryError; }
+    // proxy.enableSystemProxy already attempted to restore the snapshot. If
+    // that rollback also failed, retain the persisted ownership record so the
+    // startup healer can finish recovery instead of forgetting a registry
+    // state that may still point at Dart.
+    if (!ownershipPrepared || !error.restoreError) {
+      try { forgetSystemProxyOwnership(server); } catch (recoveryError) { error.recoveryError = recoveryError; }
+    } else {
+      sendLog('[gui] retained system proxy recovery data after a failed registry rollback');
+    }
     throw error;
   }
 }
 
 function detectCustomRuleSetFormat(url) {
-  try {
-    const pathname = new URL(url).pathname.toLowerCase();
-    if (pathname.endsWith('.srs')) return 'sing-box';
-  } catch (_) {
-    /* invalid URLs are reported by the IPC validation layer */
-  }
   return 'clash';
 }
 
 function normalizeCustomRuleSetFormat(format, url) {
-  if (format === 'sing-box') return 'sing-box';
-  if (format === 'clash') return 'clash';
-  // Legacy records used to allow Surge/Loon/QuantumultX; process them as Clash-compatible text.
-  return url ? detectCustomRuleSetFormat(url) : 'clash';
+  return 'clash';
 }
 
 function customRuleSetSourceKey(item) {
@@ -360,11 +369,7 @@ function restoreFileSnapshot(snapshot) {
 }
 
 function snapshotCustomRuleSetUpdate(record) {
-  const binaryTouched = normalizeCustomRuleSetFormat(record.format, record.url) === 'sing-box';
-  const target = binaryTouched
-    ? path.join(state.singbox.ensureCoreDir('sing-box'), customRuleSetFileName(record.id))
-    : null;
-  return { record, ...snapshotFile(target, 'auto-update-backup'), applied: null };
+  return { record, ...snapshotFile(null, 'auto-update-backup'), applied: null };
 }
 
 function discardCustomRuleSetUpdateSnapshot(snapshot) {
@@ -544,57 +549,40 @@ function activeSubData() {
   };
 }
 
-/** Point a route rule at a target ('direct' | 'reject' | proxy), in place. */
-function applyRuleTarget(rule, target) {
-  if (target === 'direct') rule.outbound = 'direct';
-  else if (target === 'reject') rule.action = 'reject';
-  else rule.outbound = '🚀 Proxy';
-  return rule;
-}
-
-/** Turn a stored local rule into a sing-box route rule object. */
+/** Turn a stored local rule into Mihomo rule lines. */
 function buildLocalRuleObject(lr) {
-  const vals = (lr.values || []).map((v) => String(v).trim()).filter(Boolean);
+  const vals = (lr.values || [])
+    .map((v) => String(v).trim())
+    .filter((value) => value && !/[\r\n,]/.test(value));
   if (!vals.length || !lr.matchType) return null;
-  return applyRuleTarget({ [lr.matchType]: vals }, lr.target);
+  const type = {
+    domain: 'DOMAIN',
+    domain_suffix: 'DOMAIN-SUFFIX',
+    domain_keyword: 'DOMAIN-KEYWORD',
+    ip_cidr: 'IP-CIDR',
+    process_name: 'PROCESS-NAME',
+  }[lr.matchType];
+  if (!type) return null;
+  const target = lr.target === 'direct' ? 'DIRECT' : lr.target === 'reject' ? 'REJECT' : APP_PROXY_GROUP;
+  return vals.map((value) => `${type},${value},${target}`);
 }
 
-const MATCH_FIELDS = ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name'];
-
-/**
- * Older inline custom rule-sets were persisted as one rule containing every
- * matcher field. sing-box AND-combines fields inside a rule, so split them into
- * adjacent single-field rules at load time. New records store `rules` already.
- */
+/** Convert legacy stored route objects into Mihomo rule lines. */
 function splitInlineRule(rule) {
-  if (!rule || typeof rule !== 'object') return [];
-  const fields = MATCH_FIELDS.filter((f) => Array.isArray(rule[f]) && rule[f].length);
-  if (fields.length <= 1) return [rule];
-  const target = rule.action === 'reject' ? { action: 'reject' } : { outbound: rule.outbound || '🚀 Proxy' };
-  return fields.map((f) => ({ [f]: rule[f].slice(), ...target }));
-}
-
-/** Stable, traversal-safe file name for a stored custom rule-set id. */
-function customRuleSetFileName(id) {
-  const raw = String(id || '');
-  const safe = /^[A-Za-z0-9_-]{1,128}$/.test(raw)
-    ? raw
-    : crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32);
-  return `custom-${safe}.srs`;
+  if (typeof rule === 'string') return [rule];
+  return routeObjectToClashRules(rule);
 }
 
 /**
- * Build extraRules/extraRuleSets from the user's local rules + pre-processed
- * custom rule-sets. Local rules come first (most specific user intent).
+ * Build Mihomo rule lines from the user's local rules and pre-processed custom
+ * rule lists. Local rules come first (most specific user intent).
  */
-function collectCustomRules(coreType = 'sing-box') {
-  const adapter = getCoreAdapter(coreType);
+function collectCustomRules() {
   const extraRules = [];
-  const extraRuleSets = [];
   for (const lr of state.store.get('localRules') || []) {
     if (lr.enabled === false) continue;
-    const rule = buildLocalRuleObject(lr);
-    if (rule) extraRules.push(rule);
+    const rules = buildLocalRuleObject(lr);
+    if (rules) extraRules.push(...rules);
   }
   for (const meta of state.store.listCustomRuleSets()) {
     if (meta.enabled === false) continue;
@@ -602,84 +590,47 @@ function collectCustomRules(coreType = 'sing-box') {
     if (!c) continue;
     if (c.kind === 'inline') {
       if (Array.isArray(c.rules) && c.rules.length) {
-        for (const rule of c.rules) extraRules.push(rule);
+        for (const rule of c.rules) extraRules.push(...splitInlineRule(rule));
       } else if (c.rule) {
         for (const rule of splitInlineRule(c.rule)) extraRules.push(rule);
       }
-    } else if (c.kind === 'ruleset' && adapter.supportsBinaryRuleSets) {
-      // Mihomo cannot consume sing-box .srs binaries. Emitting a RULE-SET
-      // matcher without a Mihomo rule-provider makes the whole config invalid.
-      const p = path.join(state.singbox.coreDir('sing-box'), customRuleSetFileName(c.id));
-      if (state.singbox._validSrs(p)) {
-        const tag = 'custom-' + c.id;
-        extraRuleSets.push({ type: 'local', tag, format: 'binary', path: p.replace(/\\/g, '/') });
-        extraRules.push(applyRuleTarget({ rule_set: [tag] }, c.target));
-      }
     }
   }
-  return { extraRules, extraRuleSets };
+  return { extraRules };
 }
 
 /** Download + convert one custom rule-set, returning the processed record. */
 async function processCustomRuleSet(c, { beforeCommit } = {}) {
   const proxyPort = currentProxyPort();
   const format = normalizeCustomRuleSetFormat(c.format, c.url);
-  if (format === 'sing-box') {
-    const dest = path.join(state.singbox.ensureCoreDir('sing-box'), customRuleSetFileName(c.id));
-    const tmp = dest + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-    if (!fs.existsSync(path.dirname(dest))) fs.mkdirSync(path.dirname(dest), { recursive: true });
-    try {
-      await fetch.downloadWithFallback(c.url, tmp, { proxyPort });
-      if (!state.singbox._validSrs(tmp)) {
-        throw new Error('downloaded .srs is invalid (blocked or not a sing-box rule-set)');
-      }
-      if (beforeCommit) await beforeCommit();
-      replaceFileSync(tmp, dest);
-    } finally {
-      try { fs.unlinkSync(tmp); } catch (_) {}
-    }
-    return { ...c, format, kind: 'ruleset', count: null, error: null, updatedAt: Date.now() };
-  }
   const { body } = await fetch.getBufferWithFallback(c.url, {
     proxyPort,
     maxBytes: 32 * 1024 * 1024,
     headers: { 'User-Agent': 'clash-verge/v2.0.2' },
   });
-  const { rule, rules, count } = ruleListToSingboxRule(body.toString('utf-8'), c.target);
+  const { rules, count } = ruleListToClashRules(body.toString('utf-8'), c.target);
   if (!rules.length) throw new Error('no rules parsed from the list (unsupported format?)');
   if (beforeCommit) await beforeCommit();
-  return { ...c, format, kind: 'inline', rule, rules, count, error: null, updatedAt: Date.now() };
+  return { ...c, format, kind: 'inline', rules, count, error: null, updatedAt: Date.now() };
 }
 
 function kernelSmartProbeConfig(coreType, includeMode = false) {
-  if (coreType === 'mihomo') {
-    const group = {
-      name: 'Dart Smart Capability Probe',
-      type: 'smart',
-      proxies: ['DIRECT'],
-      url: 'http://www.gstatic.com/generate_204',
-    };
-    if (includeMode) group.mode = 'balanced';
-    return {
-      proxies: [],
-      'proxy-groups': [group],
-      rules: ['MATCH,Dart Smart Capability Probe'],
-    };
-  }
-  const group = { type: 'smart', tag: 'dart-smart-capability-probe', outbounds: ['direct-probe'] };
+  const group = {
+    name: 'Dart Smart Capability Probe',
+    type: 'smart',
+    proxies: ['DIRECT'],
+    url: 'http://www.gstatic.com/generate_204',
+  };
   if (includeMode) group.mode = 'balanced';
   return {
-    log: { disabled: true },
-    outbounds: [
-      group,
-      { type: 'direct', tag: 'direct-probe' },
-    ],
-    route: { final: 'dart-smart-capability-probe' },
+    proxies: [],
+    'proxy-groups': [group],
+    rules: ['MATCH,Dart Smart Capability Probe'],
   };
 }
 
 function kernelSmartProbeKey(coreType, coreVersion) {
-  const bin = state.singbox.resolveBinaryPath(coreType);
+  const bin = state.coreManager.resolveBinaryPath(coreType);
   if (!bin) return null;
   try {
     const stat = fs.statSync(bin);
@@ -692,16 +643,16 @@ function kernelSmartProbeKey(coreType, coreVersion) {
 async function probeKernelSmart(coreType, coreVersion) {
   const fallback = coreSupportsKernelSmart(coreType, coreVersion);
   if (
-    !state.singbox.isCoreInstalled(coreType) ||
-    typeof state.singbox.checkConfigFor !== 'function'
+    !state.coreManager.isCoreInstalled(coreType) ||
+    typeof state.coreManager.checkConfigFor !== 'function'
   ) return { supported: fallback, mode: false, detection: 'version' };
   const key = kernelSmartProbeKey(coreType, coreVersion);
   if (!key) return { supported: fallback, mode: false, detection: 'version' };
   const cached = kernelSmartProbeCache.get(key);
   if (cached) return cached;
-  const operation = state.singbox.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, true))
+  const operation = state.coreManager.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, true))
     .then(() => ({ supported: true, mode: true, detection: 'probe' }))
-    .catch(() => state.singbox.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, false))
+    .catch(() => state.coreManager.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, false))
       .then(() => ({ supported: true, mode: false, detection: 'probe' }))
       .catch(() => ({ supported: false, mode: false, detection: 'probe' })));
   if (kernelSmartProbeCache.size >= 16) {
@@ -713,11 +664,11 @@ async function probeKernelSmart(coreType, coreVersion) {
 
 /** Resolve type: smart support from the binary itself, not its release suffix. */
 async function resolveKernelSmart(coreType = null) {
-  const resolvedCoreType = normalizeCoreType(coreType || state.singbox.getCoreType());
-  let coreVersion = state.singbox.peekCoreVersion(resolvedCoreType);
-  if (coreVersion == null && state.singbox.isCoreInstalled(resolvedCoreType)) {
+  const resolvedCoreType = normalizeCoreType(coreType || state.coreManager.getCoreType());
+  let coreVersion = state.coreManager.peekCoreVersion(resolvedCoreType);
+  if (coreVersion == null && state.coreManager.isCoreInstalled(resolvedCoreType)) {
     try {
-      coreVersion = await state.singbox.getCoreVersion(resolvedCoreType);
+      coreVersion = await state.coreManager.getCoreVersion(resolvedCoreType);
     } catch (_) {
       coreVersion = null;
     }
@@ -751,15 +702,15 @@ function buildCurrentConfig(coreType = null, options = {}) {
   // rules and custom rule-sets are what actually steer routing.
   const clashRules = settings.useBuiltinRules ? [] : allRules;
   const policyGroups = settings.useBuiltinRules ? [] : allGroups;
-  const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
+  const { extraRules } = collectCustomRules();
   const adapter = getCoreAdapter(settings.coreType);
   const ui = panelUiInfo();
-  try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* sing-box will report */ }
+  try { fs.mkdirSync(ui.dir, { recursive: true }); } catch (_) { /* core will report */ }
   const resolvedCoreType = normalizeCoreType(settings.coreType);
   // Prefer explicit meta from resolveKernelSmart(); else peek cache.
   const coreVersion = options.coreVersion !== undefined
     ? options.coreVersion
-    : state.singbox.peekCoreVersion(resolvedCoreType);
+    : state.coreManager.peekCoreVersion(resolvedCoreType);
   const probedCapability = lastKernelSmartMeta.detection === 'probe' &&
     lastKernelSmartMeta.coreType === resolvedCoreType &&
     lastKernelSmartMeta.version === coreVersion;
@@ -794,6 +745,7 @@ function buildCurrentConfig(coreType = null, options = {}) {
     policyGroups,
     ruleProviders: providers,
     enableIpv6: settings.enableIpv6,
+    enableDnsOverride: settings.enableDnsOverride,
     dnsRemote: settings.dnsRemote,
     dnsLocal: settings.dnsLocal,
     dnsStrategy: settings.dnsStrategy,
@@ -801,18 +753,15 @@ function buildCurrentConfig(coreType = null, options = {}) {
     smartMode: settings.smartMode,
     smartRegions: settings.smartRegions,
     extraRules,
-    extraRuleSets,
     kernelSmart,
     kernelSmartMode,
     coreVersion,
   };
   const config = adapter.buildConfig(allNodes, commonOpts, {
-    manager: state.singbox,
+    manager: state.coreManager,
     ui,
     clashRules,
     providers,
-    availableGeoSet,
-    loadRuleSetData,
   });
   return { config, settings, kernelSmart, kernelSmartMode, coreVersion };
 }
@@ -820,7 +769,7 @@ function buildCurrentConfig(coreType = null, options = {}) {
 /** Always probe core version before building (start/export/validate paths). */
 async function buildCurrentConfigAsync(coreType = null) {
   const resolved = normalizeCoreType(
-    coreType || state.store.getSettings().coreType || state.singbox.getCoreType()
+    coreType || state.store.getSettings().coreType || state.coreManager.getCoreType()
   );
   const meta = await resolveKernelSmart(resolved);
   return buildCurrentConfig(resolved, meta);
@@ -828,35 +777,8 @@ async function buildCurrentConfigAsync(coreType = null) {
 
 /** Build the route info (rules + rule-sets) from the current config, without running. */
 function currentRouteInfo() {
-  const { nodes, groups, rules, providers } = activeSubData();
-  // Mirror buildCurrentConfig: in built-in rules mode the subscription's own
-  // rules are dropped so the Rules view shows what actually runs.
-  const settings = state.store.getSettings();
-  const clashRules = settings.useBuiltinRules ? [] : rules;
-  // Same folding as runtime config: main-proxy aliases (e.g. "Proxy") are not
-  // freestanding source targets and must not appear as available outbounds.
-  const policyGroups = settings.useBuiltinRules ? [] : prepareSourcePolicyGroups(groups, nodes);
-  const availableTargets = new Set([
-    AUTO_PROXY_GROUP,
-    SMART_PROXY_GROUP,
-    '🛟 Fallback',
-    APP_PROXY_GROUP,
-    ...nodes.map((node) => node && node.name).filter(Boolean),
-    ...policyGroups.map((group) => group.name),
-  ]);
-  const { extraRules, extraRuleSets } = collectCustomRules(settings.coreType);
-  // Only the route is needed here, so skip converting every node to an outbound.
-  const route = buildRoute({
-    ruleSetDir: state.singbox.resolveRuleSetDir(),
-    clashRules,
-    extraRules,
-    extraRuleSets,
-    ruleOverrides: settings.ruleOverrides,
-    geoAvailable: availableGeoSet(clashRules),
-    ruleSetData: loadRuleSetData(clashRules, providers),
-    availableTargets,
-  });
-  return { rules: route.rules, ruleSets: route.rule_set };
+  const { config } = buildCurrentConfig();
+  return { rules: config.rules || [], ruleSets: [] };
 }
 
 /**
@@ -941,7 +863,7 @@ async function setRuleGroupSelection(groupName, outbound) {
   // Store empty omission when equal to computed default without explicit user... always store explicit picks.
   nextSelections[name] = normalized === 'direct' ? 'direct' : normalized;
   const settings = state.store.updateSettings({ ruleGroupSelections: nextSelections });
-  if (!state.singbox.isRunning()) return { settings, applied: true, live: false };
+  if (!state.coreManager.isRunning()) return { settings, applied: true, live: false };
   try {
     const candidates = normalized === 'direct' ? ['direct', 'DIRECT']
       : normalized === 'reject' ? ['reject', 'REJECT']
@@ -968,9 +890,8 @@ async function startCoreNow() {
   // the cleanup may observe and disable the freshly enabled local proxy.
   if (staleProxyHealPromise) await staleProxyHealPromise;
   assertLifecycleOpen();
-  await state.singbox.ensureBundledSingBoxPatch();
-  const coreType = state.singbox.getCoreType();
-  await getCoreAdapter(coreType).prepareStart(state.singbox);
+  const coreType = state.coreManager.getCoreType();
+  await getCoreAdapter(coreType).prepareStart(state.coreManager);
   const { config, settings } = await buildCurrentConfigAsync(coreType);
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
@@ -979,7 +900,7 @@ async function startCoreNow() {
     tunAdaptersClean = await cleanupTunAdapters(sendLog);
   }
   assertLifecycleOpen();
-  await state.singbox.start(config);
+  await state.coreManager.start(config);
   kernelDialFeedback.reset();
   tunWasActive = !!settings.enableTun;
   if (tunWasActive) {
@@ -1004,13 +925,6 @@ async function startCoreNow() {
   startManagedAutoSelection();
   try {
     maybeFetchGeodata();
-    // Pull anything the subscription's rules reference but that isn't on disk
-    // yet. This housekeeping is non-fatal and applies on the next start.
-    if (getCoreAdapter(settings.coreType).supportsDynamicRuleData) {
-      const { rules, providers } = effectiveSub();
-      maybeFetchGeoCategories(rules);
-      maybeFetchRuleProviders(rules, providers);
-    }
   } catch (error) {
     sendLog('[gui] post-start rule data check failed (non-fatal): ' + error.message);
   }
@@ -1025,11 +939,11 @@ async function startCoreNow() {
 const geodataFetchTried = {};
 const backgroundFetchKeys = new Set();
 function maybeFetchGeodata() {
-  const key = state.singbox.getCoreType();
+  const key = state.coreManager.getCoreType();
   if (geodataFetchTried[key] || geoDataReady()) return;
   geodataFetchTried[key] = true;
   const proxyPort = currentProxyPort();
-  state.singbox
+  state.coreManager
     .updateGeoData(() => {}, proxyPort)
     .then(() => sendLog('[gui] geodata fetched; restart to enable CN direct routing'))
     .catch((e) => {
@@ -1039,199 +953,7 @@ function maybeFetchGeodata() {
 }
 
 function geoDataReady() {
-  return getCoreAdapter(state.singbox.getCoreType()).geoDataReady(state.singbox);
-}
-
-/** Writable dir holding all geo rule-sets (base + downloaded categories). */
-function geoBinDir() {
-  return state.singbox.ensureCoreDir('sing-box');
-}
-
-// The bundled CN rule-sets only need copying into the writable runtime bin once
-// per process (so every geo .srs sits in the one dir resolveRuleSetDir returns).
-// Gate the fs work behind a flag so it doesn't repeat on every config build.
-let geoBaseEnsured = false;
-function ensureGeoBaseWritable() {
-  if (geoBaseEnsured) return;
-  state.singbox.ensureSingBoxGeoData();
-  geoBaseEnsured = true;
-}
-
-/** The active subscription's rules + providers, honoring built-in-rules mode. */
-function effectiveSub() {
-  const { rules, providers } = activeSubData();
-  return { rules: state.store.getSettings().useBuiltinRules ? [] : rules, providers };
-}
-
-/**
- * Geo rule-set tags backed by a real local .srs right now: the CN pair plus any
- * GEOSITE/GEOIP category the rules reference that has been downloaded. Passed to
- * the converter so it only references rule-sets that actually exist on disk.
- */
-function availableGeoSet(clashRules) {
-  ensureGeoBaseWritable();
-  const dir = state.singbox.resolveRuleSetDir();
-  const avail = new Set();
-  if (!dir) return avail;
-  const tags = new Set(['geoip-cn', 'geosite-cn', ...extractGeoCategories(clashRules).map((c) => c.tag)]);
-  for (const tag of tags) {
-    if (state.singbox._validSrs(path.join(dir, tag + '.srs'))) avail.add(tag);
-  }
-  return avail;
-}
-
-/**
- * Shared scaffold for the post-start, best-effort background downloads (geo
- * categories + rule-providers): bail when nothing is missing, run each item
- * (isolating per-item failures), count successes, log a summary, and never
- * reject into the caller. `perItem` returns true when it fetched something.
- */
-function runBackgroundFetch(label, items, perItem, keyFor) {
-  const admitted = [];
-  for (const item of items) {
-    const key = keyFor ? keyFor(item) : null;
-    if (key && backgroundFetchKeys.has(key)) continue;
-    if (key) backgroundFetchKeys.add(key);
-    admitted.push({ item, key });
-  }
-  if (!admitted.length) return;
-  (async () => {
-    let got = 0;
-    for (const entry of admitted) {
-      try {
-        if (await perItem(entry.item)) got += 1;
-      } catch (_) {
-        /* skip a failed item */
-      } finally {
-        if (entry.key) backgroundFetchKeys.delete(entry.key);
-      }
-    }
-    if (got) sendLog(`[gui] fetched ${got} ${label}; restart to apply`);
-  })().catch((e) => {
-    for (const entry of admitted) if (entry.key) backgroundFetchKeys.delete(entry.key);
-    sendLog(`[gui] ${label} fetch failed (non-fatal): ` + e.message);
-  });
-}
-
-/**
- * Download one rule-set .srs (trying each mirror in turn), validating before
- * swapping it into place so a blocked/HTML response never replaces a good file.
- * Returns true when a valid .srs landed at dest.
- */
-async function fetchSrs(repo, file, dest, proxyPort) {
-  const tmp = uniqueSibling(dest, 'tmp');
-  for (const url of geoDataUrls(repo, file)) {
-    try {
-      await fetch.downloadWithFallback(url, tmp, { proxyPort });
-    } catch (_) {
-      try { fs.unlinkSync(tmp); } catch (_) {}
-      continue;
-    }
-    if (state.singbox._validSrs(tmp)) {
-      try {
-        replaceFileSync(tmp, dest);
-        return true;
-      } catch (_) {
-        try { fs.unlinkSync(tmp); } catch (_) {}
-        return false;
-      }
-    }
-    try { fs.unlinkSync(tmp); } catch (_) {}
-  }
-  return false;
-}
-
-/**
- * After the core is up (so downloads can use the proxy), fetch any GEOSITE/GEOIP
- * .srs the subscription references but that aren't on disk yet. Best-effort and
- * non-blocking; newly fetched sets apply on the next start (like base geodata).
- */
-function maybeFetchGeoCategories(clashRules) {
-  const dir = geoBinDir();
-  const missing = extractGeoCategories(clashRules).filter(
-    (c) => !state.singbox._validSrs(path.join(dir, c.file))
-  );
-  const proxyPort = currentProxyPort();
-  runBackgroundFetch(
-    'subscription rule-set(s)',
-    missing,
-    (c) => fetchSrs(c.repo, c.file, path.join(dir, c.file), proxyPort),
-    (c) => 'geo:' + path.join(dir, c.file)
-  );
-}
-
-/** Cache path for a rule-provider's parsed matchers (keyed by its URL). */
-function ruleProviderCacheFile(url) {
-  const h = crypto.createHash('sha1').update(String(url)).digest('hex').slice(0, 16);
-  return path.join(geoBinDir(), `rp-${h}.json`);
-}
-
-/**
- * Load the parsed matcher arrays for every RULE-SET provider the rules
- * reference and that has already been downloaded + cached. Returns a map
- * name -> { domain, domain_suffix, ip_cidr, ... } for the converter; providers
- * not yet cached are simply absent (their RULE-SET rule is then skipped).
- */
-function loadRuleSetData(clashRules, providers) {
-  const data = {};
-  for (const name of extractRuleSetRefs(clashRules)) {
-    const p = providers && providers[name];
-    if (!p || !p.url) continue;
-    try {
-      const f = ruleProviderCacheFile(p.url);
-      if (fs.existsSync(f)) {
-        const m = JSON.parse(fs.readFileSync(f, 'utf-8'));
-        if (m && typeof m === 'object' && !Array.isArray(m)) data[name] = m;
-      }
-    } catch (_) {
-      // A corrupt cache must not permanently suppress its re-download.
-      try { fs.unlinkSync(ruleProviderCacheFile(p.url)); } catch (_) {}
-    }
-  }
-  return data;
-}
-
-/**
- * After the core is up, download any referenced rule-providers not cached yet,
- * parse them into matcher arrays, and cache them. Best-effort and non-blocking;
- * applies on the next start. `file`/`inline` providers (no URL) and binary
- * `mrs` rule-sets are skipped (nothing fetchable / not parseable here).
- */
-function maybeFetchRuleProviders(clashRules, providers) {
-  const proxyPort = currentProxyPort();
-  const todo = [];
-  for (const name of extractRuleSetRefs(clashRules)) {
-    const p = providers && providers[name];
-    if (!p || !/^https?:\/\//i.test(p.url || '')) continue;
-    if ((p.format || '').toLowerCase() === 'mrs') continue;
-    const f = ruleProviderCacheFile(p.url);
-    let cached = false;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
-      cached = !!parsed && typeof parsed === 'object' && !Array.isArray(parsed);
-    } catch (_) {
-      try { fs.unlinkSync(f); } catch (_) {}
-    }
-    if (!cached) todo.push({ p, f });
-  }
-  runBackgroundFetch('rule-provider(s)', todo, async ({ p, f }) => {
-    const { body } = await fetch.getBufferWithFallback(p.url, {
-      proxyPort,
-      maxBytes: 32 * 1024 * 1024,
-      headers: { 'User-Agent': 'clash-verge/v2.0.2' },
-    });
-    const m = parseRuleList(body.toString('utf-8'));
-    const total = Object.values(m).reduce((n, a) => n + a.length, 0);
-    if (total === 0) return false;
-    const tmp = f + `.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-    try {
-      fs.writeFileSync(tmp, JSON.stringify(m), 'utf-8');
-      replaceFileSync(tmp, f);
-    } finally {
-      try { fs.unlinkSync(tmp); } catch (_) {}
-    }
-    return true;
-  }, ({ f }) => 'provider:' + f);
+  return getCoreAdapter(state.coreManager.getCoreType()).geoDataReady(state.coreManager);
 }
 
 /**
@@ -1273,7 +995,7 @@ async function stopCoreNow(remember, { preserveSystemProxyIntent = false } = {})
     }
   }
   try {
-    await state.singbox.stop();
+    await state.coreManager.stop();
     kernelDialFeedback.reset();
     if (tunWasActive) tunAdaptersClean = await cleanupTunAdapters(sendLog);
     tunWasActive = false;
@@ -1344,14 +1066,14 @@ function startCore() {
     return Promise.reject(error);
   }
   return queueLifecycle(() => {
-    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
-    return state.singbox.isRunning() ? true : startCoreNow();
+    if (state.coreManager.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    return state.coreManager.isRunning() ? true : startCoreNow();
   });
 }
 
 function stopCore(remember, { allowDuringCoreUpdate = false } = {}) {
   return queueLifecycle(() => {
-    if (!allowDuringCoreUpdate && state.singbox.isCoreDownloadInProgress()) {
+    if (!allowDuringCoreUpdate && state.coreManager.isCoreDownloadInProgress()) {
       throw new Error('wait for the core update to finish');
     }
     return stopCoreNow(remember);
@@ -1362,8 +1084,8 @@ function stopCore(remember, { allowDuringCoreUpdate = false } = {}) {
 function restartCore() {
   return queueLifecycle(async () => {
     assertLifecycleOpen();
-    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
-    if (state.singbox.isRunning()) await stopCoreNow(undefined, { preserveSystemProxyIntent: true });
+    if (state.coreManager.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    if (state.coreManager.isRunning()) await stopCoreNow(undefined, { preserveSystemProxyIntent: true });
     return startCoreNow();
   });
 }
@@ -1372,7 +1094,7 @@ function restartCore() {
 function setSystemProxyEnabled(enable) {
   return queueLifecycle(async () => {
     if (enable) {
-      if (!state.singbox.isRunning()) throw new Error('start the core before enabling the system proxy');
+      if (!state.coreManager.isRunning()) throw new Error('start the core before enabling the system proxy');
       const port = state.store.getSettings().mixedPort;
       const enabled = await enableOwnedSystemProxy(port);
       if (enabled) startProxyGuard(port);
@@ -1398,7 +1120,7 @@ function setSystemProxyEnabled(enable) {
 async function cleanup() {
   operations.close();
   stopManagedAutoSelection();
-  flushSmartShadowHistory();
+  smartShadowService.close();
   if (typeof state.cancelPendingUpdates === 'function') {
     await state.cancelPendingUpdates();
   }
@@ -1429,14 +1151,14 @@ async function restartIfRunning() {
     let appliedGeneration = 0;
     let restarts = 0;
     try {
-      if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+      if (state.coreManager.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
       while (appliedGeneration !== restartGeneration) {
         appliedGeneration = restartGeneration;
-        if (!state.singbox.isRunning()) return false;
-        const coreType = state.singbox.getCoreType();
-        await getCoreAdapter(coreType).prepareStart(state.singbox);
+        if (!state.coreManager.isRunning()) return false;
+        const coreType = state.coreManager.getCoreType();
+        await getCoreAdapter(coreType).prepareStart(state.coreManager);
         const { config } = await buildCurrentConfigAsync(coreType);
-        await state.singbox.checkConfigFor(coreType, config);
+        await state.coreManager.checkConfigFor(coreType, config);
         await stopCoreNow(undefined, { preserveSystemProxyIntent: true });
         await startCoreNow();
         restarts += 1;
@@ -1547,7 +1269,7 @@ function ensureSmartModelContext() {
 }
 
 /**
- * Query the latency of a node via the sing-box Clash API.
+ * Query the latency of a node via the Mihomo Clash API.
  * Results are shared across Auto/Smart sweeps for a short TTL. A standalone
  * probe updates the UI delay only; Smart route history requires dual-source
  * measurements from testNodeDelayDual.
@@ -1685,7 +1407,7 @@ function smartNodeQualities() {
   return smartSelectionModel.qualities(names);
 }
 
-/** Generic Clash API request (sing-box external controller). Resolves parsed JSON. */
+/** Generic Mihomo Clash API request. Resolves parsed JSON. */
 function clashApi(method, apiPath, body) {
   return new Promise((resolve, reject) => {
     const done = responseLatch(resolve, reject);
@@ -1752,107 +1474,15 @@ function clashApi(method, apiPath, body) {
 const smartSelectionModel = new SmartSelectionModel();
 const connectionFeedbackTracker = new ConnectionFeedbackTracker();
 const smartProbeSignalWeights = new SmartProbeSignalWeights();
-const smartShadowEvaluator = new SmartShadowEvaluator();
 const kernelDialFeedback = new KernelDialFeedback();
 let smartIdentityCache = { subscription: null, identities: new Map() };
 let smartProbeFamilyCache = { subscription: null, families: new Map() };
 let appliedSmartIdentities = null;
-let smartFeedbackTimer = null;
-let smartFeedbackRun = null;
-let smartFeedbackGeneration = 0;
-let smartShadowLoadedPath = null;
-let smartShadowPersistTimer = null;
-let smartShadowPersistFailed = false;
 
 function smartSelectionContextKey() {
   const id = getActiveSubId() || '';
   const settings = state.store.getSettings();
-  return `${state.singbox.getCoreType()}:${id}:${settings.testUrl || ''}`;
-}
-
-function smartShadowHistoryPath() {
-  const dir = state.store && typeof state.store.dir === 'string'
-    ? state.store.dir
-    : '';
-  return dir ? path.join(dir, SMART_SHADOW_HISTORY_FILE) : '';
-}
-
-function loadSmartShadowHistory() {
-  const file = smartShadowHistoryPath();
-  if (!file || smartShadowLoadedPath === file) return;
-  smartShadowLoadedPath = file;
-  try {
-    const stat = fs.statSync(file);
-    if (!stat.isFile() || stat.size <= 0 || stat.size > SMART_SHADOW_MAX_FILE_BYTES) return;
-    smartShadowEvaluator.restore(JSON.parse(fs.readFileSync(file, 'utf-8')));
-  } catch (_) {
-    // History is advisory. A missing/corrupt sidecar must never affect routing.
-  }
-}
-
-function flushSmartShadowHistory() {
-  if (smartShadowPersistTimer) clearTimeout(smartShadowPersistTimer);
-  smartShadowPersistTimer = null;
-  const file = smartShadowHistoryPath();
-  if (!file || smartShadowLoadedPath !== file) return false;
-  try {
-    const snapshot = smartShadowEvaluator.snapshot();
-    if (Buffer.byteLength(JSON.stringify(snapshot), 'utf-8') > SMART_SHADOW_MAX_FILE_BYTES) {
-      return false;
-    }
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    writeJsonAtomicSync(file, snapshot);
-    smartShadowPersistFailed = false;
-    return true;
-  } catch (error) {
-    if (!smartShadowPersistFailed) {
-      smartShadowPersistFailed = true;
-      sendLog('[gui] local Smart shadow history could not be saved: ' + error.message);
-    }
-    return false;
-  }
-}
-
-function scheduleSmartShadowPersist() {
-  if (smartShadowPersistTimer || !smartShadowHistoryPath()) return;
-  smartShadowPersistTimer = setTimeout(
-    flushSmartShadowHistory,
-    SMART_SHADOW_PERSIST_DELAY_MS
-  );
-  if (smartShadowPersistTimer.unref) smartShadowPersistTimer.unref();
-}
-
-function smartShadowHash(namespace, value) {
-  return crypto
-    .createHash('sha256')
-    .update(`${namespace}\0${String(value || '')}`)
-    .digest('hex')
-    .slice(0, 24);
-}
-
-function smartShadowNetworkKey() {
-  return smartShadowHash('network', networkFingerprint());
-}
-
-function smartShadowContextKey(contextKey = smartSelectionContextKey()) {
-  // The production context contains subscription IDs and a probe URL. Shadow
-  // replay only needs a stable namespace, so never persist those raw values.
-  return smartShadowHash('context', contextKey || 'default');
-}
-
-function smartShadowNodeKey(name) {
-  if (typeof name !== 'string' || !name) return '';
-  const identity = activeSmartNodeIdentities().get(name) || name;
-  return smartShadowHash('node', identity);
-}
-
-function smartShadowLegacyOptions() {
-  // These switches are intentionally local to shadow models. Production keeps
-  // every current feature enabled; the legacy arm exists only as a benchmark.
-  return {
-    routeChangeDetection: false,
-    multiSignalHealth: false,
-  };
+  return `${state.coreManager.getCoreType()}:${id}:${settings.testUrl || ''}`;
 }
 
 function applySmartShadowCalibration(calibration) {
@@ -1872,66 +1502,36 @@ function applySmartShadowCalibration(calibration) {
     : false;
 }
 
-function ensureSmartShadowContext(contextKey = smartSelectionContextKey()) {
-  loadSmartShadowHistory();
-  const baseOptions = typeof smartSelectionModel.getUncalibratedOptions === 'function'
-    ? smartSelectionModel.getUncalibratedOptions()
-    : smartSelectionModel.options;
-  const summary = smartShadowEvaluator.configure({
-    contextKey: smartShadowContextKey(contextKey),
+const smartShadowService = createSmartShadowService({
+  getHistoryDirectory: () => state.store && typeof state.store.dir === 'string'
+    ? state.store.dir
+    : '',
+  getActiveContextKey: smartSelectionContextKey,
+  getModelConfig: () => ({
     mode: smartSelectionModel.mode,
-    baseOptions,
-    legacyOptions: smartShadowLegacyOptions(),
-  });
-  if (summary) applySmartShadowCalibration(summary.calibration);
+    baseOptions: typeof smartSelectionModel.getUncalibratedOptions === 'function'
+      ? smartSelectionModel.getUncalibratedOptions()
+      : smartSelectionModel.options,
+    // Production keeps every feature enabled. This arm is only a benchmark.
+    legacyOptions: { routeChangeDetection: false, multiSignalHealth: false },
+  }),
+  getScopeKey: () => smartSelectionModel.mode,
+  resolveNodeIdentity: (name) => activeSmartNodeIdentities().get(name) || name,
+  getNetworkIdentity: networkFingerprint,
+  applyCalibration: applySmartShadowCalibration,
+  log: sendLog,
+});
+
+function ensureSmartShadowContext(contextKey = smartSelectionContextKey()) {
+  return smartShadowService.ensureContext(contextKey);
 }
 
-function recordSmartShadowRound({
-  contextKey,
-  names,
-  current,
-  measurements,
-  productionPick,
-  now = Date.now(),
-}) {
-  ensureSmartShadowContext(contextKey);
-  const shadowNames = (names || []).map(smartShadowNodeKey);
-  const shadowMeasurements = (measurements || []).map((measurement) => ({
-    ...measurement,
-    name: smartShadowNodeKey(measurement && measurement.name),
-  }));
-  const result = smartShadowEvaluator.recordRound({
-    contextKey: smartShadowContextKey(contextKey),
-    networkKey: smartShadowNetworkKey(),
-    names: shadowNames,
-    current: current ? smartShadowNodeKey(current) : null,
-    measurements: shadowMeasurements,
-    productionPick: productionPick ? smartShadowNodeKey(productionPick) : null,
-    now,
-  });
-  const calibration = result && result.calibration;
-  if (
-    calibration &&
-    calibration.patch &&
-    typeof smartSelectionModel.setCalibrationOptions === 'function'
-  ) {
-    const changed = applySmartShadowCalibration(calibration.patch);
-    if (changed) {
-      sendLog(`[gui] Smart shadow calibration applied (${calibration.variant})`);
-    }
-  }
-  scheduleSmartShadowPersist();
-  return result;
+function recordSmartShadowRound(value) {
+  return smartShadowService.recordRound(value);
 }
 
 function observeSmartShadowConnection(event, now = Date.now()) {
-  ensureSmartShadowContext();
-  if (smartShadowEvaluator.observeConnection({
-    ...event,
-    name: smartShadowNodeKey(event && event.name),
-  }, now)) {
-    scheduleSmartShadowPersist();
-  }
+  return smartShadowService.observeConnection(event, now);
 }
 
 function activeSmartNodeIdentities() {
@@ -1997,7 +1597,7 @@ async function harvestKernelDialFeedback(nodeNames, contextKey) {
     // model now as well instead of waiting out a previously relaxed timer.
     queueMicrotask(() => {
       if (
-        !state.singbox.isRunning() ||
+        !state.coreManager.isRunning() ||
         !managedSmartSelection.isActive() ||
         smartSelectionContextKey() !== contextKey
       ) return;
@@ -2012,7 +1612,7 @@ async function harvestKernelDialFeedback(nodeNames, contextKey) {
  * Destination addresses never leave the core; only node-level health is used.
  */
 async function harvestConnectionFeedback() {
-  if (!state.singbox.isRunning()) return 0;
+  if (!state.coreManager.isRunning()) return 0;
   ensureSmartModelContext();
   const contextKey = smartSelectionContextKey();
   const settings = state.store.getSettings();
@@ -2047,41 +1647,20 @@ async function harvestConnectionFeedback() {
   return (dialResult.events || []).length + events.length;
 }
 
+let smartFeedbackSampler = null;
+
 function stopSmartFeedbackSampler() {
-  smartFeedbackGeneration += 1;
-  if (smartFeedbackTimer) clearTimeout(smartFeedbackTimer);
-  smartFeedbackTimer = null;
-  smartFeedbackRun = null;
-  connectionFeedbackTracker.reset();
+  if (smartFeedbackSampler) smartFeedbackSampler.stop();
+  else connectionFeedbackTracker.reset();
 }
 
 /** Sample local Clash connection snapshots only while Smart carries traffic. */
 function setSmartFeedbackSamplerActive(active) {
-  if (!active || !state.singbox.isRunning()) {
+  if (!active || !state.coreManager.isRunning()) {
     stopSmartFeedbackSampler();
     return;
   }
-  if (smartFeedbackTimer || smartFeedbackRun) return;
-  const generation = ++smartFeedbackGeneration;
-  const schedule = (delayMs) => {
-    if (generation !== smartFeedbackGeneration) return;
-    smartFeedbackTimer = setTimeout(tick, Math.max(0, Number(delayMs) || 0));
-    if (smartFeedbackTimer.unref) smartFeedbackTimer.unref();
-  };
-  const tick = async () => {
-    smartFeedbackTimer = null;
-    if (
-      generation !== smartFeedbackGeneration ||
-      !managedSmartSelection.isActive() ||
-      !state.singbox.isRunning()
-    ) return;
-    const operation = harvestConnectionFeedback();
-    smartFeedbackRun = operation;
-    try { await operation; } catch (_) { /* advisory signal */ }
-    if (smartFeedbackRun === operation) smartFeedbackRun = null;
-    if (generation === smartFeedbackGeneration) schedule(SMART_FEEDBACK_INTERVAL_MS);
-  };
-  schedule(0);
+  if (smartFeedbackSampler) smartFeedbackSampler.start();
 }
 
 function smartActiveIntervalMs() {
@@ -2148,7 +1727,7 @@ function resolveManagedOverrideForGroup(group, names) {
 }
 
 async function resolveOuterManagedGroup() {
-  if (!state.singbox.isRunning()) {
+  if (!state.coreManager.isRunning()) {
     const selected = state.store.get('selected');
     if (selected === AUTO_PROXY_GROUP) return AUTO_PROXY_GROUP;
     if (selected === SMART_PROXY_GROUP) return SMART_PROXY_GROUP;
@@ -2181,7 +1760,7 @@ async function setManagedNodeOverride(name) {
   if (!managedOverrideEligible(name, group)) {
     throw new Error('node is unavailable in the selected group');
   }
-  if (state.singbox.isRunning()) {
+  if (state.coreManager.isRunning()) {
     try {
       const target = await clashApi('GET', '/proxies/' + encodeURIComponent(group));
       if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
@@ -2322,7 +1901,7 @@ async function remountManagedOverrideForOuter(outer) {
   if (!ov || !ov.name) return null;
   const profileId = getActiveSubId() || '';
   if (outer !== AUTO_PROXY_GROUP && outer !== SMART_PROXY_GROUP) return ov;
-  if (state.singbox.isRunning()) {
+  if (state.coreManager.isRunning()) {
     try {
       const target = await clashApi('GET', '/proxies/' + encodeURIComponent(outer));
       if ((getActiveSubId() || '') !== profileId) return null;
@@ -2354,7 +1933,7 @@ const managedSelectionOptions = {
   clashApi,
   activeIntervalMs: MANAGED_AUTO_INTERVAL_MS,
   idleIntervalMs: MANAGED_IDLE_INTERVAL_MS,
-  isRunning: () => state.singbox.isRunning(),
+  isRunning: () => state.coreManager.isRunning(),
   testDelay: testNodeDelay,
 };
 
@@ -2451,6 +2030,14 @@ const managedSmartSelection = new ManagedAutoSelection({
   },
 });
 
+smartFeedbackSampler = new SmartFeedbackSampler({
+  harvest: harvestConnectionFeedback,
+  getActivity: getTrafficActivity,
+  shouldRun: () => managedSmartSelection.isActive() && state.coreManager.isRunning(),
+  onStop: () => connectionFeedbackTracker.reset(),
+});
+setTrafficActivityListener(() => smartFeedbackSampler.wake());
+
 function getManagedSmartPreferred() {
   return managedSmartSelection.getPreferred() || smartSelectionModel.selected || null;
 }
@@ -2458,7 +2045,7 @@ function getManagedSmartPreferred() {
 /** Apply app-managed Smart weights immediately without discarding observations. */
 function applySmartMode(mode) {
   const changed = smartSelectionModel.setMode(mode);
-  if (changed && state.singbox.isRunning() && managedSmartSelection.isScheduled()) {
+  if (changed && state.coreManager.isRunning() && managedSmartSelection.isScheduled()) {
     managedSmartSelection.refresh({ force: true }).catch(() => null);
   }
   return smartSelectionModel.mode;
@@ -2473,6 +2060,8 @@ function applyMeasuredAutoCandidate(name) {
 
 function stopManagedAutoSelection() {
   managedSelectionSyncRevision += 1;
+  managedAutoSelection.setActive(false);
+  managedSmartSelection.setActive(false);
   managedAutoSelection.stop();
   managedSmartSelection.stop();
   stopSmartFeedbackSampler();
@@ -2489,7 +2078,7 @@ function stopManagedAutoSelection() {
  */
 async function syncManagedSelectionSchedulers({ forceRefresh = null } = {}) {
   const syncRevision = managedSelectionSyncRevision;
-  if (!state.singbox.isRunning()) {
+  if (!state.coreManager.isRunning()) {
     stopManagedAutoSelection();
     return null;
   }
@@ -2549,10 +2138,10 @@ function modeChangeNeedsRestart(coreType, currentMode, nextMode) {
 
 function setProxyMode(mode) {
   const apply = async () => {
-    if (state.singbox.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
+    if (state.coreManager.isCoreDownloadInProgress()) throw new Error('wait for the core update to finish');
     const previous = state.store.getSettings().clashMode;
-    const running = state.singbox.isRunning();
-    const rebuild = modeChangeNeedsRestart(state.singbox.getCoreType(), previous, mode);
+    const running = state.coreManager.isRunning();
+    const rebuild = modeChangeNeedsRestart(state.coreManager.getCoreType(), previous, mode);
     if (running && rebuild) {
       state.store.updateSettings({ clashMode: mode });
       try {
@@ -2562,7 +2151,7 @@ function setProxyMode(mode) {
         // restartIfRunning stops the old core before starting the rebuilt
         // config. If the new mode fails validation/startup, restore the old
         // mode and bring that known-good configuration back online.
-        if (!state.singbox.isRunning()) {
+        if (!state.coreManager.isRunning()) {
           try {
             await startCore();
           } catch (recoveryError) {
@@ -2632,10 +2221,6 @@ async function runAutoUpdateTick() {
         const proxyPort = current.updateViaProxy ? currentProxyPort() : 0;
         const r = await subscription.fetchSubscription(sourceUrl, sendLog, {
           proxyPort,
-          coreType: state.store.getSettings().coreType,
-          userAgentMode: ['sing-box', 'clash'].includes(current.userAgentMode)
-            ? current.userAgentMode
-            : 'auto',
         });
         if (!r.nodes.length) throw new Error('no nodes parsed from the updated config');
         const applied = await queueConfigMutation(() => {
@@ -2719,7 +2304,7 @@ async function runAutoUpdateTick() {
           } catch (restoreError) {
             recoveryError = restoreError;
           }
-          if (!state.singbox.isRunning()) {
+          if (!state.coreManager.isRunning()) {
             try {
               await startCore();
             } catch (startError) {
@@ -2823,7 +2408,7 @@ async function runAutoUpdateTick() {
           // For an actual I/O failure, preserve the backup as the last good copy.
           discardSnapshots = restoreError.code === 'DART_UPDATE_SUPERSEDED';
         }
-        if (!state.singbox.isRunning()) {
+        if (!state.coreManager.isRunning()) {
           try {
             await startCore();
           } catch (startError) {
@@ -2875,7 +2460,7 @@ function fileFingerprint(file) {
 }
 
 function snapshotGeoData(coreType) {
-  const dir = state.singbox.ensureCoreDir(coreType);
+  const dir = state.coreManager.ensureCoreDir(coreType);
   const snapshots = [];
   try {
     for (const file of getCoreAdapter(coreType).geoDataFiles) {
@@ -2906,16 +2491,16 @@ function restoreGeoData(snapshots) {
 }
 
 async function refreshGeoData(onProgress = () => {}) {
-  const coreType = state.singbox.getCoreType();
+  const coreType = state.coreManager.getCoreType();
   const successKey = 'geoUpdatedAt_' + coreType.replace(/[^a-z0-9]/gi, '');
   const snapshots = snapshotGeoData(coreType);
   try {
-    const dir = await state.singbox.updateGeoData(onProgress, currentProxyPort());
+    const dir = await state.coreManager.updateGeoData(onProgress, currentProxyPort());
     markGeoDataApplied(snapshots);
     if (
       !operations.closing &&
-      state.singbox.getCoreType() === coreType &&
-      state.singbox.isRunning()
+      state.coreManager.getCoreType() === coreType &&
+      state.coreManager.isRunning()
     ) {
       try {
         await restartIfRunning();
@@ -2929,8 +2514,8 @@ async function refreshGeoData(onProgress = () => {}) {
         }
         if (
           !operations.closing &&
-          !state.singbox.isRunning() &&
-          state.singbox.getCoreType() === coreType
+          !state.coreManager.isRunning() &&
+          state.coreManager.getCoreType() === coreType
         ) {
           try {
             await startCore();
@@ -2954,7 +2539,7 @@ async function refreshGeoData(onProgress = () => {}) {
 
 async function checkGeoUpdate() {
   if (operations.closing) return;
-  const coreType = state.singbox.getCoreType();
+  const coreType = state.coreManager.getCoreType();
   const suffix = coreType.replace(/[^a-z0-9]/gi, '');
   const successKey = 'geoUpdatedAt_' + suffix;
   const attemptKey = 'geoAttemptedAt_' + suffix;
@@ -2962,7 +2547,7 @@ async function checkGeoUpdate() {
   if (!lastSuccess) {
     // First run on this version: seed the clock from the last known update
     // (or now for bundled geodata) so we don't re-download immediately.
-    const meta = state.singbox.geoMeta();
+    const meta = state.coreManager.geoMeta();
     const stamps = Object.values(meta).map((m) => (m && m.updatedAt) || 0);
     lastSuccess = Math.max(0, ...stamps) || Date.now();
     state.store.set(successKey, lastSuccess);
@@ -3067,7 +2652,6 @@ module.exports = {
   activeSubData,
   buildLocalRuleObject,
   splitInlineRule,
-  customRuleSetFileName,
   collectCustomRules,
   processCustomRuleSet,
   detectCustomRuleSetFormat,

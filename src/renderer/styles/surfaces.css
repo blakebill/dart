@@ -2,7 +2,7 @@
 .panel,
 .card {
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--surface);
   box-shadow: var(--panel-shadow);
 }
@@ -22,21 +22,35 @@
 }
 
 .canvas-page > .workspace-section {
-  margin-bottom: 22px;
-  padding-bottom: 22px;
-  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+  padding: 17px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  box-shadow: var(--panel-shadow);
 }
 
 .canvas-page > .workspace-section:last-child {
   margin-bottom: 0;
-  padding-bottom: 0;
-  border-bottom: 0;
 }
 
 .workspace-section > h2,
 .workspace-section > .row:first-child > h2 {
   color: var(--text);
   font-weight: 600;
+}
+
+.workspace-section > h2::before,
+.workspace-section > .row:first-child > h2::before,
+#tab-settings .panel > h2::before {
+  display: inline-block;
+  width: 3px;
+  height: 13px;
+  margin-right: 8px;
+  border-radius: 999px;
+  vertical-align: -1px;
+  background: linear-gradient(180deg, var(--accent), var(--teal));
+  content: "";
 }
 
 .canvas-page > .workspace-section > .row:first-child {
@@ -49,20 +63,38 @@
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 18px;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(300px, 1.35fr) minmax(150px, 0.75fr);
+  margin-bottom: 14px;
   gap: 14px;
 }
 
 .card {
+  position: relative;
   display: flex;
   min-width: 0;
-  min-height: 96px;
+  min-height: 104px;
   flex-direction: column;
   align-items: stretch;
-  padding: 16px 18px;
+  padding: 17px 18px 16px 20px;
   text-align: left;
 }
+
+.card::before {
+  position: absolute;
+  top: 18px;
+  bottom: 18px;
+  left: 0;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: var(--card-accent, var(--accent));
+  content: "";
+  opacity: 0.72;
+}
+
+#dashCoreCard { --card-accent: var(--green); }
+#dashProxyCard { --card-accent: var(--accent); }
+#dashNodeCard { --card-accent: var(--teal); }
+#dashConnectionsCard { --card-accent: var(--yellow); }
 
 button.card {
   font: inherit;
@@ -72,8 +104,10 @@ button.card {
 }
 
 button.card:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-hover);
+  border-color: color-mix(in srgb, var(--card-accent, var(--accent)) 35%, var(--border));
+  background: color-mix(in srgb, var(--card-accent, var(--accent)) 5%, var(--surface-hover));
+  box-shadow: var(--shadow);
+  transform: translateY(-1px);
 }
 
 button.card:active {
@@ -150,7 +184,23 @@ button.card:focus-visible {
 .traffic-stat {
   display: inline-flex;
   align-items: center;
+  padding: 3px 5px;
   gap: 5px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  transition: opacity var(--motion-standard), background-color var(--motion-standard);
+}
+
+.traffic-stat:hover {
+  background: var(--surface-hover);
+}
+
+.traffic-stat[aria-pressed='false'] {
+  opacity: 0.42;
 }
 
 .traffic-stat b {
@@ -177,7 +227,7 @@ button.card:focus-visible {
 .traffic-chart {
   display: block;
   width: 100%;
-  height: 120px;
+  height: 112px;
   margin-top: 8px;
 }
 
@@ -212,15 +262,40 @@ button.card:focus-visible {
   align-items: stretch;
 }
 
+.workspace-commandbar {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  box-shadow: var(--panel-shadow);
+}
+
+.workspace-commandbar > .hint {
+  margin-top: 0;
+}
+
 .dash-split > .panel {
   min-width: 0;
   margin-bottom: 0;
+}
+
+.dash-split > #usagePanel {
+  height: 100%;
 }
 
 .dash-control {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.traffic-panel {
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--teal) 5%, transparent), transparent 44%),
+    var(--surface);
+}
+
+#usagePanel {
+  min-height: 152px;
 }
 
 .dash-control > h2 {
@@ -242,7 +317,7 @@ button.card:focus-visible {
   gap: 12px;
   padding: 6px 10px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 9px;
   color: var(--text);
   background: color-mix(in srgb, var(--field) 70%, transparent);
   cursor: pointer;
@@ -440,6 +515,13 @@ button.card:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.usage-more {
+  margin-top: 8px;
+  color: var(--text-faint);
+  font-size: 10px;
+  text-align: right;
 }
 
 .usage-item + .usage-item {

@@ -2,16 +2,16 @@
 :root {
   --bg: transparent;
   --sidebar: transparent;
-  --surface: rgba(38, 38, 41, 0.66);
-  --surface-raised: rgba(46, 46, 49, 0.82);
+  --surface: rgba(38, 38, 41, 0.72);
+  --surface-raised: rgba(46, 46, 49, 0.88);
   --surface-hover: rgba(62, 62, 66, 0.76);
   --field: rgba(24, 24, 27, 0.62);
   --raised-filter: blur(22px) saturate(1.16);
   --menu-surface: rgb(43, 43, 46);
   --menu-border: rgba(255, 255, 255, 0.19);
   --menu-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.78), 0 6px 18px -8px rgba(0, 0, 0, 0.62), inset 0 1px 0 rgba(255, 255, 255, 0.09);
-  --border: rgba(255, 255, 255, 0.1);
-  --border-strong: rgba(255, 255, 255, 0.16);
+  --border: rgba(255, 255, 255, 0.13);
+  --border-strong: rgba(255, 255, 255, 0.21);
   --text: #ffffff;
   --text-dim: #d0d0d0;
   --text-faint: #a8a8a8;
@@ -36,23 +36,39 @@
   --control-height-compact: 32px;
   --commandbar-height: 40px;
   --row-height: 62px;
+  /* Component scale: use these before introducing page-local measurements. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-control: 8px;
+  --radius-card: 10px;
+  --radius-panel: 12px;
+  --field-width: 160px;
+  --field-width-wide: 260px;
+  --font-page-title: 24px;
+  --font-section-title: 16px;
+  --font-body: 14px;
+  --font-caption: 11px;
 }
 
 :root[data-theme='light'] {
   --bg: transparent;
   --sidebar: transparent;
-  --surface: rgba(255, 255, 255, 0.62);
-  --surface-raised: rgba(255, 255, 255, 0.8);
-  --surface-hover: rgba(255, 255, 255, 0.74);
-  --field: rgba(255, 255, 255, 0.56);
+  --surface: rgba(255, 255, 255, 0.74);
+  --surface-raised: rgba(255, 255, 255, 0.9);
+  --surface-hover: rgba(255, 255, 255, 0.86);
+  --field: rgba(255, 255, 255, 0.72);
   --menu-surface: rgb(252, 252, 252);
   --menu-border: rgba(0, 0, 0, 0.16);
   --menu-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.34), 0 6px 18px -8px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.95);
-  --border: rgba(0, 0, 0, 0.08);
-  --border-strong: rgba(0, 0, 0, 0.14);
+  --border: rgba(31, 43, 55, 0.11);
+  --border-strong: rgba(31, 43, 55, 0.19);
   --text: #1a1a1a;
-  --text-dim: #4a4a4a;
-  --text-faint: #6e6e6e;
+  --text-dim: #3f4954;
+  --text-faint: #68737f;
   --accent: #0067c0;
   --accent-hover: #005a9e;
   --accent-soft: rgba(0, 103, 192, 0.12);
@@ -65,8 +81,8 @@
   --code-bg: rgba(248, 248, 248, 0.94);
   --log-surface: rgba(255, 255, 255, 0.58);
   --code-text: #1a1a1a;
-  --shadow: 0 18px 48px -24px rgba(0, 0, 0, 0.32), 0 4px 14px -8px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.82);
-  --panel-shadow: 0 10px 28px -22px rgba(0, 0, 0, 0.3), 0 2px 8px -6px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  --shadow: 0 20px 48px -24px rgba(28, 39, 50, 0.34), 0 5px 16px -9px rgba(28, 39, 50, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --panel-shadow: 0 12px 30px -22px rgba(28, 39, 50, 0.32), 0 3px 10px -7px rgba(28, 39, 50, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.82);
 }
 
 * {
@@ -167,7 +183,9 @@ textarea,
   min-width: 880px;
   flex-direction: column;
   overflow: hidden;
-  background: transparent;
+  background:
+    radial-gradient(circle at 88% 2%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 34%),
+    transparent;
 }
 
 .app-shell {
@@ -346,8 +364,9 @@ textarea,
   min-width: 208px;
   padding: 8px 12px 12px;
   overflow: hidden;
-  background: transparent;
+  background: color-mix(in srgb, var(--surface) 46%, transparent);
   border-right: 1px solid var(--border);
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--text) 3%, transparent);
 }
 
 .logo {
@@ -359,11 +378,12 @@ textarea,
 }
 
 .logo-dot {
-  width: 11px;
-  height: 28px;
+  width: 10px;
+  height: 30px;
   flex: none;
-  border-radius: 3px;
-  background: var(--accent);
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent-hover), var(--accent));
+  box-shadow: 0 6px 18px -5px color-mix(in srgb, var(--accent) 70%, transparent);
   transition: background-color var(--motion-standard), box-shadow var(--motion-standard), opacity var(--motion-standard);
 }
 
@@ -424,7 +444,7 @@ textarea,
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
 }
 
 .nav-indicator {
@@ -455,11 +475,14 @@ textarea,
   position: relative;
   z-index: 1;
   width: 100%;
-  min-height: 36px;
-  padding: 8px 12px;
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  padding: 8px 12px 8px 10px;
+  gap: 11px;
   overflow: hidden;
   border: 0;
-  border-radius: 4px;
+  border-radius: 8px;
   color: var(--text);
   background: transparent;
   cursor: pointer;
@@ -470,13 +493,43 @@ textarea,
   transition: color var(--motion-standard), background-color var(--motion-standard);
 }
 
+.nav-item::before {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  transition: color var(--motion-standard), background-color var(--motion-standard);
+}
+
+.nav-item[data-tab='dashboard']::before { content: "\E80F"; }
+.nav-item[data-tab='subs']::before { content: "\E8B7"; }
+.nav-item[data-tab='nodes']::before { content: "\E774"; }
+.nav-item[data-tab='rules']::before { content: "\E8A5"; }
+.nav-item[data-tab='conns']::before { content: "\E71B"; }
+.nav-item[data-tab='tools']::before { content: "\E90F"; }
+.nav-item[data-tab='logs']::before { content: "\E9D5"; }
+.nav-item[data-tab='settings']::before { content: "\E713"; }
+
 .nav-item:hover {
   background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
 .nav-item.active {
-  background: color-mix(in srgb, var(--text) 9%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   font-weight: 600;
+}
+
+.nav-item.active::before {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 :root[data-theme='light'] .nav-item:hover {
@@ -484,7 +537,7 @@ textarea,
 }
 
 :root[data-theme='light'] .nav-item.active {
-  background: rgba(0, 0, 0, 0.06);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .sidebar-footer {
@@ -667,6 +720,7 @@ textarea,
   display: flex;
   min-width: 0;
   align-items: center;
+  gap: 10px;
 }
 
 .topbar-title strong {
@@ -674,8 +728,7 @@ textarea,
   font-size: 22px;
   font-weight: 700;
   line-height: 1.15;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: -0.02em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -775,9 +828,7 @@ textarea,
 }
 
 .tab:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-  border-radius: 8px;
+  outline: none;
 }
 
 .live-workspace.active {

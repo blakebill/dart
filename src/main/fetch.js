@@ -119,7 +119,7 @@ function tunneledHttpAgent(socket) {
 
 /**
  * HTTP(S) fetch helpers that can optionally tunnel through the local mixed
- * proxy (sing-box) via HTTP CONNECT. Used to download rule-sets: we try through
+ * local proxy via HTTP CONNECT. Used for downloads: we try through
  * the proxy first (so GFW-blocked GitHub raw URLs work) and fall back to a
  * direct connection on timeout/failure.
  */
@@ -165,7 +165,7 @@ function openRequest(urlStr, opts, cb, errCb) {
         errCb(abortedError());
         return;
       }
-      // Swallow late resets on the tunneled socket: when the proxy (sing-box) is
+      // Swallow late resets on the tunneled socket: when the proxy is
       // torn down — e.g. the core is stopped right after an update download — the
       // tunnel emits ECONNRESET. Without a listener that would crash the process.
       socket.on('error', () => {});

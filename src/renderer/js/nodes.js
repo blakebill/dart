@@ -408,8 +408,9 @@
         if (next.size !== qualities.size) qualityChanged = true;
         qualities.clear();
         for (const [name, value] of next) qualities.set(name, value);
-        if (delayChanged && typeof App.renderDashNodeCards === 'function' && !document.hidden) {
-          App.renderDashNodeCards();
+        if (delayChanged && !document.hidden) {
+          if (typeof App.renderDashNodeCards === 'function') App.renderDashNodeCards();
+          if (typeof App.renderDashboardQuality === 'function') App.renderDashboardQuality();
         }
         if ((qualityChanged || delayChanged) && App.currentTab === 'nodes' && !document.hidden) {
           renderNodeWindow();
@@ -570,9 +571,15 @@
     const list = $('#nodeList');
     if (!list) return;
     if (!nodeRows.length) {
-      list.innerHTML = `<p class="hint">${t('nodes.empty')}</p>`;
+      App.ui.renderEmptyState(list, {
+        iconClass: 'node-empty-icon',
+        title: t('nodes.empty'),
+        actionLabel: t('nodes.openConfigs'),
+        actionName: 'open-configs',
+      });
       return;
     }
+    list.classList.remove('is-empty');
     const { start, end, startRow, endRow, totalRows } = virtualRange(list, nodeRows.length);
     const smartScope = smartScopeState();
     let html = startRow
@@ -626,6 +633,10 @@
   }
   $('#nodeList').addEventListener('click', (e) => {
     hideNodeContextMenu();
+    if (e.target.closest('[data-ui-action="open-configs"]')) {
+      App.router.go('subs');
+      return;
+    }
     const tb = e.target.closest('.node-test-btn');
     if (tb) {
       e.stopPropagation();
@@ -797,8 +808,9 @@
     delayPatchQueued = true;
     requestAnimationFrame(() => {
       delayPatchQueued = false;
-      if (typeof App.renderDashNodeCards === 'function' && !document.hidden) {
-        App.renderDashNodeCards();
+      if (!document.hidden) {
+        if (typeof App.renderDashNodeCards === 'function') App.renderDashNodeCards();
+        if (typeof App.renderDashboardQuality === 'function') App.renderDashboardQuality();
       }
       if (App.currentTab !== 'nodes' || document.hidden) {
         dirtyDelays.clear(); // renderNodes() on tab show covers these
@@ -949,4 +961,5 @@
   App.renderCurrentNode = renderCurrentNode;
   App.refreshGroupSelections = refreshGroupSelections;
   App.testCurrentNodeDelay = testCurrentNodeDelay;
+  App.testAllNodes = testAll;
 })();

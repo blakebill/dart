@@ -1,0 +1,284 @@
+/* Configuration workspace */
+#tab-subs .config-add-section {
+  border-color: color-mix(in srgb, var(--accent) 14%, var(--border));
+  background: color-mix(in srgb, var(--surface) 74%, transparent);
+}
+
+.config-section-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.config-section-head h2 {
+  margin-bottom: 3px;
+}
+
+.config-section-head h2::before {
+  display: inline-block;
+  width: 3px;
+  height: 13px;
+  margin-right: 8px;
+  border-radius: 999px;
+  vertical-align: -1px;
+  background: linear-gradient(180deg, var(--accent), var(--teal));
+  content: "";
+}
+
+.config-section-head .hint {
+  margin: 0;
+  line-height: 1.55;
+}
+
+#tab-subs .subscription-add-form {
+  display: grid;
+  margin: 12px 0 0;
+  grid-template-columns: minmax(160px, 0.7fr) minmax(360px, 2fr) auto;
+  align-items: end;
+  gap: var(--space-3);
+}
+
+.config-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.config-field > label {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-field > .input,
+.config-field > .ui-select {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+
+#tab-subs .subscription-add-form > .btn {
+  min-width: 56px;
+  min-height: var(--control-height);
+  justify-self: end;
+}
+
+#tab-subs .workspace-list-section {
+  padding-bottom: 18px;
+}
+
+#tab-subs .config-list-head {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+#tab-subs .sub-list {
+  display: grid;
+  margin-top: 12px;
+  gap: 10px;
+}
+
+#tab-subs .sub-item {
+  display: grid;
+  min-height: 112px;
+  padding: 14px 15px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--field) 62%, transparent);
+  transition: border-color var(--motion-standard), background-color var(--motion-standard), box-shadow var(--motion-standard);
+}
+
+#tab-subs .sub-item:first-child {
+  border-top: 1px solid var(--border);
+}
+
+#tab-subs .sub-item:hover {
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+  box-shadow: var(--panel-shadow);
+}
+
+#tab-subs .sub-item.active {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 64%, var(--field));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+#tab-subs .sub-info {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.sub-title-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+#tab-subs .sub-name {
+  min-width: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.sub-active-badge,
+.sub-fact {
+  display: inline-flex;
+  min-height: 21px;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.sub-active-badge {
+  flex: none;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.sub-facts {
+  display: flex;
+  min-width: 0;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.sub-fact {
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--surface-hover) 65%, transparent);
+  font-size: 10px;
+}
+
+#tab-subs .sub-meta {
+  margin-top: 7px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.sub-usage {
+  max-width: 380px;
+  margin-top: 8px;
+}
+
+.sub-usage-copy {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-usage-track {
+  height: 3px;
+  margin-top: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 64%, transparent);
+}
+
+.sub-usage-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--teal);
+}
+
+#tab-subs .sub-actions {
+  display: flex;
+  min-width: 210px;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 9px;
+}
+
+.sub-actions-primary,
+.sub-actions-secondary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+#tab-subs .sub-actions .btn {
+  min-height: 32px;
+  padding: 5px 10px;
+}
+
+#tab-subs .btn.primary-soft {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+#tab-subs .btn.danger-quiet {
+  color: var(--red);
+  background: transparent;
+}
+
+#subEditPanel .setting-row > .input,
+#subEditPanel .setting-row > .ui-select {
+  width: min(100%, 280px);
+  max-width: 280px;
+  flex: 0 1 280px;
+}
+
+@media (max-width: 1100px) {
+  #tab-subs .subscription-add-form {
+    grid-template-columns: minmax(140px, 0.62fr) minmax(260px, 1.38fr) auto;
+  }
+
+  #tab-subs .sub-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #tab-subs .sub-actions {
+    min-width: 0;
+    flex-direction: row;
+    align-items: center;
+  }
+}
+
+@media (max-width: 720px) {
+  #tab-subs .subscription-add-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #tab-subs .config-name-field,
+  #tab-subs .config-url-field,
+  #tab-subs .subscription-add-form > .btn {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  #tab-subs .subscription-add-form > .btn {
+    width: auto;
+    justify-self: end;
+  }
+
+  #tab-subs .sub-actions,
+  .sub-actions-primary,
+  .sub-actions-secondary {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}

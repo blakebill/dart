@@ -11,7 +11,6 @@
     'local-rule': 'dialog/editors.js',
     'remote-rule': 'dialog/editors.js',
     'raw-profile': 'dialog/editors.js',
-    convert: 'dialog/editors.js',
     core: 'dialog/system.js',
     'smart-regions': 'dialog/system.js',
     geodata: 'dialog/system.js',

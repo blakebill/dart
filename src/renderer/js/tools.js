@@ -12,6 +12,13 @@
     } catch (_) {}
   });
 
-  $('#convertOpen').addEventListener('click', () => App.openDialog('convert'));
   $('#uwpOpen').addEventListener('click', () => App.openDialog('uwp'));
+
+  document.querySelectorAll('#tab-tools .tool-card').forEach((card) => {
+    card.addEventListener('click', (event) => {
+      if (event.target.closest('button')) return;
+      const launcher = card.querySelector('button');
+      if (launcher && !launcher.disabled) launcher.click();
+    });
+  });
 })();

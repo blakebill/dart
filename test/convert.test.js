@@ -2,23 +2,16 @@
 
 /**
  * Lightweight self-test script (no test framework needed): node test/convert.test.js
- * Verifies the core logic of share-link parsing, Clash parsing, and sing-box conversion.
+ * Verifies share-link parsing, Clash parsing, and Mihomo conversion.
  */
 
 const assert = require('assert');
 const linkParser = require('../src/main/parsers/share-link');
 const clashParser = require('../src/main/parsers/clash');
 const {
-  nodeToOutbound,
   nodeToClashProxy,
-  buildSingboxConfig,
   buildMihomoConfig,
-  buildRoute,
-  clashRulesToSingbox,
   extractRuleGroups,
-  extractGeoCategories,
-  dnsServerFromAddress,
-  ruleListToSingboxRule,
 } = require('../src/main/converter');
 const {
   parseSubscriptionContent,
@@ -27,8 +20,7 @@ const {
   configFingerprint,
   formatSubscriptionForEditing,
 } = require('../src/main/subscription');
-const { geoDataUrls } = require('../src/main/singbox');
-const { normalizePolicyGroups, singboxPolicyOutbounds } = require('../src/main/policy-groups');
+const { normalizePolicyGroups } = require('../src/main/policy-groups');
 
 let passed = 0;
 function test(name, fn) {
@@ -74,41 +66,6 @@ test('parse vless:// (reality)', () => {
   assert.strictEqual(node.name, 'US-Node');
 });
 
-test('parse vless:// falls back SNI to host for WS+TLS CDN links', () => {
-  const uri = 'vless://uuid-abcd@1.2.3.4:443?type=ws&security=tls&host=cdn.example.com&path=%2Fws#CDN';
-  const node = linkParser.parseSingleLink(uri);
-  assert.strictEqual(node.tls, true);
-  assert.strictEqual(node.servername, 'cdn.example.com');
-  assert.strictEqual(node.wsOpts.headers.Host, 'cdn.example.com');
-  const outbound = nodeToOutbound(node);
-  assert.strictEqual(outbound.tls.server_name, 'cdn.example.com');
-});
-
-test('Clash vless reality-opts implies TLS even without tls: true', () => {
-  const yaml = `
-proxies:
-  - name: r1
-    type: vless
-    server: 1.2.3.4
-    port: 443
-    uuid: 00000000-0000-0000-0000-000000000001
-    network: tcp
-    client-fingerprint: chrome
-    servername: www.example.com
-    reality-opts:
-      public-key: PUBKEY
-      short-id: ab
-`;
-  const { nodes } = clashParser.parseClashConfig(yaml);
-  assert.strictEqual(nodes.length, 1);
-  assert.strictEqual(nodes[0].tls, true);
-  assert.strictEqual(nodes[0].reality.publicKey, 'PUBKEY');
-  const outbound = nodeToOutbound(nodes[0]);
-  assert.ok(outbound.tls && outbound.tls.enabled);
-  assert.strictEqual(outbound.tls.reality.public_key, 'PUBKEY');
-  assert.strictEqual(outbound.tls.server_name, 'www.example.com');
-});
-
 test('parse trojan://', () => {
   const uri = 'trojan://pass123@tj.example.com:443?sni=tj.example.com&type=ws&path=/tj#JP-Node';
   const node = linkParser.parseSingleLink(uri);
@@ -143,32 +100,6 @@ test('parse plain SIP002 credentials and reject invalid ports', () => {
   assert.strictEqual(linkParser.parseSingleLink('vmess://' + suffixedVmess), null);
 });
 
-test('parse ss:// plugin options and IPv6 endpoint', () => {
-  const userinfo = Buffer.from('aes-128-gcm:secret').toString('base64');
-  const plugin = encodeURIComponent('v2ray-plugin;mode=websocket;tls;host=cdn.example.com;path=/ws');
-  const node = linkParser.parseSingleLink(`ss://${userinfo}@[2001:db8::1]:443/?plugin=${plugin}#IPv6-SS`);
-  assert.strictEqual(node.server, '2001:db8::1');
-  assert.strictEqual(node.port, 443);
-  assert.strictEqual(node.plugin, 'v2ray-plugin');
-  assert.deepStrictEqual(node.pluginOpts, {
-    mode: 'websocket', tls: true, host: 'cdn.example.com', path: '/ws',
-  });
-  const outbound = nodeToOutbound(node);
-  assert.strictEqual(outbound.plugin, 'v2ray-plugin');
-  assert.ok(outbound.plugin_opts.includes('tls'));
-  assert.ok(outbound.plugin_opts.includes('host=cdn.example.com'));
-});
-
-test('parse ss:// simple-obfs option names', () => {
-  const userinfo = Buffer.from('aes-128-gcm:secret').toString('base64');
-  const plugin = encodeURIComponent('simple-obfs;obfs=http;obfs-host=edge.example.com');
-  const node = linkParser.parseSingleLink(`ss://${userinfo}@ss.example.com:443?plugin=${plugin}#obfs`);
-  assert.deepStrictEqual(node.pluginOpts, { mode: 'http', host: 'edge.example.com' });
-  const outbound = nodeToOutbound(node);
-  assert.strictEqual(outbound.plugin, 'obfs-local');
-  assert.strictEqual(outbound.plugin_opts, 'obfs=http;obfs-host=edge.example.com');
-});
-
 test('parse hysteria2://', () => {
   const uri = 'hysteria2://pass@hy2.example.com:443?sni=hy2.example.com&insecure=1&obfs=salamander&obfs-password=xyz#HY2';
   const node = linkParser.parseSingleLink(uri);
@@ -179,30 +110,10 @@ test('parse hysteria2://', () => {
   assert.strictEqual(node.skipCertVerify, true);
 });
 
-test('parse base64 bulk subscription', () => {
-  const links = [
-    'trojan://p1@a.com:443#node1',
-    'trojan://p2@b.com:443#node2',
-  ].join('\n');
-  const b64 = Buffer.from(links).toString('base64');
-  const nodes = linkParser.parseSubscriptionLinks(b64);
-  assert.strictEqual(nodes.length, 2);
-  assert.strictEqual(nodes[0].name, 'node1');
-  assert.strictEqual(formatSubscriptionForEditing(b64), links);
-  const clashEditable = formatSubscriptionForEditing(b64, 'clash');
-  const singboxEditable = formatSubscriptionForEditing(b64, 'sing-box');
-  assert.strictEqual(parseSubscriptionContent(clashEditable).format, 'clash');
-  assert.strictEqual(parseSubscriptionContent(clashEditable).nodes.length, 2);
-  assert.strictEqual(parseSubscriptionContent(singboxEditable).format, 'singbox');
-  assert.strictEqual(parseSubscriptionContent(singboxEditable).nodes.length, 2);
-});
-
-console.log('\nClash config parsing:');
-
 const clashYaml = `
 port: 7890
 proxies:
-  - name: "HK-vmess"
+  - name: HK-vmess
     type: vmess
     server: hk.example.com
     port: 443
@@ -216,13 +127,13 @@ proxies:
       path: /path
       headers:
         Host: cdn.example.com
-  - name: "US-ss"
+  - name: US-ss
     type: ss
     server: us.example.com
     port: 8388
     cipher: aes-128-gcm
     password: pass
-  - name: "JP-trojan"
+  - name: JP-trojan
     type: trojan
     server: jp.example.com
     port: 443
@@ -260,137 +171,12 @@ test('parse Clash proxies', () => {
   });
 });
 
-test('sing-box urltest idle_timeout is never below interval', () => {
-  const [group] = singboxPolicyOutbounds(
-    [{ name: '自动选择', type: 'url-test', members: ['a', 'b'], interval: 3600 }],
-    'http://www.gstatic.com/generate_204',
-    60
-  );
-  assert.strictEqual(group.type, 'urltest');
-  assert.strictEqual(group.interval, '3600s');
-  // Default 30m would be shorter than a 1h Clash interval and crash sing-box.
-  assert.strictEqual(group.idle_timeout, '3600s');
-
-  const [capped] = singboxPolicyOutbounds(
-    [{ name: 'g', type: 'url-test', members: ['a'], interval: 120, idleTimeout: 30 }],
-    'http://www.gstatic.com/generate_204',
-    60
-  );
-  assert.strictEqual(capped.interval, '120s');
-  assert.strictEqual(capped.idle_timeout, '120s');
-});
-
-test('Clash policy groups survive both core generators', () => {
-  const parsed = parseSubscriptionContent(`${clashYaml}
-rules:
-  - DOMAIN-SUFFIX,example.com,PROXY
-  - MATCH,PROXY
-`);
-  const singbox = buildSingboxConfig(parsed.nodes, {
-    policyGroups: parsed.policyGroups,
-    clashRules: parsed.rules,
-    ruleSetDir: null,
-  });
-  const mihomo = buildMihomoConfig(parsed.nodes, {
-    policyGroups: parsed.policyGroups,
-    clashRules: parsed.rules,
-  });
-
-  assert.ok(singbox.outbounds.some((outbound) => outbound.tag === 'PROXY' && outbound.type === 'selector'));
-  assert.strictEqual(singbox.route.final, 'PROXY');
-  assert.ok(mihomo['proxy-groups'].some((group) => group.name === 'PROXY' && group.type === 'select'));
-  assert.strictEqual(mihomo.rules.at(-1), 'MATCH,PROXY');
-});
-
 test('base64 Clash configs decode for parsing and editing', () => {
   const encoded = Buffer.from(clashYaml).toString('base64');
   const parsed = parseSubscriptionContent(encoded);
   assert.strictEqual(parsed.format, 'clash');
   assert.strictEqual(parsed.nodes.length, 3);
   assert.strictEqual(formatSubscriptionForEditing(encoded), clashYaml.trim());
-});
-
-test('Clash parser rejects malformed endpoints and out-of-range ports', () => {
-  const { nodes } = clashParser.parseClashConfig(`proxies:
-  - { name: good, type: trojan, server: example.com, port: "443", password: p }
-  - { name: negative, type: trojan, server: example.com, port: -1, password: p }
-  - { name: overflow, type: trojan, server: example.com, port: 70000, password: p }
-  - { name: suffix, type: trojan, server: example.com, port: 443x, password: p }
-  - { name: object, type: trojan, server: { host: example.com }, port: 443, password: p }`);
-  assert.deepStrictEqual(nodes.map((node) => node.name), ['good']);
-});
-
-console.log('\nsing-box conversion:');
-
-test('vmess node -> outbound', () => {
-  const { nodes } = clashParser.parseClashConfig(clashYaml);
-  const ob = nodeToOutbound(nodes[0]);
-  assert.strictEqual(ob.type, 'vmess');
-  assert.strictEqual(ob.server, 'hk.example.com');
-  assert.strictEqual(ob.uuid, 'uuid-xyz');
-  assert.strictEqual(ob.tls.enabled, true);
-  assert.strictEqual(ob.tls.server_name, 'cdn.example.com');
-  assert.strictEqual(ob.transport.type, 'ws');
-  assert.strictEqual(ob.transport.path, '/path');
-  assert.strictEqual(ob.transport.headers.Host, 'cdn.example.com');
-});
-
-test('trojan node -> outbound', () => {
-  const { nodes } = clashParser.parseClashConfig(clashYaml);
-  const ob = nodeToOutbound(nodes[2]);
-  assert.strictEqual(ob.type, 'trojan');
-  assert.strictEqual(ob.password, 'tjpass');
-  assert.strictEqual(ob.tls.enabled, true);
-  assert.strictEqual(ob.tls.server_name, 'jp.example.com');
-});
-
-test('full Clash -> sing-box config', () => {
-  const { nodes } = clashParser.parseClashConfig(clashYaml);
-  const config = buildSingboxConfig(nodes, {});
-  // Structure checks
-  assert.ok(config.log);
-  assert.ok(config.dns);
-  assert.ok(Array.isArray(config.inbounds));
-  assert.ok(Array.isArray(config.outbounds));
-  assert.ok(config.route);
-  // Inbounds include mixed
-  assert.ok(config.inbounds.some((i) => i.type === 'mixed' && i.listen_port === 7890));
-  // Outbounds include selector / automatic groups / 3 nodes / direct.
-  const types = config.outbounds.map((o) => o.type);
-  assert.ok(types.includes('selector'));
-  assert.ok(types.includes('urltest'));
-  assert.ok(config.outbounds.some((o) => o.tag === '🛟 Fallback' && o.type === 'urltest'));
-  assert.ok(config.outbounds.some((o) => o.tag === '🧠 Smart' && o.type === 'selector'));
-  assert.ok(config.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('🧠 Smart'));
-  assert.ok(config.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('🛟 Fallback'));
-  assert.ok(types.includes('direct'));
-  assert.ok(!types.includes('block'), 'block outbound removed in 1.12+');
-  assert.strictEqual(config.outbounds.filter((o) => ['vmess', 'shadowsocks', 'trojan'].includes(o.type)).length, 3);
-  // selector includes all node tags
-  const selector = config.outbounds.find((o) => o.type === 'selector');
-  assert.ok(selector.outbounds.includes('HK-vmess'));
-  assert.ok(selector.outbounds.includes('US-ss'));
-  // DNS uses the new 1.12+ server format (type/server, not address)
-  assert.ok(config.dns.servers.every((s) => s.type && !s.address), 'DNS servers use new format');
-  // route final
-  assert.strictEqual(config.route.final, '🚀 Proxy');
-  // clash api
-  assert.ok(config.experimental.clash_api.external_controller.includes('9090'));
-});
-
-test('deduplicate nodes with duplicate names', () => {
-  const nodes = [
-    { type: 'trojan', name: 'dup', server: 'a.com', port: 443, password: 'p' },
-    { type: 'trojan', name: 'dup', server: 'b.com', port: 443, password: 'p' },
-  ];
-  const config = buildSingboxConfig(nodes, {});
-  const tags = config.outbounds.filter((o) => o.type === 'trojan').map((o) => o.tag);
-  assert.strictEqual(new Set(tags).size, 2, 'duplicate tags should be deduplicated');
-});
-
-test('configs reject profiles with no supported proxy nodes', () => {
-  assert.throws(() => buildSingboxConfig([{ type: 'unsupported', name: 'bad' }]), /No supported proxy nodes/);
-  assert.throws(() => buildMihomoConfig([{ type: 'unsupported', name: 'bad' }]), /No supported proxy nodes/);
 });
 
 test('node -> Mihomo proxy', () => {
@@ -468,38 +254,10 @@ test('Mihomo injects private and CN direct even when the subscription has rules'
   assert.ok(cnIdx < cfg.rules.length - 1);
 });
 
-test('Clash OR logical rules expand into separate matchers', () => {
-  const { rules } = clashRulesToSingbox([
-    'OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-SUFFIX,googleapis.com)),PROXY',
-    'MATCH,PROXY',
-  ]);
-  assert.ok(rules.some((rule) => rule.domain_suffix && rule.domain_suffix.includes('google.com')));
-  assert.ok(rules.some((rule) => rule.domain_suffix && rule.domain_suffix.includes('googleapis.com')));
-});
-
-test('Clash AND logical rules merge different matcher fields', () => {
-  const { rules } = clashRulesToSingbox([
-    'AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),DIRECT',
-  ]);
-  assert.strictEqual(rules.length, 1);
-  assert.deepStrictEqual(rules[0].domain_suffix, ['example.com']);
-  assert.deepStrictEqual(rules[0].port, [443]);
-  assert.strictEqual(rules[0].outbound, 'direct');
-
-  const mihomo = buildMihomoConfig([
-    { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' },
-  ], {
-    clashRules: ['AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),DIRECT'],
-    hasGeoData: false,
-  });
-  assert.ok(mihomo.rules.includes('AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),DIRECT'));
-  assert.ok(!mihomo.rules.includes('DOMAIN-SUFFIX,example.com,DIRECT'));
-  assert.ok(!mihomo.rules.includes('DST-PORT,443,DIRECT'));
-});
-
 test('Mihomo TUN mode emits tun configuration', () => {
   const cfg = buildMihomoConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {
     enableTun: true,
+    enableDnsOverride: true,
     enableIpv6: false,
     dnsRemote: 'https://1.1.1.1/dns-query',
     dnsLocal: 'https://223.5.5.5/dns-query',
@@ -551,374 +309,19 @@ test('subscription node names are unique and cannot shadow strategy groups', () 
   assert.deepStrictEqual(res.nodes.map((node) => node.name), ['dup', 'dup 2', '♻️ Auto 2', '🧠 Smart 2']);
 });
 
-test('TUN inbound', () => {
-  const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], { enableTun: true });
-  const tun = config.inbounds.find((inbound) => inbound.type === 'tun');
-  assert.ok(tun);
-  assert.strictEqual(tun.interface_name, 'Dart');
-});
-
-test('clash_api secret is included when given, absent otherwise', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const withSecret = buildSingboxConfig([node], { clashApiSecret: 's3cret' });
-  assert.strictEqual(withSecret.experimental.clash_api.secret, 's3cret');
-  const noSecret = buildSingboxConfig([node], {});
-  assert.ok(!('secret' in noSecret.experimental.clash_api));
-});
-
-test('clash_api hosts a local panel when externalUi opts are set', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const config = buildSingboxConfig([node], {
-    externalUiDir: '/tmp/ui/zashboard',
-    externalUiDownloadUrl: 'https://example.com/dist.zip',
-  });
-  const c = config.experimental.clash_api;
-  assert.strictEqual(c.external_ui, '/tmp/ui/zashboard');
-  assert.strictEqual(c.external_ui_download_url, 'https://example.com/dist.zip');
-  assert.strictEqual(c.external_ui_download_detour, '🚀 Proxy');
-  // And absent when not configured.
-  const plain = buildSingboxConfig([node], {});
-  assert.ok(!('external_ui' in plain.experimental.clash_api));
-});
-
-test('Block mode rejects everything via a top clash_mode rule', () => {
-  const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {});
-  const rules = config.route.rules;
-  const blockIdx = rules.findIndex((r) => r.clash_mode === 'block');
-  assert.ok(blockIdx >= 0, 'Block rule present');
-  assert.strictEqual(rules[blockIdx].action, 'reject');
-  // It must sit above every routing decision (only sniff/dns hijack before it).
-  const directIdx = rules.findIndex((r) => r.clash_mode === 'direct');
-  assert.ok(blockIdx < directIdx, 'Block precedes other mode rules');
-});
-
-test('sing-box mode rules use the lowercase values emitted by the Clash API', () => {
-  const config = buildSingboxConfig([{ type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' }], {});
-  assert.deepStrictEqual(
-    config.route.rules.filter((rule) => rule.clash_mode).map((rule) => rule.clash_mode),
-    ['block', 'direct', 'global']
-  );
-  assert.deepStrictEqual(config.dns.rules.slice(0, 2).map((rule) => rule.clash_mode), ['direct', 'global']);
-});
-
-test('custom latency URL is used by both cores health-check groups', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const testUrl = 'https://example.com/ping';
-  const singbox = buildSingboxConfig([node], { testUrl });
-  assert.ok(singbox.outbounds.filter((outbound) => outbound.type === 'urltest').every((outbound) => outbound.url === testUrl));
-  const mihomo = buildMihomoConfig([node], { testUrl });
-  assert.ok(mihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type)).every((group) => group.url === testUrl));
-
-  const defaultUrl = 'http://www.gstatic.com/generate_204';
-  const defaultSingbox = buildSingboxConfig([node]);
-  assert.ok(defaultSingbox.outbounds.filter((outbound) => outbound.type === 'urltest')
-    .every((outbound) => outbound.url === defaultUrl));
-  const defaultMihomo = buildMihomoConfig([node]);
-  assert.ok(defaultMihomo['proxy-groups'].filter((group) => ['url-test', 'fallback'].includes(group.type))
-    .every((group) => group.url === defaultUrl));
-});
-
-test('Auto groups stay app-managed selectors for both cores', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const singbox = buildSingboxConfig([node]);
-  const singboxAuto = singbox.outbounds.find((outbound) => outbound.tag === '♻️ Auto');
-  assert.strictEqual(singboxAuto.type, 'selector');
-  assert.deepStrictEqual(singboxAuto.outbounds, ['n']);
-  assert.strictEqual(singboxAuto.default, 'n');
-  const mihomo = buildMihomoConfig([node]);
-  const mihomoAuto = mihomo['proxy-groups'].find((group) => group.name === '♻️ Auto');
-  assert.strictEqual(mihomoAuto.type, 'select');
-  assert.deepStrictEqual(mihomoAuto.proxies, ['n']);
-});
-
-test('Smart groups are app-managed selectors', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const singbox = buildSingboxConfig([node]);
-  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
-  assert.strictEqual(singboxSmart.type, 'selector');
-  assert.deepStrictEqual(singboxSmart.outbounds, ['n']);
-  const mihomo = buildMihomoConfig([node]);
-  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
-  assert.strictEqual(mihomoSmart.type, 'select');
-  assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
-});
-
-test('Smart region preferences restrict both core groups and safely handle stale choices', () => {
-  const nodes = [
-    { type: 'trojan', name: '🇭🇰 HK-01', server: 'hk.example.com', port: 443, password: 'p' },
-    { type: 'trojan', name: 'US-01', server: 'us.example.com', port: 443, password: 'p' },
-    { type: 'trojan', name: 'Other', server: 'edge.example.net', port: 443, password: 'p' },
-  ];
-  const singbox = buildSingboxConfig(nodes, { smartRegions: ['HK', 'ZZ'] });
-  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
-  assert.deepStrictEqual(singboxSmart.outbounds, ['🇭🇰 HK-01', 'Other']);
-
-  const mihomo = buildMihomoConfig(nodes, { smartRegions: ['US'] });
-  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
-  assert.deepStrictEqual(mihomoSmart.proxies, ['US-01']);
-
-  const stale = buildSingboxConfig(nodes, { smartRegions: ['JP'] });
-  assert.deepStrictEqual(
-    stale.outbounds.find((outbound) => outbound.tag === '🧠 Smart').outbounds,
-    nodes.map((node) => node.name)
-  );
-});
-
-test('kernel Smart version fallback stays conservative for old Dart builds', () => {
-  const { coreSupportsKernelSmart } = require('../src/main/converter');
-  assert.strictEqual(coreSupportsKernelSmart('unknown', '1.13.14-dart.99'), false);
-  assert.strictEqual(coreSupportsKernelSmart('sing-box', null), false);
-  assert.strictEqual(coreSupportsKernelSmart('sing-box', '1.13.14'), false);
-  assert.strictEqual(coreSupportsKernelSmart('sing-box', '1.13.14-dart.1'), false);
-  assert.strictEqual(coreSupportsKernelSmart('sing-box', '1.13.14-dart.2'), false);
-  assert.strictEqual(coreSupportsKernelSmart('sing-box', '1.13.14-dart.3'), true);
-  assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29'), false);
-  assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29-dart.1'), false);
-  assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29-dart.2'), false);
-  assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29-dart.3'), false);
-  assert.strictEqual(coreSupportsKernelSmart('mihomo', '1.19.29-dart.4'), true);
-});
-
-test('kernel Smart emits type and mode for both cores', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const singbox = buildSingboxConfig([node], {
-    kernelSmart: true, kernelSmartMode: true, smartMode: 'stable',
-  });
-  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
-  assert.strictEqual(singboxSmart.type, 'smart');
-  assert.strictEqual(singboxSmart.mode, 'stable');
-  assert.deepStrictEqual(singboxSmart.outbounds, ['n']);
-  assert.strictEqual(singboxSmart.interrupt_exist_connections, false);
-
-  const mihomo = buildMihomoConfig([node], {
-    kernelSmart: true, kernelSmartMode: true, smartMode: 'latency',
-  });
-  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
-  assert.strictEqual(mihomoSmart.type, 'smart');
-  assert.strictEqual(mihomoSmart.mode, 'latency');
-  assert.deepStrictEqual(mihomoSmart.proxies, ['n']);
-});
-
-test('kernel Smart omits mode for older compatible Dart cores', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const singbox = buildSingboxConfig([node], { kernelSmart: true, smartMode: 'stable' });
-  const singboxSmart = singbox.outbounds.find((outbound) => outbound.tag === '🧠 Smart');
-  assert.strictEqual(singboxSmart.type, 'smart');
-  assert.strictEqual(singboxSmart.mode, undefined);
-  const mihomo = buildMihomoConfig([node], { kernelSmart: true, smartMode: 'stable' });
-  const mihomoSmart = mihomo['proxy-groups'].find((group) => group.name === '🧠 Smart');
-  assert.strictEqual(mihomoSmart.type, 'smart');
-  assert.strictEqual(mihomoSmart.mode, undefined);
-});
-
-test('interface binding only in TUN mode (VPN/WireGuard coexistence)', () => {
-  const node = { type: 'trojan', name: 'n', server: 'a.com', port: 443, password: 'p' };
-  const tun = buildSingboxConfig([node], { enableTun: true });
-  assert.strictEqual(tun.route.auto_detect_interface, true);
-  // Without TUN there is no routing loop to avoid; leaving sockets unbound lets
-  // them follow the routing table (e.g. into an active WireGuard tunnel).
-  const sysProxy = buildSingboxConfig([node], { enableTun: false });
-  assert.strictEqual(sysProxy.route.auto_detect_interface, undefined);
-});
-
-console.log('\nClash rules conversion:');
-
-test('clashRulesToSingbox maps common rule types', () => {
-  const { rules } = clashRulesToSingbox([
-    'DOMAIN-SUFFIX,google.com,PROXY',
-    'DOMAIN,example.com,DIRECT',
-    'DOMAIN-KEYWORD,github,PROXY',
-    'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
-    'DST-PORT,80,PROXY',
-    'GEOIP,CN,DIRECT',
-    'PROCESS-NAME,Telegram.exe,PROXY',
-    'REJECT-RULE,ads.com,REJECT', // unknown type -> skipped
-    'MATCH,PROXY', // final -> ignored
-  ]);
-  assert.deepStrictEqual(rules[0], { domain_suffix: ['google.com'], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(rules[1], { domain: ['example.com'], outbound: 'direct' });
-  assert.deepStrictEqual(rules[2], { domain_keyword: ['github'], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(rules[3], { ip_cidr: ['192.168.0.0/16'], outbound: 'direct' });
-  assert.deepStrictEqual(rules[4], { port: [80], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(rules[5], { rule_set: ['geoip-cn'], outbound: 'direct' });
-  assert.deepStrictEqual(rules[6], { process_name: ['Telegram.exe'], outbound: '🚀 Proxy' });
-  assert.strictEqual(rules.length, 7, 'unknown type and MATCH are skipped');
-});
-
-test('REJECT target becomes a reject action', () => {
-  const { rules } = clashRulesToSingbox(['DOMAIN,ad.com,REJECT']);
-  assert.deepStrictEqual(rules[0], { domain: ['ad.com'], action: 'reject' });
-});
-
-test('buildSingboxConfig injects converted Clash rules before the geoip fallback', () => {
-  const nodes = [{ type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' }];
-  const config = buildSingboxConfig(nodes, {
-    ruleSetDir: '/geo', // geodata present, so the geoip-cn fallback is emitted
-    clashRules: ['DOMAIN-SUFFIX,openai.com,PROXY'],
-  });
-  const idxConverted = config.route.rules.findIndex(
-    (r) => Array.isArray(r.domain_suffix) && r.domain_suffix.includes('openai.com')
-  );
-  const idxGeoip = config.route.rules.findIndex(
-    (r) => Array.isArray(r.rule_set) && r.rule_set.includes('geoip-cn')
-  );
-  assert.ok(idxConverted > -1, 'converted rule present');
-  assert.ok(idxConverted < idxGeoip, 'converted rule comes before geoip-cn fallback');
-});
-
-console.log('\nDNS address parsing:');
-
-test('dnsServerFromAddress parses DoH/DoT/UDP', () => {
-  assert.deepStrictEqual(dnsServerFromAddress('https://1.1.1.1/dns-query', 'r', '🚀 Proxy'), {
-    tag: 'r', type: 'https', server: '1.1.1.1', detour: '🚀 Proxy',
-  });
-  assert.deepStrictEqual(dnsServerFromAddress('tls://8.8.8.8', 'l'), {
-    tag: 'l', type: 'tls', server: '8.8.8.8',
-  });
-  assert.deepStrictEqual(dnsServerFromAddress('223.5.5.5', 'l'), {
-    tag: 'l', type: 'udp', server: '223.5.5.5',
-  });
-  // custom DoH path is preserved
-  const doh = dnsServerFromAddress('https://dns.google/resolve', 'r');
-  assert.strictEqual(doh.type, 'https');
-  assert.strictEqual(doh.server, 'dns.google');
-  assert.strictEqual(doh.path, '/resolve');
-  assert.deepStrictEqual(dnsServerFromAddress('udp://[2001:4860:4860::8888]:5353', 'v6'), {
-    tag: 'v6', type: 'udp', server: '2001:4860:4860::8888', server_port: 5353,
-  });
-  assert.deepStrictEqual(dnsServerFromAddress('[2001:4860:4860::8844]', 'v6'), {
-    tag: 'v6', type: 'udp', server: '2001:4860:4860::8844',
-  });
-  assert.throws(() => dnsServerFromAddress('udp://1.1.1.1:70000', 'bad'), /invalid DNS server port/);
-});
-
-test('buildSingboxConfig honors custom DNS + strategy', () => {
-  const cfg = buildSingboxConfig([{ type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' }], {
+test('Mihomo DNS override also applies outside TUN mode', () => {
+  const cfg = buildMihomoConfig([
+    { type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' },
+  ], {
+    enableDnsOverride: true,
+    enableTun: false,
     dnsRemote: 'tls://9.9.9.9',
     dnsLocal: '119.29.29.29',
-    dnsStrategy: 'prefer_ipv6',
   });
-  const remote = cfg.dns.servers.find((s) => s.tag === 'proxy-dns');
-  const local = cfg.dns.servers.find((s) => s.tag === 'local-dns');
-  assert.strictEqual(remote.type, 'tls');
-  assert.strictEqual(remote.server, '9.9.9.9');
-  assert.strictEqual(local.type, 'udp');
-  assert.strictEqual(local.server, '119.29.29.29');
-  assert.strictEqual(cfg.dns.strategy, 'prefer_ipv6');
-});
-
-test('TUN inbound uses mixed stack + mtu', () => {
-  const cfg = buildSingboxConfig([{ type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' }], {
-    enableTun: true,
-  });
-  const tun = cfg.inbounds.find((i) => i.type === 'tun');
-  assert.ok(tun);
-  assert.strictEqual(tun.stack, 'mixed');
-  assert.strictEqual(tun.mtu, 9000);
-});
-
-console.log('\nCustom rule-set conversion:');
-
-test('ruleListToSingboxRule parses Clash classical lines', () => {
-  const { rule, rules, count } = ruleListToSingboxRule(
-    [
-      '# comment',
-      'DOMAIN-SUFFIX,google.com',
-      'DOMAIN,example.com',
-      'DOMAIN-KEYWORD,telegram',
-      'IP-CIDR,1.1.1.0/24,no-resolve',
-      'USER-AGENT,Foo*', // unsupported -> skipped
-    ].join('\n'),
-    'proxy'
-  );
-  assert.strictEqual(count, 4);
-  assert.strictEqual(rule, null, 'mixed matcher fields are emitted as multiple OR rules');
-  assert.strictEqual(rules.length, 4);
-  const byField = Object.fromEntries(
-    rules.map((r) => [Object.keys(r).find((k) => k !== 'outbound' && k !== 'action'), r])
-  );
-  assert.deepStrictEqual(byField.domain_suffix, { domain_suffix: ['google.com'], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(byField.domain, { domain: ['example.com'], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(byField.domain_keyword, { domain_keyword: ['telegram'], outbound: '🚀 Proxy' });
-  assert.deepStrictEqual(byField.ip_cidr, { ip_cidr: ['1.1.1.0/24'], outbound: '🚀 Proxy' });
-});
-
-test('ruleListToSingboxRule handles a domain list + reject target', () => {
-  const { rule, rules } = ruleListToSingboxRule('payload:\n  - "+.ads.com"\n  - .track.net\n  - plain.com', 'reject');
-  assert.strictEqual(rules.length, 1);
-  assert.deepStrictEqual(rule.domain_suffix, ['ads.com', 'track.net', 'plain.com']);
-  assert.strictEqual(rule.action, 'reject');
-  assert.ok(!rule.outbound);
-});
-
-test('custom rules inject into the config before geoip fallback', () => {
-  const { rules } = ruleListToSingboxRule('DOMAIN-SUFFIX,openai.com', 'proxy');
-  const cfg = buildSingboxConfig([{ type: 'trojan', name: 'N', server: 'a.com', port: 443, password: 'p' }], {
-    ruleSetDir: '/geo', // geodata present, so the geoip-cn fallback is emitted
-    extraRules: rules,
-  });
-  const i = cfg.route.rules.findIndex((r) => Array.isArray(r.domain_suffix) && r.domain_suffix.includes('openai.com'));
-  const g = cfg.route.rules.findIndex((r) => Array.isArray(r.rule_set) && r.rule_set.includes('geoip-cn'));
-  assert.ok(i > -1 && i < g);
-});
-
-test('buildRoute matches the full config route block', () => {
-  const opts = {
-    ruleSetDir: '/geo', // geodata present -> local rule-sets
-    clashRules: ['DOMAIN-SUFFIX,openai.com,PROXY', 'DOMAIN,direct.test,DIRECT'],
-    extraRules: [{ domain: ['x.com'], action: 'reject' }],
-    extraRuleSets: [{ type: 'local', tag: 'custom-1', format: 'binary', path: '/x.srs' }],
-  };
-  const route = buildRoute(opts);
-  const cfg = buildSingboxConfig([{ type: 'trojan', name: 'A', server: 'a.com', port: 443, password: 'p' }], opts);
-  assert.deepStrictEqual(route.rules, cfg.route.rules);
-  assert.deepStrictEqual(route.rule_set, cfg.route.rule_set);
-  // The geo rule-sets are local (bundled), never remote (a remote fetch is
-  // fatal at startup in sing-box).
-  assert.ok(route.rule_set.every((rs) => rs.type === 'local'));
-  // The custom inline rule precedes the geoip/geosite fallback.
-  const r = route.rules.findIndex((x) => Array.isArray(x.domain) && x.domain.includes('x.com'));
-  const g = route.rules.findIndex((x) => Array.isArray(x.rule_set) && x.rule_set.includes('geoip-cn'));
-  assert.ok(r > -1 && r < g);
-});
-
-test('without geodata, the route never references an undefined rule-set', () => {
-  // A fresh install has no .srs (ruleSetDir = null). The config must degrade —
-  // no remote rule-sets, no geoip-cn/geosite-cn references anywhere — so the
-  // core boots instead of fatally failing to fetch a remote rule-set.
-  const opts = {
-    ruleSetDir: null,
-    // Defensive case: even if a caller accidentally says the geo tags are
-    // available, no local rule_set may be emitted without a real directory.
-    geoAvailable: new Set(['geoip-cn', 'geosite-cn']),
-    // A GEOIP,CN rule would normally convert to a geoip-cn reference.
-    clashRules: ['GEOIP,CN,DIRECT', 'DOMAIN-SUFFIX,openai.com,PROXY'],
-  };
-  const cfg = buildSingboxConfig([{ type: 'trojan', name: 'A', server: 'a.com', port: 443, password: 'p' }], opts);
-  // No rule-set definitions beyond any custom ones (none here).
-  assert.deepStrictEqual(cfg.route.rule_set, []);
-  // No remote rule-sets anywhere.
-  assert.ok(!JSON.stringify(cfg).includes('"type":"remote"'));
-  // Nothing references the (now undefined) geo rule-sets — route or DNS.
-  const refs = JSON.stringify(cfg.route.rules) + JSON.stringify(cfg.dns.rules);
-  assert.ok(!refs.includes('geoip-cn') && !refs.includes('geosite-cn'));
-  // The GEOIP,CN rule was dropped, but the normal proxy rule survives.
-  assert.ok(JSON.stringify(cfg.route.rules).includes('openai.com'));
-});
-
-console.log('\nAnyTLS:');
-
-test('parse anytls (Clash) -> outbound with tls', () => {
-  const { nodes } = clashParser.parseClashConfig('proxies:\n  - {name: AT, type: anytls, server: a.com, port: 8443, password: pw, sni: a.com, alpn: [h2], client-fingerprint: chrome}');
-  assert.strictEqual(nodes.length, 1);
-  assert.strictEqual(nodes[0].type, 'anytls');
-  const ob = nodeToOutbound(nodes[0]);
-  assert.strictEqual(ob.type, 'anytls');
-  assert.strictEqual(ob.password, 'pw');
-  assert.strictEqual(ob.tls.enabled, true);
-  assert.strictEqual(ob.tls.server_name, 'a.com');
-  assert.deepStrictEqual(ob.tls.alpn, ['h2']);
-  assert.strictEqual(ob.tls.utls.fingerprint, 'chrome');
+  assert.strictEqual(cfg.dns.enable, true);
+  assert.strictEqual(cfg.dns['enhanced-mode'], 'redir-host');
+  assert.deepStrictEqual(cfg.dns.nameserver, ['tls://9.9.9.9']);
+  assert.ok(!cfg.tun);
 });
 
 test('parse anytls:// share link', () => {
@@ -942,142 +345,6 @@ test('extractRuleGroups includes final policy targets and excludes DIRECT/REJECT
     'FINAL,FinalOnly',
   ];
   assert.deepStrictEqual(extractRuleGroups(rules), ['FinalOnly', 'ProxyPick', 'Streaming']);
-});
-
-test('clashRulesToSingbox honors per-group outbound overrides', () => {
-  const rules = [
-    'DOMAIN-SUFFIX,netflix.com,Streaming',
-    'DOMAIN-SUFFIX,google.com,ProxyPick',
-    'DOMAIN-KEYWORD,ad,Ads',
-    'DOMAIN,example.cn,DIRECT',
-  ];
-  const overrides = { Streaming: 'direct', Ads: 'reject' };
-  const out = clashRulesToSingbox(rules, true, overrides).rules;
-  assert.strictEqual(out[0].outbound, 'direct'); // Streaming -> direct
-  assert.strictEqual(out[1].outbound, '🚀 Proxy'); // ProxyPick -> default selector
-  assert.strictEqual(out[2].action, 'reject'); // Ads -> reject
-  assert.ok(!out[2].outbound, 'reject sets action, not outbound');
-  assert.strictEqual(out[3].outbound, 'direct'); // explicit DIRECT untouched
-});
-
-test('available source policy targets survive unless explicitly overridden', () => {
-  const rules = ['DOMAIN-SUFFIX,netflix.com,Streaming', 'MATCH,Streaming'];
-  const available = new Set(['Streaming']);
-  const kept = clashRulesToSingbox(rules, true, null, null, null, available);
-  assert.strictEqual(kept.rules[0].outbound, 'Streaming');
-  assert.strictEqual(kept.finalTarget, 'Streaming');
-  const forced = clashRulesToSingbox(rules, true, { Streaming: 'proxy' }, null, null, available);
-  assert.strictEqual(forced.rules[0].outbound, '🚀 Proxy');
-  assert.strictEqual(forced.finalTarget, '🚀 Proxy');
-});
-
-test('source select groups expose app anchors and honor persisted picks', () => {
-  const {
-    applySourceGroupSelections,
-    sourceGroupPickOptions,
-    buildSingboxConfig,
-    buildMihomoConfig,
-  } = require('../src/main/converter');
-  const nodes = [
-    { name: 'node-a', type: 'ss', server: '1.1.1.1', port: 1, cipher: 'aes-128-gcm', password: 'x' },
-    { name: 'node-b', type: 'ss', server: '1.1.1.2', port: 1, cipher: 'aes-128-gcm', password: 'x' },
-  ];
-  const nodeNames = nodes.map((node) => node.name);
-  // Category: first member is a node (proxy-first → default 🚀 Proxy).
-  // PreferDirect: first member is DIRECT (keep that default).
-  // Nested: extra non-node member retained in the pick list.
-  const groups = [
-    { name: 'Category', type: 'select', members: ['node-a', 'node-b', 'Nested'] },
-    { name: 'PreferDirect', type: 'select', members: ['DIRECT', 'node-a', 'node-b'] },
-    { name: 'Nested', type: 'select', members: ['node-a', 'node-b'] },
-  ];
-
-  const prepared = applySourceGroupSelections(groups, nodeNames, null);
-  const category = prepared.find((group) => group.name === 'Category');
-  assert.ok(category.members.includes('🚀 Proxy'));
-  assert.ok(category.members.includes('♻️ Auto'));
-  assert.ok(category.members.includes('🧠 Smart'));
-  assert.ok(category.members.includes('🛟 Fallback'));
-  assert.ok(category.members.includes('node-b'));
-  assert.strictEqual(category.default, '🚀 Proxy');
-
-  const preferDirect = prepared.find((group) => group.name === 'PreferDirect');
-  assert.strictEqual(preferDirect.default, 'direct');
-
-  const withPick = applySourceGroupSelections(groups, nodeNames, { Category: 'node-b' });
-  const picked = withPick.find((group) => group.name === 'Category');
-  assert.strictEqual(picked.default, 'node-b');
-  assert.strictEqual(picked.members[0], 'node-b');
-
-  const picks = sourceGroupPickOptions(nodes, groups);
-  assert.ok(picks.includes('🚀 Proxy'));
-  assert.ok(picks.includes('♻️ Auto'));
-  assert.ok(picks.includes('node-a'));
-  assert.ok(picks.includes('Nested'));
-  assert.ok(!picks.includes('direct'));
-  assert.ok(!picks.includes('DIRECT'));
-  assert.ok(!picks.includes('reject'));
-  assert.ok(!picks.some((name) => String(name).includes('直连')));
-
-  // Groups that already include REJECT keep reject in picks / selector members.
-  const withReject = applySourceGroupSelections(
-    [{ name: 'BlockAds', type: 'select', members: ['REJECT', 'DIRECT', 'node-a'] }],
-    nodeNames,
-    null
-  );
-  const blockAds = withReject.find((group) => group.name === 'BlockAds');
-  assert.ok(blockAds.members.includes('reject'));
-  assert.strictEqual(blockAds.default, 'reject');
-  const { sourcePicksForWiredGroup } = require('../src/main/converter');
-  const blockPicks = sourcePicksForWiredGroup(blockAds);
-  assert.ok(blockPicks.includes('reject'));
-  assert.ok(!blockPicks.includes('direct'));
-
-  const config = buildSingboxConfig(nodes, {
-    policyGroups: groups,
-    clashRules: ['DOMAIN-SUFFIX,example.com,Category', 'MATCH,🚀 Proxy'],
-    ruleGroupSelections: { Category: 'node-b' },
-    selected: '🧠 Smart',
-    ruleSetDir: null,
-  });
-  const outbound = config.outbounds.find((item) => item.tag === 'Category');
-  assert.strictEqual(outbound.type, 'selector');
-  assert.strictEqual(outbound.default, 'node-b');
-  assert.ok(outbound.outbounds.includes('🚀 Proxy'));
-  assert.ok(outbound.outbounds.includes('node-b'));
-  // Source groups may reference 🚀 Proxy; 🚀 Proxy must not nest those groups.
-  const main = config.outbounds.find((item) => item.tag === '🚀 Proxy');
-  assert.ok(!main.outbounds.includes('Category'));
-  assert.ok(!main.outbounds.includes('Nested'));
-  assert.ok(!main.outbounds.includes('PreferDirect'));
-  const rule = config.route.rules.find((item) => (
-    Array.isArray(item.domain_suffix) && item.domain_suffix.includes('example.com')
-  ));
-  assert.strictEqual(rule.outbound, 'Category');
-
-  const mihomo = buildMihomoConfig(nodes, {
-    policyGroups: groups,
-    clashRules: ['DOMAIN-SUFFIX,example.com,Category'],
-    selected: '🧠 Smart',
-  });
-  const mihomoMain = mihomo['proxy-groups'].find((group) => group.name === '🚀 Proxy');
-  assert.ok(!mihomoMain.proxies.includes('Category'));
-  assert.ok(mihomo['proxy-groups'].some((group) => group.name === 'Category'));
-
-  const rejectCfg = buildSingboxConfig(nodes, {
-    policyGroups: [{ name: 'BlockAds', type: 'select', members: ['REJECT', 'DIRECT'] }],
-    clashRules: ['DOMAIN-SUFFIX,ads.example,BlockAds'],
-    ruleSetDir: null,
-  });
-  assert.ok(rejectCfg.outbounds.some((item) => item.tag === 'reject' && item.type === 'block'));
-  const blockOut = rejectCfg.outbounds.find((item) => item.tag === 'BlockAds');
-  assert.ok(blockOut.outbounds.includes('reject'));
-
-  const rejectMh = buildMihomoConfig(nodes, {
-    policyGroups: [{ name: 'BlockAds', type: 'select', members: ['REJECT', 'DIRECT'] }],
-  });
-  const blockMh = rejectMh['proxy-groups'].find((group) => group.name === 'BlockAds');
-  assert.ok(blockMh.proxies.includes('REJECT'));
 });
 
 test('policy-group normalization removes invalid and cyclic references', () => {
@@ -1104,52 +371,6 @@ test('deep policy-group graphs are bounded and normalized without recursion', ()
 });
 
 console.log('\nGEOSITE / GEOIP categories:');
-
-test('extractGeoCategories collects geosite/geoip refs, dedupes, skips exotic names', () => {
-  const cats = extractGeoCategories([
-    'GEOSITE,cn,DIRECT',
-    'GEOSITE,category-ads-all,REJECT',
-    'GEOSITE,cn,Proxy', // dup tag
-    'GEOIP,JP,Proxy',
-    'GEOSITE,geolocation-!cn,Proxy', // exotic "!" -> skipped
-    'DOMAIN,x.com,DIRECT', // not geo
-  ]);
-  const tags = cats.map((c) => c.tag).sort();
-  assert.deepStrictEqual(tags, ['geoip-jp', 'geosite-category-ads-all', 'geosite-cn']);
-  const ads = cats.find((c) => c.tag === 'geosite-category-ads-all');
-  assert.strictEqual(ads.repo, 'sing-geosite');
-  assert.strictEqual(ads.file, 'geosite-category-ads-all.srs');
-  assert.strictEqual(cats.find((c) => c.tag === 'geoip-jp').repo, 'sing-geoip');
-});
-
-test('clashRulesToSingbox emits GEOSITE/GEOIP only for available tags', () => {
-  const rules = [
-    'GEOSITE,category-ads-all,REJECT',
-    'GEOSITE,cn,DIRECT',
-    'GEOIP,JP,Proxy',
-    'GEOSITE,netflix,Proxy', // not available -> dropped
-  ];
-  const avail = new Set(['geosite-cn', 'geosite-category-ads-all', 'geoip-jp']);
-  const { rules: out, usedGeoTags } = clashRulesToSingbox(rules, true, null, avail);
-  assert.deepStrictEqual(out[0], { rule_set: ['geosite-category-ads-all'], action: 'reject' });
-  assert.deepStrictEqual(out[1], { rule_set: ['geosite-cn'], outbound: 'direct' });
-  assert.deepStrictEqual(out[2], { rule_set: ['geoip-jp'], outbound: '🚀 Proxy' });
-  assert.strictEqual(out.length, 3, 'the unavailable geosite-netflix rule is dropped');
-  assert.deepStrictEqual([...usedGeoTags].sort(), ['geoip-jp', 'geosite-category-ads-all', 'geosite-cn']);
-});
-
-test('buildRoute defines a local rule_set for each used geo category', () => {
-  const route = buildRoute({
-    ruleSetDir: '/geo',
-    clashRules: ['GEOSITE,category-ads-all,REJECT', 'GEOSITE,cn,DIRECT'],
-    geoAvailable: new Set(['geoip-cn', 'geosite-cn', 'geosite-category-ads-all']),
-  });
-  const tags = route.rule_set.map((rs) => rs.tag).sort();
-  assert.deepStrictEqual(tags, ['geoip-cn', 'geosite-category-ads-all', 'geosite-cn']);
-  assert.ok(route.rule_set.every((rs) => rs.type === 'local' && rs.path.endsWith(rs.tag + '.srs')));
-});
-
-console.log('\nRULE-SET providers:');
 
 test('parseClashConfig extracts rule-providers (type/behavior/url/format)', () => {
   const yaml = [
@@ -1217,152 +438,6 @@ test('subscription user-info accepts only standard finite counters', () => {
   assert.deepStrictEqual(info, { upload: 1, download: 2, total: 3, expire: 4 });
 });
 
-test('clashRulesToSingbox emits RULE-SET as one rule per matcher field (OR), honoring target', () => {
-  const ruleSetData = {
-    direct: { domain_suffix: ['cn', 'qq.com'], ip_cidr: ['1.1.1.0/24'], domain: [], domain_keyword: [], process_name: [] },
-  };
-  const { rules } = clashRulesToSingbox(['RULE-SET,direct,DIRECT'], true, null, null, ruleSetData);
-  // Separate rules for domain_suffix and ip_cidr (single field each) → OR.
-  assert.deepStrictEqual(rules, [
-    { domain_suffix: ['cn', 'qq.com'], outbound: 'direct' },
-    { ip_cidr: ['1.1.1.0/24'], outbound: 'direct' },
-  ]);
-});
-
-test('clashRulesToSingbox drops RULE-SET whose provider is not yet cached', () => {
-  const { rules } = clashRulesToSingbox(['RULE-SET,missing,DIRECT'], true, null, null, {});
-  assert.deepStrictEqual(rules, []);
-});
-
-console.log('\nsing-box subscription parsing:');
-
-const singboxParser = require('../src/main/parsers/singbox');
-
-test('parseSingboxConfig converts outbounds to nodes, skipping non-proxies', () => {
-  const cfg = JSON.stringify({
-    outbounds: [
-      { type: 'selector', tag: 'select', outbounds: ['VL'] },
-      { type: 'vless', tag: 'VL', server: '1.2.3.4', server_port: 443, uuid: 'u', flow: 'xtls-rprx-vision',
-        tls: { enabled: true, server_name: 'e.com', reality: { enabled: true, public_key: 'PK', short_id: 'ab' } } },
-      { type: 'shadowsocks', tag: 'SS', server: '5.6.7.8', server_port: 8388, method: 'aes-128-gcm', password: 'pw' },
-      { type: 'direct', tag: 'direct' },
-    ],
-  });
-  const { nodes, groups, isSingbox } = singboxParser.parseSingboxConfig(cfg);
-  assert.strictEqual(isSingbox, true);
-  assert.strictEqual(nodes.length, 2); // selector + direct dropped
-  const vl = nodes.find((n) => n.type === 'vless');
-  assert.strictEqual(vl.uuid, 'u');
-  assert.strictEqual(vl.flow, 'xtls-rprx-vision');
-  assert.strictEqual(vl.reality.publicKey, 'PK');
-  assert.strictEqual(groups[0].name, 'select');
-  assert.deepStrictEqual(groups[0].members, ['VL']);
-});
-
-test('sing-box parser rejects malformed endpoints and out-of-range ports', () => {
-  const { nodes } = singboxParser.parseSingboxConfig(JSON.stringify({
-    outbounds: [
-      { type: 'trojan', tag: 'good', server: 'example.com', server_port: '443', password: 'p' },
-      { type: 'trojan', tag: 'zero', server: 'example.com', server_port: 0, password: 'p' },
-      { type: 'trojan', tag: 'overflow', server: 'example.com', server_port: 65536, password: 'p' },
-      { type: 'trojan', tag: 'suffix', server: 'example.com', server_port: '443x', password: 'p' },
-      { type: 'trojan', tag: 'object', server: { host: 'example.com' }, server_port: 443, password: 'p' },
-    ],
-  }));
-  assert.deepStrictEqual(nodes.map((node) => node.name), ['good']);
-});
-
-test('a sing-box node round-trips back to the same outbound type', () => {
-  const { nodes } = singboxParser.parseSingboxConfig(JSON.stringify([
-    { type: 'vmess', tag: 'VM', server: 'v.com', server_port: 443, uuid: 'x', security: 'auto', alter_id: 0,
-      transport: { type: 'ws', path: '/ws', headers: { Host: 'v.com' } } },
-  ]));
-  const ob = nodeToOutbound(nodes[0]);
-  assert.strictEqual(ob.type, 'vmess');
-  assert.strictEqual(ob.transport.type, 'ws');
-  assert.strictEqual(ob.transport.path, '/ws');
-});
-
-test('parseSubscriptionContent detects sing-box JSON (raw and base64)', () => {
-  const json = JSON.stringify({
-    outbounds: [{ type: 'trojan', tag: 'T', server: 't.com', server_port: 443, password: 'p', tls: { enabled: true } }],
-    route: {
-      rules: [
-        { domain_suffix: 'example.com', outbound: 'direct' },
-        { ip_is_private: true, outbound: 'direct' },
-        { rule_set: 'geoip-cn', outbound: 'direct' },
-        { action: 'hijack-dns', protocol: 'dns' },
-      ],
-    },
-  });
-  const parsed = parseSubscriptionContent(json);
-  assert.strictEqual(parsed.format, 'singbox');
-  assert.ok(parsed.rules.includes('DOMAIN-SUFFIX,example.com,DIRECT'));
-  assert.ok(parsed.rules.includes('IP-CIDR,10.0.0.0/8,DIRECT'));
-  assert.ok(!parsed.rules.some((rule) => rule.startsWith('RULE-SET,')));
-  assert.ok(!parsed.rules.some((rule) => rule.includes('hijack-dns')));
-  const b64 = Buffer.from(json).toString('base64');
-  assert.strictEqual(parseSubscriptionContent(b64).format, 'singbox');
-  const wrapped = b64.match(/.{1,76}/g).join('\n');
-  assert.strictEqual(parseSubscriptionContent(wrapped).format, 'singbox');
-});
-
-test('native policy groups and final routing survive both core generators', () => {
-  const json = JSON.stringify({
-    outbounds: [
-      { type: 'selector', tag: 'Streaming', outbounds: ['A', 'B', 'direct'], default: 'B' },
-      { type: 'urltest', tag: 'Fast', outbounds: ['A', 'B'], url: 'https://example.com/ping', interval: '2m', tolerance: 25 },
-      { type: 'trojan', tag: 'A', server: 'a.example.com', server_port: 443, password: 'a' },
-      { type: 'trojan', tag: 'B', server: 'b.example.com', server_port: 443, password: 'b' },
-      { type: 'direct', tag: 'direct' },
-    ],
-    route: {
-      rules: [{ domain_suffix: ['netflix.com'], outbound: 'Streaming' }],
-      final: 'Fast',
-    },
-  });
-  const parsed = parseSubscriptionContent(json);
-  assert.deepStrictEqual(parsed.policyGroups.map((group) => group.name), ['Streaming', 'Fast']);
-  assert.ok(parsed.rules.includes('DOMAIN-SUFFIX,netflix.com,Streaming'));
-  assert.ok(parsed.rules.includes('MATCH,Fast'));
-
-  const singbox = buildSingboxConfig(parsed.nodes, {
-    policyGroups: parsed.policyGroups,
-    clashRules: parsed.rules,
-    ruleSetDir: null,
-  });
-  const streamingOutbound = singbox.outbounds.find((outbound) => outbound.tag === 'Streaming');
-  assert.strictEqual(streamingOutbound.type, 'selector');
-  // Source select groups gain app anchors; 🚀 Proxy must not nest source groups.
-  assert.ok(streamingOutbound.outbounds.includes('🚀 Proxy'));
-  assert.ok(streamingOutbound.outbounds.includes('A'));
-  assert.ok(streamingOutbound.outbounds.includes('B'));
-  assert.ok(!streamingOutbound.outbounds.includes('direct'));
-  assert.strictEqual(streamingOutbound.default, '🚀 Proxy');
-  assert.ok(!singbox.outbounds.find((o) => o.tag === '🚀 Proxy').outbounds.includes('Streaming'));
-  assert.strictEqual(singbox.outbounds.find((outbound) => outbound.tag === 'Fast').interval, '120s');
-  assert.strictEqual(singbox.route.rules.find((rule) => rule.domain_suffix).outbound, 'Streaming');
-  assert.strictEqual(singbox.route.final, 'Fast');
-
-  const locked = buildSingboxConfig(parsed.nodes, {
-    policyGroups: parsed.policyGroups,
-    clashRules: parsed.rules,
-    ruleGroupSelections: { Streaming: 'B' },
-    ruleSetDir: null,
-  });
-  assert.strictEqual(locked.outbounds.find((o) => o.tag === 'Streaming').default, 'B');
-
-  const mihomo = buildMihomoConfig(parsed.nodes, {
-    policyGroups: parsed.policyGroups,
-    clashRules: parsed.rules,
-  });
-  assert.strictEqual(mihomo['proxy-groups'].find((group) => group.name === 'Streaming').type, 'select');
-  assert.strictEqual(mihomo['proxy-groups'].find((group) => group.name === 'Fast').type, 'url-test');
-  assert.ok(mihomo.rules.includes('DOMAIN-SUFFIX,netflix.com,Streaming'));
-  assert.strictEqual(mihomo.rules.at(-1), 'MATCH,Fast');
-  assert.ok(!mihomo['proxy-groups'].find((group) => group.name === '🚀 Proxy').proxies.includes('Streaming'));
-});
-
 test('policy groups affect config fingerprints', () => {
   const base = { nodes: [{ name: 'A' }], rules: ['MATCH,Group'] };
   const first = configFingerprint({ ...base, policyGroups: [{ name: 'Group', type: 'select', members: ['A'] }] });
@@ -1371,17 +446,6 @@ test('policy groups affect config fingerprints', () => {
 });
 
 console.log('\nGeoData mirrors:');
-
-test('geoDataUrls offers raw + jsDelivr fallbacks for a rule-set', () => {
-  const urls = geoDataUrls('sing-geoip', 'geoip-cn.srs');
-  assert.ok(urls.length >= 2, 'has fallback sources, not just raw');
-  assert.strictEqual(urls[0], 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs');
-  // Every URL targets the same repo@branch/file, just via a different host.
-  assert.ok(urls.every((u) => u.endsWith('geoip-cn.srs')));
-  assert.ok(urls.some((u) => u.includes('jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs')));
-});
-
-console.log('\nLarge input regressions:');
 
 test('node-name normalization drops corrupt non-object entries', () => {
   assert.deepStrictEqual(
@@ -1423,6 +487,14 @@ test('Mihomo conversion accepts very large inline remote rule lists', () => {
   // private LAN directs + expanded domain rules + GEOIP CN fallback + MATCH
   assert.strictEqual(config.rules.length, domains.length + 10);
   assert.strictEqual(config.rules[config.rules.length - 1], 'MATCH,🚀 Proxy');
+});
+
+test('Mihomo conversion keeps preprocessed custom rule lines', () => {
+  const config = buildMihomoConfig(
+    [{ name: 'node', type: 'trojan', server: 'example.com', port: 443, password: 'p' }],
+    { extraRules: ['DOMAIN-SUFFIX,custom.example,DIRECT'] }
+  );
+  assert.ok(config.rules.includes('DOMAIN-SUFFIX,custom.example,DIRECT'));
 });
 
 console.log(`\nDone, ${passed} tests passed.`);

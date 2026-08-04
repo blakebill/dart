@@ -1,12 +1,9 @@
 'use strict';
 
 const crypto = require('crypto');
-const yaml = require('js-yaml');
 const clashParser = require('./parsers/clash');
 const linkParser = require('./parsers/share-link');
-const singboxParser = require('./parsers/singbox');
-const { singboxRuleToClashRules, nodeToClashProxy, nodeToOutbound } = require('./converter');
-const { clashPolicyGroups, normalizePolicyGroups } = require('./policy-groups');
+const { clashPolicyGroups } = require('./policy-groups');
 const fetch = require('./fetch');
 const MAX_SUBSCRIPTION_BYTES = 32 * 1024 * 1024;
 const MAX_PROFILE_EDIT_FORMAT_BYTES = 4 * 1024 * 1024;
@@ -134,38 +131,13 @@ function maybeBase64Decode(text) {
 
 /**
  * Auto-detect the content format and parse it into a unified array of node objects.
- * Native sing-box JSON is checked before Clash YAML and share-link subscriptions.
+ * Clash YAML and share-link subscriptions are accepted.
  */
 function parseSubscriptionContent(content) {
   const text = String(content || '').trim();
   if (!text) return { nodes: [], groups: [], policyGroups: [], format: 'empty' };
   const decodedText = maybeBase64Decode(text);
   const candidates = decodedText ? [text, decodedText] : [text];
-
-  // sing-box JSON config (a sing-box client must accept its own format). Try the
-  // raw text, then a base64-decoded copy (some airports base64 the whole body).
-  for (const candidate of candidates) {
-    if (!candidate || (candidate[0] !== '{' && candidate[0] !== '[')) continue;
-    const r = singboxParser.parseSingboxConfig(candidate);
-    if (r.isSingbox && r.nodes.length) {
-      const nodes = uniqueNodeNames(r.nodes);
-      const policyGroups = normalizePolicyGroups(r.groups, nodes);
-      const rules = (r.routeRules || []).flatMap((rule) => (
-        singboxRuleToClashRules(rule, { includeRuleSets: false, preserveOutbound: true })
-      ));
-      const routeFinal = String(r.routeFinal || '').trim();
-      if (routeFinal && !/[\r\n,]/.test(routeFinal)) rules.push(`MATCH,${routeFinal}`);
-      return {
-        nodes,
-        groups: policyGroups,
-        policyGroups,
-        // sing-box binary rule sets are not Clash-compatible; preserve common
-        // inline matchers and omit unresolved RULE-SET references.
-        rules,
-        format: 'singbox',
-      };
-    }
-  }
 
   // Clash YAML first. The cheap "proxies:" check gates the YAML load, and the
   // parse result is reused for detection + conversion (one parse, not two).
@@ -207,7 +179,7 @@ function parseSubscriptionContent(content) {
   return { nodes: [], groups: [], policyGroups: [], rules: [], format: 'unknown' };
 }
 
-function formatSubscriptionForEditing(content, targetFormat = 'auto') {
+function formatSubscriptionForEditing(content) {
   const text = typeof content === 'string' ? content : '';
   if (!text || Buffer.byteLength(text, 'utf-8') > MAX_PROFILE_EDIT_FORMAT_BYTES) return text;
   const readable = maybeBase64Decode(text) || text;
@@ -218,95 +190,50 @@ function formatSubscriptionForEditing(content, targetFormat = 'auto') {
     // Continue below: an encoded share-link list can be rendered as the
     // explicitly requested subscription format instead of opaque URIs.
   }
-  const parsed = parseSubscriptionContent(readable);
-  try {
-    if (parsed.format === 'links' && parsed.nodes.length && targetFormat === 'clash') {
-      const proxies = parsed.nodes.map(nodeToClashProxy).filter(Boolean);
-      if (proxies.length) {
-        return yaml.dump(
-          { proxies },
-          { noRefs: true, lineWidth: -1, noCompatMode: true }
-        ).trimEnd();
-      }
-    }
-    if (parsed.format === 'links' && parsed.nodes.length && targetFormat === 'sing-box') {
-      const outbounds = parsed.nodes.map(nodeToOutbound).filter(Boolean);
-      if (outbounds.length) return JSON.stringify({ outbounds }, null, 2);
-    }
-  } catch (_) {
-    return readable;
-  }
   return readable;
 }
 
-// Many airports select an output format from the client User-Agent. Ask for the
-// active core's native format first, then fall back to the other ecosystem.
-const SINGBOX_USER_AGENTS = ['sing-box/1.13.0'];
 const MIHOMO_USER_AGENT = 'mihomo/1.18.10';
-const CLASH_USER_AGENTS = [
+const SUBSCRIPTION_USER_AGENTS = [
+  MIHOMO_USER_AGENT,
   'clash-verge/v2.0.2',
   'ClashforWindows/0.20.39',
   'clash.meta',
   'Clash/2023.08.17',
 ];
 
-function subscriptionUserAgents(coreType, userAgentMode = 'auto') {
-  if (userAgentMode === 'sing-box') return [...SINGBOX_USER_AGENTS];
-  if (userAgentMode === 'clash') return [...CLASH_USER_AGENTS, MIHOMO_USER_AGENT];
-  return coreType === 'sing-box'
-    ? [...SINGBOX_USER_AGENTS, MIHOMO_USER_AGENT, ...CLASH_USER_AGENTS]
-    : [MIHOMO_USER_AGENT, ...CLASH_USER_AGENTS, ...SINGBOX_USER_AGENTS];
-}
-
-function preferredSubscriptionFormat(coreType, userAgentMode = 'auto') {
-  if (userAgentMode === 'sing-box') return 'singbox';
-  if (userAgentMode === 'clash') return 'clash';
-  if (coreType === 'sing-box') return 'singbox';
-  if (coreType === 'mihomo') return 'clash';
-  return null;
-}
-
 function subscriptionFormatRank(format, preferredFormat) {
   if (format === preferredFormat) return 3;
-  if (format === 'clash' || format === 'singbox') return 2;
+  if (format === 'clash') return 2;
   if (format === 'links') return 1;
   return 0;
 }
 
-function userAgentNativeFormat(userAgent) {
-  return String(userAgent).startsWith('sing-box/') ? 'singbox' : 'clash';
-}
-
 /**
- * Fetch and parse a subscription. Requests the active core's native format
- * first, then retries with compatible client User-Agents when necessary.
+ * Fetch and parse a subscription. Requests Mihomo-compatible Clash output and
+ * automatically retries compatible client identifiers when a provider rejects
+ * or returns an unusable response for the preferred identifier.
  * @param {string} url subscription URL
  * @param {function} log
- * @param {{proxyPort?:number,coreType?:string,userAgentMode?:string}} opts when proxyPort is set, the request tunnels
+ * @param {{proxyPort?:number}} opts when proxyPort is set, the request tunnels
  *   through the local mixed proxy first and falls back to a direct connection
- *   (for airports whose subscription endpoint is itself blocked). userAgentMode
- *   can pin requests to the sing-box or Clash client ecosystem.
+ *   (for providers whose subscription endpoint is itself blocked).
  * @returns {{ nodes, groups, format, userInfo }}
  */
 async function fetchSubscription(url, log = () => {}, opts = {}) {
   const proxyPort = opts.proxyPort || 0;
-  const expectedFormat = preferredSubscriptionFormat(opts.coreType, opts.userAgentMode);
+  const expectedFormat = 'clash';
   let last = null;
   let usableFallback = null;
   let fallbackRank = 0;
-  const userAgents = subscriptionUserAgents(opts.coreType, opts.userAgentMode);
-  let preferredAgentsLeft = expectedFormat
-    ? userAgents.filter((ua) => userAgentNativeFormat(ua) === expectedFormat).length
-    : 0;
-  for (const ua of userAgents) {
-    const isPreferredAgent = userAgentNativeFormat(ua) === expectedFormat;
-    if (isPreferredAgent) preferredAgentsLeft -= 1;
+  for (const ua of SUBSCRIPTION_USER_AGENTS) {
     let res;
     try {
       // One HTTP path for both modes: with proxyPort the request tunnels
       // through the local proxy first and falls back to direct.
       const r = await fetch.getBufferWithFallback(url, {
         proxyPort,
+        log,
         maxBytes: MAX_SUBSCRIPTION_BYTES,
         headers: { 'User-Agent': ua, Accept: '*/*' },
       });
@@ -336,13 +263,6 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
       if (rank > fallbackRank) {
         usableFallback = result;
         fallbackRank = rank;
-      }
-      // Once every UA from the preferred ecosystem has been tried, a full
-      // config from the other ecosystem is strictly better than Links and no
-      // further request can produce the preferred native format.
-      if (rank >= 2 && preferredAgentsLeft === 0) {
-        log(`[sub] preferred ${expectedFormat} unavailable; using structured ${usableFallback.format} response`);
-        return usableFallback;
       }
       log(`[sub] preferred ${expectedFormat}, continuing after compatible ${result.format} response`);
       continue;

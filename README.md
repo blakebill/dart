@@ -1,178 +1,34 @@
 # Dart Network Control
 
-Dart Network Control is a native-feeling Windows desktop workspace for operating the
-[Dart sing-box](https://github.com/blakebill/sing-box) and
-[Dart mihomo](https://github.com/blakebill/mihomo) forks, with official upstream builds available as alternatives. It brings profiles, routing, traffic, connections, logs, TUN, system proxy controls, and core maintenance into one operational interface. Each core keeps its own executable, runtime configuration, and GeoData, so switching cores does not require reinstalling either one.
+Dart is a Windows desktop proxy client built with Electron and Mihomo. It provides a native-feeling Windows 11 interface for profile management, routing, traffic inspection, TUN, system proxy control, and adaptive node selection.
 
-This is an independent project and is not affiliated with or endorsed by sing-box, mihomo, or Zashboard.
+This is an independent project and is not affiliated with or endorsed by Mihomo or Zashboard.
 
-### Features
+## Highlights
 
-- Run and manage sing-box and mihomo independently, including official or Dart builds, in-app switching, downloads, updates, and Smart capability detection.
-- Import Clash, sing-box, Base64, and share-link configs, with automatic bidirectional conversion. Subscription requests follow the active core's User-Agent ecosystem by default, while an explicit User-Agent can be pinned when a provider requires it.
-- Use system proxy or TUN alongside launch-at-login, silent startup, notifications, and UWP loopback exemptions.
-- Manage local and remote rules, policy groups, GeoData, and manual, Auto, Smart, or Fallback routing. Auto selects the lowest valid measured latency and excludes timeouts. Smart combines latency, jitter, failures, recent traffic, cooldowns, and bounded exploration, with an optional region allowlist inferred from node labels.
-- Smart keeps GUI long-term preference separate from kernel dial failover, detects per-node route changes with CUSUM/Page-Hinkley signals, tracks TCP, UDP, handshake, and first-byte health independently, and uses bounded shadow replay to calibrate scoring without causing live node switches.
-- Monitor nodes, traffic, connections, logs, and latency, or open the locally hosted [Zashboard](https://github.com/Zephyruso/zashboard).
-- Inspect routes, validate configs, diagnose networking and DNS, inspect ports, and back up or restore user data.
+- Run either the official Mihomo release or the Dart customized Mihomo build.
+- Import Clash YAML, Base64 subscriptions, and supported share links.
+- Generate and validate Mihomo YAML before starting the core.
+- Use system proxy or administrator-assisted TUN mode.
+- Choose Manual, Auto, Fallback, or Smart node selection.
+- Inspect connections, traffic, logs, routing rules, DNS paths, and runtime health.
+- Update profiles, remote Clash rule lists, GeoData, the core, and the app in place.
+- Keep the local controller protected with a per-run secret bound to loopback.
 
-### Quick Start
+## Requirements
 
-1. Download the latest Windows x64 installer from [GitHub Releases](https://github.com/blakebill/dart/releases/latest).
-2. Add a config from Clash YAML, sing-box JSON, a subscription URL, or supported share links, then make it active.
-3. Select sing-box or mihomo in **Core Management**, choose a node and routing mode, and start the core.
-4. Enable **System Proxy** for application proxying or **TUN** for system-wide routing. Administrator permission is requested only by operations that require it.
+- Windows 10 or Windows 11 (x64)
+- Node.js 22 or newer for development
+- Administrator approval when enabling TUN
 
-Release installers bundle both Dart cores and their matching GeoData. Core Management can install the latest stable official or Dart release, reports whether the selected binary supports kernel Smart, and keeps both independent runtime directories available.
+## Quick start
 
-### Desktop Experience
+1. Install Dart or run it from source.
+2. Add a Clash-compatible profile URL or supported share links.
+3. Select a node and routing mode.
+4. Start Mihomo, then enable system proxy or TUN as needed.
 
-- A frameless custom title bar and Windows 11 Mica material where supported, with transparent Fluent-style surfaces rather than a browser-like page background.
-- Dropdowns and context menus use opaque high-elevation Fluent surfaces, theme-specific borders, and layered shadows so underlying controls cannot reduce readability.
-- System, light, and dark themes, defaulting to the Windows setting, plus complete English and Simplified Chinese interface switching.
-- Full-width responsive pages with equal outer spacing. Nodes, connections, and logs fill the remaining window height and scroll internally.
-- Two-column node cards, compact live traffic, the current outbound in the sidebar, and a tray icon that reflects stopped or running state.
-- Close-to-tray and silent-start behavior, with background rendering and polling reduced while the window is hidden.
-
-### Tools
-
-| Tool | Purpose |
-| --- | --- |
-| Control Panel | Opens the locally hosted Zashboard for the running core |
-| UWP Loopback | Lists Windows Store apps and applies loopback exemptions with automatic elevation when needed |
-| Config Converter | Auto-detects Clash, sing-box, or share-link input and previews either Clash or sing-box output |
-| Route Inspector | Shows the matched rule, policy target, final outbound, and DNS path for a domain or IP |
-| Network Diagnostics | Checks the core, Clash API, ports, system proxy, TUN, DNS, and direct/proxy egress; reports can be exported |
-| Config Checker | Validates generated sing-box and mihomo configurations, shows readable bounded previews, and reports precise error locations |
-| Port Inspector | Shows listeners and owning processes for the proxy, API, or custom ports |
-| Backup & Restore | Exports configs, settings, and rules without cores or caches; selected files are revalidated before restore |
-| DNS Comparison | Compares system, local, and remote DNS answers, latency, and suspicious divergence |
-
-Backups contain raw profile contents and node credentials. Treat exported backup and diagnostic files as private data.
-
-### Runtime and Performance
-
-- Feature views and secondary dialogs load their renderer modules on first use, while shared CSS is split by responsibility and loaded in a stable cascade.
-- Node, connection, and rule lists render only a bounded visible window instead of retaining thousands of DOM rows.
-- Profile bodies, node data, and rule data are loaded only when their views need them; profile payload caching is deliberately bounded.
-- Status IPC uses compact snapshots, connection polling is coalesced, and retained log output is capped.
-- Atomic store writes protect settings, while large profile contents live in separate files to avoid rewriting them on every preference change.
-- Hidden windows stop view-specific polling and reduce renderer frame rate, while the main process keeps the tray state current.
-- Transient menus avoid redundant real-time backdrop blur; Mica and lightweight translucency remain on the surfaces where they provide useful visual depth.
-
-### Architecture
-
-```mermaid
-flowchart LR
-    UI["Renderer shell and lazy feature views"] -->|"contextBridge"| PRELOAD["Preload API"]
-    PRELOAD -->|"validated IPC"| MAIN["Electron main process"]
-
-    MAIN --> STORE["Store\nsettings and profiles"]
-    MAIN --> SUB["Subscription parsers"]
-    MAIN --> TOOLS["Diagnostics, backup, and Windows integration"]
-    SUB --> MODEL["Normalized nodes and rules"]
-    MODEL --> CONVERT["Config builders"]
-
-    CONVERT --> ADAPTER["Core adapter registry"]
-    ADAPTER --> MANAGER["Core process manager"]
-    MANAGER --> SB["sing-box process"]
-    MANAGER --> MH["mihomo process"]
-
-    MAIN --> SMART["Session Smart selector\nmulti-signal health, route-change detection, shadow replay"]
-    SMART -->|"Clash API selection"| MANAGER
-
-    SB -->|"Clash API"| MAIN
-    MH -->|"Clash API"| MAIN
-    MAIN -->|"events and snapshots"| UI
-
-    GEO["GeoData and remote rules"] --> CONVERT
-    TOOLS --> SYSTEM["System proxy, UWP, DNS, and Dart TUN"]
-    PANEL["Zashboard"] -->|"same-origin Clash API"| SB
-    PANEL -->|"same-origin Clash API"| MH
-```
-
-The Network Control renderer has no direct access to Node.js or operating-system APIs. Feature views and native secondary dialogs are loaded on demand, the preload script exposes the only allowed interface, and the main process handles validation, configuration generation, persistence, core processes, system proxy integration, and elevated operations.
-
-Configuration flow:
-
-1. Format detection dispatches an imported profile to the Clash, sing-box, or share-link parser. The stored source format remains independent from the currently selected runtime core.
-2. Parsed data is normalized into an internal node, rule, and policy-group model.
-3. The selected core adapter always generates the matching runtime format—sing-box JSON or mihomo YAML—and supplies its paths, commands, GeoData capabilities, release assets, and export behavior.
-4. `CoreManager` uses that adapter to write and validate the configuration, verify downloaded core archives, and start the independent child process.
-5. Both generated core configurations always expose a loopback-only Clash API protected by a per-session random secret. The main process uses it for runtime state and managed selection, then sends only the required data to the renderer.
-
-### Data Directories
-
-On Windows, the default user-data directory is `%APPDATA%\Dart`:
-
-```text
-Dart/
-├── config.json                 # Settings, profile metadata, and UI state
-├── profiles/                   # Nodes, rules, and raw content for each profile
-└── runtime/
-    ├── singbox/
-    │   ├── sing-box.exe
-    │   ├── config.json
-    │   ├── geoip-cn.srs
-    │   ├── geosite-cn.srs
-    │   └── geodata-meta.json
-    ├── mihomo/
-    │   ├── mihomo.exe
-    │   ├── config.yaml
-    │   ├── geoip.dat
-    │   ├── geosite.dat
-    │   ├── country.mmdb
-    │   └── geodata-meta.json
-    └── ui/
-        └── zashboard/          # Local dashboard shared by both cores
-```
-
-Bundled cores are stored under `resources/bin/` and copied into the writable runtime directory when needed. Application updates do not merge or replace the two user runtime directories.
-
-### Source Layout
-
-```text
-dart/
-├── package.json                 # Scripts, dependencies, and electron-builder config
-├── bin/                         # Downloaded cores and GeoData; ignored by Git
-├── build/                       # Icons and NSIS installer configuration
-├── scripts/
-│   ├── download-core.js         # Pins, verifies, and inventories cores and GeoData
-│   ├── release-metadata.js      # CycloneDX SBOM and SHA-256 release manifest
-│   └── make-icon.js
-├── src/
-│   ├── main/
-│   │   ├── index.js             # Electron lifecycle
-│   │   ├── window.js            # Frameless window, Mica, and background throttling
-│   │   ├── ipc.js               # Domain IPC registration
-│   │   ├── ipc-validation.js    # Shared payload limits and validation
-│   │   ├── core-control.js      # Core, proxy, rule, and update orchestration
-│   │   ├── core-adapters.js     # sing-box and mihomo capabilities
-│   │   ├── smart-selection.js   # Multi-signal Smart scoring, change detection, and replay
-│   │   ├── managed-auto-selection.js # Valid-latency Auto probing and selection
-│   │   ├── operation-coordinator.js # Serialized mutations and stale-work guards
-│   │   ├── singbox.js           # Core processes, downloads, paths, and GeoData
-│   │   ├── tun-adapter.js       # Windows Dart TUN cleanup and display naming
-│   │   ├── toolbox.js           # Diagnostics, route/DNS checks, and backups
-│   │   ├── converter.js         # sing-box and mihomo configuration builders
-│   │   ├── subscription.js      # Format detection and parser dispatch
-│   │   ├── store.js             # Atomic persistence and separate profile files
-│   │   └── parsers/             # Clash, sing-box, and share-link parsers
-│   ├── preload/index.js         # The renderer's only IPC boundary
-│   └── renderer/
-│       ├── index.html           # Main application shell
-│       ├── dialog.html          # Shared host for secondary windows
-│       ├── js/                  # Feature modules loaded on first use
-│       ├── dialog/              # Secondary-window workflows and styles
-│       ├── styles/              # Surfaces, controls, lists, tools, and motion
-│       └── style.css            # Design tokens, reset, and application layout
-├── test/                        # Conversion, unit, download, and smoke tests
-└── .github/workflows/release.yml
-```
-
-### Development and Testing
-
-Node.js 22 or later is required. Windows production builds use Node.js 24, PowerShell, and NSIS. macOS and Linux can be used for UI and most logic development, but Windows system proxy, UWP, and elevation flows must be verified on Windows.
+## Development
 
 ```bash
 npm ci
@@ -180,47 +36,66 @@ npm test
 npm run dev
 ```
 
-`npm ci` installs dependencies only into this repository's `node_modules`; no global npm packages are required.
-
-Download the latest stable releases of both cores and their GeoData:
+Useful commands:
 
 ```bash
 npm run fetch-core
-```
-
-Set `SINGBOX_VERSION` or `MIHOMO_VERSION` to reproduce a specific core version. Empty variables resolve to the latest stable GitHub Release.
-
-Build the Windows installer:
-
-```bash
-npm run fetch-core
+npm run test:visual
 npm run dist
 ```
 
-Build output is written to `release/`. For a local patch release, `npm version patch --no-git-tag-version` updates both `package.json` and `package-lock.json`; an explicit target version can be used instead of `patch`. GitHub Actions runs the same test, core-download, and packaging flow and synchronizes the package version from the release tag. Manual runs may pin either core version; empty version inputs bundle the latest stable releases.
+`npm run fetch-core` downloads the customized Mihomo Windows binary and required GeoData into `bin/mihomo/`. Set `MIHOMO_VERSION` to pin a release; an empty value resolves the latest stable release.
 
-### Release Security
+## Architecture
 
-- `npm ci` installs exactly the versions and integrity hashes in `package-lock.json`; Dependabot monitors npm and GitHub Actions updates.
-- Release workflow actions are pinned to immutable commit SHAs, build and publish permissions are isolated, runtime dependencies are audited, and downloaded core/GeoData release assets must match upstream SHA-256 digests. SagerNet rule sets are fetched from resolved immutable commit IDs.
-- Every Dart release publishes `SHA256SUMS.txt` and a CycloneDX `sbom.cdx.json`. In-app installer updates refuse to execute when no matching SHA-256 digest is available.
-- Windows Authenticode signing is optional. Configure the repository secrets `WINDOWS_CERTIFICATE` and `WINDOWS_CERTIFICATE_PASSWORD`; the workflow verifies every generated executable before publishing when signing is enabled.
+```text
+Renderer (Fluent-style UI)
+        │ IPC through contextBridge
+        ▼
+Electron main process
+  ├─ profile and settings store
+  ├─ Mihomo config generator
+  ├─ core lifecycle and updater
+  ├─ system proxy and TUN control
+  ├─ Smart/Auto selection services
+  └─ diagnostics and connection sampling
+        │
+        ▼
+Mihomo process + authenticated loopback Clash API
+```
 
-Generate the same release metadata after a local build with `npm run release:metadata`. Keep signing certificates and passwords only in GitHub Actions secrets, never in the repository.
+Important source areas:
 
-### Third-Party Components and Licenses
+```text
+src/main/core-manager.js       Core process, downloads, paths, and GeoData
+src/main/core-adapters.js      Mihomo runtime capabilities and release assets
+src/main/converter.js          Mihomo YAML configuration generation
+src/main/core-control.js       Lifecycle, selection, routing, and controller API
+src/main/subscription.js       Clash/share-link profile ingestion
+src/main/smart-selection.js    Long-term Smart selection model
+src/renderer/                  Desktop UI
+scripts/download-core.js       Reproducible Mihomo bundle acquisition
+```
 
-The Dart Network Control Electron UI, configuration management, and process orchestration code is declared as MIT in `package.json`. The installer and runtime also use the independent third-party components below. Each component remains subject to its upstream license and is not relicensed under Dart's license.
+## Smart selection
 
-| Component | Purpose and distribution | Upstream license |
+Smart makes a stable long-term choice from latency, jitter, failures, connection feedback, signal decay, and network changes. The customized Mihomo Smart group can provide per-connection failover, while the GUI remains responsible for the long-term preferred node. Auto remains available as the simpler lowest-latency strategy.
+
+## Security and privacy
+
+- The controller listens on `127.0.0.1` and uses a randomly generated secret for every app run.
+- Profile credentials remain local unless the user explicitly exports a generated configuration.
+- Core and GeoData downloads are checked against release SHA-256 metadata when available.
+- Subscription requests use Mihomo/Clash-compatible User-Agent values only.
+- No telemetry is implemented by Dart.
+
+## Bundled components
+
+| Component | Purpose | License |
 | --- | --- | --- |
-| [Dart sing-box fork](https://github.com/blakebill/sing-box) | Independent core process bundled with the installer; patched from [SagerNet/sing-box](https://github.com/SagerNet/sing-box) | [GPL v3 or later with the upstream additional notice](https://github.com/SagerNet/sing-box/blob/dev/LICENSE) |
-| [Dart mihomo fork](https://github.com/blakebill/mihomo) | Independent core process bundled with the installer; patched from [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo/tree/Meta) | [GPL v3](https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE) |
-| [SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip) | Bundled and updateable sing-box GeoIP rules | [GPL v3 or later](https://github.com/SagerNet/sing-geoip/blob/main/LICENSE) |
-| [SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) | Bundled and updateable sing-box Geosite rules | [GPL v3 or later](https://github.com/SagerNet/sing-geosite/blob/main/LICENSE) |
-| [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) | Bundled and updateable mihomo GeoData | [GPL v3](https://github.com/MetaCubeX/meta-rules-dat/blob/master/LICENSE) |
-| [Zashboard](https://github.com/Zephyruso/zashboard) | Clash API dashboard downloaded from the latest release when needed | [MIT](https://github.com/Zephyruso/zashboard/blob/main/LICENSE) |
+| [Dart Mihomo fork](https://github.com/blakebill/mihomo) | Proxy runtime bundled with the installer | GPL-3.0-only |
+| [Mihomo](https://github.com/MetaCubeX/mihomo) | Optional official runtime source | GPL-3.0-only |
+| [MetaCubeX meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) | GeoIP, Geosite, and Country MMDB data | GPL-3.0-only |
+| [Zashboard](https://github.com/Zephyruso/zashboard) | Local controller panel downloaded on demand | MIT |
 
-Dart Network Control communicates with both cores through configuration files, standard streams, and the local Clash API; neither core is linked into the Electron application. Installer distributions should still preserve the copyright and license notices above and provide an upstream source-code location corresponding to each bundled binary version. The upstream `LICENSE` files are authoritative.
-
-Node.js dependencies retain their individual licenses. Their resolved versions can be traced through `package-lock.json`.
+The Dart application source is licensed under the MIT License. Bundled third-party components retain their own licenses.

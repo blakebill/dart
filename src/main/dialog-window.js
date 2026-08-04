@@ -5,7 +5,7 @@ const os = require('os');
 const { pathToFileURL } = require('url');
 const { BrowserWindow, nativeTheme } = require('electron');
 
-const { state, sendToMain } = require('./state');
+const { state, liveWebContents, sendToMain } = require('./state');
 
 const isWin = process.platform === 'win32';
 const windowsBuild = isWin ? Number(os.release().split('.')[2]) || 0 : 0;
@@ -15,8 +15,7 @@ const DIALOG_SPECS = Object.freeze({
   'local-rule': { width: 580, height: 610 },
   'remote-rule': { width: 680, height: 600 },
   'raw-profile': { width: 920, height: 700 },
-  convert: { width: 920, height: 700 },
-  core: { width: 700, height: 500 },
+  core: { width: 560, height: 420 },
   'smart-regions': { width: 620, height: 560 },
   geodata: { width: 720, height: 560 },
   uwp: { width: 780, height: 650 },
@@ -174,8 +173,9 @@ function createDialogWindow(parent, spec, appearance) {
   });
 
   const loadPromise = win.loadURL(DIALOG_URL).then(() => {
-    if (win.isDestroyed()) return;
-    win.webContents.on('will-navigate', (event, targetUrl) => {
+    const contents = liveWebContents(win);
+    if (!contents) return;
+    contents.on('will-navigate', (event, targetUrl) => {
       if (targetUrl !== DIALOG_URL) event.preventDefault();
     });
   }).catch((error) => {
@@ -262,17 +262,21 @@ async function openDialog(type, payload) {
   applyDialogMaterial(win, appearance.dark);
   await loadPromise;
   if (win.isDestroyed() || dialogWindow !== win) throw new Error('dialog window unavailable');
-  if (prepared) win.webContents.send('dialog:context', getDialogContext({ sender: win.webContents }));
+  if (prepared) {
+    const contents = liveWebContents(win);
+    if (!contents) throw new Error('dialog window unavailable');
+    contents.send('dialog:context', getDialogContext({ sender: contents }));
+  }
   scheduleShowFallback(win);
   return true;
 }
 
 function requireDialogSender(event) {
+  const contents = liveWebContents(dialogWindow);
   if (
-    !dialogWindow ||
-    dialogWindow.isDestroyed() ||
+    !contents ||
     !event ||
-    event.sender !== dialogWindow.webContents
+    event.sender !== contents
   ) {
     throw new Error('invalid dialog window');
   }
@@ -308,14 +312,10 @@ function ownerWindow(event) {
 }
 
 function sendToDialog(channel, payload) {
-  if (
-    !dialogWindow ||
-    dialogWindow.isDestroyed() ||
-    !dialogWindow.webContents ||
-    (typeof dialogWindow.webContents.isDestroyed === 'function' && dialogWindow.webContents.isDestroyed())
-  ) return false;
+  const contents = liveWebContents(dialogWindow);
+  if (!contents) return false;
   try {
-    dialogWindow.webContents.send(channel, payload);
+    contents.send(channel, payload);
     return true;
   } catch (_) {
     return false;

@@ -7,7 +7,7 @@ const { app } = require('electron');
 /**
  * Shared main-process state and the helpers every module needs.
  *
- * The mutable references (mainWindow, tray, store, singbox, systemProxyOn)
+ * The mutable references (mainWindow, tray, store, coreManager, systemProxyOn)
  * live on the exported `state` object and are assigned during boot in
  * index.js. Modules must read them at call time (state.store.get(...)),
  * never destructure them at load time.
@@ -21,7 +21,7 @@ const state = {
   mainWindow: null,
   tray: null,
   store: null,
-  singbox: null,
+  coreManager: null,
   // Installed by ipc.js; cleanup invokes it before stopping the core so active
   // installer/core downloads cannot keep writing while Electron exits.
   cancelPendingUpdates: null,
@@ -44,15 +44,10 @@ const resourcesBinDir = isDev
   : path.join(process.resourcesPath, 'bin');
 
 function sendToMain(channel, payload) {
-  const win = state.mainWindow;
-  if (
-    !win ||
-    (typeof win.isDestroyed === 'function' && win.isDestroyed()) ||
-    !win.webContents ||
-    (typeof win.webContents.isDestroyed === 'function' && win.webContents.isDestroyed())
-  ) return false;
+  const contents = liveWebContents(state.mainWindow);
+  if (!contents) return false;
   try {
-    win.webContents.send(channel, payload);
+    contents.send(channel, payload);
     return true;
   } catch (_) {
     return false;
@@ -72,14 +67,21 @@ let logSequence = 0;
 // output can be very chatty; sending it to an unopened lazy renderer is wasted.
 let recentLogTarget = null;
 
+function liveWebContents(win) {
+  try {
+    if (!win || (typeof win.isDestroyed === 'function' && win.isDestroyed())) return null;
+    const contents = win.webContents;
+    if (!contents || (typeof contents.isDestroyed === 'function' && contents.isDestroyed())) return null;
+    return contents;
+  } catch (_) {
+    // BrowserWindow getters can throw while Chromium is tearing a renderer down.
+    return null;
+  }
+}
+
 function setRecentLogStreaming(target, enabled) {
   if (enabled) {
-    if (
-      !target ||
-      state.mainWindow == null ||
-      state.mainWindow.webContents !== target ||
-      (typeof target.isDestroyed === 'function' && target.isDestroyed())
-    ) return false;
+    if (!target || liveWebContents(state.mainWindow) !== target) return false;
     recentLogTarget = target;
     return true;
   }
@@ -101,8 +103,8 @@ function sendLog(line) {
     recentLogs = recentLogs.slice(recentLogStart);
     recentLogStart = 0;
   }
-  if (state.mainWindow && state.mainWindow.webContents === recentLogTarget) {
-    sendToMain('singbox:log', entry);
+  if (recentLogTarget && liveWebContents(state.mainWindow) === recentLogTarget) {
+    sendToMain('core:log', entry);
   }
 }
 
@@ -136,19 +138,19 @@ function refreshTray() {
 }
 
 function sendStatus() {
-  sendToMain('singbox:status', {
-    running: state.singbox.isRunning(),
+  sendToMain('core:status', {
+    running: state.coreManager.isRunning(),
     systemProxy: state.systemProxyOn,
-    coreInstalled: state.singbox.isCoreInstalled(),
-    coreType: state.singbox.getCoreType(),
-    coreName: state.singbox.coreLabel,
+    coreInstalled: state.coreManager.isCoreInstalled(),
+    coreType: state.coreManager.getCoreType(),
+    coreName: state.coreManager.coreLabel,
   });
   refreshTray();
 }
 
 /** Full core/proxy status, including the (cached) core path + version. */
 async function coreStatusInfo() {
-  const manager = state.singbox;
+  const manager = state.coreManager;
   let probedType = manager.getCoreType();
   let coreVersion = await manager.getCoreVersion(probedType);
   // A version probe can take several seconds for a broken executable. If the
@@ -176,6 +178,7 @@ module.exports = {
   isDev,
   runtimeDir,
   resourcesBinDir,
+  liveWebContents,
   sendToMain,
   sendLog,
   setRecentLogStreaming,

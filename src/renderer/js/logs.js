@@ -4,11 +4,18 @@
   const App = window.App;
   const { $, escapeHtml } = App;
   const api = window.api;
+  const t = window.i18n?.t || ((key) => key);
+
+  function renderLogEmptyState() {
+    const box = $('#logBox');
+    if (box?.dataset) box.dataset.emptyText = t('logs.empty');
+  }
+  renderLogEmptyState();
 
   // Batch log lines (flush at most ~5x/s); each flush appends one <span> chunk
   // of colorized lines, so trimming drops whole chunks from the front instead of
   // re-rendering the entire log.
-  // sing-box and mihomo use different log formats. Normalize the common shapes
+  // Normalize common Mihomo log shapes
   // so the log tab still reads like one console.
   const LOG_LINE_RE =
     /^([+-]\d{4}\s+)?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\b\s*/;
@@ -16,6 +23,8 @@
     /^time=(?:"([^"]+)"|(\S+))\s+level=(?:"?([a-z]+)"?)\s+msg=(?:"((?:[^"\\]|\\.)*)"|(.+))$/i;
   const MIHOMO_BRACKET_RE = /^(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\[(\d+)\]\s*(.*)$/i;
   const LEADING_LEVEL_RE = /^\[?(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\]?\s+(.+)$/i;
+  const LOG_LEVELS = new Set(['all', 'debug', 'info', 'warning', 'error']);
+  let lastDetectedLevel = 'info';
 
   function levelName(level) {
     const lv = String(level || '').toUpperCase();
@@ -30,10 +39,34 @@
     return unescapeLogString(value).replace(/^"/, '').replace(/"$/, '');
   }
 
+  function levelGroup(level) {
+    const lv = levelName(level);
+    if (lv === 'TRACE' || lv === 'DEBUG') return 'debug';
+    if (lv === 'WARN') return 'warning';
+    if (lv === 'ERROR' || lv === 'FATAL' || lv === 'PANIC') return 'error';
+    return 'info';
+  }
+
+  function looseLevel(line) {
+    const value = String(line || '');
+    if (/^\s|^\[signal\b|^goroutine\s+\d+\s+\[|^created by\s/i.test(value) && lastDetectedLevel === 'error') {
+      return 'error';
+    }
+    if (/\b(?:panic|fatal|error|failed|invalid memory|exited unexpectedly)\b/i.test(value)) return 'error';
+    if (/\b(?:warn|warning|retry|skipped|unavailable)\b/i.test(value)) return 'warning';
+    return 'info';
+  }
+
+  function logEntryHtml(content, level) {
+    lastDetectedLevel = LOG_LEVELS.has(level) && level !== 'all' ? level : 'info';
+    return `<span class="log-entry" data-level="${lastDetectedLevel}">${content}\n</span>`;
+  }
+
   function structuredLine(time, level, rest) {
     const lv = levelName(level);
     const stamp = time ? `<b class="log-time">${escapeHtml(time)}</b> ` : '';
-    return stamp + `<span class="log-lv ${lv.toLowerCase()}">${lv}</span> ${escapeHtml(rest)}\n`;
+    const content = stamp + `<span class="log-lv ${lv.toLowerCase()}">${lv}</span> ${escapeHtml(rest)}`;
+    return logEntryHtml(content, levelGroup(lv));
   }
 
   function logLineHtml(line) {
@@ -58,9 +91,12 @@
       return structuredLine('', leading[1], leading[2]);
     }
     if (line.startsWith('[gui]')) {
-      return `<span class="log-gui">[gui]</span>${escapeHtml(line.slice(5))}\n`;
+      return logEntryHtml(
+        `<span class="log-gui">[gui]</span>${escapeHtml(line.slice(5))}`,
+        looseLevel(line)
+      );
     }
-    return escapeHtml(line) + '\n';
+    return logEntryHtml(escapeHtml(line), looseLevel(line));
   }
   const LOG_LIMIT = 120000;
   const LOG_FLUSH_LINES = 100;
@@ -77,9 +113,54 @@
   let clearGeneration = 0;
   let streamGeneration = 0;
   let streamEnabled = false;
+  let activeLevel = 'all';
+  let logDrainWaiters = [];
+
+  function logsDrained() {
+    return historyLoaded && logBufStart >= logBuf.length && !logFlushTimer && !logFlushRaf;
+  }
+
+  function settleLogDrain(value = true, { force = false } = {}) {
+    if (!force && !logsDrained()) return false;
+    const waiters = logDrainWaiters;
+    logDrainWaiters = [];
+    for (const resolve of waiters) resolve(value);
+    return true;
+  }
+
+  function waitForLogDrain() {
+    if (logsDrained()) return Promise.resolve(true);
+    return new Promise((resolve) => logDrainWaiters.push(resolve));
+  }
+
+  function setLogLevelFilter(level) {
+    activeLevel = LOG_LEVELS.has(level) ? level : 'all';
+    const box = $('#logBox');
+    if (box?.dataset) box.dataset.levelFilter = activeLevel;
+    const buttons = typeof document.querySelectorAll === 'function'
+      ? document.querySelectorAll('[data-log-level]')
+      : [];
+    for (const button of buttons) {
+      const active = button.dataset.logLevel === activeLevel;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+    if (box && $('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
+    return activeLevel;
+  }
+
+  if (typeof document.querySelectorAll === 'function') {
+    for (const button of document.querySelectorAll('[data-log-level]')) {
+      button.addEventListener('click', () => setLogLevelFilter(button.dataset.logLevel));
+    }
+  }
+  setLogLevelFilter(activeLevel);
 
   function scheduleLogFlush(delay = 200) {
-    if (logFlushTimer || logFlushRaf || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    if (logFlushTimer || logFlushRaf || document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) {
+      settleLogDrain();
+      return;
+    }
     const pending = logBuf.length - logBufStart;
     // Large backlog: yield to the browser paint loop instead of tight timers.
     if (delay <= 0 && pending > LOG_FLUSH_LINES && typeof requestAnimationFrame === 'function') {
@@ -98,7 +179,10 @@
       cancelAnimationFrame(logFlushRaf);
       logFlushRaf = 0;
     }
-    if (document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) return;
+    if (document.hidden || App.currentTab !== 'logs' || logBufStart >= logBuf.length) {
+      settleLogDrain();
+      return;
+    }
     const pending = logBuf.length - logBufStart;
     const chunkSize = pending > 400 ? LOG_FLUSH_LINES_HEAVY : LOG_FLUSH_LINES;
     const end = Math.min(logBuf.length, logBufStart + chunkSize);
@@ -135,6 +219,7 @@
     // full synchronous layout. Scroll once after the final chunk instead.
     if (drained && $('#logAutoScroll').checked) box.scrollTop = box.scrollHeight;
     if (!drained) scheduleLogFlush(pending > 200 ? 0 : 16);
+    else settleLogDrain();
   }
 
   function enqueueLog(value) {
@@ -168,12 +253,16 @@
     const next = !!enabled;
     if (!api || !api.setLogStreaming || !api.getRecentLogs) return false;
     if (!next) {
-      if (!streamEnabled) return false;
+      if (!streamEnabled) {
+        settleLogDrain(false, { force: true });
+        return false;
+      }
       streamEnabled = false;
       streamGeneration++;
       historyLoaded = true;
       pendingLiveLogs = [];
       api.setLogStreaming(false).catch(() => {});
+      settleLogDrain(false, { force: true });
       return false;
     }
     if (streamEnabled) {
@@ -204,6 +293,7 @@
       for (const entry of pendingLiveLogs) enqueueLog(entry);
       pendingLiveLogs = [];
       scheduleLogFlush(0);
+      settleLogDrain();
     }
     return true;
   }
@@ -223,8 +313,13 @@
     pendingLiveLogs = [];
     $('#logBox').textContent = '';
     logLen = 0;
+    lastDetectedLevel = 'info';
+    settleLogDrain();
   });
 
   App.flushLogs = () => scheduleLogFlush(0);
+  App.waitForLogDrain = waitForLogDrain;
   App.setLogStreaming = setLogStreaming;
+  App.setLogLevelFilter = setLogLevelFilter;
+  App.renderLogEmptyState = renderLogEmptyState;
 })();

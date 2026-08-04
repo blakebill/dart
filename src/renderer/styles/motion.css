@@ -69,8 +69,43 @@
     gap: 12px;
   }
 
+  .dashboard-insights {
+    grid-template-areas:
+      "quick"
+      "quality"
+      "events";
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-quick {
+    display: block;
+  }
+
+  .dashboard-action-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 14px;
+  }
+
   .dash-control {
     gap: 8px;
+  }
+
+  #tab-rules.active {
+    grid-template-columns: 1fr;
+  }
+
+  #tab-rules > .rule-remote-section,
+  #tab-rules > .rule-browser-section {
+    grid-column: auto;
+  }
+
+  .remote-rule-form,
+  .subscription-add-form {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .tool-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   #tab-settings.active {
@@ -112,6 +147,30 @@
     padding-right: 6px;
     font-size: 12px;
   }
+
+  .quality-metrics,
+  .dashboard-event-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .remote-rule-form,
+  .subscription-add-form,
+  .tool-list {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-list .btn {
+    grid-column: 1;
+  }
+
+  .rule-group-item {
+    grid-template-columns: 1fr;
+  }
+
+  .rule-group-item .rule-group-actions {
+    width: 100%;
+    margin-top: 8px;
+  }
 }
 
 @media (max-height: 660px) {
@@ -150,6 +209,96 @@
   }
 }
 
+@media (max-height: 760px) {
+  :root {
+    --content-inset: 18px;
+  }
+
+  .topbar {
+    height: 54px;
+    min-height: 54px;
+  }
+
+  .cards {
+    margin-bottom: 12px;
+    gap: 10px;
+  }
+
+  .card {
+    min-height: 86px;
+    padding: 12px 14px 11px 17px;
+  }
+
+  .card::before {
+    top: 14px;
+    bottom: 14px;
+  }
+
+  .card-label {
+    margin-bottom: 3px;
+  }
+
+  .card-value {
+    min-height: 23px;
+    font-size: 18px;
+  }
+
+  .card-hint {
+    padding-top: 3px;
+  }
+
+  #tab-dashboard > .panel {
+    margin-bottom: 12px;
+    padding: 15px 18px;
+  }
+
+  .traffic-chart {
+    height: 92px;
+    margin-top: 4px;
+  }
+
+  .traffic-totals {
+    margin-top: 3px;
+  }
+
+  .dash-split {
+    gap: 12px;
+  }
+
+  .dash-split > .panel {
+    padding: 14px 16px;
+  }
+
+  .dash-control {
+    gap: 7px;
+  }
+
+  .switch-row {
+    min-height: 36px;
+    padding-block: 4px;
+  }
+
+  #usagePanel {
+    min-height: 0;
+  }
+
+  .usage-featured {
+    gap: 5px;
+  }
+
+  .usage-featured-meta {
+    gap: 5px 10px;
+  }
+
+  .usage-others-label {
+    margin-top: 8px;
+  }
+
+  .usage-others {
+    gap: 5px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -159,6 +308,21 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Screenshot fixtures must not depend on animation phase or blinking carets. */
+:root[data-visual-test='true'] *,
+:root[data-visual-test='true'] *::before,
+:root[data-visual-test='true'] *::after {
+  scroll-behavior: auto !important;
+  animation: none !important;
+  transition: none !important;
+  caret-color: transparent !important;
+}
+
+:root[data-visual-test='true'] .tab.active {
+  opacity: 1 !important;
+  transform: none !important;
 }
 
 @media (prefers-reduced-transparency: reduce) {

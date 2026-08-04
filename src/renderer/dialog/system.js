@@ -11,13 +11,10 @@
     let state = await Dialog.call(api.getState);
     let status = state.status || {};
     Dialog.setView('settings.coreManageTitle', `
-      <div class="dialog-body dialog-flex">
+      <div class="dialog-body dialog-flex dialog-core-body">
         <div class="setting-row">
-          <label for="dialogCoreType" data-i18n="settings.runningCore">${escapeHtml(t('settings.runningCore'))}</label>
-          <select id="dialogCoreType" class="input small">
-            <option value="sing-box">sing-box</option>
-            <option value="mihomo">mihomo</option>
-          </select>
+          <span data-i18n="settings.runningCore">${escapeHtml(t('settings.runningCore'))}</span>
+          <strong id="dialogCoreName">Mihomo</strong>
         </div>
         <div class="setting-row">
           <label for="dialogCoreSource" data-i18n="settings.downloadSource">${escapeHtml(t('settings.downloadSource'))}</label>
@@ -26,12 +23,12 @@
             <option value="official" data-i18n="settings.officialCore">${escapeHtml(t('settings.officialCore'))}</option>
           </select>
         </div>
-        <div class="setting-row">
+        <div class="setting-row dialog-core-path-row">
           <div class="setting-label">
             <span data-i18n="settings.corePath">${escapeHtml(t('settings.corePath'))}</span>
             <span id="dialogCoreStatus" class="hint" data-dialog-status></span>
           </div>
-          <button id="dialogCoreFolder" class="btn" data-i18n="settings.openCoreFolder">${escapeHtml(t('settings.openCoreFolder'))}</button>
+          <button id="dialogCoreFolder" class="btn dialog-core-folder" data-i18n="settings.openCoreFolder">${escapeHtml(t('settings.openCoreFolder'))}</button>
         </div>
         <div id="dialogProgress" class="progress dialog-progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
         <div class="dialog-feature-status">
@@ -41,11 +38,9 @@
       </div>
       ${Dialog.footer(`
         <button id="dialogCoreRestart" class="btn" data-i18n="dash.restartCore">${escapeHtml(t('dash.restartCore'))}</button>
-        <button id="dialogCoreUpdate" class="btn" data-i18n="settings.updateCore">${escapeHtml(t('settings.updateCore'))}</button>
-        <button id="dialogCoreApply" class="btn primary" data-i18n="settings.applyCore">${escapeHtml(t('settings.applyCore'))}</button>
+        <button id="dialogCoreUpdate" class="btn primary" data-i18n="settings.updateCore">${escapeHtml(t('settings.updateCore'))}</button>
       `)}
     `);
-    $('#dialogCoreType').value = (state.settings && state.settings.coreType) || status.coreType || 'sing-box';
     $('#dialogCoreSource').value = status.coreInstalled && !/-dart\.\d+/i.test(status.coreVersion || '')
       ? 'official'
       : 'custom';
@@ -60,26 +55,20 @@
 
     function renderStatus(next) {
       status = { ...status, ...next };
-      const coreName = status.coreName || status.coreType || $('#dialogCoreType').value;
+      const coreName = status.coreName || 'Mihomo';
+      $('#dialogCoreName').textContent = coreName;
       if (!status.coreInstalled) {
         $('#dialogCoreStatus').textContent = `${coreName} · ${t('settings.notInstalled')}`;
+        $('#dialogCoreStatus').title = $('#dialogCoreStatus').textContent;
         return;
       }
       const version = status.coreVersion ? 'v' + status.coreVersion : t('settings.versionUnknown');
       $('#dialogCoreStatus').textContent = `${coreName} · ${version}${status.corePath ? ' · ' + status.corePath : ''}`;
+      $('#dialogCoreStatus').title = $('#dialogCoreStatus').textContent;
     }
 
     async function refreshStatus() {
       renderStatus(await Dialog.call(api.coreStatus));
-    }
-
-    async function applySelection() {
-      const coreType = $('#dialogCoreType').value;
-      const current = (state.settings && state.settings.coreType) || 'sing-box';
-      if (coreType === current) return false;
-      state.settings = await Dialog.call(api.updateSettings, { coreType });
-      await refreshStatus();
-      return true;
     }
 
     renderStatus(status);
@@ -93,14 +82,6 @@
 
     Dialog.bind('#dialogCoreFolder', 'click', () => Dialog.call(api.openCoreFolder));
     Dialog.bind('#dialogCoreSource', 'change', renderFeatureStatus);
-    Dialog.bind('#dialogCoreApply', 'click', async () => {
-      await Dialog.runBusy($('#dialogCoreApply'), null, async () => {
-        await applySelection();
-        await Dialog.changed('state');
-        await refreshStatus();
-        toast(t('settings.coreChanged'));
-      });
-    });
     Dialog.bind('#dialogCoreRestart', 'click', async () => {
       await Dialog.runBusy($('#dialogCoreRestart'), null, async () => {
         await Dialog.call(api.restartCore);
@@ -115,10 +96,8 @@
       setProgress(progress, 0);
       try {
         await Dialog.runBusy($('#dialogCoreUpdate'), 'settings.updatingCore', async () => {
-          const coreType = $('#dialogCoreType').value;
           const source = $('#dialogCoreSource').value;
-          await Dialog.call(api.downloadCore, { version: '', coreType, source });
-          await applySelection();
+          await Dialog.call(api.downloadCore, { version: '', coreType: 'mihomo', source });
           await refreshStatus();
           await Dialog.changed('state');
           toast(t('settings.coreDownloaded'));

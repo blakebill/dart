@@ -2,7 +2,6 @@
 
 const {
   normalizePolicyGroups,
-  singboxPolicyOutbounds,
   mihomoPolicyGroups,
 } = require('./policy-groups');
 const { smartRegionMembers } = require('./node-region');
@@ -185,12 +184,8 @@ function sourceGroupPickOptions(nodes = [], groups = []) {
 /**
  * Conservative version fallback for callers that cannot execute the core.
  * Runtime config generation probes a minimal type:smart config instead.
- * Stock upstream builds never do. Older Dart forks report versions like
- * `1.13.14-dart.3` / `1.19.29-dart.4`.
- *
- * First builds that shipped kernel Smart:
- * - sing-box: `-dart.3`+
- * - mihomo:   `-dart.4`+
+ * Stock upstream builds never do. Mihomo Dart builds added kernel Smart in
+ * `-dart.4`.
  */
 function coreSupportsKernelSmart(coreType, version) {
   const text = String(version || '');
@@ -198,32 +193,10 @@ function coreSupportsKernelSmart(coreType, version) {
   if (!match) return false;
   const rev = Number(match[1]);
   if (!Number.isFinite(rev)) return false;
-  if (coreType === 'mihomo') return rev >= 4;
-  if (coreType === 'sing-box') return rev >= 3;
-  return false;
+  return coreType === 'mihomo' && rev >= 4;
 }
 
-/** Build the 🧠 Smart group for sing-box (kernel smart or app-managed fallback). */
-function buildSingboxSmartGroup(nodeTags, opts = {}) {
-  const {
-    kernelSmart = false,
-    kernelSmartMode = false,
-    smartMode = 'balanced',
-  } = opts;
-  if (kernelSmart) {
-    const group = {
-      type: 'smart',
-      tag: SMART_GROUP,
-      outbounds: nodeTags,
-      interrupt_exist_connections: false,
-    };
-    if (kernelSmartMode) group.mode = normalizeSmartMode(smartMode);
-    return group;
-  }
-  return { type: 'selector', tag: SMART_GROUP, outbounds: nodeTags, default: nodeTags[0] };
-}
-
-/** Build the 🧠 Smart proxy-group for mihomo (kernel smart or app-managed fallback). */
+/** Build the 🧠 Smart proxy-group for Mihomo (kernel smart or app-managed fallback). */
 function buildMihomoSmartGroup(proxyNames, opts = {}) {
   const {
     kernelSmart = false,
@@ -245,308 +218,6 @@ function buildMihomoSmartGroup(proxyNames, opts = {}) {
     return group;
   }
   return { name: SMART_GROUP, type: 'select', proxies: proxyNames };
-}
-
-/**
- * Core converter
- *
- * 1) nodeToOutbound: internal node object -> sing-box outbound
- * 2) buildSingboxConfig: node list + options -> full sing-box config
- *    (inbounds, DNS, route, groups)
- *
- * This layer hides source differences: whether nodes come from Clash YAML or
- * share links, the internal node object shape is the same, so the conversion
- * logic is unified.
- */
-
-/** Normalize the alpn field into a string array. */
-function normAlpn(alpn) {
-  if (!alpn) return undefined;
-  if (Array.isArray(alpn)) return alpn.filter(Boolean);
-  return String(alpn)
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-/** Build a sing-box TLS config block. */
-function buildTls(node) {
-  if (!node.tls) return undefined;
-  const tls = {
-    enabled: true,
-    server_name: node.servername || node.server || '',
-  };
-  if (node.skipCertVerify) tls.insecure = true;
-  const alpn = normAlpn(node.alpn);
-  if (alpn) tls.alpn = alpn;
-  if (node.clientFingerprint) {
-    tls.utls = { enabled: true, fingerprint: node.clientFingerprint };
-  }
-  if (node.reality && node.reality.publicKey) {
-    tls.reality = {
-      enabled: true,
-      public_key: node.reality.publicKey,
-      short_id: node.reality.shortId || '',
-    };
-    // reality requires utls
-    if (!tls.utls) tls.utls = { enabled: true, fingerprint: 'chrome' };
-  }
-  return tls;
-}
-
-/** Build a sing-box v2ray transport config block (ws/grpc/http). */
-function buildTransport(node) {
-  const net = node.network;
-  if (!net || net === 'tcp') return undefined;
-
-  if (net === 'ws') {
-    const opts = node.wsOpts || {};
-    const headers = opts.headers || {};
-    const transport = {
-      type: 'ws',
-      path: opts.path || '/',
-    };
-    // sing-box uses headers.Host to specify the ws host
-    const host = headers.Host || headers.host;
-    if (host) transport.headers = { Host: host };
-    if (opts['max-early-data'] || opts.maxEarlyData) {
-      transport.max_early_data = opts['max-early-data'] || opts.maxEarlyData;
-    }
-    if (opts['early-data-header-name'] || opts.earlyDataHeaderName) {
-      transport.early_data_header_name = opts['early-data-header-name'] || opts.earlyDataHeaderName;
-    }
-    return transport;
-  }
-
-  if (net === 'grpc') {
-    const opts = node.grpcOpts || {};
-    return {
-      type: 'grpc',
-      service_name: opts.serviceName || opts['grpc-service-name'] || '',
-    };
-  }
-
-  if (net === 'h2' || net === 'http') {
-    const opts = node.h2Opts || {};
-    const transport = { type: 'http' };
-    if (opts.path) transport.path = opts.path;
-    const hosts = opts.host || opts.Host;
-    if (hosts) transport.host = Array.isArray(hosts) ? hosts : [hosts];
-    return transport;
-  }
-
-  return undefined;
-}
-
-/**
- * Convert an internal node object into a sing-box outbound object.
- * Returns null for unsupported types.
- */
-function nodeToOutbound(node) {
-  if (!node || !node.type) return null;
-  const tag = node.name;
-
-  switch (node.type) {
-    case 'ss': {
-      const ob = {
-        type: 'shadowsocks',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        method: node.cipher,
-        password: node.password,
-      };
-      // Simple pass-through for shadowsocks plugins (obfs / v2ray-plugin)
-      if (node.plugin === 'obfs' || node.plugin === 'simple-obfs' || node.plugin === 'obfs-local') {
-        ob.plugin = 'obfs-local';
-        const o = node.pluginOpts || {};
-        const parts = [];
-        if (o.mode) parts.push(`obfs=${o.mode}`);
-        if (o.host) parts.push(`obfs-host=${o.host}`);
-        ob.plugin_opts = parts.join(';');
-      } else if (node.plugin === 'v2ray-plugin') {
-        ob.plugin = 'v2ray-plugin';
-        const o = node.pluginOpts || {};
-        const parts = [];
-        if (o.mode) parts.push(`mode=${o.mode}`);
-        if (o.tls) parts.push('tls');
-        if (o.host) parts.push(`host=${o.host}`);
-        if (o.path) parts.push(`path=${o.path}`);
-        ob.plugin_opts = parts.join(';');
-      }
-      return ob;
-    }
-
-    case 'vmess': {
-      const ob = {
-        type: 'vmess',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        uuid: node.uuid,
-        security: node.cipher || 'auto',
-        alter_id: node.alterId || 0,
-      };
-      const tls = buildTls(node);
-      if (tls) ob.tls = tls;
-      const transport = buildTransport(node);
-      if (transport) ob.transport = transport;
-      return ob;
-    }
-
-    case 'vless': {
-      const ob = {
-        type: 'vless',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        uuid: node.uuid,
-      };
-      if (node.flow) ob.flow = node.flow;
-      const tls = buildTls(node);
-      if (tls) ob.tls = tls;
-      const transport = buildTransport(node);
-      if (transport) ob.transport = transport;
-      return ob;
-    }
-
-    case 'trojan': {
-      const ob = {
-        type: 'trojan',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        password: node.password,
-      };
-      const tls = buildTls({ ...node, tls: true });
-      if (tls) ob.tls = tls;
-      const transport = buildTransport(node);
-      if (transport) ob.transport = transport;
-      return ob;
-    }
-
-    case 'hysteria2': {
-      const ob = {
-        type: 'hysteria2',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        password: node.password,
-        tls: {
-          enabled: true,
-          server_name: node.servername || node.server,
-        },
-      };
-      if (node.skipCertVerify) ob.tls.insecure = true;
-      const alpn = normAlpn(node.alpn);
-      if (alpn) ob.tls.alpn = alpn;
-      if (node.obfs) {
-        ob.obfs = { type: node.obfs, password: node.obfsPassword || '' };
-      }
-      if (node.up) ob.up_mbps = parseInt(node.up, 10) || undefined;
-      if (node.down) ob.down_mbps = parseInt(node.down, 10) || undefined;
-      return ob;
-    }
-
-    case 'hysteria': {
-      const ob = {
-        type: 'hysteria',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        auth_str: node.authStr,
-        tls: {
-          enabled: true,
-          server_name: node.servername || node.server,
-        },
-      };
-      if (node.skipCertVerify) ob.tls.insecure = true;
-      const alpn = normAlpn(node.alpn);
-      if (alpn) ob.tls.alpn = alpn;
-      if (node.obfs) ob.obfs = node.obfs;
-      if (node.up) ob.up_mbps = parseInt(node.up, 10) || undefined;
-      if (node.down) ob.down_mbps = parseInt(node.down, 10) || undefined;
-      return ob;
-    }
-
-    case 'anytls': {
-      const ob = {
-        type: 'anytls',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        password: node.password,
-        tls: {
-          enabled: true,
-          server_name: node.servername || node.server,
-        },
-      };
-      if (node.skipCertVerify) ob.tls.insecure = true;
-      const alpn = normAlpn(node.alpn);
-      if (alpn) ob.tls.alpn = alpn;
-      if (node.clientFingerprint) ob.tls.utls = { enabled: true, fingerprint: node.clientFingerprint };
-      const dur = (v) => (v == null || v === '' ? undefined : /[a-z]/i.test(String(v)) ? String(v) : String(v) + 's');
-      if (dur(node.idleCheck)) ob.idle_session_check_interval = dur(node.idleCheck);
-      if (dur(node.idleTimeout)) ob.idle_session_timeout = dur(node.idleTimeout);
-      if (node.minIdleSession != null && node.minIdleSession !== '') {
-        ob.min_idle_session = parseInt(node.minIdleSession, 10) || 0;
-      }
-      return ob;
-    }
-
-    case 'tuic': {
-      const ob = {
-        type: 'tuic',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        uuid: node.uuid,
-        password: node.password || '',
-        congestion_control: node.congestionControl || 'bbr',
-        udp_relay_mode: node.udpRelayMode || 'native',
-        tls: {
-          enabled: true,
-          server_name: node.servername || node.server,
-        },
-      };
-      if (node.skipCertVerify) ob.tls.insecure = true;
-      const alpn = normAlpn(node.alpn);
-      if (alpn) ob.tls.alpn = alpn;
-      return ob;
-    }
-
-    case 'socks': {
-      const ob = {
-        type: 'socks',
-        tag,
-        server: node.server,
-        server_port: node.port,
-        version: '5',
-      };
-      if (node.username) ob.username = node.username;
-      if (node.password) ob.password = node.password;
-      return ob;
-    }
-
-    case 'http': {
-      const ob = {
-        type: 'http',
-        tag,
-        server: node.server,
-        server_port: node.port,
-      };
-      if (node.username) ob.username = node.username;
-      if (node.password) ob.password = node.password;
-      if (node.tls) {
-        ob.tls = { enabled: true, server_name: node.servername || node.server };
-        if (node.skipCertVerify) ob.tls.insecure = true;
-      }
-      return ob;
-    }
-
-    default:
-      return null;
-  }
 }
 
 function cleanObject(obj) {
@@ -686,69 +357,6 @@ function nodeToClashProxy(node) {
   }
 }
 
-/**
- * Convert a user-entered DNS address into a sing-box 1.12+ DNS server object.
- * Accepts: https://host/dns-query (DoH), tls://host (DoT), quic://host,
- * h3://host, udp://host or a bare host/IP (UDP), tcp://host. Optional :port.
- */
-function dnsServerFromAddress(addr, tag, detour) {
-  const out = { tag };
-  let s = String(addr || '').trim();
-  let type = 'udp';
-  let path;
-  const m = s.match(/^([a-z0-9]+):\/\//i);
-  if (m) {
-    const scheme = m[1].toLowerCase();
-    type = { https: 'https', http3: 'h3', h3: 'h3', tls: 'tls', quic: 'quic', tcp: 'tcp', udp: 'udp' }[scheme] || 'udp';
-    s = s.slice(m[0].length);
-  }
-  // For DoH, capture and strip the path (e.g. /dns-query).
-  const slash = s.indexOf('/');
-  if (slash >= 0) {
-    path = s.slice(slash);
-    s = s.slice(0, slash);
-  }
-  // Split an optional port. Bracketed IPv6 is required when a port is present;
-  // bare IPv6 remains unambiguous and is kept as-is.
-  let server = s;
-  let port;
-  if (s.startsWith('[')) {
-    const end = s.indexOf(']');
-    if (end < 0) throw new Error('invalid bracketed DNS server');
-    server = s.slice(1, end);
-    const suffix = s.slice(end + 1);
-    if (suffix) {
-      if (!/^:\d+$/.test(suffix)) throw new Error('invalid DNS server port');
-      port = Number(suffix.slice(1));
-    }
-  } else {
-    const firstColon = s.indexOf(':');
-    const lastColon = s.lastIndexOf(':');
-    if (firstColon > 0 && firstColon === lastColon) {
-      const maybePort = s.slice(lastColon + 1);
-      if (!/^\d+$/.test(maybePort)) throw new Error('invalid DNS server port');
-      server = s.slice(0, lastColon);
-      port = Number(maybePort);
-    }
-  }
-  if (!server) throw new Error('DNS server is empty');
-  if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) {
-    throw new Error('invalid DNS server port');
-  }
-  out.type = type;
-  out.server = server;
-  if (port) out.server_port = port;
-  if (type === 'https' && path && path !== '/dns-query') out.path = path;
-  if (detour) out.detour = detour;
-  return out;
-}
-
-/**
- * Map a Clash rule target (proxy/group name) to a sing-box outbound tag.
- * `overrides` lets the user remap a subscription policy group by name to
- * 'direct' | 'proxy' | 'reject' (so the sub's matching is kept but its
- * outbound is the user's choice). DIRECT/REJECT in the rule itself always win.
- */
 function mapClashTarget(name, overrides, availableTargets = null) {
   const n = String(name || '').trim();
   if (/^DIRECT$/i.test(n)) return 'direct';
@@ -864,58 +472,6 @@ function flattenClashRules(clashRules) {
   return out;
 }
 
-const AND_FIELD_BY_TYPE = {
-  DOMAIN: 'domain',
-  HOST: 'domain',
-  'DOMAIN-SUFFIX': 'domain_suffix',
-  'HOST-SUFFIX': 'domain_suffix',
-  'DOMAIN-KEYWORD': 'domain_keyword',
-  'HOST-KEYWORD': 'domain_keyword',
-  'DOMAIN-REGEX': 'domain_regex',
-  'IP-CIDR': 'ip_cidr',
-  'IP-CIDR6': 'ip_cidr',
-  'IP6-CIDR': 'ip_cidr',
-  'IP-ADDR': 'ip_cidr',
-  'DST-PORT': 'port',
-  'SRC-PORT': 'source_port',
-  'PROCESS-NAME': 'process_name',
-};
-
-/** Build one sing-box rule from a flattened AND descriptor, or null when unsupported. */
-function andDescriptorToSingboxRule(descriptor, overrides, availableTargets) {
-  if (!descriptor || descriptor.logical !== 'AND' || !Array.isArray(descriptor.parts)) return null;
-  const target = mapClashTarget(descriptor.target, overrides, availableTargets);
-  const rule = {};
-  const usedFields = new Set();
-  for (const part of descriptor.parts) {
-    const segs = String(part || '').split(',').map((s) => s.trim());
-    const type = (segs[0] || '').toUpperCase().replace(/\s+/g, '');
-    const value = segs[1];
-    if (!type || value === undefined || value === '') return null;
-    if (type === 'GEOIP' || type === 'GEOSITE' || type === 'RULE-SET' || type === 'NETWORK') {
-      // These need side-channel rule-set plumbing or are not expressible as AND
-      // fields alongside the rest of our converter path.
-      return null;
-    }
-    const field = AND_FIELD_BY_TYPE[type];
-    if (!field) return null;
-    // Same matcher field twice would be OR inside sing-box; that is not AND.
-    if (usedFields.has(field)) return null;
-    usedFields.add(field);
-    if (field === 'port' || field === 'source_port') {
-      const port = parseInt(value, 10);
-      if (Number.isNaN(port)) return null;
-      rule[field] = [port];
-    } else {
-      rule[field] = [value];
-    }
-  }
-  if (!usedFields.size) return null;
-  if (target === 'reject') rule.action = 'reject';
-  else rule.outbound = target;
-  return rule;
-}
-
 /** Preserve Clash/Mihomo AND semantics while applying the selected target override. */
 function andDescriptorToMihomoRule(descriptor, overrides, availableTargets) {
   if (!descriptor || descriptor.logical !== 'AND' || !Array.isArray(descriptor.parts)) return null;
@@ -957,167 +513,9 @@ function extractRuleSetRefs(clashRules) {
   }
   return names;
 }
-
-/**
- * The sing-box rule-set tag for a GEOSITE/GEOIP category, or null when the
- * category name is exotic (e.g. `geolocation-!cn`). Restricting to
- * [a-z0-9-] keeps tags/filenames sane; the skipped "!cn = foreign" categories
- * usually route to the proxy anyway, which is already the route's final.
- */
-function geoTag(kind, cat) {
-  const c = String(cat || '').trim().toLowerCase();
-  if (!/^[a-z0-9-]+$/.test(c)) return null;
-  return `${kind}-${c}`;
-}
-
-/** Default set of available geo tags: the bundled CN pair when geodata exists. */
-function defaultGeoAvailable(hasGeo) {
-  return new Set(hasGeo ? ['geoip-cn', 'geosite-cn'] : []);
-}
-
-/** Resolve a geoAvailable argument: an explicit Set wins, else the default. */
-function resolveGeoAvailable(geoAvailable, hasGeo) {
-  if (!hasGeo) return new Set();
-  return geoAvailable instanceof Set ? geoAvailable : defaultGeoAvailable(hasGeo);
-}
-
-/**
- * Distinct GEOSITE/GEOIP rule-sets a subscription references, as
- * { repo, file, tag } — so the caller can ensure each .srs is on disk before
- * the config references it. Exotic category names are skipped (see geoTag).
- */
-function extractGeoCategories(clashRules) {
-  const seen = new Map();
-  for (const raw of flattenClashRules(clashRules)) {
-    if (raw && typeof raw === 'object') continue;
-    const r = parseClashRule(raw);
-    if (!r) continue;
-    let kind = null;
-    let repo = null;
-    if (r.type === 'GEOSITE') { kind = 'geosite'; repo = 'sing-geosite'; }
-    else if (r.type === 'GEOIP') { kind = 'geoip'; repo = 'sing-geoip'; }
-    else continue;
-    const tag = geoTag(kind, r.value);
-    if (tag) seen.set(tag, { repo, file: tag + '.srs', tag });
-  }
-  return [...seen.values()];
-}
-
-/**
- * Convert Clash `rules:` entries into sing-box route rules.
- * Unsupported rule types are skipped gracefully. MATCH/FINAL is ignored (the
- * generated config keeps its own final outbound).
- * @param {string[]} clashRules
- * @param {boolean} hasGeo  whether the bundled geoip-cn/geosite-cn exist.
- * @param {object|null} overrides  policy-group outbound overrides.
- * @param {Set<string>|null} geoAvailable  geo rule-set tags backed by a real
- *   local .srs. A GEOSITE/GEOIP rule is only emitted when its tag is in here,
- *   so the config never references an undefined rule_set (a fatal error in
- *   sing-box). Defaults to the bundled CN pair when hasGeo.
- * @param {object|null} ruleSetData  RULE-SET provider name -> parsed matcher
- *   arrays ({domain, domain_suffix, ip_cidr, ...}). A RULE-SET rule is only
- *   emitted when its provider has been downloaded + parsed into here.
- * @returns {{ rules: object[], usedGeoTags: Set<string> }}
- */
-function clashRulesToSingbox(
-  clashRules,
-  hasGeo = true,
-  overrides = null,
-  geoAvailable = null,
-  ruleSetData = null,
-  availableTargets = null
-) {
-  const avail = resolveGeoAvailable(geoAvailable, hasGeo);
-  const out = [];
-  const usedGeoTags = new Set();
-  let finalTarget = null;
-  for (const raw of flattenClashRules(clashRules)) {
-    if (raw && typeof raw === 'object' && raw.logical === 'AND') {
-      const combined = andDescriptorToSingboxRule(raw, overrides, availableTargets);
-      if (combined) out.push(combined);
-      continue;
-    }
-    const parsed = parseClashRule(raw);
-    if (!parsed) continue;
-    const { type, value } = parsed;
-    const target = mapClashTarget(parsed.target, overrides, availableTargets);
-    if (type === 'MATCH' || type === 'FINAL') {
-      if (finalTarget === null) finalTarget = target;
-      continue;
-    }
-    const apply = (rule) => {
-      if (target === 'reject') rule.action = 'reject';
-      else rule.outbound = target;
-      out.push(rule);
-    };
-    const applyGeo = (kind) => {
-      const tag = geoTag(kind, value);
-      if (tag && avail.has(tag)) {
-        apply({ rule_set: [tag] });
-        usedGeoTags.add(tag);
-      }
-    };
-    const port = () => parseInt(value, 10);
-    switch (type) {
-      case 'DOMAIN':
-        if (value) apply({ domain: [value] });
-        break;
-      case 'DOMAIN-SUFFIX':
-        if (value) apply({ domain_suffix: [value] });
-        break;
-      case 'DOMAIN-KEYWORD':
-        if (value) apply({ domain_keyword: [value] });
-        break;
-      case 'DOMAIN-REGEX':
-        if (value) apply({ domain_regex: [value] });
-        break;
-      case 'IP-CIDR':
-      case 'IP-CIDR6':
-      case 'IP-ADDR':
-        if (value) apply({ ip_cidr: [value] });
-        break;
-      case 'DST-PORT':
-        if (!Number.isNaN(port())) apply({ port: [port()] });
-        break;
-      case 'SRC-PORT':
-        if (!Number.isNaN(port())) apply({ source_port: [port()] });
-        break;
-      case 'PROCESS-NAME':
-        if (value) apply({ process_name: [value] });
-        break;
-      case 'GEOIP':
-        // Any country whose geoip-<cc>.srs is on disk; CN ships bundled.
-        applyGeo('geoip');
-        break;
-      case 'GEOSITE':
-        // Any category whose geosite-<cat>.srs is on disk (downloaded on demand).
-        applyGeo('geosite');
-        break;
-      case 'RULE-SET': {
-        // The referenced rule-provider, downloaded + parsed into matcher arrays.
-        // Emit one rule per matcher field: different fields in a single sing-box
-        // rule are AND-combined, so separate rules give the OR we want across
-        // a provider's mixed domain/ip entries.
-        const data = ruleSetData && ruleSetData[value];
-        if (data) {
-          for (const field of ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name']) {
-            const vals = data[field];
-            if (Array.isArray(vals) && vals.length) apply({ [field]: vals.slice() });
-          }
-        }
-        break;
-      }
-      default:
-        // PROCESS-PATH, MATCH/FINAL, etc. -> skipped.
-        break;
-    }
-  }
-  return { rules: out, usedGeoTags, finalTarget };
-}
-
 /**
  * Parse a remote Clash-style rule list (classical/domain/ipcidr, or a plain
- * domain list) into sing-box matcher arrays.
+ * domain list) into normalized matcher arrays.
  */
 function parseRuleList(text) {
   const m = { domain: [], domain_suffix: [], domain_keyword: [], ip_cidr: [], process_name: [] };
@@ -1168,30 +566,23 @@ function parseRuleList(text) {
   return m;
 }
 
-/**
- * Build a single sing-box route rule from a remote rule list + a target.
- * @param {string} text  the downloaded rule list
- * @param {string} target 'proxy' | 'direct' | 'reject'
- * @returns {{ rule: object|null, rules: object[], count: number }}
- */
-function ruleListToSingboxRule(text, target) {
-  const m = parseRuleList(text);
+function ruleListToClashRules(text, target = 'proxy') {
+  const matchers = parseRuleList(text);
+  const ruleTarget = target === 'direct' ? 'DIRECT' : target === 'reject' ? 'REJECT' : APP_PROXY_GROUP;
+  const typeByField = {
+    domain: 'DOMAIN',
+    domain_suffix: 'DOMAIN-SUFFIX',
+    domain_keyword: 'DOMAIN-KEYWORD',
+    ip_cidr: 'IP-CIDR',
+    process_name: 'PROCESS-NAME',
+  };
   const rules = [];
-  let count = 0;
-  for (const k of Object.keys(m)) {
-    if (m[k].length) {
-      const rule = { [k]: m[k].slice() };
-      if (target === 'direct') rule.outbound = 'direct';
-      else if (target === 'reject') rule.action = 'reject';
-      else rule.outbound = '🚀 Proxy';
-      rules.push(rule);
-      count += m[k].length;
-    }
+  for (const [field, values] of Object.entries(matchers)) {
+    const type = typeByField[field];
+    if (!type) continue;
+    for (const value of values) rules.push(`${type},${value},${ruleTarget}`);
   }
-  // Different matcher fields in one sing-box rule are AND-combined. Emit one
-  // rule per field so a mixed domain/IP/process list behaves as the source
-  // list intended: any entry may match.
-  return { rule: rules.length === 1 ? rules[0] : null, rules, count };
+  return { rules, count: rules.length };
 }
 
 function dedupeNames(items, key, reserved = []) {
@@ -1214,289 +605,6 @@ function dedupeNames(items, key, reserved = []) {
   return items;
 }
 
-/** Deduplicate tags and keep generated strategy outbounds unambiguous. */
-function dedupeTags(outbounds) {
-  return dedupeNames(outbounds, 'tag', ['🚀 Proxy', AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct']);
-}
-
-/**
- * Build just the sing-box route block ({ rules, rule_set }) from options. The
- * route references outbounds by tag (string), so it does not need the node
- * outbounds — letting callers (e.g. the Rules view) compute it cheaply without
- * converting every node.
- */
-function buildRoute(opts = {}) {
-  const {
-    ruleSetDir = null,
-    clashRules = [],
-    extraRules = [],
-    extraRuleSets = [],
-    ruleOverrides = null,
-    geoAvailable = null,
-    ruleSetData = null,
-    availableTargets = null,
-  } = opts;
-  // Local .srs only. A `remote` rule-set would be fetched during start-up via
-  // download_detour, and sing-box treats a failed fetch as FATAL — so a fresh
-  // install with no geodata (and raw.githubusercontent.com blocked, or no
-  // healthy node yet) would crash on boot. When the geodata is absent we drop
-  // the geoip-cn/geosite-cn optimization entirely instead: the core starts
-  // clean (all traffic via the proxy), and the rule-set returns once geodata
-  // is bundled or downloaded.
-  const hasGeo = !!ruleSetDir;
-  // Which geo rule-sets are backed by a real local .srs. Defaults to the bundled
-  // CN pair; the caller passes a wider set once extra category .srs are on disk.
-  const avail = resolveGeoAvailable(geoAvailable, hasGeo);
-  const { rules: convertedRules, usedGeoTags, finalTarget } = clashRulesToSingbox(
-    clashRules,
-    hasGeo,
-    ruleOverrides,
-    avail,
-    ruleSetData,
-    availableTargets
-  );
-
-  // Define a local rule_set for every geo tag that is both available and used,
-  // plus the CN pair (needed by the direct fallback + DNS). The file is always
-  // <tag>.srs in ruleSetDir. Tags are unique so this also dedupes.
-  const baseCn = ['geoip-cn', 'geosite-cn'].filter((t) => avail.has(t));
-  const geoTags = [...new Set([...baseCn, ...usedGeoTags])];
-  const geoRuleSets = geoTags.map((tag) => ({
-    type: 'local', tag, format: 'binary', path: (ruleSetDir + '/' + tag + '.srs').replace(/\\/g, '/'),
-  }));
-  // The "CN traffic goes direct" fallback only when both CN rule-sets exist.
-  const geoDirectRule = baseCn.length === 2 ? [{ rule_set: ['geoip-cn', 'geosite-cn'], outbound: 'direct' }] : [];
-
-  return {
-    rules: [
-      { action: 'sniff' },
-      { protocol: 'dns', action: 'hijack-dns' },
-      // Block mode: reject every connection (placed above all other routing).
-      { clash_mode: 'block', action: 'reject' },
-      { ip_is_private: true, outbound: 'direct' },
-      { clash_mode: 'direct', outbound: 'direct' },
-      { clash_mode: 'global', outbound: '🚀 Proxy' },
-      // Custom rule-sets (user-added) take top priority.
-      ...extraRules,
-      // Converted from the subscription's Clash rules (above the geoip/geosite fallback).
-      ...convertedRules,
-      ...geoDirectRule,
-      ...(finalTarget === 'reject' ? [{ action: 'reject' }] : []),
-    ],
-    rule_set: [...geoRuleSets, ...extraRuleSets],
-    final: finalTarget && finalTarget !== 'reject' ? finalTarget : '🚀 Proxy',
-  };
-}
-
-/**
- * Assemble a full sing-box config.
- *
- * @param {object[]} nodes  array of internal node objects
- * @param {object}   opts   options
- *   - mixedPort: mixed inbound port (default 7890)
- *   - enableTun: whether to enable TUN (default false)
- *   - logLevel: log level (default info)
- *   - finalOutbound: fallback outbound tag (default node selector)
- * @returns {object} sing-box config
- */
-function buildSingboxConfig(nodes, opts = {}) {
-  const {
-    mixedPort = 7890,
-    enableTun = false,
-    clashApiPort = 9090,
-    clashApiSecret = '', // when set, the Clash API requires Authorization
-    externalUiDir = '', // serve a local dashboard at /ui when set
-    externalUiDownloadUrl = '',
-    logLevel = 'info',
-    ruleSetDir = null,
-    selected = null,
-    clashMode = 'rule',
-    clashRules = [],
-    policyGroups = [],
-    ruleOverrides = null, // { [policyGroupName]: 'direct'|'proxy'|'reject' }
-    ruleGroupSelections = null, // { [policyGroupName]: outboundTag } for source selectors
-    geoAvailable = null, // Set of geo rule-set tags backed by a local .srs
-    ruleSetData = null, // RULE-SET provider name -> parsed matcher arrays
-    enableIpv6 = true,
-    tunInterfaceName = 'Dart',
-    dnsRemote = 'https://1.1.1.1/dns-query',
-    dnsLocal = 'https://223.5.5.5/dns-query',
-    dnsStrategy = 'prefer_ipv4',
-    testUrl = DEFAULT_TEST_URL,
-    extraRules = [], // route rules from custom rule-sets
-    extraRuleSets = [], // local rule_set defs from custom .srs
-  } = opts;
-
-  const nodeEntries = nodes
-    .map((node) => ({ node, outbound: nodeToOutbound(node) }))
-    .filter((entry) => !!entry.outbound);
-  const nodeOutbounds = dedupeTags(nodeEntries.map((entry) => entry.outbound));
-  const nodeTags = nodeOutbounds.map((o) => o.tag);
-  if (!nodeTags.length) throw new Error('No supported proxy nodes are available.');
-  const smartNodeTags = smartRegionMembers(
-    nodeEntries.map((entry) => entry.node),
-    nodeTags,
-    opts.smartRegions
-  );
-  const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
-  const sourceGroups = applySourceGroupSelections(
-    prepareSourcePolicyGroups(policyGroups, nodeTags),
-    nodeTags,
-    ruleGroupSelections
-  );
-  const sourceGroupNames = sourceGroups.map((group) => group.name);
-  const availableTargets = new Set([AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...nodeTags, ...sourceGroupNames]);
-
-  // Members of 🚀 Proxy only — never source policy groups (they may point back
-  // at 🚀 Proxy for "follow main selection").
-  const proxyMembers = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...nodeTags, 'direct'];
-  const defaultOutbound =
-    selected && (proxyMembers.includes(selected) || selected === 'DIRECT')
-      ? (selected === 'DIRECT' ? 'direct' : selected)
-      : AUTO_GROUP;
-
-  // sing-box has no distinct ordered-fallback outbound. A sticky URLTest group
-  // is its native health-checked equivalent: it keeps a healthy route and
-  // moves when that route fails.
-  const proxyGroup = {
-    type: 'selector',
-    tag: APP_PROXY_GROUP,
-    outbounds: proxyMembers,
-    default: defaultOutbound,
-  };
-  // Dart owns Auto selection and applies its measured winner through the
-  // always-on local Clash API.
-  const autoGroup = { type: 'selector', tag: AUTO_GROUP, outbounds: nodeTags, default: nodeTags[0] };
-  const smartGroup = buildSingboxSmartGroup(smartNodeTags, {
-    kernelSmart: !!opts.kernelSmart,
-    kernelSmartMode: !!opts.kernelSmartMode,
-    smartMode: opts.smartMode,
-  });
-  const fallbackGroup = {
-    type: 'urltest',
-    tag: FALLBACK_GROUP,
-    outbounds: nodeTags,
-    url: latencyUrl,
-    interval: '1m',
-    tolerance: 10000,
-    idle_timeout: '1m',
-  };
-
-  // direct is a real outbound; reject uses type block so selectors can offer it
-  // when a subscription group includes REJECT. Route actions still use reject.
-  const sourceGroupOutbounds = singboxPolicyOutbounds(sourceGroups, latencyUrl, AUTO_TEST_INTERVAL_SECONDS);
-  const needsRejectOutbound = sourceGroups.some((group) => (
-    Array.isArray(group.members) && group.members.includes('reject')
-  ));
-  const outbounds = [
-    proxyGroup,
-    autoGroup,
-    smartGroup,
-    fallbackGroup,
-    ...sourceGroupOutbounds,
-    ...nodeOutbounds,
-    { type: 'direct', tag: 'direct' },
-    ...(needsRejectOutbound ? [{ type: 'block', tag: 'reject' }] : []),
-  ];
-
-  // Inbounds (sing-box 1.12+: sniffing is a route rule action, not an inbound field)
-  const inbounds = [];
-  if (enableTun) {
-    inbounds.push({
-      type: 'tun',
-      tag: 'tun-in',
-      ...(tunInterfaceName ? { interface_name: tunInterfaceName } : {}),
-      // IPv4-only when IPv6 is disabled, so the TUN never advertises a v6 route.
-      address: enableIpv6 ? ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'] : ['172.19.0.1/30'],
-      mtu: 9000,
-      auto_route: true,
-      strict_route: true,
-      // "mixed" (system TCP + gVisor UDP) is the most compatible on Windows.
-      stack: 'mixed',
-    });
-  }
-  inbounds.push({
-    type: 'mixed',
-    tag: 'mixed-in',
-    listen: '127.0.0.1',
-    listen_port: mixedPort,
-  });
-
-  const avail = resolveGeoAvailable(geoAvailable, !!ruleSetDir);
-  const route = buildRoute({
-    ruleSetDir,
-    clashRules,
-    extraRules,
-    extraRuleSets,
-    ruleOverrides,
-    geoAvailable: avail,
-    ruleSetData,
-    availableTargets,
-  });
-
-  const config = {
-    log: {
-      level: logLevel,
-      timestamp: true,
-    },
-    dns: {
-      servers: [
-        dnsServerFromAddress(dnsRemote, 'proxy-dns', '🚀 Proxy'),
-        dnsServerFromAddress(dnsLocal, 'local-dns'),
-      ],
-      rules: [
-        { clash_mode: 'direct', server: 'local-dns' },
-        { clash_mode: 'global', server: 'proxy-dns' },
-        // Resolve CN domains with the local resolver — only when the rule-set
-        // exists (see buildRoute: a missing geosite-cn must not be referenced).
-        ...(avail.has('geosite-cn') ? [{ rule_set: 'geosite-cn', server: 'local-dns' }] : []),
-      ],
-      final: 'proxy-dns',
-      // When IPv6 is disabled, force IPv4-only resolution regardless of the
-      // user's preferred strategy.
-      strategy: enableIpv6 ? dnsStrategy : 'ipv4_only',
-    },
-    inbounds,
-    outbounds,
-    route: {
-      rules: route.rules,
-      rule_set: route.rule_set,
-      final: route.final,
-      default_domain_resolver: 'local-dns',
-    },
-  };
-
-  // Bind outbounds to the default physical interface only in TUN mode, where it
-  // is required to keep sing-box's own traffic out of its own TUN (routing
-  // loop). In system-proxy mode the binding is unnecessary and actively harmful:
-  // with a WireGuard full tunnel up, its kill-switch (WFP) rejects any traffic
-  // pinned to another interface (WSAEACCES), while unbound sockets follow the
-  // routing table into the WG tunnel — i.e. proxy-over-WG chaining just works.
-  if (enableTun) config.route.auto_detect_interface = true;
-
-  config.experimental = {
-    clash_api: {
-      external_controller: `127.0.0.1:${clashApiPort}`,
-      default_mode: clashMode || 'rule',
-      ...(clashApiSecret ? { secret: clashApiSecret } : {}),
-      // Local panel hosting: the core serves the dashboard at /ui (same
-      // origin as the API) and downloads it through its own proxy outbound.
-      ...(externalUiDir
-        ? {
-            external_ui: externalUiDir,
-            ...(externalUiDownloadUrl ? { external_ui_download_url: externalUiDownloadUrl } : {}),
-            external_ui_download_detour: '🚀 Proxy',
-          }
-        : {}),
-    },
-    cache_file: {
-      enabled: true,
-    },
-  };
-
-  return config;
-}
-
 function dedupeProxyNames(proxies) {
   return dedupeNames(proxies, 'name', ['🚀 Proxy', AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, 'direct', 'DIRECT', 'REJECT', 'GLOBAL']);
 }
@@ -1507,7 +615,7 @@ function clashTargetName(target) {
   return target || '🚀 Proxy';
 }
 
-function singboxRuleToClashRules(rule, options = {}) {
+function routeObjectToClashRules(rule, options = {}) {
   if (!rule || typeof rule !== 'object' || ['sniff', 'hijack-dns'].includes(rule.action)) return [];
   const rawOutbound = String(rule.outbound || '').trim();
   const outbound = rawOutbound.toLowerCase();
@@ -1538,7 +646,7 @@ function singboxRuleToClashRules(rule, options = {}) {
   }
   if (rule.type === 'logical' && rule.mode === 'or' && Array.isArray(rule.rules)) {
     for (const child of rule.rules) {
-      for (const converted of singboxRuleToClashRules(
+      for (const converted of routeObjectToClashRules(
         { ...child, outbound: rule.outbound, action: rule.action },
         options
       )) out.push(converted);
@@ -1610,6 +718,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     enableIpv6 = true,
     enableTun = false,
     tunInterfaceName = 'Dart',
+    enableDnsOverride = false,
     dnsRemote = 'https://1.1.1.1/dns-query',
     dnsLocal = 'https://223.5.5.5/dns-query',
     testUrl = DEFAULT_TEST_URL,
@@ -1640,7 +749,7 @@ function buildMihomoConfig(nodes, opts = {}) {
   const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
   const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
-  // Same as sing-box: 🚀 Proxy must not list source policy groups. Those groups
+  // Keep the main selector acyclic: 🚀 Proxy must not list source policy groups. Those groups
   // already include 🚀 Proxy for "follow main selection"; nesting both ways is a
   // cycle (Mihomo may accept it, but selection/routing becomes undefined).
   const proxyMembers = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...proxyNames, 'DIRECT'];
@@ -1672,7 +781,7 @@ function buildMihomoConfig(nodes, opts = {}) {
   if (clashMode === 'block') {
     rules.push('MATCH,REJECT');
   } else {
-    // Always prepend private-LAN direct, matching sing-box's early
+    // Always prepend private-LAN direct,
     // ip_is_private rule — even when the subscription ships its own rules.
     const privateDirect = [
       'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
@@ -1686,7 +795,12 @@ function buildMihomoConfig(nodes, opts = {}) {
     ];
     for (const rule of privateDirect) rules.push(rule);
     for (const r of extraRules) {
-      for (const converted of singboxRuleToClashRules(r)) rules.push(converted);
+      if (typeof r === 'string') {
+        const converted = clashRuleToMihomo(r, ruleOverrides, availableRuleProviders, availableTargets);
+        if (converted && !/^MATCH,/i.test(converted)) rules.push(converted);
+        continue;
+      }
+      for (const converted of routeObjectToClashRules(r)) rules.push(converted);
     }
     for (const raw of flattenClashRules(clashRules)) {
       if (raw && typeof raw === 'object' && raw.logical === 'AND') {
@@ -1700,7 +814,7 @@ function buildMihomoConfig(nodes, opts = {}) {
       else if (rule) rules.push(rule);
     }
     // CN direct fallback, after subscription rules and before MATCH — same
-    // relative order as sing-box's geoip-cn/geosite-cn rule.
+    // relative order as the remaining subscription rules.
     if (hasGeoData) rules.push('GEOIP,CN,DIRECT');
     rules.push(finalRule);
   }
@@ -1743,22 +857,41 @@ function buildMihomoConfig(nodes, opts = {}) {
     ],
     rules,
   };
-  if (enableTun) {
-    // TUN captures the system's port 53 traffic, so Mihomo's DNS module must
-    // answer it. Resolve proxy server hostnames through the local resolver to
-    // avoid a bootstrap loop, while regular queries follow the proxy rules.
+  if (enableDnsOverride) {
+    // Resolve proxy server hostnames through the local resolver to avoid a
+    // bootstrap loop, while regular queries follow the proxy rules.
     config.dns = {
       enable: true,
       ipv6: !!enableIpv6,
-      'enhanced-mode': 'fake-ip',
-      'fake-ip-range': '198.18.0.1/16',
-      'fake-ip-filter': ['*.lan', '*.local', 'localhost', 'localhost.*'],
+      'enhanced-mode': enableTun ? 'fake-ip' : 'redir-host',
+      ...(enableTun ? {
+        'fake-ip-range': '198.18.0.1/16',
+        'fake-ip-filter': ['*.lan', '*.local', 'localhost', 'localhost.*'],
+      } : {}),
       'default-nameserver': ['223.5.5.5', '1.1.1.1'],
       nameserver: [dnsRemote],
       'proxy-server-nameserver': [dnsLocal],
       'direct-nameserver': [dnsLocal],
       'respect-rules': true,
     };
+  } else {
+    // A TUN adapter's synthetic Windows DNS address cannot safely delegate
+    // back to `system` without recursion. Pure system-proxy mode can retain the
+    // system resolver; TUN mode instead uses the configured direct resolver.
+    const defaultResolver = enableTun ? dnsLocal : 'system';
+    config.dns = {
+      enable: true,
+      ipv6: !!enableIpv6,
+      'enhanced-mode': 'redir-host',
+      'use-hosts': true,
+      'use-system-hosts': true,
+      'default-nameserver': ['223.5.5.5', '1.1.1.1'],
+      nameserver: [defaultResolver],
+      'proxy-server-nameserver': [dnsLocal],
+      'direct-nameserver': [defaultResolver],
+    };
+  }
+  if (enableTun) {
     config.tun = {
       enable: true,
       ...(tunInterfaceName ? { device: tunInterfaceName } : {}),
@@ -1767,6 +900,8 @@ function buildMihomoConfig(nodes, opts = {}) {
       'auto-route': true,
       'strict-route': true,
       'auto-detect-interface': true,
+      // strict-route blocks Windows' alternate DNS paths. Feed both UDP and
+      // TCP DNS into Mihomo even when custom DNS override is disabled.
       'dns-hijack': ['any:53', 'tcp://any:53'],
     };
   }
@@ -1785,23 +920,16 @@ module.exports = {
   SMART_GROUP,
   APP_PROXY_GROUP,
   coreSupportsKernelSmart,
-  buildSingboxSmartGroup,
   buildMihomoSmartGroup,
   prepareSourcePolicyGroups,
   applySourceGroupSelections,
   sourceGroupPickOptions,
   sourcePicksForWiredGroup,
-  nodeToOutbound,
   nodeToClashProxy,
-  buildSingboxConfig,
   buildMihomoConfig,
-  buildRoute,
-  clashRulesToSingbox,
   extractRuleGroups,
   extractRuleSetRefs,
-  extractGeoCategories,
   parseRuleList,
-  dnsServerFromAddress,
-  singboxRuleToClashRules,
-  ruleListToSingboxRule,
+  routeObjectToClashRules,
+  ruleListToClashRules,
 };

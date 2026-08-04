@@ -13,6 +13,38 @@
     );
   }
 
+  function settingsCandidate() {
+    return {
+      mixedPort: parseInt($('#setMixedPort').value, 10),
+      clashApiPort: parseInt($('#setClashPort').value, 10),
+      logLevel: $('#setLogLevel').value,
+      autoSetSystemProxy: $('#setAutoProxy').checked,
+      autoLaunch: $('#setAutoLaunch').checked,
+      silentStart: $('#setSilentStart').checked,
+      notifications: $('#setNotifications').checked,
+      enableIpv6: $('#setIpv6').checked,
+      useBuiltinRules: $('#setBuiltinRules').checked,
+      testUrl: $('#setTestUrl').value.trim(),
+      language: $('#setLanguage').value,
+      smartMode: $('#setSmartMode').value,
+      enableDnsOverride: $('#setDnsOverride').checked,
+      dnsRemote: $('#setDnsRemote').value.trim(),
+      dnsLocal: $('#setDnsLocal').value.trim(),
+      dnsStrategy: $('#setDnsStrategy').value,
+    };
+  }
+
+  function updateDirtyState() {
+    const dirty = Object.keys(changedSettingsPatch(settingsCandidate())).length > 0;
+    const bar = $('.settings-savebar');
+    const label = $('#settingsDirtyState');
+    const button = $('#saveAllSettings');
+    if (bar) bar.classList.toggle('is-dirty', dirty);
+    if (label) label.textContent = t(dirty ? 'settings.unsaved' : 'settings.allSaved');
+    if (button) button.disabled = !dirty;
+    return dirty;
+  }
+
   async function persistChangedSettings(candidate, button) {
     const patch = changedSettingsPatch(candidate);
     if (!Object.keys(patch).length) {
@@ -45,6 +77,13 @@
     return true;
   }
 
+  function syncDnsOverrideControls(enabled) {
+    for (const selector of ['#setDnsRemote', '#setDnsLocal', '#setDnsStrategy']) {
+      const control = $(selector);
+      if (control) control.disabled = !enabled;
+    }
+  }
+
   function renderSettings() {
     const s = App.state.settings || {};
     let changed = false;
@@ -60,10 +99,11 @@
     changed = setFieldValue($('#setTestUrl'), s.testUrl || '') || changed;
     changed = setFieldValue($('#setSmartMode'), s.smartMode || 'balanced') || changed;
     changed = setFieldValue($('#setLanguage'), s.language || 'zh') || changed;
+    changed = setFieldValue($('#setDnsOverride'), !!s.enableDnsOverride, true) || changed;
     changed = setFieldValue($('#setDnsRemote'), s.dnsRemote || '') || changed;
     changed = setFieldValue($('#setDnsLocal'), s.dnsLocal || '') || changed;
     changed = setFieldValue($('#setDnsStrategy'), s.dnsStrategy || 'prefer_ipv4') || changed;
-    changed = setFieldValue($('#setCoreType'), s.coreType || 'sing-box') || changed;
+    syncDnsOverrideControls(!!s.enableDnsOverride);
     const smartRegions = Array.isArray(s.smartRegions) ? s.smartRegions : [];
     const smartRegionsSummary = $('#smartRegionsSummary');
     if (smartRegionsSummary) {
@@ -73,13 +113,14 @@
     }
     // Enhanced selects only need a refresh when an underlying value actually moved.
     if (changed && App.refreshSelects && App.currentTab === 'settings') App.refreshSelects();
+    updateDirtyState();
   }
 
   // Pure render of the core-status label from a status object.
   function renderCoreStatus(st) {
     const el = $('#coreStatus');
     if (!el || !st) return;
-    const coreName = st.coreName || st.coreType || (App.state.settings && App.state.settings.coreType) || 'sing-box';
+    const coreName = st.coreName || 'Mihomo';
     if (st.coreInstalled) {
       const ver = st.coreVersion
         ? 'v' + st.coreVersion
@@ -129,26 +170,27 @@
     } catch (_) {
       App.setLanguage(previous);
       App.patchSettings({ language: previous });
+    } finally {
+      updateDirtyState();
     }
   });
-  $('#saveSettings').addEventListener('click', async (event) => {
-    const candidate = {
-      mixedPort: parseInt($('#setMixedPort').value, 10),
-      clashApiPort: parseInt($('#setClashPort').value, 10),
-      logLevel: $('#setLogLevel').value,
-      autoSetSystemProxy: $('#setAutoProxy').checked,
-      autoLaunch: $('#setAutoLaunch').checked,
-      silentStart: $('#setSilentStart').checked,
-      notifications: $('#setNotifications').checked,
-      enableIpv6: $('#setIpv6').checked,
-      useBuiltinRules: $('#setBuiltinRules').checked,
-      testUrl: $('#setTestUrl').value.trim(),
-      language: $('#setLanguage').value,
-    };
+
+  $('#setDnsOverride').addEventListener('change', (event) => {
+    syncDnsOverrideControls(event.currentTarget.checked);
+    if (App.refreshSelects) App.refreshSelects();
+  });
+
+  $('#tab-settings').addEventListener('input', updateDirtyState);
+  $('#tab-settings').addEventListener('change', updateDirtyState);
+
+  $('#saveAllSettings').addEventListener('click', async (event) => {
     try {
-      const patch = await persistChangedSettings(candidate, event.currentTarget);
+      const patch = await persistChangedSettings(settingsCandidate(), event.currentTarget);
       if (patch && 'useBuiltinRules' in patch && App.invalidateRuleCaches) App.invalidateRuleCaches();
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      updateDirtyState();
+    }
   });
   $('#checkConfigBtn').addEventListener('click', async () => {
     try {
@@ -157,28 +199,8 @@
     } catch (_) {}
   });
 
-  $('#saveFeatures').addEventListener('click', async (event) => {
-    try {
-      await persistChangedSettings(
-        { smartMode: $('#setSmartMode').value },
-        event.currentTarget
-      );
-    } catch (_) {}
-  });
-
-  // Save DNS settings.
-  $('#saveDns').addEventListener('click', async (event) => {
-    const candidate = {
-      dnsRemote: $('#setDnsRemote').value.trim(),
-      dnsLocal: $('#setDnsLocal').value.trim(),
-      dnsStrategy: $('#setDnsStrategy').value,
-    };
-    try {
-      await persistChangedSettings(candidate, event.currentTarget);
-    } catch (_) {}
-  });
-
   $('#coreManageBtn').addEventListener('click', () => App.openDialog('core'));
+  $('#geoManageBtn').addEventListener('click', () => App.openDialog('geodata'));
   $('#smartRegionsBtn').addEventListener('click', () => App.openDialog('smart-regions'));
 
   // Open the project homepage.

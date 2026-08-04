@@ -11,13 +11,17 @@
     <!-- Sets data-theme before the stylesheet loads, so first paint matches the
          saved theme (no dark→light flash). Must precede the stylesheet link. -->
     <script src="theme-init.js"></script>
-    <link rel="stylesheet" href="style.css?v=50" />
-    <link rel="stylesheet" href="styles/surfaces.css?v=1" />
+    <link rel="stylesheet" href="style.css?v=51" />
+    <link rel="stylesheet" href="styles/surfaces.css?v=3" />
+    <link rel="stylesheet" href="styles/dashboard.css?v=1" />
     <link rel="stylesheet" href="styles/controls.css?v=1" />
-    <link rel="stylesheet" href="styles/lists.css?v=1" />
-    <link rel="stylesheet" href="styles/workspaces.css?v=2" />
+    <link rel="stylesheet" href="styles/lists.css?v=3" />
+    <link rel="stylesheet" href="styles/workspaces.css?v=11" />
+    <link rel="stylesheet" href="styles/logs.css?v=1" />
+    <link rel="stylesheet" href="styles/configs.css?v=1" />
     <link rel="stylesheet" href="styles/tools.css?v=1" />
-    <link rel="stylesheet" href="styles/motion.css?v=1" />
+    <link rel="stylesheet" href="styles/motion.css?v=3" />
+    <link rel="stylesheet" href="styles/polish.css?v=3" />
   </head>
   <body>
     <div class="app">
@@ -98,7 +102,7 @@
           <div class="runtime-strip">
             <div class="runtime-item">
               <span data-i18n="settings.currentCore">当前运行内核</span>
-              <b id="topCore">sing-box</b>
+              <b id="topCore">Mihomo</b>
             </div>
             <div class="runtime-item runtime-profile">
               <span data-i18n="subs.title">配置</span>
@@ -109,7 +113,7 @@
         </header>
 
         <!-- Main content -->
-        <main class="content">
+        <main class="content" id="mainContent">
         <!-- Dashboard -->
         <section class="tab active" id="tab-dashboard" role="tabpanel" aria-labelledby="nav-dashboard" tabindex="-1">
           <h1 data-i18n="dash.title">概览</h1>
@@ -124,15 +128,21 @@
               <div class="card-value" id="dashProxy">-</div>
               <div class="card-hint" data-i18n="dash.tapToggle">点击切换</div>
             </button>
-            <button type="button" class="card card-action" id="dashNodeCard" data-dash-action="nodes" title="">
-              <div class="card-label" data-i18n="dash.currentNode">当前节点</div>
-              <div class="card-value" id="dashNode">-</div>
-              <div class="card-hint" data-i18n="dash.tapNodes">查看节点</div>
-            </button>
-            <button type="button" class="card card-action" id="dashDelayCard" data-dash-action="testDelay" title="">
-              <div class="card-label" data-i18n="dash.latency">延迟</div>
-              <div class="card-value" id="dashDelay">-</div>
-              <div class="card-hint" data-i18n="dash.tapTest">点击测速</div>
+            <div class="card card-route" id="dashNodeCard">
+              <button type="button" class="card-route-main" data-dash-action="nodes" title="">
+                <span class="card-label" data-i18n="dash.currentRoute">当前路由</span>
+                <span class="card-value" id="dashNode">-</span>
+                <span class="card-hint" data-i18n="dash.tapNodes">查看节点</span>
+              </button>
+              <button type="button" class="route-delay" id="dashDelayCard" data-dash-action="testDelay" title="">
+                <span data-i18n="dash.latency">延迟</span>
+                <strong id="dashDelay">-</strong>
+              </button>
+            </div>
+            <button type="button" class="card card-action" id="dashConnectionsCard" data-dash-action="connections" title="">
+              <div class="card-label" data-i18n="dash.activeConnections">活动连接</div>
+              <div class="card-value" id="dashConnections">0</div>
+              <div class="card-hint" data-i18n="dash.tapConnections">查看连接</div>
             </button>
           </div>
 
@@ -140,8 +150,8 @@
             <div class="traffic-head">
               <h2 data-i18n="dash.traffic">实时流量</h2>
               <div class="traffic-now">
-                <span class="traffic-stat down"><span class="dot"></span><span data-i18n="dash.down">下载</span> <b id="trafficDown">0 B/s</b></span>
-                <span class="traffic-stat up"><span class="dot"></span><span data-i18n="dash.up">上传</span> <b id="trafficUp">0 B/s</b></span>
+                <button type="button" id="trafficDownToggle" class="traffic-stat down" aria-pressed="true"><span class="dot"></span><span data-i18n="dash.down">下载</span> <b id="trafficDown">0 B/s</b></button>
+                <button type="button" id="trafficUpToggle" class="traffic-stat up" aria-pressed="true"><span class="dot"></span><span data-i18n="dash.up">上传</span> <b id="trafficUp">0 B/s</b></button>
               </div>
             </div>
             <canvas id="trafficChart" class="traffic-chart" height="120" role="img" data-i18n-aria-label="dash.trafficChartLabel"></canvas>
@@ -177,12 +187,89 @@
               <div id="usageList"></div>
             </div>
           </div>
+
+          <div class="dashboard-insights">
+            <section class="panel dashboard-quick" aria-labelledby="quickTitle">
+              <div class="dashboard-panel-head">
+                <div>
+                  <h2 id="quickTitle" data-i18n="dash.quickActions">快速操作</h2>
+                  <p class="dashboard-panel-subtitle" data-i18n="dash.quickActionsHint">常用维护与诊断入口</p>
+                </div>
+              </div>
+              <div class="dashboard-action-grid">
+                <button id="dashTestAll" class="dashboard-action" type="button" data-icon="speed">
+                  <span data-i18n="nodes.testAll">全部测速</span>
+                </button>
+                <button id="dashUpdateProfile" class="dashboard-action" type="button" data-icon="refresh">
+                  <span data-i18n="dash.updateProfile">更新当前配置</span>
+                </button>
+                <button id="dashDiagnostics" class="dashboard-action" type="button" data-icon="diagnostics">
+                  <span data-i18n="dash.runDiagnostics">网络诊断</span>
+                </button>
+                <button id="dashOpenPanel" class="dashboard-action" type="button" data-icon="panel">
+                  <span data-i18n="dash.openPanel">打开控制面板</span>
+                </button>
+              </div>
+            </section>
+
+            <section class="panel dashboard-quality" aria-labelledby="qualityTitle">
+              <div class="dashboard-panel-head">
+                <div>
+                  <h2 id="qualityTitle" data-i18n="dash.networkQuality">网络质量</h2>
+                  <p class="dashboard-panel-subtitle" data-i18n="dash.networkQualityHint">基于当前延迟与已测速节点生成</p>
+                </div>
+                <span id="qualityBadge" class="quality-badge is-unknown" data-i18n="dash.qualityUnknown">等待数据</span>
+              </div>
+              <div class="quality-metrics">
+                <div class="quality-metric">
+                  <span data-i18n="dash.currentLatency">当前延迟</span>
+                  <strong id="qualityLatency">—</strong>
+                </div>
+                <div class="quality-metric">
+                  <span data-i18n="dash.measuredNodes">已测速</span>
+                  <strong id="qualityMeasured">0</strong>
+                </div>
+                <div class="quality-metric">
+                  <span data-i18n="dash.healthyNodes">可用节点</span>
+                  <strong id="qualityHealthy">0</strong>
+                </div>
+                <div class="quality-metric">
+                  <span data-i18n="dash.activeMode">当前模式</span>
+                  <strong id="qualityMode">—</strong>
+                </div>
+              </div>
+            </section>
+
+            <section class="panel dashboard-events" aria-labelledby="eventsTitle">
+              <div class="dashboard-panel-head">
+                <div>
+                  <h2 id="eventsTitle" data-i18n="dash.recentEvents">运行事件</h2>
+                  <p class="dashboard-panel-subtitle" data-i18n="dash.recentEventsHint">最近的重要状态与异常记录</p>
+                </div>
+                <button id="dashViewLogs" class="btn compact" type="button" data-i18n="dash.viewLogs">查看日志</button>
+              </div>
+              <div id="dashboardEventList" class="dashboard-event-list" aria-live="polite">
+                <p class="dashboard-empty" data-i18n="dash.noEvents">暂无重要事件</p>
+              </div>
+            </section>
+          </div>
         </section>
 
         <!-- Rules -->
         <section class="tab canvas-page" id="tab-rules" role="tabpanel" aria-labelledby="nav-rules" tabindex="-1" hidden>
           <h1 data-i18n="nav.rules">规则</h1>
-          <div class="workspace-section">
+          <div class="workspace-section rule-browser-section">
+            <div class="row">
+              <h2 data-i18n="rules.current">当前生效规则</h2>
+              <label class="sr-only" for="ruleFilter" data-i18n="rules.searchPh">搜索规则...</label>
+              <input id="ruleFilter" class="input grow" data-i18n-ph="rules.searchPh" />
+              <span class="hint" id="ruleCount"></span>
+              <button id="ruleRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
+            </div>
+            <p class="hint" data-i18n="rules.hint"></p>
+            <div id="ruleList" class="rule-list is-empty"></div>
+          </div>
+          <div class="workspace-section rule-compact-section">
             <div class="row">
               <h2 data-i18n="rulegroups.section">策略组</h2>
               <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
@@ -190,7 +277,7 @@
             <p class="hint" data-i18n="rulegroups.hint"></p>
             <div id="ruleGroupList" class="sub-list"></div>
           </div>
-          <div class="workspace-section">
+          <div class="workspace-section rule-compact-section">
             <div class="row">
               <h2 data-i18n="localrules.section">本地规则</h2>
               <button id="lrAdd" class="btn primary" data-i18n="localrules.add">添加本地规则</button>
@@ -198,16 +285,14 @@
             <p class="hint" data-i18n="localrules.hint"></p>
             <div id="lrList" class="sub-list"></div>
           </div>
-          <div class="workspace-section">
+          <div class="workspace-section rule-remote-section">
             <h2 data-i18n="customrs.title">远程规则</h2>
             <p class="hint section-intro" data-i18n="customrs.hint"></p>
-            <div class="form-row">
+            <div class="form-row remote-rule-form">
               <label class="sr-only" for="crsName" data-i18n="customrs.namePh">名称</label>
               <input id="crsName" class="input" data-i18n-ph="customrs.namePh" />
               <label class="sr-only" for="crsUrl" data-i18n="customrs.urlPh">远程规则链接</label>
               <input id="crsUrl" class="input grow" data-i18n-ph="customrs.urlPh" />
-            </div>
-            <div class="form-row">
               <label class="sr-only" for="crsTarget" data-i18n="localrules.target">目标</label>
               <select id="crsTarget" class="input small">
                 <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
@@ -218,47 +303,38 @@
             </div>
             <div id="crsList" class="sub-list"></div>
           </div>
-          <div class="workspace-section">
-            <div class="row">
-              <label class="sr-only" for="ruleFilter" data-i18n="rules.searchPh">搜索规则...</label>
-              <input id="ruleFilter" class="input grow" data-i18n-ph="rules.searchPh" />
-              <span class="hint" id="ruleCount"></span>
-              <button id="ruleRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
-            </div>
-            <p class="hint" data-i18n="rules.hint"></p>
-            <div id="ruleList" class="rule-list"></div>
-          </div>
         </section>
 
         <!-- Connections -->
         <section class="tab live-workspace" id="tab-conns" role="tabpanel" aria-labelledby="nav-conns" tabindex="-1" hidden>
           <h1 data-i18n="nav.conns">连接</h1>
-          <div class="row workspace-commandbar">
-            <span class="hint grow" id="connStats"></span>
-            <button id="connClose" class="btn danger" data-i18n="conns.closeAll">关闭全部</button>
+          <div class="live-data-surface">
+            <div class="row workspace-commandbar">
+              <span class="commandbar-status grow" id="connStats"></span>
+              <button id="connClose" class="btn danger" data-i18n="conns.closeAll">关闭全部</button>
+            </div>
+            <div id="connList" class="conn-list" role="list" data-i18n-aria-label="nav.conns"></div>
           </div>
-          <div id="connList" class="conn-list" role="list" data-i18n-aria-label="nav.conns"></div>
         </section>
 
         <!-- Subscriptions -->
         <section class="tab canvas-page" id="tab-subs" role="tabpanel" aria-labelledby="nav-subs" tabindex="-1" hidden>
           <h1 data-i18n="subs.title">配置</h1>
-          <div class="workspace-section">
-            <h2 data-i18n="subs.add">添加配置</h2>
-            <div class="form-row">
-              <label class="sr-only" for="subName" data-i18n="subs.namePh">名称（可选）</label>
-              <input id="subName" class="input" data-i18n-ph="subs.namePh" />
-              <label class="sr-only" for="subUrl" data-i18n="subs.urlPh">配置链接</label>
-              <input id="subUrl" class="input grow" data-i18n-ph="subs.urlPh" />
-              <label class="sr-only" for="subUserAgent" data-i18n="subs.userAgent">请求 UA</label>
-              <select id="subUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
-                <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
-                <option value="clash" data-i18n="subs.userAgentClash">Clash（Mihomo）</option>
-              </select>
+          <div class="workspace-section config-add-section">
+            <div class="config-section-head">
+              <h2 data-i18n="subs.add">添加配置</h2>
+            </div>
+            <div class="form-row subscription-add-form">
+              <div class="config-field config-name-field">
+                <label for="subName" data-i18n="subs.namePh">名称（可选）</label>
+                <input id="subName" class="input" data-i18n-ph="subs.namePh" />
+              </div>
+              <div class="config-field config-url-field">
+                <label for="subUrl" data-i18n="subs.urlPh">配置链接</label>
+                <input id="subUrl" class="input" data-i18n-ph="subs.urlPh" />
+              </div>
               <button id="subAddBtn" class="btn primary" data-i18n="subs.addBtn">添加</button>
             </div>
-            <p class="hint" data-i18n="subs.hint"></p>
           </div>
           <div class="workspace-section hidden" id="subEditPanel">
             <h2 data-i18n="subs.editTitle">编辑配置</h2>
@@ -283,14 +359,6 @@
               </select>
             </div>
             <div class="setting-row">
-              <label for="editUserAgent" data-i18n="subs.userAgent">请求 UA</label>
-              <select id="editUserAgent" class="input small">
-                <option value="auto" data-i18n="subs.userAgentAuto">自动（跟随内核）</option>
-                <option value="sing-box" data-i18n="subs.userAgentSingbox">sing-box</option>
-                <option value="clash" data-i18n="subs.userAgentClash">Clash（Mihomo）</option>
-              </select>
-            </div>
-            <div class="setting-row">
               <label class="setting-label" for="editViaProxy">
                 <span data-i18n="subs.viaProxy">通过代理更新</span>
                 <span class="hint" data-i18n="subs.viaProxyHint"></span>
@@ -302,8 +370,13 @@
               <button id="editCancel" class="btn" data-i18n="subs.editCancel">取消</button>
             </div>
           </div>
-          <div class="workspace-section">
-            <h2 data-i18n="subs.listTitle">配置列表</h2>
+          <div class="workspace-section workspace-list-section">
+            <div class="config-section-head config-list-head">
+              <div>
+                <h2 data-i18n="subs.listTitle">配置列表</h2>
+                <p id="subListSummary" class="hint"></p>
+              </div>
+            </div>
             <div id="subList" class="sub-list"></div>
           </div>
         </section>
@@ -311,108 +384,114 @@
         <!-- Nodes -->
         <section class="tab live-workspace" id="tab-nodes" role="tabpanel" aria-labelledby="nav-nodes" tabindex="-1" hidden>
           <h1 data-i18n="nodes.title">节点</h1>
-          <div class="form-row workspace-commandbar">
-            <label class="sr-only" for="nodeFilter" data-i18n="nodes.searchPh">搜索节点...</label>
-            <input id="nodeFilter" class="input grow" data-i18n-ph="nodes.searchPh" />
-            <button id="testAllBtn" class="btn" data-i18n="nodes.testAll">全部测速</button>
-            <span class="hint" id="nodeCount"></span>
+          <div class="live-data-surface">
+            <div class="form-row workspace-commandbar">
+              <label class="sr-only" for="nodeFilter" data-i18n="nodes.searchPh">搜索节点...</label>
+              <input id="nodeFilter" class="input grow" data-i18n-ph="nodes.searchPh" />
+              <span class="commandbar-count" id="nodeCount"></span>
+              <button id="testAllBtn" class="btn" data-i18n="nodes.testAll">全部测速</button>
+            </div>
+            <button id="smartRegionScope" class="smart-scope-bar" type="button" aria-haspopup="dialog" hidden>
+              <span class="smart-scope-copy">
+                <span class="smart-scope-label" data-i18n="nodes.smartScope">Smart 候选范围</span>
+                <strong id="smartRegionScopeValue"></strong>
+              </span>
+              <span class="smart-scope-action" data-i18n="nodes.smartScopeChange">更改</span>
+            </button>
+            <div id="nodeList" class="node-list" role="list" data-i18n-aria-label="nodes.title"></div>
           </div>
-          <button id="smartRegionScope" class="smart-scope-bar" type="button" aria-haspopup="dialog" hidden>
-            <span class="smart-scope-copy">
-              <span class="smart-scope-label" data-i18n="nodes.smartScope">Smart 候选范围</span>
-              <strong id="smartRegionScopeValue"></strong>
-            </span>
-            <span class="smart-scope-action" data-i18n="nodes.smartScopeChange">更改</span>
-          </button>
-          <div id="nodeList" class="node-list" role="list" data-i18n-aria-label="nodes.title"></div>
         </section>
 
         <!-- Tools -->
         <section class="tab canvas-page" id="tab-tools" role="tabpanel" aria-labelledby="nav-tools" tabindex="-1" hidden>
           <h1 data-i18n="tools.title">工具</h1>
-          <div class="tool-list">
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolPanelLabel" data-i18n="dash.openPanel">打开控制面板</span>
-                <span class="hint" data-i18n="tools.panelHint">在浏览器中打开内核自带的 Web 面板</span>
+          <div class="tool-groups">
+            <section class="tool-group" aria-labelledby="toolGroupDiagnostics">
+              <div class="tool-group-head">
+                <h2 id="toolGroupDiagnostics" data-i18n="tools.groupDiagnostics">常用诊断</h2>
+                <p data-i18n="tools.groupDiagnosticsHint">诊断代理、路由与网络状态。</p>
               </div>
-              <button id="openPanelBtn" class="btn" aria-labelledby="toolPanelLabel openPanelBtn" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolUwpLabel" data-i18n="uwp.title">UWP 回环豁免</span>
-                <span class="hint" data-i18n="uwp.rowHint"></span>
+              <div class="tool-list">
+                <div class="setting-row tool-card" data-tool="diagnostics">
+                  <div class="setting-label"><span id="toolDiagLabel" data-i18n="toolbox.diagTitle">一键网络诊断</span><span class="hint" data-i18n="toolbox.diagRowHint"></span></div>
+                  <button id="diagOpen" class="btn" aria-labelledby="toolDiagLabel diagOpen" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="route">
+                  <div class="setting-label"><span id="toolRouteLabel" data-i18n="toolbox.routeTitle">路由检查器</span><span class="hint" data-i18n="toolbox.routeRowHint"></span></div>
+                  <button id="routeOpen" class="btn" aria-labelledby="toolRouteLabel routeOpen" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="dns">
+                  <div class="setting-label"><span id="toolDnsLabel" data-i18n="toolbox.dnsTitle">DNS 对比</span><span class="hint" data-i18n="toolbox.dnsRowHint"></span></div>
+                  <button id="dnsOpen" class="btn" aria-labelledby="toolDnsLabel dnsOpen" data-i18n="tools.open">打开</button>
+                </div>
               </div>
-              <button id="uwpOpen" class="btn" aria-labelledby="toolUwpLabel uwpOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolConvertLabel" data-i18n="tools.convert">配置转换</span>
-                <span class="hint" data-i18n="tools.convertHint"></span>
+            </section>
+            <section class="tool-group" aria-labelledby="toolGroupConfig">
+              <div class="tool-group-head">
+                <h2 id="toolGroupConfig" data-i18n="tools.groupConfig">配置维护</h2>
+                <p data-i18n="tools.groupConfigHint">检查和备份应用配置。</p>
               </div>
-              <button id="convertOpen" class="btn" aria-labelledby="toolConvertLabel convertOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolRouteLabel" data-i18n="toolbox.routeTitle">路由检查器</span>
-                <span class="hint" data-i18n="toolbox.routeRowHint"></span>
+              <div class="tool-list tool-list-two">
+                <div class="setting-row tool-card" data-tool="config">
+                  <div class="setting-label"><span id="toolConfigLabel" data-i18n="toolbox.configTitle">配置检查器</span><span class="hint" data-i18n="toolbox.configRowHint"></span></div>
+                  <button id="configCheckOpen" class="btn" aria-labelledby="toolConfigLabel configCheckOpen" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="backup">
+                  <div class="setting-label"><span id="toolBackupLabel" data-i18n="toolbox.backupTitle">备份与恢复</span><span class="hint" data-i18n="toolbox.backupRowHint"></span></div>
+                  <button id="backupOpen" class="btn" aria-labelledby="toolBackupLabel backupOpen" data-i18n="tools.open">打开</button>
+                </div>
               </div>
-              <button id="routeOpen" class="btn" aria-labelledby="toolRouteLabel routeOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolDiagLabel" data-i18n="toolbox.diagTitle">一键网络诊断</span>
-                <span class="hint" data-i18n="toolbox.diagRowHint"></span>
+            </section>
+            <section class="tool-group" aria-labelledby="toolGroupSystem">
+              <div class="tool-group-head">
+                <h2 id="toolGroupSystem" data-i18n="tools.groupSystem">系统工具</h2>
+                <p data-i18n="tools.groupSystemHint">管理内核面板与 Windows 网络功能。</p>
               </div>
-              <button id="diagOpen" class="btn" aria-labelledby="toolDiagLabel diagOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolConfigLabel" data-i18n="toolbox.configTitle">配置检查器</span>
-                <span class="hint" data-i18n="toolbox.configRowHint"></span>
+              <div class="tool-list">
+                <div class="setting-row tool-card" data-tool="port">
+                  <div class="setting-label"><span id="toolPortLabel" data-i18n="toolbox.portTitle">端口检查</span><span class="hint" data-i18n="toolbox.portRowHint"></span></div>
+                  <button id="portOpen" class="btn" aria-labelledby="toolPortLabel portOpen" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="panel">
+                  <div class="setting-label"><span id="toolPanelLabel" data-i18n="dash.openPanel">打开控制面板</span><span class="hint" data-i18n="tools.panelHint">在浏览器中打开内核 Web 面板。</span></div>
+                  <button id="openPanelBtn" class="btn" aria-labelledby="toolPanelLabel openPanelBtn" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="uwp">
+                  <div class="setting-label"><span id="toolUwpLabel" data-i18n="uwp.title">UWP 回环豁免</span><span class="hint" data-i18n="uwp.rowHint"></span></div>
+                  <button id="uwpOpen" class="btn" aria-labelledby="toolUwpLabel uwpOpen" data-i18n="tools.open">打开</button>
+                </div>
               </div>
-              <button id="configCheckOpen" class="btn" aria-labelledby="toolConfigLabel configCheckOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolPortLabel" data-i18n="toolbox.portTitle">端口检查</span>
-                <span class="hint" data-i18n="toolbox.portRowHint"></span>
-              </div>
-              <button id="portOpen" class="btn" aria-labelledby="toolPortLabel portOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolBackupLabel" data-i18n="toolbox.backupTitle">备份与恢复</span>
-                <span class="hint" data-i18n="toolbox.backupRowHint"></span>
-              </div>
-              <button id="backupOpen" class="btn" aria-labelledby="toolBackupLabel backupOpen" data-i18n="tools.open">打开</button>
-            </div>
-            <div class="setting-row">
-              <div class="setting-label">
-                <span id="toolDnsLabel" data-i18n="toolbox.dnsTitle">DNS 对比</span>
-                <span class="hint" data-i18n="toolbox.dnsRowHint"></span>
-              </div>
-              <button id="dnsOpen" class="btn" aria-labelledby="toolDnsLabel dnsOpen" data-i18n="tools.open">打开</button>
-            </div>
+            </section>
           </div>
         </section>
 
         <!-- Logs -->
         <section class="tab live-workspace" id="tab-logs" role="tabpanel" aria-labelledby="nav-logs" tabindex="-1" hidden>
           <h1 data-i18n="logs.title">日志</h1>
-          <div class="row workspace-commandbar">
-            <button id="logClear" class="btn" data-i18n="logs.clear">清空</button>
-            <label class="check"><input type="checkbox" id="logAutoScroll" checked /> <span data-i18n="logs.autoScroll">自动滚动</span></label>
+          <div class="log-workspace-surface live-data-surface">
+            <div class="row workspace-commandbar">
+              <span class="commandbar-status grow" data-i18n="logs.live">实时日志</span>
+              <div class="log-level-filter" role="group" data-i18n-aria-label="logs.filterLabel" aria-label="日志级别">
+                <button class="log-level-btn active" type="button" data-log-level="all" aria-pressed="true" data-i18n="logs.levelAll">全部</button>
+                <button class="log-level-btn" type="button" data-log-level="debug" aria-pressed="false" data-i18n="logs.levelDebug">Debug</button>
+                <button class="log-level-btn" type="button" data-log-level="info" aria-pressed="false" data-i18n="logs.levelInfo">Info</button>
+                <button class="log-level-btn" type="button" data-log-level="warning" aria-pressed="false" data-i18n="logs.levelWarning">Warning</button>
+                <button class="log-level-btn" type="button" data-log-level="error" aria-pressed="false" data-i18n="logs.levelError">Error</button>
+              </div>
+              <label class="check"><input type="checkbox" id="logAutoScroll" checked /> <span data-i18n="logs.autoScroll">自动滚动</span></label>
+              <button id="logClear" class="btn" data-i18n="logs.clear">清空</button>
+            </div>
+            <pre id="logBox" class="log-box" data-i18n-aria-label="logs.title"></pre>
           </div>
-          <pre id="logBox" class="log-box" data-i18n-aria-label="logs.title"></pre>
         </section>
 
         <!-- Settings -->
         <section class="tab" id="tab-settings" role="tabpanel" aria-labelledby="nav-settings" tabindex="-1" hidden>
           <h1 data-i18n="settings.title">设置</h1>
           <div class="settings-column">
-          <div class="panel">
+          <div class="panel core-settings-panel">
             <h2 data-i18n="settings.coreSection">内核</h2>
+            <p class="hint settings-section-hint" data-i18n="settings.coreHint">管理运行内核与 GeoData 资源。</p>
             <div class="setting-row">
               <div class="setting-label">
                 <span data-i18n="settings.currentCore">当前运行内核</span>
@@ -431,6 +510,7 @@
 
           <div class="panel">
             <h2 data-i18n="settings.general">常规</h2>
+            <p class="hint settings-section-hint" data-i18n="settings.generalHint">设置应用行为、端口与启动选项。</p>
             <div class="setting-row">
               <label for="setLanguage" data-i18n="settings.language">界面语言</label>
               <select id="setLanguage" class="input small">
@@ -484,16 +564,13 @@
               <label for="setTestUrl" data-i18n="settings.testUrl">测速地址</label>
               <input id="setTestUrl" class="input" data-i18n-ph="settings.testUrlPh" />
             </div>
-            <div class="row save-row">
-              <button id="saveSettings" class="btn primary" data-i18n="settings.save">保存设置</button>
-              <button id="checkConfigBtn" class="btn" data-i18n="settings.check">校验当前配置</button>
-            </div>
           </div>
           </div>
 
           <div class="settings-column">
-          <div class="panel">
+          <div class="panel feature-settings-panel">
             <h2 data-i18n="settings.featuresSection">功能</h2>
+            <p class="hint settings-section-hint" data-i18n="settings.smartModeHint">调整 Smart 的切换速度与稳定性权重。</p>
             <div class="setting-row">
               <label for="setSmartMode" data-i18n="settings.smartMode">Smart 模式</label>
               <select id="setSmartMode" class="input small">
@@ -509,15 +586,15 @@
               </div>
               <button id="smartRegionsBtn" class="btn" data-i18n="settings.smartRegionsManage">选择地区</button>
             </div>
-            <p class="hint" data-i18n="settings.smartModeHint">调整 Smart 的切换速度与稳定性权重。</p>
-            <div class="row save-row">
-              <button id="saveFeatures" class="btn primary" data-i18n="settings.save">保存设置</button>
-            </div>
           </div>
 
           <div class="panel">
             <h2 data-i18n="settings.dnsSection">DNS</h2>
-            <p class="hint" data-i18n="settings.dnsHint"></p>
+            <p class="hint settings-section-hint" data-i18n="settings.dnsHint"></p>
+            <div class="setting-row">
+              <label for="setDnsOverride" data-i18n="settings.dnsOverride">覆写 DNS</label>
+              <input id="setDnsOverride" type="checkbox" />
+            </div>
             <div class="setting-row">
               <label for="setDnsRemote" data-i18n="settings.dnsRemote">远程 DNS（代理解析）</label>
               <input id="setDnsRemote" class="input" data-i18n-ph="settings.dnsRemotePh" />
@@ -535,13 +612,11 @@
                 <option value="ipv6_only">ipv6_only</option>
               </select>
             </div>
-            <div class="row save-row">
-              <button id="saveDns" class="btn primary" data-i18n="settings.save">保存设置</button>
-            </div>
           </div>
 
           <div class="panel">
             <h2 data-i18n="about.title">关于</h2>
+            <p class="hint settings-section-hint" data-i18n="about.hint">查看版本信息与项目入口。</p>
             <div class="setting-row">
               <div class="setting-label">
                 <span data-i18n="about.version">当前版本</span>
@@ -559,6 +634,16 @@
             </div>
           </div>
           </div>
+          <div class="settings-savebar">
+            <div class="settings-save-state">
+              <span class="settings-save-dot" aria-hidden="true"></span>
+              <span id="settingsDirtyState" data-i18n="settings.allSaved">所有设置均已保存</span>
+            </div>
+            <div class="row">
+              <button id="checkConfigBtn" class="btn" data-i18n="settings.check">校验当前配置</button>
+              <button id="saveAllSettings" class="btn primary" data-i18n="settings.save" disabled>保存设置</button>
+            </div>
+          </div>
         </section>
         </main>
       </div>
@@ -570,11 +655,14 @@
          it, feature modules attach their pieces, main.js (last) boots the app. -->
     <script src="i18n.js"></script>
     <script src="js/util.js"></script>
+    <script src="js/ui-state.js"></script>
+    <script src="js/ui.js"></script>
     <script src="js/window.js"></script>
     <script src="js/select.js"></script>
     <script src="js/charts.js"></script>
     <script src="js/dashboard.js"></script>
     <script src="js/updates.js"></script>
+    <script src="js/visual-fixtures.js"></script>
     <script src="js/main.js"></script>
   </body>
 </html>

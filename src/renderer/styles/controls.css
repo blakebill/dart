@@ -42,6 +42,20 @@ select:hover,
   border-color: var(--border-strong);
 }
 
+.input:disabled,
+.textarea:disabled,
+select:disabled {
+  cursor: not-allowed;
+  color: var(--text-dim);
+  opacity: 0.52;
+}
+
+.input:disabled:hover,
+.textarea:disabled:hover,
+select:disabled:hover {
+  border-color: var(--border);
+}
+
 .input:focus-visible,
 .textarea:focus-visible,
 select:focus-visible,

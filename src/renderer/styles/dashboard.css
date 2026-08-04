@@ -1,0 +1,275 @@
+/* Dashboard intelligence and action modules */
+.card-route {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.card-route-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.route-delay {
+  display: flex;
+  min-width: 86px;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 7px 10px;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--field) 72%, transparent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  transition: border-color var(--motion-standard), background-color var(--motion-standard);
+}
+
+.route-delay strong {
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.route-delay:hover {
+  border-color: color-mix(in srgb, var(--yellow) 40%, var(--border));
+  background: color-mix(in srgb, var(--yellow) 7%, var(--surface-hover));
+}
+
+.card-route-main:focus-visible,
+.route-delay:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.route-delay strong.delay-good { color: var(--green); }
+.route-delay strong.delay-mid { color: var(--yellow); }
+.route-delay strong.delay-bad { color: var(--red); }
+.route-delay strong.delay-testing { color: var(--text-dim); }
+
+.dashboard-insights {
+  display: grid;
+  grid-template-areas:
+    "quick quick"
+    "quality events";
+  grid-template-columns: minmax(320px, 0.85fr) minmax(460px, 1.15fr);
+  margin-top: 12px;
+  gap: 14px;
+  align-items: stretch;
+}
+
+.dashboard-insights > .panel {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.dashboard-panel-head {
+  display: flex;
+  min-height: 38px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.dashboard-panel-head h2 {
+  margin-bottom: 2px;
+}
+
+.dashboard-panel-subtitle {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.quality-badge {
+  flex: none;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  background: var(--field);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.quality-badge.is-good {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+  background: color-mix(in srgb, var(--green) 11%, var(--surface));
+}
+
+.quality-badge.is-fair {
+  color: var(--yellow);
+  border-color: color-mix(in srgb, var(--yellow) 35%, var(--border));
+  background: color-mix(in srgb, var(--yellow) 11%, var(--surface));
+}
+
+.quality-badge.is-poor,
+.quality-badge.is-offline {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+  background: color-mix(in srgb, var(--red) 10%, var(--surface));
+}
+
+.quality-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 14px;
+  gap: 8px;
+}
+
+.quality-metric {
+  min-width: 0;
+  padding: 11px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--field) 72%, transparent);
+}
+
+.quality-metric span,
+.quality-metric strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quality-metric span {
+  margin-bottom: 5px;
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.quality-metric strong {
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-action-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 0;
+  gap: 8px;
+}
+
+.dashboard-quick {
+  display: grid;
+  grid-area: quick;
+  grid-template-columns: minmax(180px, 0.55fr) minmax(0, 2.45fr);
+  align-items: center;
+  gap: 18px;
+}
+
+.dashboard-quality {
+  grid-area: quality;
+}
+
+.dashboard-action {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  padding: 8px 11px;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--field) 72%, transparent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.dashboard-action::before {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: none;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
+  font-size: 13px;
+}
+
+.dashboard-action[data-icon='speed']::before { content: "\E9D9"; }
+.dashboard-action[data-icon='refresh']::before { content: "\E72C"; }
+.dashboard-action[data-icon='diagnostics']::before { content: "\E9D2"; }
+.dashboard-action[data-icon='panel']::before { content: "\E7F4"; }
+
+.dashboard-action:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface-hover));
+  transform: translateY(-1px);
+}
+
+.dashboard-events {
+  grid-area: events;
+}
+
+.btn.compact {
+  min-height: 30px;
+  padding: 4px 10px;
+}
+
+.dashboard-event-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 12px;
+  gap: 7px 16px;
+}
+
+.dashboard-event {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  padding: 8px 9px;
+  gap: 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dashboard-event-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.dashboard-event.is-warn .dashboard-event-dot { background: var(--yellow); }
+.dashboard-event.is-error .dashboard-event-dot { background: var(--red); }
+
+.dashboard-event-text {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-event-time {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-empty {
+  grid-column: 1 / -1;
+  padding: 16px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+}

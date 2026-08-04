@@ -50,18 +50,18 @@
 
     if (!running || !raw || raw === '-') {
       delayEl.textContent = running ? t('dash.noDelay') : t('dash.needRunning');
-      delayEl.className = 'card-value';
+      delayEl.className = '';
       return;
     }
 
     const delayVal = App.delays && App.delays.get(raw);
     if (delayVal === undefined) {
       delayEl.textContent = t('dash.noDelay');
-      delayEl.className = 'card-value';
+      delayEl.className = '';
       return;
     }
     delayEl.textContent = delayText(delayVal) || t('dash.noDelay');
-    delayEl.className = 'card-value ' + delayClass(delayVal);
+    delayEl.className = delayClass(delayVal);
   }
 
   function renderDashboard() {
@@ -76,6 +76,7 @@
     if (coreCard) coreCard.setAttribute('aria-pressed', String(!!st.running));
     if (proxyCard) proxyCard.setAttribute('aria-pressed', String(!!st.systemProxy));
     renderDashNodeCards();
+    if (!st.running) setText($('#dashConnections'), '0');
 
     const coreHint = $('#coreHint');
     if (coreHint) {
@@ -90,7 +91,7 @@
 
     const topCore = $('#topCore');
     if (topCore) {
-      topCore.textContent = st.coreName || st.coreType || (App.state.settings && App.state.settings.coreType) || 'sing-box';
+      topCore.textContent = st.coreName || 'Mihomo';
     }
     const topProfile = $('#topProfile');
     if (topProfile) {
@@ -100,6 +101,36 @@
     }
     const topDot = $('#topStatusDot');
     if (topDot) topDot.className = 'status-dot ' + (st.running ? 'on' : 'off');
+    renderDashboardQuality();
+  }
+
+  function renderDashboardQuality() {
+    const st = App.state.status || {};
+    const delays = App.delays instanceof Map ? App.delays : new Map();
+    const currentName = st.running && typeof App.currentNodeName === 'function' ? App.currentNodeName() : '';
+    const currentDelay = currentName ? delays.get(currentName) : undefined;
+    const values = Array.from(delays.values());
+    const measured = values.filter((value) => value !== 'testing').length;
+    const healthy = values.filter((value) => Number.isFinite(value) && value > 0).length;
+    const mode = (App.state.settings && App.state.settings.clashMode) || 'rule';
+
+    setText($('#qualityLatency'), Number.isFinite(currentDelay) ? `${currentDelay} ms` : '—');
+    setText($('#qualityMeasured'), String(measured));
+    setText($('#qualityHealthy'), String(healthy));
+    setText($('#qualityMode'), t('mode.' + mode));
+
+    let level = 'unknown';
+    if (!st.running) level = 'offline';
+    else if (Number.isFinite(currentDelay)) {
+      if (currentDelay < 200) level = 'good';
+      else if (currentDelay < 500) level = 'fair';
+      else level = 'poor';
+    }
+    const badge = $('#qualityBadge');
+    if (badge) {
+      badge.className = `quality-badge is-${level}`;
+      badge.textContent = t('dash.quality' + level[0].toUpperCase() + level.slice(1));
+    }
   }
 
   function renderStatus() {
@@ -194,8 +225,10 @@
 
   function renderUsageOthers(subs) {
     if (!subs.length) return '';
+    const visible = subs.slice(0, 2);
+    const hidden = Math.max(0, subs.length - visible.length);
     let html = `<div class="usage-others-label">${escapeHtml(t('usage.others'))}</div><div class="usage-others">`;
-    for (const s of subs) {
+    for (const s of visible) {
       const o = usageStats(s);
       const ol = usageLevel(o.pct);
       const meta = o.total
@@ -210,7 +243,9 @@
           <div class="usage-bar" role="progressbar" aria-label="${escapeHtml(s.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${o.pct.toFixed(1)}" aria-valuetext="${escapeHtml(meta)}"><div class="usage-fill" style="width:${o.pct}%"></div></div>
         </div>`;
     }
-    return html + '</div>';
+    html += '</div>';
+    if (hidden) html += `<div class="usage-more">${escapeHtml(t('usage.more', hidden))}</div>`;
+    return html;
   }
 
   function renderUsage() {
@@ -278,6 +313,109 @@
     });
   }
 
+  function dashboardButtonAction(button, action) {
+    if (!button || button.disabled) return;
+    const operation = runDashboardAction(button.id, async () => {
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      try {
+        await action();
+      } finally {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
+    });
+    operation.catch(() => {});
+  }
+
+  function eventLevel(line) {
+    if (/\b(ERROR|FATAL|PANIC)\b/i.test(line)) return 'error';
+    if (/\b(WARN|WARNING)\b/i.test(line)) return 'warn';
+    return 'info';
+  }
+
+  function eventText(line) {
+    return String(line || '')
+      .replace(/^\[gui\]\s*/i, '')
+      .replace(/^time=(?:"[^"]+"|\S+)\s+level=(?:"?[a-z]+"?)\s+msg=/i, '')
+      .replace(/^[+-]\d{4}\s+/, '')
+      .replace(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\s*/i, '')
+      .replace(/^"(.*)"$/, '$1')
+      .trim();
+  }
+
+  function eventTime(line) {
+    const matched = String(line || '').match(/(?:\d{4}-\d{2}-\d{2}[ T]|T)(\d{2}:\d{2}:\d{2})/);
+    return matched ? matched[1] : '';
+  }
+
+  let dashboardEventGeneration = 0;
+  let dashboardConnectionGeneration = 0;
+  async function loadDashboardConnections() {
+    const value = $('#dashConnections');
+    if (!value) return null;
+    if (!(App.state.status && App.state.status.running)) {
+      value.textContent = '0';
+      return { running: false, totalConnections: 0 };
+    }
+    const generation = ++dashboardConnectionGeneration;
+    try {
+      const data = api && api.getConnectionSummary ? await api.getConnectionSummary() : null;
+      if (generation !== dashboardConnectionGeneration || App.currentTab !== 'dashboard') return data;
+      const count = data && Number.isFinite(data.totalConnections) ? data.totalConnections : 0;
+      value.textContent = String(Math.max(0, count));
+      return data;
+    } catch (_) {
+      if (generation === dashboardConnectionGeneration && App.currentTab === 'dashboard') value.textContent = '—';
+      return null;
+    }
+  }
+
+  async function loadDashboardEvents() {
+    const list = $('#dashboardEventList');
+    if (!list) return;
+    const generation = ++dashboardEventGeneration;
+    let entries = [];
+    try {
+      const snapshot = api && api.getRecentLogs ? await api.getRecentLogs() : null;
+      entries = snapshot && Array.isArray(snapshot.entries) ? snapshot.entries : [];
+    } catch (_) {
+      entries = [];
+    }
+    if (generation !== dashboardEventGeneration || !list.isConnected) return;
+    const important = entries
+      .map((entry) => String(entry && typeof entry === 'object' ? entry.line || '' : entry || ''))
+      .filter((line) => /^\[gui\]/i.test(line) || /\b(WARN|WARNING|ERROR|FATAL|PANIC)\b/i.test(line))
+      .slice(-6)
+      .reverse();
+
+    list.textContent = '';
+    if (!important.length) {
+      const empty = document.createElement('p');
+      empty.className = 'dashboard-empty';
+      empty.textContent = t('dash.noEvents');
+      list.appendChild(empty);
+      return;
+    }
+    for (const line of important) {
+      const row = document.createElement('div');
+      const level = eventLevel(line);
+      row.className = `dashboard-event is-${level}`;
+      const dot = document.createElement('span');
+      dot.className = 'dashboard-event-dot';
+      dot.setAttribute('aria-hidden', 'true');
+      const text = document.createElement('span');
+      text.className = 'dashboard-event-text';
+      text.textContent = eventText(line);
+      text.title = text.textContent;
+      const time = document.createElement('time');
+      time.className = 'dashboard-event-time';
+      time.textContent = eventTime(line);
+      row.append(dot, text, time);
+      list.appendChild(row);
+    }
+  }
+
   $('#powerBtn').addEventListener('click', () => togglePower().catch(() => {}));
   $('#quickProxy').addEventListener('click', () => toggleSystemProxy().catch(() => {}));
 
@@ -290,6 +428,37 @@
       renderDashboard();
       toast(App.state.settings.enableTun ? t('toast.tunOn') : t('toast.tunOff'));
     }).catch(() => {});
+  });
+
+  $('#dashTestAll').addEventListener('click', (event) => {
+    dashboardButtonAction(event.currentTarget, async () => {
+      await App.ensureTabModules('nodes');
+      if (App.testAllNodes) await App.testAllNodes();
+      renderDashboardQuality();
+      await loadDashboardEvents();
+    });
+  });
+
+  $('#dashUpdateProfile').addEventListener('click', (event) => {
+    dashboardButtonAction(event.currentTarget, async () => {
+      const id = App.state.activeSub;
+      if (!id) {
+        toast(t('dash.noActiveProfile'), true);
+        return;
+      }
+      await call(api.updateSubscription, { id });
+      toast(t('toast.subUpdated'));
+      if (App.refresh) await App.refresh();
+      await loadDashboardEvents();
+    });
+  });
+
+  $('#dashDiagnostics').addEventListener('click', () => App.openDialog('diagnostics'));
+  $('#dashOpenPanel').addEventListener('click', () => {
+    call(api.openClashApi).catch(() => {});
+  });
+  $('#dashViewLogs').addEventListener('click', () => {
+    if (App.showTab) App.showTab('logs');
   });
 
   const THEME_ORDER = ['system', 'light', 'dark'];
@@ -345,6 +514,7 @@
       if (action === 'power') return togglePower().catch(() => {});
       if (action === 'proxy') return toggleSystemProxy().catch(() => {});
       if (action === 'nodes') return App.showTab && App.showTab('nodes');
+      if (action === 'connections') return App.showTab && App.showTab('conns');
       if (action === 'testDelay') {
         if (App.testCurrentNodeDelay) return App.testCurrentNodeDelay();
         toast(t('nodes.needRunning'), true);
@@ -357,4 +527,7 @@
   App.renderUsage = renderUsage;
   App.renderDashboard = renderDashboard;
   App.renderDashNodeCards = renderDashNodeCards;
+  App.renderDashboardQuality = renderDashboardQuality;
+  App.loadDashboardConnections = loadDashboardConnections;
+  App.loadDashboardEvents = loadDashboardEvents;
 })();

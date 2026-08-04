@@ -5,6 +5,9 @@
 // The authoritative value still lives in the main-process store.
 (function () {
   try {
+    if (new URLSearchParams(window.location.search).get('visual-test') === '1') {
+      document.documentElement.dataset.visualTest = 'true';
+    }
     const pref = localStorage.getItem('themePref');
     if (pref === 'system') {
       let dark = true;

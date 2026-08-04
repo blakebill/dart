@@ -40,6 +40,44 @@ function registryDwordEnabled(output, name = 'ProxyEnable') {
   return parsed === 1;
 }
 
+function registrySettingEnabled(setting) {
+  if (!setting || !setting.exists) return false;
+  const value = String(setting.value || '').trim();
+  const parsed = /^0x/i.test(value) ? Number.parseInt(value.slice(2), 16) : Number.parseInt(value, 10);
+  return parsed === 1;
+}
+
+function registrySettingsEqual(left, right) {
+  return !!left && !!right &&
+    left.exists === right.exists &&
+    (!left.exists || String(left.value).trim().toLowerCase() === String(right.value).trim().toLowerCase());
+}
+
+function registrySetting(output, name) {
+  const value = registryValue(output, name);
+  return value === null
+    ? { exists: false, value: null }
+    : { exists: true, value };
+}
+
+function proxyRegistrySnapshot(output) {
+  return {
+    enable: registrySetting(output, 'ProxyEnable'),
+    server: registrySetting(output, 'ProxyServer'),
+    override: registrySetting(output, 'ProxyOverride'),
+  };
+}
+
+function isInterruptedProxyApply(current, restore) {
+  return !!(
+    current &&
+    restore &&
+    !registrySettingEnabled(current.enable) &&
+    registrySettingsEqual(current.server, restore.server) &&
+    registrySettingsEqual(current.override, restore.override)
+  );
+}
+
 function proxyServerMatches(output, server) {
   const value = registryValue(output, 'ProxyServer');
   return value !== null && value.toLowerCase() === String(server || '').trim().toLowerCase();
@@ -63,14 +101,14 @@ function runReg(args) {
   });
 }
 
-async function readRegistrySetting(name) {
+async function readProxyRegistrySnapshot() {
   try {
-    const output = await runReg(['query', REG_PATH, '/v', name]);
-    const value = registryValue(output, name);
-    if (value === null) throw new Error('registry query returned no ' + name);
-    return { exists: true, value };
+    // Query the Internet Settings key once. The guard runs twice a minute, so
+    // one process instead of separate ProxyEnable/ProxyServer queries removes
+    // a steady stream of short-lived reg.exe processes.
+    return proxyRegistrySnapshot(await runReg(['query', REG_PATH]));
   } catch (error) {
-    if (error && error.code === 1) return { exists: false, value: null };
+    if (error && error.code === 1) return proxyRegistrySnapshot('');
     throw error;
   }
 }
@@ -120,24 +158,23 @@ function queueProxyOperation(operation) {
  * registry snapshot (ProxyEnable / ProxyServer / ProxyOverride) so callers can
  * put the user's bypass list back when Dart releases ownership.
  */
-async function enableSystemProxy(host, port) {
+async function enableSystemProxy(host, port, options = {}) {
   if (process.platform !== 'win32' || shuttingDown) return false;
   return queueProxyOperation(async () => {
     if (shuttingDown) return false;
     const server = `${host}:${port}`;
     const private172 = Array.from({ length: 16 }, (_, i) => `172.${16 + i}.*`).join(';');
-    const [enable, previousServer, override] = await Promise.all([
-      readRegistrySetting('ProxyEnable'),
-      readRegistrySetting('ProxyServer'),
-      readRegistrySetting('ProxyOverride'),
-    ]);
-    const snapshot = { enable, server: previousServer, override };
+    const snapshot = await readProxyRegistrySnapshot();
     let changed = false;
     try {
+      // The caller persists both ownership and this restore snapshot before the
+      // first registry write. A hard crash anywhere below can then be repaired
+      // on the next launch, including the brief ProxyEnable=0 transition.
+      if (typeof options.beforeApply === 'function') await options.beforeApply(snapshot);
       // Turn off any previous proxy while its endpoint is being replaced, so a
       // partial write can never make Windows use a half-written configuration.
-      await writeRegistrySetting('ProxyEnable', 'REG_DWORD', 0);
       changed = true;
+      await writeRegistrySetting('ProxyEnable', 'REG_DWORD', 0);
       if (shuttingDown) throw Object.assign(new Error('app is shutting down'), { code: 'DART_SHUTDOWN' });
       await writeRegistrySetting('ProxyServer', 'REG_SZ', server);
       if (shuttingDown) throw Object.assign(new Error('app is shutting down'), { code: 'DART_SHUTDOWN' });
@@ -176,17 +213,25 @@ async function disableSystemProxyIfOurs(server, options = {}) {
   return queueProxyOperation(async () => {
     let current;
     try {
-      current = await runReg(['query', REG_PATH, '/v', 'ProxyServer']);
+      current = await readProxyRegistrySnapshot();
     } catch (_) {
       return false;
     }
-    if (!proxyServerMatches(current, server)) return false;
+    const owned = current.server.exists &&
+      String(current.server.value).trim().toLowerCase() === String(server).trim().toLowerCase();
+    // If the process died immediately after disabling ProxyEnable, ProxyServer
+    // and ProxyOverride still equal the saved pre-Dart snapshot. Treat only that
+    // exact state as interrupted ownership; an unrelated proxy remains untouched.
+    const interrupted = !!(
+      options.restoreInterrupted &&
+      isInterruptedProxyApply(current, options.restore)
+    );
+    if (!owned && !interrupted) return false;
     if (options.restore) {
       await restoreProxySettings(options.restore);
       return true;
     }
-    const enabled = await runReg(['query', REG_PATH, '/v', 'ProxyEnable']);
-    if (!registryDwordEnabled(enabled)) return false;
+    if (!registrySettingEnabled(current.enable)) return false;
     await writeRegistrySetting('ProxyEnable', 'REG_DWORD', 0);
     await refreshSettings();
     return true;
@@ -244,10 +289,10 @@ function disableSystemProxySyncIfOurs(server) {
 async function isSystemProxyActive(server) {
   if (process.platform !== 'win32') return true;
   try {
-    const enable = await runReg(['query', REG_PATH, '/v', 'ProxyEnable']);
-    if (!registryDwordEnabled(enable)) return false;
-    const srv = await runReg(['query', REG_PATH, '/v', 'ProxyServer']);
-    return proxyServerMatches(srv, server);
+    const current = await readProxyRegistrySnapshot();
+    return registrySettingEnabled(current.enable) &&
+      current.server.exists &&
+      String(current.server.value).trim().toLowerCase() === String(server || '').trim().toLowerCase();
   } catch (e) {
     return false;
   }
@@ -288,5 +333,9 @@ module.exports = {
   isSystemProxyActive,
   registryValue,
   registryDwordEnabled,
+  registrySettingEnabled,
+  registrySettingsEqual,
+  proxyRegistrySnapshot,
+  isInterruptedProxyApply,
   proxyServerMatches,
 };

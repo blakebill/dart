@@ -2,12 +2,10 @@
 
 const path = require('path');
 const yaml = require('js-yaml');
-const { buildMihomoConfig, buildSingboxConfig } = require('./converter');
+const { buildMihomoConfig } = require('./converter');
 const { assetSha256 } = require('./integrity');
 
-const DART_SINGBOX_REPO = 'blakebill/sing-box';
 const DART_MIHOMO_REPO = 'blakebill/mihomo';
-const OFFICIAL_SINGBOX_REPO = 'SagerNet/sing-box';
 const OFFICIAL_MIHOMO_REPO = 'MetaCubeX/mihomo';
 
 function releaseRepo(customRepo, officialRepo, source) {
@@ -29,119 +27,6 @@ function findReleaseAsset(release, predicate) {
 }
 
 const adapters = {
-  'sing-box': {
-    id: 'sing-box',
-    label: 'sing-box',
-    folderName: 'singbox',
-    resourceFolders: ['singbox', 'sing-box'],
-    configFile: 'config.json',
-    configExtension: '.json',
-    configFormat: 'JSON',
-    repo: DART_SINGBOX_REPO,
-    officialRepo: OFFICIAL_SINGBOX_REPO,
-    repoFor(source) {
-      return releaseRepo(DART_SINGBOX_REPO, OFFICIAL_SINGBOX_REPO, source);
-    },
-    supportsBinaryRuleSets: true,
-    supportsDynamicRuleData: true,
-    supportsLiveRuleInspection: false,
-    geoDataFiles: ['geoip-cn.srs', 'geosite-cn.srs', 'geodata-meta.json'],
-    ruleSetItems: [
-      { tag: 'geoip-cn', file: 'geoip-cn.srs' },
-      { tag: 'geosite-cn', file: 'geosite-cn.srs' },
-    ],
-    exportDialog: {
-      title: 'Export sing-box config',
-      defaultPath: 'config.json',
-      filters: [{ name: 'JSON', extensions: ['json'] }],
-    },
-    legacyGeoDirs(runtimeDir, resourcesBinDir) {
-      return [
-        { loc: 'updated', dir: path.join(runtimeDir, 'bin') },
-        { loc: 'bundled', dir: resourcesBinDir },
-      ];
-    },
-    binaryName(platform = process.platform) {
-      return platform === 'win32' ? 'sing-box.exe' : 'sing-box';
-    },
-    // Runtime configs are written often on start/restart; pretty-print only when
-    // exporting for humans (see serializeConfig options.pretty).
-    serializeConfig(config, options = {}) {
-      return options.pretty ? JSON.stringify(config, null, 2) : JSON.stringify(config);
-    },
-    routeEntries(config) {
-      return (((config.route || {}).rules) || []).map((rule) => ({ kind: 'sing-box', rule }));
-    },
-    summarizeConfig(config) {
-      return {
-        generatedNodes: (config.outbounds || [])
-          .filter((item) => !['selector', 'urltest', 'smart', 'direct'].includes(item.type)).length,
-        generatedRules: (((config.route || {}).rules) || []).length,
-        tun: (config.inbounds || []).some((item) => item.type === 'tun'),
-      };
-    },
-    dnsPath(config, settings, direct) {
-      return {
-        resolver: direct ? 'local-dns' : 'proxy-dns',
-        server: direct ? settings.dnsLocal : settings.dnsRemote,
-        detour: direct ? 'direct' : '🚀 Proxy',
-        confidence: settings.clashMode === 'rule' ? 'estimated' : 'exact',
-      };
-    },
-    checkArgs(configPath) {
-      return ['check', '-c', configPath];
-    },
-    runArgs(configPath, workDir) {
-      return ['run', '-c', configPath, '-D', workDir];
-    },
-    versionArgs: ['version'],
-    processEnv(baseEnv) {
-      return baseEnv;
-    },
-    prepareStart() {
-      return Promise.resolve(true);
-    },
-    geoDataReady(manager) {
-      return manager.ensureSingBoxGeoData();
-    },
-    validateGeoFile(manager, file) {
-      return manager._validSrs(file);
-    },
-    updateGeoData(manager, onProgress, proxyPort) {
-      return manager._coalesceGeoUpdate(
-        'sing-box',
-        () => manager._updateSingBoxGeoData(onProgress, proxyPort)
-      );
-    },
-    buildConfig(nodes, commonOpts, context) {
-      return buildSingboxConfig(nodes, {
-        ...commonOpts,
-        externalUiDir: context.ui.dir.replace(/\\/g, '/'),
-        externalUiDownloadUrl: context.ui.downloadUrl,
-        ruleSetDir: context.manager.resolveRuleSetDir(),
-        geoAvailable: context.availableGeoSet(context.clashRules),
-        ruleSetData: context.loadRuleSetData(context.clashRules, context.providers),
-      });
-    },
-    releaseAsset(version, goos, arch, release, source = 'custom') {
-      const ext = goos === 'windows' ? 'zip' : 'tar.gz';
-      const fileName = `sing-box-${version}-${goos}-${arch}.${ext}`;
-      const exact = findReleaseAsset(release, (asset) => asset.fileName === fileName)[0];
-      return exact || {
-        fileName,
-        url: `https://github.com/${this.repoFor(source)}/releases/download/v${version}/${fileName}`,
-        sha256: null,
-      };
-    },
-    releaseTag(version, source = 'custom') {
-      const clean = String(version || '').replace(/^v/, '');
-      if (source === 'official') return `v${clean.replace(/-dart\.\d+$/, '')}`;
-      return `v${/-dart\.\d+$/.test(clean) ? clean : `${clean}-dart.1`}`;
-    },
-    modeChangeNeedsRestart() {
-      return false;
-    },
-  },
   mihomo: {
     id: 'mihomo',
     label: 'mihomo',
@@ -155,8 +40,6 @@ const adapters = {
     repoFor(source) {
       return releaseRepo(DART_MIHOMO_REPO, OFFICIAL_MIHOMO_REPO, source);
     },
-    supportsBinaryRuleSets: false,
-    supportsDynamicRuleData: false,
     supportsLiveRuleInspection: true,
     geoDataFiles: [
       'geoip.dat',
@@ -197,8 +80,11 @@ const adapters = {
         tun: !!(config.tun && config.tun.enable),
       };
     },
+    dnsOverrideEnabled(config) {
+      return !!(config.dns && config.dns.enable);
+    },
     dnsPath(config, settings, direct) {
-      if (!settings.enableTun || !config.dns) {
+      if (!settings.enableDnsOverride || !config.dns) {
         return { resolver: 'system', server: 'System DNS', detour: 'system', confidence: 'exact' };
       }
       const servers = direct ? config.dns['direct-nameserver'] : config.dns.nameserver;
@@ -276,7 +162,7 @@ for (const adapter of Object.values(adapters)) Object.freeze(adapter);
 Object.freeze(adapters);
 
 function normalizeCoreType(type) {
-  return type === 'mihomo' ? 'mihomo' : 'sing-box';
+  return 'mihomo';
 }
 
 function hasCoreAdapter(type) {

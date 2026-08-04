@@ -52,6 +52,7 @@ function createAutoLaunchService(options) {
       return spawnSync('schtasks.exe', ['/query', '/tn', AUTOSTART_TASK], {
         windowsHide: true,
         encoding: 'utf-8',
+        timeout: 5000,
       }).status === 0;
     } catch (_) {
       return false;
@@ -60,7 +61,11 @@ function createAutoLaunchService(options) {
 
   function runSchtasks(args, elevate) {
     if (!elevate) {
-      const result = spawnSync('schtasks.exe', args, { windowsHide: true, encoding: 'utf-8' });
+      const result = spawnSync('schtasks.exe', args, {
+        windowsHide: true,
+        encoding: 'utf-8',
+        timeout: 15000,
+      });
       return !result.error && result.status === 0;
     }
     const argList = args.map((arg) => `'${String(arg).replace(/'/g, "''")}'`).join(',');

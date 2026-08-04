@@ -1,11 +1,9 @@
 'use strict';
 
-const { dnsServerFromAddress } = require('./converter');
 
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
 const MAX_RULE_GROUP_SELECTION_ENTRIES = 512;
-const VALID_CRS_FORMATS = ['clash', 'sing-box'];
-const VALID_SUBSCRIPTION_UA_MODES = ['auto', 'sing-box', 'clash'];
+const VALID_CRS_FORMATS = ['clash'];
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
 const VALID_SMART_MODES = ['balanced', 'latency', 'stable'];
 const MAX_IPC_CONNECTIONS = 300;
@@ -15,14 +13,14 @@ const MAX_AUTO_UPDATE_MINUTES = 365 * 24 * 60;
 const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
-  'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
+  'enableDnsOverride', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
   'testUrl', 'smartMode', 'smartRegions',
   'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
 ]);
 
 const CORE_CONFIG_SETTINGS = new Set([
   'mixedPort', 'clashApiPort', 'logLevel',
-  'enableIpv6', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
+  'enableIpv6', 'enableDnsOverride', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'useBuiltinRules',
   // ruleGroupSelections is NOT core-config: picks apply live via Clash API and
   // only become config defaults on the next start/rebuild.
   'ruleOverrides', 'coreType', 'testUrl', 'smartRegions',
@@ -72,8 +70,10 @@ function reqConfigText(value) {
   return value;
 }
 
-function recentConnections(items, limit) {
-  const keyEntry = (item) => ({ item, key: String(item.start || '') + '\0' + String(item.id || '') });
+function recentConnections(items, limit, selectKey = null) {
+  const keyEntry = typeof selectKey === 'function'
+    ? (item) => ({ item, key: String(selectKey(item) || '') })
+    : (item) => ({ item, key: String(item.start || '') + '\0' + String(item.id || '') });
   if (items.length <= limit) {
     return items.map(keyEntry).sort((a, b) => b.key.localeCompare(a.key)).map((entry) => entry.item);
   }
@@ -121,11 +121,11 @@ function validateSettingsPatch(patch, current) {
   }
   for (const key of [
     'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'enableTun',
-    'notifications', 'enableIpv6', 'useBuiltinRules',
+    'notifications', 'enableIpv6', 'enableDnsOverride', 'useBuiltinRules',
   ]) {
     if (key in patch && typeof patch[key] !== 'boolean') throw new Error(`invalid ${key}`);
   }
-  if ('coreType' in patch) reqEnum(patch.coreType, ['sing-box', 'mihomo'], 'coreType');
+  if ('coreType' in patch) reqEnum(patch.coreType, ['mihomo'], 'coreType');
   if ('logLevel' in patch) reqEnum(patch.logLevel, ['trace', 'debug', 'info', 'warn', 'error'], 'logLevel');
   if ('dnsStrategy' in patch) {
     reqEnum(patch.dnsStrategy, ['prefer_ipv4', 'prefer_ipv6', 'ipv4_only', 'ipv6_only'], 'dnsStrategy');
@@ -157,7 +157,8 @@ function validateSettingsPatch(patch, current) {
       !/^(?:(?:https|tls|quic|h3|http3|tcp|udp):\/\/)?[^/]+(?:\/\S*)?$/i.test(value)
     ) throw new Error('invalid ' + key);
     patch[key] = value;
-    dnsServerFromAddress(value, 'validate');
+    const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `udp://${value}`);
+    if (!parsed.hostname) throw new Error(`${key} must contain a host`);
   }
   if ('testUrl' in patch && patch.testUrl) reqUrl(patch.testUrl, 'testUrl');
   if ('ruleOverrides' in patch) {
@@ -196,7 +197,6 @@ module.exports = {
   SETTING_KEYS,
   VALID_CRS_FORMATS,
   VALID_MODES,
-  VALID_SUBSCRIPTION_UA_MODES,
   VALID_TARGETS,
   recentConnections,
   reqAutoUpdateMinutes,

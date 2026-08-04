@@ -4,9 +4,6 @@
  * Download bundled proxy cores + their GeoData into ./bin before packaging.
  *
  * Output layout copied by electron-builder to resources/bin:
- *   bin/singbox/sing-box.exe
- *   bin/singbox/geoip-cn.srs
- *   bin/singbox/geosite-cn.srs
  *   bin/mihomo/mihomo.exe
  *   bin/mihomo/geoip.dat
  *   bin/mihomo/geosite.dat
@@ -14,8 +11,8 @@
  *
  * Usage:
  *   node scripts/download-core.js
- *   SINGBOX_VERSION=1.11.4 MIHOMO_VERSION=1.19.13 node scripts/download-core.js
- *   SINGBOX_OS=windows SINGBOX_ARCH=amd64 node scripts/download-core.js
+ *   MIHOMO_VERSION=1.19.13 node scripts/download-core.js
+ *   MIHOMO_OS=windows MIHOMO_ARCH=amd64 node scripts/download-core.js
  */
 
 const fs = require('fs');
@@ -27,9 +24,7 @@ const { URL } = require('url');
 const { assetSha256, sha256File, verifyFileSha256 } = require('../src/main/integrity');
 
 const BIN_DIR = path.join(__dirname, '..', 'bin');
-const SINGBOX_DIR = path.join(BIN_DIR, 'singbox');
 const MIHOMO_DIR = path.join(BIN_DIR, 'mihomo');
-const DART_SINGBOX_REPO = 'blakebill/sing-box';
 const DART_MIHOMO_REPO = 'blakebill/mihomo';
 const DART_RELEASE_PATTERN = /^v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-dart\.([1-9]\d*)$/;
 const BASE_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
@@ -118,7 +113,7 @@ async function downloadFirst(urls, dest, validate) {
 }
 
 function detectOs() {
-  if (process.env.SINGBOX_OS) return process.env.SINGBOX_OS;
+  if (process.env.MIHOMO_OS) return process.env.MIHOMO_OS;
   if (process.env.CORE_OS) return process.env.CORE_OS;
   if (process.platform === 'win32') return 'windows';
   if (process.platform === 'darwin') return 'darwin';
@@ -126,7 +121,7 @@ function detectOs() {
 }
 
 function detectArch() {
-  if (process.env.SINGBOX_ARCH) return process.env.SINGBOX_ARCH;
+  if (process.env.MIHOMO_ARCH) return process.env.MIHOMO_ARCH;
   if (process.env.CORE_ARCH) return process.env.CORE_ARCH;
   return process.arch === 'arm64' ? 'arm64' : 'amd64';
 }
@@ -242,19 +237,6 @@ function findFile(dir, predicate, depth = 3) {
   return null;
 }
 
-function validSrs(file) {
-  try {
-    if (!fs.existsSync(file) || fs.statSync(file).size < 8) return false;
-    const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(3);
-    fs.readSync(fd, buf, 0, 3, 0);
-    fs.closeSync(fd);
-    return buf.toString('latin1') === 'SRS';
-  } catch (_) {
-    return false;
-  }
-}
-
 function validGeo(file) {
   try {
     if (!fs.existsSync(file)) return false;
@@ -290,15 +272,6 @@ function validGeo(file) {
   } catch (_) {
     return false;
   }
-}
-
-function geoDataUrls(repo, file, ref = 'rule-set') {
-  return [
-    `https://raw.githubusercontent.com/SagerNet/${repo}/${ref}/${file}`,
-    `https://cdn.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
-    `https://fastly.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
-    `https://gcore.jsdelivr.net/gh/SagerNet/${repo}@${ref}/${file}`,
-  ];
 }
 
 function mihomoGeoDataUrls(file) {
@@ -345,87 +318,6 @@ function validateMihomoGeoData(dir, binName) {
   } finally {
     try { fs.unlinkSync(configPath); } catch (_) {}
   }
-}
-
-async function bundleSingBox(goos, arch, outputDir = SINGBOX_DIR) {
-  cleanDir(outputDir);
-  const binName = goos === 'windows' ? 'sing-box.exe' : 'sing-box';
-  const rel = await release(DART_SINGBOX_REPO, 'SINGBOX_VERSION');
-  const tag = rel.tag_name;
-  if (!tag) throw new Error('could not resolve sing-box release tag');
-  const ver = String(tag).replace(/^v/, '');
-  const ext = goos === 'windows' ? 'zip' : 'tar.gz';
-  const fileName = `sing-box-${ver}-${goos}-${arch}.${ext}`;
-  const archivePath = path.join(outputDir, fileName);
-  const releaseAsset = (rel.assets || []).find((asset) => asset.name === fileName);
-  if (!releaseAsset || !releaseAsset.browser_download_url) {
-    throw new Error('sing-box release does not contain ' + fileName);
-  }
-  const url = releaseAsset.browser_download_url;
-  const digest = assetSha256(releaseAsset);
-  if (!digest) throw new Error('sing-box release asset has no SHA-256 digest: ' + fileName);
-
-  console.log('Downloading sing-box core:', url);
-  await download(url, archivePath);
-  await verifyFileSha256(archivePath, digest, fileName);
-  console.log('Verified sing-box SHA-256:', digest);
-  console.log('Extracting sing-box...');
-  if (goos === 'windows') extractZip(archivePath, outputDir);
-  else extractTarGz(archivePath, outputDir);
-
-  const innerDir = findFile(outputDir, (name) => name === binName);
-  if (!innerDir) throw new Error('sing-box binary not found after extraction');
-  const root = path.dirname(innerDir);
-  for (const f of fs.readdirSync(root)) {
-    if (f === binName || /\.(dll|so|dylib)$/i.test(f)) {
-      const source = path.join(root, f);
-      const target = path.join(outputDir, f);
-      if (path.resolve(source) !== path.resolve(target)) fs.copyFileSync(source, target);
-      if (goos !== 'windows' && f === binName) fs.chmodSync(target, 0o755);
-    }
-  }
-  for (const entry of fs.readdirSync(outputDir, { withFileTypes: true })) {
-    if (entry.isDirectory()) fs.rmSync(path.join(outputDir, entry.name), { recursive: true, force: true });
-  }
-  fs.unlinkSync(archivePath);
-
-  const ruleSets = [
-    { file: 'geoip-cn.srs', repo: 'sing-geoip' },
-    { file: 'geosite-cn.srs', repo: 'sing-geosite' },
-  ];
-  const meta = {};
-  const dataComponents = [];
-  for (const rs of ruleSets) {
-    const commitInfo = await getJson(`https://api.github.com/repos/SagerNet/${rs.repo}/commits/rule-set`);
-    const commit = String(commitInfo.sha || '');
-    if (!/^[a-f0-9]{40}$/i.test(commit)) throw new Error('could not pin SagerNet/' + rs.repo + ' rule-set commit');
-    const dest = path.join(outputDir, rs.file);
-    await downloadFirst(geoDataUrls(rs.repo, rs.file, commit), dest, validSrs);
-    const fileDigest = await sha256File(dest);
-    meta[rs.file] = { updatedAt: Date.now() };
-    dataComponents.push({
-      type: 'data',
-      name: rs.repo,
-      version: commit,
-      repository: `https://github.com/SagerNet/${rs.repo}`,
-      license: 'GPL-3.0-or-later',
-      asset: rs.file,
-      assetSha256: fileDigest,
-      binaryPath: `singbox/${rs.file}`,
-    });
-  }
-  fs.writeFileSync(path.join(outputDir, 'geodata-meta.json'), JSON.stringify(meta), 'utf-8');
-  console.log('sing-box bundle ready in', outputDir);
-  return [{
-    type: 'application',
-    name: 'sing-box',
-    version: ver,
-    repository: `https://github.com/${DART_SINGBOX_REPO}`,
-    license: 'GPL-3.0-or-later',
-    asset: fileName,
-    assetSha256: digest,
-    binaryPath: `singbox/${binName}`,
-  }, ...dataComponents];
 }
 
 function mihomoAsset(rel, goos, arch) {
@@ -535,7 +427,7 @@ async function bundleMihomo(goos, arch, outputDir = MIHOMO_DIR) {
 async function createBundleManifest(bundleRoot, bundledComponents) {
   const components = [...bundledComponents];
   const files = [];
-  for (const folder of ['singbox', 'mihomo']) {
+  for (const folder of ['mihomo']) {
     const dir = path.join(bundleRoot, folder);
     for (const name of fs.readdirSync(dir).sort()) {
       const file = path.join(dir, name);
@@ -552,7 +444,7 @@ async function createBundleManifest(bundleRoot, bundledComponents) {
 }
 
 function installStagedBundle(stageRoot, binDir) {
-  const names = ['singbox', 'mihomo', 'manifest.json'];
+  const names = ['mihomo', 'manifest.json'];
   const backupDir = path.join(stageRoot, '.previous');
   const installed = [];
   const backedUp = [];
@@ -587,21 +479,17 @@ async function buildCoreBundle(options = {}) {
   const binDir = options.binDir || BIN_DIR;
   const goos = options.goos || detectOs();
   const arch = options.arch || detectArch();
-  const singBoxBundler = options.bundleSingBox || bundleSingBox;
   const mihomoBundler = options.bundleMihomo || bundleMihomo;
   fs.mkdirSync(binDir, { recursive: true });
   const stageRoot = fs.mkdtempSync(path.join(binDir, '.core-bundle-'));
   try {
-    const components = [
-      await singBoxBundler(goos, arch, path.join(stageRoot, 'singbox')),
-      await mihomoBundler(goos, arch, path.join(stageRoot, 'mihomo')),
-    ].flat();
+    const components = await mihomoBundler(goos, arch, path.join(stageRoot, 'mihomo'));
     await createBundleManifest(stageRoot, components);
     installStagedBundle(stageRoot, binDir);
   } finally {
     fs.rmSync(stageRoot, { recursive: true, force: true });
   }
-  console.log('Bundled cores and GeoData in', binDir);
+  console.log('Bundled Mihomo and GeoData in', binDir);
 }
 
 async function main() {
@@ -610,7 +498,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch((err) => {
-    console.error('Failed to download bundled cores:', err.message);
+    console.error('Failed to download bundled Mihomo:', err.message);
     process.exitCode = 1;
   });
 }

@@ -5,6 +5,7 @@
   const App = window.App;
   const { $, $$ } = App;
   const api = window.api;
+  const uiState = App.uiState;
   const { setLang, getLang, applyI18n } = window.i18n;
 
   const TAB_MODULES = Object.freeze({
@@ -51,6 +52,7 @@
     if (App.renderSubs) App.renderSubs();
     if (App.renderNodes) App.renderNodes();
     if (App.renderSettings) App.renderSettings();
+    if (App.renderLogEmptyState) App.renderLogEmptyState();
     // Policy-group controls are generated dynamically and may remain mounted
     // while another tab is active, so data-i18n cannot update their options.
     if (App.refreshRuleGroupLabels) App.refreshRuleGroupLabels();
@@ -168,11 +170,21 @@
     if (active && title) title.textContent = pageTitleFromNav(active);
   }
 
-  function showTab(tab) {
+  function showTab(tab, options = {}) {
     const btn = document.querySelector(`.nav-item[data-tab="${tab}"]`);
     const panel = $('#tab-' + tab);
     if (!btn || !panel) return;
+    if (options.capture !== false) uiState.capture();
     const previousPanel = document.querySelector('.tab.active');
+    if (
+      options.activate !== false && App.currentTab === tab &&
+      previousPanel === panel && (loadedTabs.has(tab) || !TAB_MODULES[tab])
+    ) {
+      syncTopbarTitle(btn);
+      syncNavIndicator(btn);
+      uiState.scheduleSave();
+      return;
+    }
     const shouldMoveFocus = previousPanel && previousPanel !== panel && previousPanel.contains(document.activeElement);
     $$('.nav-item').forEach((button) => {
       const active = button === btn;
@@ -188,7 +200,12 @@
     syncTopbarTitle(btn);
     syncNavIndicator(btn);
     if (shouldMoveFocus) requestAnimationFrame(() => panel.focus({ preventScroll: true }));
+    if (options.activate === false) {
+      App.currentTab = tab;
+      return;
+    }
     onTabShown(tab).catch((error) => App.toast(error.message || String(error), true));
+    uiState.scheduleSave();
   }
   App.showTab = showTab;
 
@@ -215,21 +232,29 @@
     syncNavIndicator(document.querySelector('.nav-item.active'), true);
   });
 
-  // Per-tab activation: load rules on demand, start/stop connection polling.
-  let connTimer = null;
-  function connectionPollDelay(data) {
-    const shown = data && Array.isArray(data.connections) ? data.connections.length : 0;
-    return data && data.totalConnections > shown ? 5000 : 3000;
+  // Per-tab activation: load expensive feature data only on demand.
+  let dashboardStatsTimer = null;
+  function stopDashboardStats() {
+    if (!dashboardStatsTimer) return;
+    clearTimeout(dashboardStatsTimer);
+    dashboardStatsTimer = null;
   }
-  function scheduleConnectionPoll(delay = 3000) {
-    if (connTimer) clearTimeout(connTimer);
-    connTimer = setTimeout(async () => {
-      connTimer = null;
-      if (document.hidden || App.currentTab !== 'conns') return;
-      const data = await App.loadConnections();
-      if (document.hidden || App.currentTab !== 'conns') return;
-      scheduleConnectionPoll(connectionPollDelay(data));
+  function scheduleDashboardStats(delay = 5000) {
+    stopDashboardStats();
+    if (document.hidden || App.currentTab !== 'dashboard' ||
+        !(App.state.status && App.state.status.running)) return;
+    dashboardStatsTimer = setTimeout(async () => {
+      dashboardStatsTimer = null;
+      if (document.hidden || App.currentTab !== 'dashboard') return;
+      if (App.loadDashboardConnections) await App.loadDashboardConnections();
+      scheduleDashboardStats();
     }, delay);
+  }
+  function startDashboardStats() {
+    stopDashboardStats();
+    if (document.hidden || App.currentTab !== 'dashboard') return;
+    Promise.resolve(App.loadDashboardConnections && App.loadDashboardConnections())
+      .finally(() => scheduleDashboardStats());
   }
   function afterPaint(fn, delay = 0) {
     const run = () => {
@@ -249,7 +274,10 @@
     ];
     for (const [preferred, fallback, delay] of tasks) {
       afterPaint(() => {
-        if (!document.hidden && App.currentTab === 'rules') (App[preferred] || App[fallback])();
+        if (!document.hidden && App.currentTab === 'rules') {
+          Promise.resolve((App[preferred] || App[fallback])())
+            .finally(() => uiState.restoreScroll('rules', { final: preferred === 'ensureRulesLoaded' }));
+        }
       }, delay);
     }
   }
@@ -262,41 +290,55 @@
     if (previousTab === 'logs' && tab !== 'logs' && App.setLogStreaming) {
       App.setLogStreaming(false);
     }
-    if (previousTab === 'conns' && tab !== 'conns' && App.clearConnections) App.clearConnections();
+    if (previousTab === 'conns' && tab !== 'conns' && App.deactivateConnections) {
+      App.deactivateConnections();
+    }
     // Keep the small session-only latency cache and let an explicit sweep finish
     // while releasing the heavier node list whenever the user changes pages.
     if (previousTab === 'nodes' && tab !== 'nodes' && App.releaseNodes) {
       App.releaseNodes({ cancelTests: false });
     }
-    if (connTimer) {
-      clearTimeout(connTimer);
-      connTimer = null;
-    }
+    stopDashboardStats();
     await ensureTabModules(tab);
     if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== tab) return;
     if (tab === 'rules') {
       showRulesTab();
     } else if (tab === 'conns') {
-      // Defer Clash API + list paint so the tab switch stays responsive.
+      // The controller owns its visibility lease, polling and data release.
       afterPaint(() => {
         if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== 'conns') return;
-        App.loadConnections().then((data) => {
-          if (!document.hidden && App.currentTab === 'conns') {
-            scheduleConnectionPoll(connectionPollDelay(data));
-          }
-        });
+        Promise.resolve(App.activateConnections())
+          .catch((error) => App.toast(error.message || String(error), true));
       });
     } else if (tab === 'nodes') {
-      App.loadNodes();
+      Promise.resolve(App.loadNodes())
+        .finally(() => uiState.restoreScroll('nodes', { final: true }));
       App.refreshGroupSelections();
     } else if (tab === 'logs') {
       // Main retains a bounded history, so stream chatty core output only while
       // it can actually be consumed. Re-entry snapshots the missed sequence.
-      if (App.setLogStreaming) App.setLogStreaming(true);
+      const historyReady = Promise.resolve(
+        App.setLogStreaming ? App.setLogStreaming(true) : true
+      );
       // History may be large; flush after paint in rAF-sized chunks (logs.js).
       afterPaint(() => {
         if (sequence !== tabActivationSequence || document.hidden || App.currentTab !== 'logs') return;
         if (App.flushLogs) App.flushLogs();
+        historyReady
+          .then(() => {
+            if (
+              sequence !== tabActivationSequence || document.hidden ||
+              App.currentTab !== 'logs'
+            ) return false;
+            return App.waitForLogDrain ? App.waitForLogDrain() : true;
+          })
+          .then(() => {
+            if (
+              sequence === tabActivationSequence && !document.hidden &&
+              App.currentTab === 'logs'
+            ) uiState.restoreScroll('logs', { final: true });
+          })
+          .catch(() => {});
       });
     } else if (tab === 'subs') {
       App.renderSubs();
@@ -312,8 +354,12 @@
         if (api.warmUwpApps) api.warmUwpApps().catch(() => {});
       });
     } else if (tab === 'dashboard') {
+      App.renderDashboard();
       App.trafficChart.draw();
+      startDashboardStats();
+      if (App.loadDashboardEvents) App.loadDashboardEvents();
     }
+    afterPaint(() => uiState.restoreScroll(tab, { force: true }));
   }
 
   // Prewarm the lightweight dialog shell only when the pointer or keyboard is
@@ -345,27 +391,31 @@
 
   // While hidden (minimized to tray), stop polling and drawing. The main
   // process keeps the tray tooltip live without waking the renderer each second.
+  let rendererSuspended = false;
+  function suspendRenderer() {
+    if (rendererSuspended) return;
+    uiState.capture();
+    rendererSuspended = true;
+    cancelNavIndicatorAnimation();
+    tabActivationSequence++;
+    if (App.setLogStreaming) App.setLogStreaming(false);
+    if (App.deactivateConnections) App.deactivateConnections();
+    stopDashboardStats();
+    if (App.releaseNodes) App.releaseNodes();
+    if (App.releaseRuleCache) App.releaseRuleCache();
+  }
+
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      cancelNavIndicatorAnimation();
-      tabActivationSequence++;
-      if (App.setLogStreaming) App.setLogStreaming(false);
-      if (connTimer) {
-        clearTimeout(connTimer);
-        connTimer = null;
-      }
-      if (App.currentTab === 'conns' && App.clearConnections) App.clearConnections();
-      if (App.releaseNodes) App.releaseNodes();
-      if (App.releaseRuleCache) App.releaseRuleCache();
+      suspendRenderer();
     } else {
+      rendererSuspended = false;
       onTabShown(App.currentTab).catch((error) => App.toast(error.message || String(error), true));
-      App.trafficChart.draw();
+      if (App.currentTab !== 'dashboard') App.trafficChart.draw();
       App.miniChart.draw();
     }
   });
-  window.addEventListener('pagehide', () => {
-    if (App.setLogStreaming) App.setLogStreaming(false);
-  });
+  window.addEventListener('pagehide', suspendRenderer);
 
   // ---------- Data refresh ----------
   let prevActiveSub;
@@ -498,6 +548,7 @@
         });
       }
     }
+    if (statusChanged && App.currentTab === 'dashboard') startDashboardStats();
   }
 
   function refreshSafely() {
@@ -566,6 +617,7 @@
       App.trafficChart.reset();
       App.miniChart.reset();
     }
+    if (App.currentTab === 'dashboard' && wasRunning !== status.running) startDashboardStats();
   });
 
   App.refresh = refresh;
@@ -575,13 +627,25 @@
   applyI18n();
   syncTopbarTitle();
   App.refreshPalette();
+  if (App.visualTest) {
+    App.visualTest.boot({ ensureTabModules, showTab, setLanguage })
+      .catch((error) => {
+        window.__visualTestError = error && (error.stack || error.message) || String(error);
+      });
+    return;
+  }
   if (!api) {
     if (App.renderThemeLabel) App.renderThemeLabel();
     App.trafficChart.draw();
     App.miniChart.draw();
     return;
   }
-  refreshSafely();
+  uiState.restoreControls();
+  refreshSafely().then(() => {
+    const restoredTab = uiState.restoredTab;
+    if (restoredTab !== App.currentTab) showTab(restoredTab, { capture: false });
+    else uiState.restoreScroll(restoredTab, { final: true });
+  });
   App.trafficChart.draw();
   App.miniChart.draw();
   App.initVersion();

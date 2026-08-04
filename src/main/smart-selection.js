@@ -35,6 +35,10 @@ const DEFAULT_OPTIONS = Object.freeze({
   switchUncertaintyCapMs: 180,
   switchUncertaintySpreadCap: 3,
   sampleHalfLifeMs: 15 * 60_000,
+  // UI stability maturity needs a wider evidence window than live selection.
+  // Standby Smart intentionally probes each node infrequently, so reusing the
+  // short selection half-life can make a large profile stay "probing" forever.
+  stabilitySampleHalfLifeMs: 6 * 60 * 60_000,
   failureHalfLifeMs: 8 * 60_000,
   networkChangeRetention: 0.25,
   // Keep a few small per-network histories. The active network counts toward
@@ -296,8 +300,10 @@ const STABILITY_RECOVER_MID_SUCCESSES = 3;
  * Recovery is intentionally sticky: a few lucky re-tests must not instantly
  * paint a recently-red node green (that was the main UX complaint).
  */
-function stabilityFromState(state, now = Date.now()) {
-  const samples = Math.max(0, Number(state && state.effectiveSamples) || 0);
+function stabilityFromState(state, now = Date.now(), evidenceSamples = null) {
+  const samples = evidenceSamples == null
+    ? Math.max(0, Number(state && state.effectiveSamples) || 0)
+    : Math.max(0, Number(evidenceSamples) || 0);
   if (!state || samples < 0.5 || state.ewma == null) return { level: 'unknown' };
 
   const softFails = Math.max(0, Number(state.softFails) || 0);
@@ -357,6 +363,7 @@ function emptyNodeState() {
     effectiveAttempts: 0,
     samples: 0,
     effectiveSamples: 0,
+    stabilitySamples: 0,
     primaryEwma: null,
     secondaryEwma: null,
     ewma: null,
@@ -735,11 +742,17 @@ class SmartSelectionModel {
     state.lastDecay = Math.max(previous, now);
     if (!elapsed) return;
     const sampleHalfLife = Math.max(60_000, Number(this.options.sampleHalfLifeMs) || 900_000);
+    const stabilitySampleHalfLife = Math.max(
+      60_000,
+      Number(this.options.stabilitySampleHalfLifeMs) || 21_600_000
+    );
     const failureHalfLife = Math.max(60_000, Number(this.options.failureHalfLifeMs) || 480_000);
     const sampleFactor = 2 ** (-elapsed / sampleHalfLife);
+    const stabilitySampleFactor = 2 ** (-elapsed / stabilitySampleHalfLife);
     const failureFactor = 2 ** (-elapsed / failureHalfLife);
     state.effectiveAttempts *= sampleFactor;
     state.effectiveSamples *= sampleFactor;
+    state.stabilitySamples = Math.max(0, Number(state.stabilitySamples) || 0) * stabilitySampleFactor;
     state.delayM2 *= sampleFactor;
     state.trafficEvidence *= sampleFactor;
     state.failureRate *= failureFactor;
@@ -879,6 +892,7 @@ class SmartSelectionModel {
       this._decayState(state, now);
       state.effectiveAttempts *= retention;
       state.effectiveSamples *= retention;
+      state.stabilitySamples *= retention;
       state.delayM2 *= retention;
       state.trafficEvidence *= retention;
       state.failureRate *= retention;
@@ -1030,6 +1044,7 @@ class SmartSelectionModel {
     state.effectiveAttempts = 0;
     state.samples = 0;
     state.effectiveSamples = 0;
+    state.stabilitySamples = 0;
     state.primaryEwma = null;
     state.secondaryEwma = null;
     state.ewma = null;
@@ -1185,6 +1200,10 @@ class SmartSelectionModel {
         state.peakJitter = Math.max(state.jitter, (Number(state.peakJitter) || 0) * 0.92);
       }
       state.samples = Math.min(1000, state.samples + 1);
+      state.stabilitySamples = Math.min(
+        1000,
+        Math.max(0, Number(state.stabilitySamples) || 0) + 1
+      );
       state.failureRate *= 1 - this.options.failureAlpha;
       state.consecutiveFailures = 0;
       state.cooldownUntil = 0;
@@ -1557,8 +1576,9 @@ class SmartSelectionModel {
    */
   qualities(names, now = Date.now()) {
     const out = {};
-    // A decaying count drops infinitesimally below an integer immediately;
-    // use a half-sample tolerance to avoid flickering around the maturity edge.
+    // Stability evidence decays on a wider window than selection evidence.
+    // This lets standby Smart mature large profiles without making old RTT
+    // samples influential in live routing decisions.
     const minSamples = 4.5;
     for (const value of names || []) {
       const name = typeof value === 'string' ? value : '';
@@ -1584,6 +1604,9 @@ class SmartSelectionModel {
         ? Number(state.displayDelay)
         : (validDelay(state.ewma) ? Number(state.ewma) : null);
       const effectiveSamples = Math.max(0, Number(state.effectiveSamples) || 0);
+      const stabilitySamples = state.stabilitySamples === undefined
+        ? effectiveSamples
+        : Math.max(0, Number(state.stabilitySamples) || 0);
       if (failed) {
         out[name] = {
           level: 'unavailable',
@@ -1594,7 +1617,7 @@ class SmartSelectionModel {
         };
         continue;
       }
-      if (effectiveSamples < 0.5 || ewma == null) {
+      if (stabilitySamples < 0.5 || ewma == null) {
         out[name] = {
           level: 'unknown',
           samples: Math.round(effectiveSamples * 10) / 10,
@@ -1605,7 +1628,7 @@ class SmartSelectionModel {
         continue;
       }
       // Honest cold-start: do not paint traffic-light grades on 1–4 lucky hits.
-      if (effectiveSamples < minSamples) {
+      if (stabilitySamples < minSamples) {
         out[name] = {
           level: 'probing',
           samples: Math.round(effectiveSamples * 10) / 10,
@@ -1615,7 +1638,7 @@ class SmartSelectionModel {
         };
         continue;
       }
-      const quality = stabilityFromState(state, now);
+      const quality = stabilityFromState(state, now, stabilitySamples);
       out[name] = {
         level: quality.level,
         samples: Math.round(effectiveSamples * 10) / 10,
@@ -1645,6 +1668,9 @@ class SmartSelectionModel {
       const effectiveSamples = state.effectiveSamples === undefined
         ? samples
         : Math.max(0, Math.min(1000, Number(state.effectiveSamples) || 0));
+      const stabilitySamples = state.stabilitySamples === undefined
+        ? samples
+        : Math.max(0, Math.min(1000, Number(state.stabilitySamples) || 0));
       const healthSignals = importHealthSignals(state.healthSignals, state);
       const importedHealth = healthSummary(healthSignals);
       imported.set(name, {
@@ -1655,6 +1681,7 @@ class SmartSelectionModel {
         effectiveAttempts,
         samples,
         effectiveSamples,
+        stabilitySamples,
         primaryEwma: validDelay(state.primaryEwma) ? Number(state.primaryEwma) : null,
         secondaryEwma: validDelay(state.secondaryEwma) ? Number(state.secondaryEwma) : null,
         ewma: validDelay(state.ewma) ? Number(state.ewma) : null,

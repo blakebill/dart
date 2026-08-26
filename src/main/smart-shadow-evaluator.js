@@ -1,6 +1,7 @@
 'use strict';
 
 const { SmartSelectionModel, normalizeSmartMode } = require('./smart-selection');
+const { connectionHealthSignal } = require('./smart-health');
 
 const DEFAULT_MAX_CONTEXTS = 3;
 const DEFAULT_MAX_HISTORY = 80;
@@ -20,7 +21,6 @@ const EVENT_KINDS = new Set([
   'dialSuccess',
   'dialFailure',
 ]);
-const SIGNALS = new Set(['tcp', 'udp', 'handshake', 'first-byte']);
 const CALIBRATION_KEYS = new Set([
   'switchThresholdMs',
   'switchConfidenceZ',
@@ -274,13 +274,14 @@ function sanitizeEvent(value) {
   const name = boundedString(value.name);
   const kind = boundedString(value.kind, 32);
   if (!name || !EVENT_KINDS.has(kind)) return null;
-  const signal = boundedString(value.signal, 32);
+  const healthSignal = connectionHealthSignal(value, true);
+  const signal = healthSignal === 'firstByte' ? 'first-byte' : healthSignal;
   return {
     type: 'event',
     event: {
       name,
       kind,
-      ...(SIGNALS.has(signal) ? { signal } : {}),
+      ...(signal ? { signal } : {}),
       ...(finiteDelay(value.durationMs) == null
         ? {}
         : { durationMs: finiteDelay(value.durationMs) }),

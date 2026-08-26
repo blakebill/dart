@@ -46,7 +46,7 @@
       : 'custom';
 
     function renderFeatureStatus() {
-      const supported = $('#dialogCoreSource').value === 'custom';
+      const supported = !!(status.coreInstalled && status.kernelSmart);
       const value = $('#dialogSmartSupport');
       value.textContent = t(supported ? 'settings.supported' : 'settings.unsupported');
       value.classList.toggle('supported', supported);
@@ -69,6 +69,7 @@
 
     async function refreshStatus() {
       renderStatus(await Dialog.call(api.coreStatus));
+      renderFeatureStatus();
     }
 
     renderStatus(status);
@@ -81,7 +82,6 @@
     window.addEventListener('beforeunload', removeProgress, { once: true });
 
     Dialog.bind('#dialogCoreFolder', 'click', () => Dialog.call(api.openCoreFolder));
-    Dialog.bind('#dialogCoreSource', 'change', renderFeatureStatus);
     Dialog.bind('#dialogCoreRestart', 'click', async () => {
       await Dialog.runBusy($('#dialogCoreRestart'), null, async () => {
         await Dialog.call(api.restartCore);

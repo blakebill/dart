@@ -36,7 +36,21 @@ const { KernelDialFeedback } = require('../src/main/kernel-dial-feedback');
 const { detectNodeRegion, normalizeSmartRegions, smartRegionMembers } = require('../src/main/node-region');
 const { nodeFingerprint } = require('../src/main/subscription');
 const { ManagedAutoSelection } = require('../src/main/managed-auto-selection');
+const { ManagedSelectionCoordinator } = require('../src/main/managed-selection-coordinator');
+const { SmartModelStore, contextStorageKey } = require('../src/main/smart-model-store');
 const { connectionRows, registerConnectionsIpc } = require('../src/main/connections-ipc');
+const { ConnectionSnapshotService } = require('../src/main/connection-snapshot-service');
+const {
+  hasProxyProviders,
+  normalizeProxyProviders,
+  runtimeProviderInventory,
+  unavailableProviderFiles,
+} = require('../src/main/proxy-providers');
+const {
+  buildLocalRuleLines,
+  normalizeTextRules,
+  validateValues: validateLocalRuleValues,
+} = require('../src/main/local-rules');
 
 let passed = 0;
 const pendingTests = [];
@@ -62,6 +76,44 @@ function test(name, fn) {
 }
 
 console.log('i18n:');
+
+test('local rules generate structured IP-ASN rules and validate ASN ranges', () => {
+  assert.deepStrictEqual(
+    buildLocalRuleLines({ matchType: 'ip_asn', values: ['13335', '15169'], target: 'proxy' }, '🚀 Proxy'),
+    ['IP-ASN,13335,🚀 Proxy', 'IP-ASN,15169,🚀 Proxy']
+  );
+  assert.deepStrictEqual(validateLocalRuleValues('ip_asn', ['1', '4294967295']), ['1', '4294967295']);
+  for (const invalid of ['AS13335', '0', '4294967296', '-1']) {
+    assert.throws(() => validateLocalRuleValues('ip_asn', [invalid]), /IP-ASN/);
+  }
+});
+
+test('local text rules normalize Mihomo syntax and map the app proxy target', () => {
+  const input = [
+    '# local overrides',
+    'domain-suffix, example.com, proxy',
+    'IP-ASN,13335,DIRECT,no-resolve',
+    'SRC-IP-ASN,15169,REJECT',
+    'MATCH,PROXY',
+    'DOMAIN-SUFFIX,example.com,PROXY',
+  ].join('\n');
+  assert.deepStrictEqual(normalizeTextRules(input), [
+    'DOMAIN-SUFFIX,example.com,PROXY',
+    'IP-ASN,13335,DIRECT,no-resolve',
+    'SRC-IP-ASN,15169,REJECT',
+    'MATCH,PROXY',
+  ]);
+  assert.deepStrictEqual(buildLocalRuleLines({ mode: 'text', rules: input }), [
+    'DOMAIN-SUFFIX,example.com,🚀 Proxy',
+    'IP-ASN,13335,DIRECT,no-resolve',
+    'SRC-IP-ASN,15169,REJECT',
+    'MATCH,🚀 Proxy',
+  ]);
+  assert.throws(() => normalizeTextRules('IP-ASN,AS13335,PROXY'), /IP-ASN/);
+  assert.throws(() => normalizeTextRules('SCRIPT,x,PROXY'), /unsupported local rule/);
+  assert.throws(() => normalizeTextRules('DOMAIN,example.com,Unknown'), /target/);
+  assert.throws(() => normalizeTextRules('DOMAIN,example.com,PROXY,no-resolve'), /parameter/);
+});
 
 test('manual latency request carries the configured URL in Clash API order', () => {
   const requestPath = buildDelayApiPath('Hong Kong / 01', 'https://example.com/ping?q=a&x=1');
@@ -467,6 +519,16 @@ test('Smart selection fails over, cools repeated failures, and bounds memory', (
     measurements: [{ name: 'z', delay: 100 }, { name: 'z', delay: null }, { name: 'z', delay: null }],
   });
   assert.strictEqual(recovering.qualities(['z'], 1500).z.level, 'unavailable');
+  // A successful manual/UI probe must remain visible even while Smart keeps the
+  // node in its historical unavailable/recovery state.
+  recovering.observeDisplayDelay('z', 76, 1600);
+  const manualRecovery = recovering.qualities(['z'], 1700).z;
+  assert.strictEqual(manualRecovery.level, 'unavailable');
+  assert.strictEqual(manualRecovery.displayDelay, 76);
+  // A later failed display probe removes that fresh override so stale RTT is not
+  // presented as current reachability.
+  recovering.observeDisplayDelay('z', null, 1800);
+  assert.strictEqual(recovering.qualities(['z'], 1900).z.displayDelay, null);
   recovering.choose({
     contextKey: 'rec', names: ['z'], current: 'z', now: 2000,
     measurements: [{ name: 'z', delay: 90 }, { name: 'z', delay: 95 }, { name: 'z', delay: 88 }],
@@ -563,6 +625,68 @@ test('managed Auto never treats a zero timeout as the fastest node', async () =>
   assert.strictEqual(await managed.refresh({ force: true }), 'valid-node');
   assert.strictEqual(putName, 'valid-node');
   managed.stop();
+});
+
+test('managed selection can filter provider-backed candidates without changing Auto behavior', async () => {
+  const measured = [];
+  let selected = null;
+  const managed = new ManagedAutoSelection({
+    appGroup: '🚀 Proxy',
+    autoGroup: '🧠 Smart',
+    clashApi: async (method, _path, body) => {
+      if (method === 'PUT') {
+        selected = body.name;
+        return {};
+      }
+      return { now: 'US Provider', all: ['US Provider', 'HK Provider'] };
+    },
+    isRunning: () => true,
+    filterNames: (names) => names.filter((name) => name.startsWith('HK')),
+    selectBatch: selectAutoTestBatch,
+    testDelay: async (name) => {
+      measured.push(name);
+      return 20;
+    },
+  });
+  await managed.refresh({ force: true });
+  assert.deepStrictEqual(measured, ['HK Provider']);
+  assert.strictEqual(selected, 'HK Provider');
+  managed.stop();
+});
+
+test('provider runtime inventory is bounded, stable and collapses ambiguous names', () => {
+  const configured = normalizeProxyProviders({
+    first: { type: 'http', url: 'https://example.com/first?token=secret' },
+    second: { type: 'http', url: 'https://example.com/second' },
+  });
+  const response = {
+    providers: {
+      first: { proxies: [{ name: 'HK 01', type: 'Trojan', alive: true }, { name: 'Inline', type: 'SS' }] },
+      second: { proxies: [{ name: 'HK 01', type: 'VMess' }, { name: 'JP 01', type: 'VLESS' }] },
+    },
+  };
+  const first = runtimeProviderInventory(configured, response, [{ name: 'Inline' }], 'profile-a');
+  const second = runtimeProviderInventory(configured, response, [{ name: 'Inline' }], 'profile-a');
+  assert.deepStrictEqual(first.nodes.map((node) => node.name), ['HK 01', 'JP 01']);
+  assert.deepStrictEqual(first.nodes.map((node) => node.id), second.nodes.map((node) => node.id));
+  assert.strictEqual(first.nodes[0].provider, 'first');
+  assert.strictEqual(first.nodes[0].type, 'trojan');
+  assert.strictEqual(first.status.collisionCount, 2);
+  assert.ok(!JSON.stringify(first).includes('token=secret'));
+});
+
+test('provider usability ignores malformed definitions and local files fail explicitly until present', () => {
+  assert.strictEqual(hasProxyProviders({ broken: { type: 'http', url: 'file:///secret' } }), false);
+  assert.strictEqual(hasProxyProviders({ remote: { type: 'http', url: 'https://example.com/sub' } }), true);
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-provider-home-'));
+  const definitions = { local: { type: 'file', path: 'providers/local.yaml' } };
+  assert.deepStrictEqual(unavailableProviderFiles(definitions, home), [
+    { name: 'local', path: 'providers/local.yaml' },
+  ]);
+  fs.mkdirSync(path.join(home, 'providers'));
+  fs.writeFileSync(path.join(home, 'providers', 'local.yaml'), 'payload: []');
+  assert.deepStrictEqual(unavailableProviderFiles(definitions, home), []);
 });
 
 test('Smart selection isolates history by core and active profile', () => {
@@ -1184,6 +1308,35 @@ test('Smart runtime calibration is bounded, non-compounding, and survives mode/s
   );
 });
 
+test('Smart production history persists bounded Map state across restarts and profiles', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-smart-model-'));
+  const first = new SmartSelectionModel();
+  const firstStore = new SmartModelStore(first, {
+    getDirectory: () => dir,
+    persistDelayMs: 0,
+    maxContexts: 2,
+  });
+  const profileA = 'mihomo:profile-a:http://probe.example/path';
+  const profileB = 'mihomo:profile-b:http://probe.example/path';
+  firstStore.switchContext(contextStorageKey(profileA), profileA);
+  first.setNetworkKey('network-a');
+  first.observe({ name: 'node-a', delay: 81 }, 10_000);
+  firstStore.switchContext(contextStorageKey(profileB), profileB);
+  first.setNetworkKey('network-a');
+  first.observe({ name: 'node-b', delay: 92 }, 11_000);
+  assert.strictEqual(firstStore.flush(), true);
+
+  const second = new SmartSelectionModel();
+  const secondStore = new SmartModelStore(second, { getDirectory: () => dir, maxContexts: 2 });
+  assert.strictEqual(secondStore.switchContext(contextStorageKey(profileA), profileA), true);
+  assert.strictEqual(second.contextKey, profileA);
+  assert.strictEqual(second.peek('node-a').samples, 1);
+  assert.strictEqual(second.peek('node-b'), null);
+  const persisted = fs.readFileSync(path.join(dir, 'smart-model-state.json'), 'utf-8');
+  assert.ok(!persisted.includes(profileA), 'raw profile/probe context leaked into persisted model keys');
+  secondStore.close();
+});
+
 test('Smart route-change detector ignores cold start and isolated noise', () => {
   const cold = new SmartSelectionModel({ routeChangeMinSamples: 6 });
   [100, 500, 90, 450, 110].forEach((delay, index) => {
@@ -1624,6 +1777,23 @@ test('Smart shadow replay is bounded, deterministic, and strips unrelated connec
   assert.ok(!restored.snapshot().contexts.some((context) => context.contextKey === 'shadow-a'));
 });
 
+test('Smart shadow connection signals match production normalization', () => {
+  const shadow = new SmartShadowEvaluator({ maxHistory: 16 });
+  shadow.configure({
+    contextKey: 'signals',
+    mode: 'balanced',
+    baseOptions: new SmartSelectionModel().getUncalibratedOptions(),
+    legacyOptions: {},
+  });
+  assert.strictEqual(shadow.observeConnection({ name: 'a', kind: 'softFail' }, 1_000), true);
+  assert.strictEqual(shadow.observeConnection({ name: 'a', kind: 'softFail', signal: 'firstByte' }, 1_001), true);
+  assert.strictEqual(shadow.observeConnection({ name: 'a', kind: 'softFail', signal: 'first-byte' }, 1_002), true);
+  const events = shadow.snapshot().contexts[0].history.filter((entry) => entry.type === 'event');
+  assert.deepStrictEqual(events.map((entry) => entry.event.signal), [
+    'first-byte', 'first-byte', 'first-byte',
+  ]);
+});
+
 test('Smart shadow calibrates only after sustained counterfactual improvement', () => {
   class FakeShadowModel {
     constructor(options) {
@@ -2048,6 +2218,27 @@ test('managed selection discards an in-flight result after stop', async () => {
   assert.strictEqual(put, 0);
 });
 
+test('managed user selections serialize the full transaction and expose new intent immediately', async () => {
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const coordinator = new ManagedSelectionCoordinator(async (name, revision) => {
+    events.push(`start:${name}:${revision}`);
+    if (name === 'A') await firstGate;
+    events.push(`finish:${name}:${revision}`);
+    return name;
+  });
+  const first = coordinator.select('A');
+  await Promise.resolve();
+  const second = coordinator.select('B');
+  assert.strictEqual(coordinator.getRevision(), 2, 'queued intent did not invalidate temporary selector leases');
+  assert.deepStrictEqual(events, ['start:A:1']);
+  releaseFirst();
+  assert.strictEqual(await first, 'A');
+  assert.strictEqual(await second, 'B');
+  assert.deepStrictEqual(events, ['start:A:1', 'finish:A:1', 'start:B:2', 'finish:B:2']);
+});
+
 // i18n.js is a browser IIFE; evaluate it with a stub window to get the DICT.
 function loadDict() {
   const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'i18n.js'), 'utf-8');
@@ -2111,6 +2302,7 @@ test('zh labels keep config terminology', () => {
   assert.strictEqual(zh['customrs.targetProxy'], '代理');
   assert.strictEqual(zh['customrs.targetReject'], '拒绝');
   assert.strictEqual(zh['rulegroups.targetSource'], '选择出站');
+  assert.strictEqual(zh['rulegroups.followProxy'], '🚀 Proxy');
 });
 
 test('static HTML fallbacks keep config terminology', () => {
@@ -2126,12 +2318,13 @@ test('static HTML fallbacks keep config terminology', () => {
   assert.ok(!html.includes('请求 UA'), 'retired User-Agent label remains');
 });
 
-test('rule-set page is folded into rules and native geodata management', () => {
+test('policy groups have a dedicated page while rule-sets stay folded into rules', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf-8');
   const dialogs = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'dialog', 'system.js'), 'utf-8');
   const settings = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'settings.js'), 'utf-8');
   const rulesets = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rulesets.js'), 'utf-8');
   const rules = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rules.js'), 'utf-8');
+  const groups = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'groups.js'), 'utf-8');
   assert.ok(!html.includes('data-tab="ruleset"'), 'standalone rule-set nav is still present');
   assert.ok(!html.includes('id="tab-ruleset"'), 'standalone rule-set tab is still present');
   assert.ok(!html.includes('id="crsFormat"'), 'remote rules should auto-detect format when adding');
@@ -2139,14 +2332,44 @@ test('rule-set page is folded into rules and native geodata management', () => {
   assert.ok(!html.includes('QuantumultX'), 'unsupported remote rule format option is still present');
   assert.ok(!html.includes('Surge'), 'unsupported remote rule format option is still present');
   assert.ok(!html.includes('Loon'), 'unsupported remote rule format option is still present');
-  assert.ok(html.indexOf('id="ruleGroupList"') < html.indexOf('id="lrList"'), 'policy groups should be the first rules section');
+  assert.ok(html.includes('data-tab="groups"'), 'standalone policy-group navigation is missing');
+  assert.ok(html.includes('id="tab-groups"'), 'standalone policy-group page is missing');
+  const groupsStart = html.indexOf('id="tab-groups"');
+  const rulesStart = html.indexOf('id="tab-rules"');
+  assert.ok(groupsStart < html.indexOf('id="ruleGroupList"'));
+  assert.ok(html.indexOf('id="ruleGroupList"') < rulesStart, 'policy groups are still embedded in Rules');
   assert.ok(html.indexOf('id="crsList"') > html.indexOf('id="lrList"'), 'remote rules should follow local rules');
   assert.ok(html.includes('id="geoManageBtn"'), 'GeoData management launcher is missing');
   assert.ok(dialogs.includes("Dialog.register('geodata'"), 'native GeoData dialog is missing');
   assert.ok(settings.includes("$('#geoManageBtn').addEventListener('click'"), 'GeoData launcher is not bound by the always-loaded settings module');
   assert.ok(!rulesets.includes("$('#geoManageBtn')"), 'lazy rules module still owns the GeoData launcher');
-  assert.ok(rules.includes('const sourceTargets = new Set(info.sourceTargets || [])'));
-  assert.ok(rules.includes("if (sel.value === 'source') delete next[g]"));
+  assert.ok(!rules.includes('sourceTargets'), 'Rules still owns policy-group state');
+  assert.ok(groups.includes('sourceTargets: new Set(info.sourceTargets || [])'));
+  assert.ok(groups.includes('next[groupName] = mode'));
+  assert.ok(groups.includes('async function reconcilePolicyGroups(info, generation)'));
+  assert.ok(groups.includes("await loadPolicyGroups({ force: true, preserveScroll: true })"));
+  assert.ok(groups.includes('patchPolicyGroupCard(info, groupName)'));
+  const coreControl = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  const groupInfo = coreControl.slice(coreControl.indexOf('function ruleGroupInfo()'), coreControl.indexOf('async function setRuleGroupSelection'));
+  assert.ok(groupInfo.includes('selections: normalizedSelections'));
+  assert.ok(!groups.includes('control.disabled = busy'));
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'main.js'), 'utf-8');
+  const statusHandler = main.slice(main.indexOf('if (api && api.onStatus)'), main.indexOf('App.refresh = refresh'));
+  assert.ok(!statusHandler.includes('App.invalidatePolicyGroupCache()'),
+    'core stop/start still rebuilds the policy-group page');
+  assert.ok(!groups.includes('<select'), 'policy-group cards still render dropdowns');
+});
+
+test('local rules expose IP-ASN and validated text editing', () => {
+  const editors = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'dialog', 'editors.js'), 'utf-8');
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'js', 'rules.js'), 'utf-8');
+  assert.ok(editors.includes('<option value="ip_asn">IP-ASN</option>'));
+  assert.ok(editors.includes('data-editor-mode="structured"'));
+  assert.ok(editors.includes('data-editor-mode="text"'));
+  assert.ok(editors.includes('id="lrTextRules"'));
+  assert.ok(rules.includes("ip_asn: 'IP-ASN'"));
+  assert.ok(rules.includes("it.mode === 'text'"));
+  assert.ok(rules.includes('(it.rules || []).length'));
 });
 
 test('Smart feedback pacing reacts to evidence and deep idle boundaries', () => {
@@ -2357,7 +2580,9 @@ const MAIN_STYLE_SRCS = [
   'styles/dashboard.css',
   'styles/controls.css',
   'styles/lists.css',
+  'styles/groups.css',
   'styles/workspaces.css',
+  'styles/connections.css',
   'styles/logs.css',
   'styles/configs.css',
   'styles/tools.css',
@@ -2421,7 +2646,7 @@ test('module load order: util.js first of the js/ modules, main.js last', () => 
 
 test('feature renderers and dialog workflows load only when requested', () => {
   const mainFeatures = [
-    'js/subs.js', 'js/nodes.js', 'js/rules.js', 'js/rulesets.js', 'js/conns.js',
+    'js/subs.js', 'js/nodes.js', 'js/groups.js', 'js/rules.js', 'js/rulesets.js', 'js/conns.js',
     'js/logs.js', 'js/settings.js', 'js/tools.js', 'js/toolbox.js',
   ];
   for (const src of mainFeatures) {
@@ -2433,6 +2658,11 @@ test('feature renderers and dialog workflows load only when requested', () => {
     assert.ok(!dialogScriptSrcs.includes(src), `dialog feature module is still eager: ${src}`);
   }
   assert.ok(mainEntry.includes('App.loadScripts(TAB_MODULES[tab])'));
+  assert.ok(mainEntry.includes('App.hasRendererModule(name)'));
+  for (const src of mainFeatures) {
+    const source = fs.readFileSync(path.join(rendererDir, src), 'utf-8');
+    assert.ok(source.includes('App.registerRendererModule('), `lazy module has no initialization handshake: ${src}`);
+  }
   assert.ok(dialogEntry.includes('await App.loadScript(module)'));
 });
 
@@ -2467,7 +2697,7 @@ test('primary navigation follows the vertical tabs keyboard pattern', () => {
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
   assert.ok(indexHtml.includes('role="tablist"'));
   assert.ok(indexHtml.includes('aria-orientation="vertical"'));
-  for (const tab of ['dashboard', 'subs', 'nodes', 'rules', 'conns', 'tools', 'logs', 'settings']) {
+  for (const tab of ['dashboard', 'subs', 'nodes', 'groups', 'rules', 'conns', 'tools', 'logs', 'settings']) {
     assert.ok(indexHtml.includes(`id="nav-${tab}"`), `missing tab id: ${tab}`);
     assert.ok(indexHtml.includes(`aria-controls="tab-${tab}"`), `missing tab target: ${tab}`);
     assert.ok(indexHtml.includes(`aria-labelledby="nav-${tab}"`), `missing panel label: ${tab}`);
@@ -2687,6 +2917,23 @@ test('connections controller keeps global App access in its compatibility adapte
   assert.ok(conns.includes('App.deactivateConnections = controller.deactivate'));
 });
 
+test('background refresh preserves unrelated node data and surfaces connection API failures', () => {
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const dashboard = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
+  const conns = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
+  const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const subsHandler = main.slice(main.indexOf('if (api && api.onSubsChanged)'), main.indexOf('if (api && api.onDialogChanged)'));
+  assert.ok(!subsHandler.includes('App.releaseNodes'), 'an inactive profile update still clears the visible node list');
+  assert.ok(subsHandler.includes("App.currentTab === 'rules'"));
+  assert.ok(subsHandler.includes('showRulesTab()'));
+  assert.ok(subsHandler.includes("App.currentTab === 'groups'"));
+  assert.ok(subsHandler.includes('showGroupsTab()'));
+  assert.ok(dashboard.includes('if (data && data.error)'));
+  assert.ok(conns.includes("title: t('conns.loadFailed')"));
+  assert.ok(conns.includes("actionName: 'retry-connections'"));
+  assert.ok(nodes.includes('return groupNow;'), 'a transient group API failure still clears the current selection');
+});
+
 test('connections controller renews a rejected or revoked visibility lease', async () => {
   const source = fs.readFileSync(path.join(rendererDir, 'js', 'conns.js'), 'utf-8');
   const element = () => ({
@@ -2709,6 +2956,7 @@ test('connections controller renews a rejected or revoked visibility lease', asy
     currentTab: 'conns',
     services: { api: {} },
     factories: {},
+    registerRendererModule() {},
     ui: { renderEmptyState() {} },
     uiState: { restoreScroll() {} },
     router: { go() {} },
@@ -2729,6 +2977,44 @@ test('connections controller renews a rejected or revoked visibility lease', asy
     },
     clearTimeout: (timer) => { if (timer) timer.cleared = true; },
   });
+
+  const sampleConnections = [
+    {
+      id: 'proxy-tcp',
+      rule: 'MATCH',
+      chains: ['Tokyo A', 'Proxy'],
+      metadata: { host: 'example.com', destinationIP: '203.0.113.1', destinationPort: '443', network: 'tcp' },
+    },
+    {
+      id: 'direct-udp',
+      rule: 'DIRECT',
+      chains: ['DIRECT'],
+      metadata: { destinationIP: '192.0.2.3', network: 'udp' },
+    },
+    {
+      id: 'rejected',
+      rule: 'REJECT-DROP',
+      chains: ['REJECT'],
+      metadata: { host: 'blocked.example', network: 'tcp' },
+    },
+  ];
+  const filter = App.factories.filterConnections;
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(filter(sampleConnections, { query: 'tokyo a' }))).map((row) => row.id),
+    ['proxy-tcp']
+  );
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(filter(sampleConnections, { query: 'example.com:443' }))).map((row) => row.id),
+    ['proxy-tcp']
+  );
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(filter(sampleConnections, { query: '192.0.2.3', network: 'udp' }))).map((row) => row.id),
+    ['direct-udp']
+  );
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(filter(sampleConnections, { route: 'reject' }))).map((row) => row.id),
+    ['rejected']
+  );
 
   let leaseCalls = 0;
   const controller = App.factories.createConnectionsController({
@@ -2779,8 +3065,10 @@ test('design tokens and visual regression fixtures are versioned contracts', () 
   assert.ok(pkg.scripts['test:visual']);
   assert.ok(pkg.scripts['test:visual:update']);
   assert.ok(visual.includes('MAX_CHANGED_PIXEL_RATIO'));
+  assert.ok(visual.includes('normalizeCapture'));
   assert.ok(visual.includes('dashboard vertical overflow'));
   assert.ok(fixtures.includes("params.get('visual-test') !== '1'"));
+  assert.ok(fixtures.includes('immediate: true'));
   const baselines = fs.readdirSync(path.join(__dirname, 'visual-baselines'))
     .filter((name) => name.endsWith('.png'))
     .sort();
@@ -2877,11 +3165,15 @@ test('large live lists use bounded virtual windows', () => {
   assert.ok(nodes.includes('NODE_COLUMNS = 2'), 'node virtualization must remain two-column aware');
   assert.ok(nodes.includes('node-grid-window'));
   assert.ok(conns.includes('VIRTUAL_CONNECTION_ROW_HEIGHT'));
+  assert.ok(conns.includes('filterTimer = setTimeout'));
+  assert.ok(conns.includes('clearTimeout(filterTimer)'));
   assert.ok(conns.includes("window.addEventListener('resize'"), 'connection virtualization must follow window resizing');
   assert.ok(conns.includes('ui.renderEmptyState'));
   assert.ok(ui.includes("container.classList.add('is-empty')"));
   assert.ok(conns.includes("elements.list.classList.remove('is-empty')"));
   assert.ok(rules.includes('VIRTUAL_RULE_ROW_HEIGHT'));
+  assert.ok(rules.includes('ruleFilterTimer = setTimeout'));
+  assert.ok(rules.includes('clearTimeout(ruleFilterTimer)'));
   for (const code of [nodes, conns, rules]) assert.ok(code.includes('virtual-spacer'));
   assert.ok(css.includes('.virtual-spacer'));
   assert.ok(css.includes('.conn-list.is-empty'));
@@ -2931,6 +3223,9 @@ test('background renderer work is bounded to visible and useful content', () => 
   assert.ok(main.includes("window.addEventListener('pagehide'"));
   assert.ok(main.includes('App.setLogStreaming(false)'));
   assert.ok(main.includes('App.setLogStreaming(true)'));
+  assert.ok(main.includes('SILENT_UPDATE_START_DELAY_MS = 30_000'));
+  assert.ok(main.indexOf('setTimeout(() => {\n    try {\n      const last = parseInt') >= 0,
+    'silent update checks still compete with startup work');
   assert.ok(settings.includes('function changedSettingsPatch(candidate)'));
   assert.ok(settings.includes("if (!Object.keys(patch).length)"));
   assert.ok(indexHtml.includes('id="mainContent"'));
@@ -2951,6 +3246,9 @@ test('main-process background work is paced and bounded', () => {
   assert.ok(core.includes('smartFeedbackSampler.wake()'));
   assert.ok(core.includes('smartFeedbackSampler.stop()'));
   assert.ok(core.includes('managedSmartSelection.setActive(false)'));
+  const drain = core.indexOf('await operations.closeAndDrain()');
+  assert.ok(drain >= 0, 'shutdown does not wait for accepted persistence transactions');
+  assert.ok(drain < core.indexOf('smartModelStore.close()', drain), 'shutdown tears down Smart state before config drain');
   assert.ok(shadow.includes('batchSize: 24'));
   assert.ok(shadow.includes('maxPending: 256'));
   assert.ok(shadow.includes('setImmediate(() =>'));
@@ -3021,6 +3319,19 @@ test('connection IPC invalidates native and renderer visibility leases', async (
     handlers['connections:close']({ sender: {} }, { id: 'x' }),
     /invalid window/
   );
+
+  const deleted = [];
+  core.clashApi = async (method, apiPath) => { deleted.push([method, apiPath]); return {}; };
+  const batch = await handlers['connections:closeMany'](event, { ids: ['a/b', 'node-2', 'a/b'] });
+  assert.deepStrictEqual(batch, { closed: 2 });
+  assert.deepStrictEqual(deleted, [
+    ['DELETE', '/connections/a%2Fb'],
+    ['DELETE', '/connections/node-2'],
+  ]);
+  await assert.rejects(
+    handlers['connections:closeMany'](event, { ids: Array(301).fill('x') }),
+    /invalid connection ids/
+  );
 });
 
 test('connection IPC rows keep bounded primitive fields', () => {
@@ -3054,6 +3365,96 @@ test('connection IPC rows keep bounded primitive fields', () => {
   assert.strictEqual(rows.down, 50);
 });
 
+test('connection snapshots share one short-lived read and build focused projections', async () => {
+  let clock = 1_000;
+  let loads = 0;
+  let releaseFirst;
+  let holdFirst = true;
+  let expireSnapshot = null;
+  const payload = {
+    uploadTotal: 12,
+    downloadTotal: 34,
+    connections: [{
+      id: 'one',
+      start: '2026-01-01T00:00:00.000Z',
+      upload: 5,
+      download: 9,
+      rule: 'MATCH',
+      chains: ['Node A', 'Proxy'],
+      metadata: {
+        host: 'example.com',
+        destinationIP: '203.0.113.2',
+        destinationPort: 443,
+        network: 'tcp',
+        process: 'must-not-survive',
+      },
+      extra: { large: 'must-not-survive' },
+    }],
+  };
+  const service = new ConnectionSnapshotService({
+    ttlMs: 750,
+    now: () => clock,
+    setTimeout: (callback) => {
+      expireSnapshot = callback;
+      return { unref() {} };
+    },
+    clearTimeout: () => {},
+    load: () => {
+      loads += 1;
+      if (!holdFirst) return payload;
+      return new Promise((resolve) => { releaseFirst = resolve; });
+    },
+  });
+
+  const summaryPending = service.summary();
+  const rowsPending = service.rendererRows();
+  const feedbackPending = service.smartFeedback();
+  await Promise.resolve();
+  assert.strictEqual(loads, 1, 'concurrent consumers did not share one /connections read');
+  holdFirst = false;
+  releaseFirst(payload);
+  const [summary, rowsResult, feedback] = await Promise.all([
+    summaryPending, rowsPending, feedbackPending,
+  ]);
+  assert.deepStrictEqual(summary, {
+    totalConnections: 1,
+    up: 12,
+    down: 34,
+    fetchedAt: 1_000,
+  });
+  assert.strictEqual(rowsResult.connections[0].metadata.destinationPort, '443');
+  assert.ok(!('process' in rowsResult.connections[0].metadata));
+  assert.ok(!('extra' in feedback[0]));
+  assert.ok(!('process' in feedback[0].metadata));
+
+  clock = 1_749;
+  await service.summary();
+  assert.strictEqual(loads, 1, 'fresh snapshot was fetched again before its TTL');
+  clock = 1_750;
+  await service.summary();
+  assert.strictEqual(loads, 2, 'expired snapshot was not refreshed');
+  expireSnapshot();
+  assert.strictEqual(service.cached, null, 'expired raw response remained retained without a later read');
+  await service.summary();
+  assert.strictEqual(loads, 3, 'a released snapshot was reused');
+  service.invalidate();
+  await service.summary();
+  assert.strictEqual(loads, 4, 'explicit invalidation retained a stale snapshot');
+
+  const large = new ConnectionSnapshotService({
+    load: () => ({
+      connections: Array.from({ length: 2_500 }, (_, index) => ({
+        id: String(index),
+        start: new Date(index * 1_000).toISOString(),
+        chains: ['Node A'],
+        metadata: { host: 'example.com', network: 'tcp' },
+      })),
+    }),
+  });
+  assert.strictEqual((await large.smartFeedback()).length, 2_000, 'Smart feedback projection was unbounded');
+  large.invalidate();
+});
+
 test('light renderer snapshots keep only bounded navigation state', () => {
   const uiState = fs.readFileSync(path.join(rendererDir, 'js', 'ui-state.js'), 'utf-8');
   const start = uiState.indexOf('  function cleanUiState(value) {');
@@ -3061,18 +3462,30 @@ test('light renderer snapshots keep only bounded navigation state', () => {
   assert.ok(start >= 0 && end > start);
   const sandbox = {
     RESTORABLE_TABS: new Set([
-      'dashboard', 'subs', 'nodes', 'rules', 'conns', 'tools', 'logs', 'settings',
+      'dashboard', 'subs', 'nodes', 'groups', 'rules', 'conns', 'tools', 'logs', 'settings',
     ]),
-    TAB_SCROLL_TARGETS: { nodes: ['nodeList'], rules: ['ruleList'], conns: ['connList'], logs: ['logBox'] },
-    FILTER_IDS: ['nodeFilter', 'ruleFilter'],
+    TAB_SCROLL_TARGETS: {
+      nodes: ['nodeList'], groups: ['ruleGroupList'], rules: ['ruleList'],
+      conns: ['connList'], logs: ['logBox'],
+    },
+    FILTER_IDS: [
+      'nodeFilter', 'ruleFilter', 'connFilter', 'connNetworkFilter', 'connRouteFilter',
+    ],
   };
   const context = {
     ...sandbox,
     input: {
       tab: 'invalid',
       scroll: { nodes: { mainContent: 20, nodeList: 99_999_999, unknown: 4 } },
-      filters: { nodeFilter: 'x'.repeat(400), secret: 'discard' },
+      filters: {
+        nodeFilter: 'x'.repeat(400),
+        connFilter: 'example.com',
+        connNetworkFilter: 'udp',
+        connRouteFilter: 'direct',
+        secret: 'discard',
+      },
       expanded: ['safe-panel', '../unsafe', 'a'.repeat(80)],
+      sidebarCollapsed: true,
       connections: [{ id: 'must-not-survive' }],
       nodes: [{ name: 'must-not-survive' }],
     },
@@ -3085,7 +3498,11 @@ test('light renderer snapshots keep only bounded navigation state', () => {
     nodes: { mainContent: 20, nodeList: 10_000_000 },
   });
   assert.strictEqual(result.filters.nodeFilter.length, 256);
+  assert.strictEqual(result.filters.connFilter, 'example.com');
+  assert.strictEqual(result.filters.connNetworkFilter, 'udp');
+  assert.strictEqual(result.filters.connRouteFilter, 'direct');
   assert.deepStrictEqual(result.expanded, ['safe-panel']);
+  assert.strictEqual(result.sidebarCollapsed, true);
   assert.ok(!('connections' in result));
   assert.ok(!('nodes' in result));
 });
@@ -3309,6 +3726,7 @@ test('log streaming resumes from history without gaps or duplicate live lines', 
     currentTab: 'logs',
     $: (selector) => elements.get(selector),
     escapeHtml: (value) => String(value),
+    registerRendererModule() {},
   };
   const context = {
     window: { App: logApp, api },
@@ -3388,11 +3806,13 @@ test('node, connection and log workspaces use a unified full-height surface', ()
   assert.ok(logSection.includes('class="log-workspace-surface live-data-surface"'));
 });
 
-test('config, rule and tool pages use grouped canvas sections without outer panels', () => {
+test('config, policy-group, rule and tool pages use grouped canvas sections without outer panels', () => {
   const css = readRendererCss();
-  for (const id of ['tab-subs', 'tab-rules', 'tab-tools']) {
-    const start = indexHtml.indexOf(`<section class="tab canvas-page" id="${id}"`);
+  for (const id of ['tab-subs', 'tab-groups', 'tab-rules', 'tab-tools']) {
+    const start = indexHtml.indexOf(`id="${id}"`);
     assert.ok(start >= 0, `${id} must use the canvas page layout`);
+    const opening = indexHtml.lastIndexOf('<section', start);
+    assert.ok(indexHtml.slice(opening, start).includes('canvas-page'), `${id} must use the canvas page layout`);
     const section = indexHtml.slice(start, indexHtml.indexOf('</section>', start));
     assert.ok(!section.includes('class="panel'), `${id} must not have an outer panel`);
   }
@@ -3400,7 +3820,7 @@ test('config, rule and tool pages use grouped canvas sections without outer pane
   assert.ok(indexHtml.includes('class="tool-list"'));
   const sectionStyle = css.slice(css.indexOf('.canvas-page > .workspace-section'), css.indexOf('.cards {'));
   assert.ok(sectionStyle.includes('border: 1px solid var(--border)'));
-  assert.ok(sectionStyle.includes('background: color-mix(in srgb, var(--surface) 68%, transparent)'));
+  assert.ok(sectionStyle.includes('background: var(--surface)'));
   assert.ok(sectionStyle.includes('border-radius: 12px'));
   assert.ok(sectionStyle.includes('box-shadow: var(--panel-shadow)'));
   const toolStyle = css.slice(css.indexOf('.tool-list {'), css.indexOf('.setting-row {'));
@@ -3412,17 +3832,32 @@ test('config, rule and tool pages use grouped canvas sections without outer pane
   const rulesStart = indexHtml.indexOf('<section class="tab canvas-page" id="tab-rules"');
   const rulesEnd = indexHtml.indexOf('</section>', rulesStart);
   const rulesSection = indexHtml.slice(rulesStart, rulesEnd);
-  assert.ok(rulesSection.indexOf('rule-browser-section') < rulesSection.indexOf('rule-compact-section'));
+  assert.ok(rulesSection.indexOf('rule-browser-section') < rulesSection.indexOf('rule-management-section'));
+  assert.strictEqual((rulesSection.match(/rule-management-section/g) || []).length, 1);
+  assert.ok(rulesSection.includes('id="ruleManagerTabs"'));
+  assert.ok(rulesSection.includes('id="localRuleManager"'));
+  assert.ok(rulesSection.includes('id="remoteRuleManager"'));
+  assert.ok(css.includes('#tab-groups > .policy-groups-section'));
   assert.ok(css.includes('#ruleGroupList {'));
-  assert.ok(css.includes('max-height: 300px'));
-  assert.ok(css.includes('grid-template-columns: minmax(120px, 1fr) 172px'));
+  assert.ok(css.includes('max-height: none'));
+  assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
+  assert.ok(css.includes('grid-template-columns: repeat(auto-fit, minmax(74px, 1fr))'));
+  const groupCardStyle = css.slice(css.indexOf('.rule-group-item,'), css.indexOf('.rule-group-item.is-expanded'));
+  assert.ok(groupCardStyle.includes('transform var(--motion-fast)'));
+  assert.ok(groupCardStyle.includes('transform: translateY(-1px)'));
+  assert.ok(groupCardStyle.includes('box-shadow: var(--panel-shadow)'));
+  assert.ok(css.includes('.rule-group-item.is-expanded'));
+  assert.ok(css.includes('grid-row: span 2'));
+  assert.ok(css.includes('@keyframes ruleGroupPickerIn'));
+  assert.ok(css.includes('animation: ruleGroupPickerIn var(--motion-fast)'));
+  assert.ok(css.includes('grid-template-columns: minmax(0, 1fr)'));
   assert.ok(css.includes('.rule-group-item .rule-group-name'));
   assert.ok(css.includes('#tab-rules #lrList > .hint:only-child::before'));
   assert.ok(css.includes('#tab-rules #crsList > .hint:only-child::before'));
   assert.ok(css.includes('content: "\\E8A5"'));
   assert.ok(css.includes('content: "\\E753"'));
-  const rulesRenderer = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
-  assert.ok(rulesRenderer.includes('class="sub-name rule-group-name"'));
+  const groupsRenderer = fs.readFileSync(path.join(rendererDir, 'js', 'groups.js'), 'utf-8');
+  assert.ok(groupsRenderer.includes('class="sub-name rule-group-name"'));
 });
 
 test('config activation state keeps a stable action width', () => {
@@ -3433,8 +3868,9 @@ test('config activation state keeps a stable action width', () => {
   assert.ok(activationStyle.includes('width: 72px'));
 });
 
-test('config workspace separates labeled entry fields, profile facts and action groups', () => {
+test('profile workspace keeps primary actions visible and secondary actions in an accessible menu', () => {
   const subs = fs.readFileSync(path.join(rendererDir, 'js', 'subs.js'), 'utf-8');
+  const i18n = fs.readFileSync(path.join(rendererDir, 'i18n.js'), 'utf-8');
   const css = readRendererCss();
   assert.ok(indexHtml.includes('class="config-field config-name-field"'));
   assert.ok(indexHtml.includes('class="config-field config-url-field"'));
@@ -3442,9 +3878,21 @@ test('config workspace separates labeled entry fields, profile facts and action 
   assert.ok(indexHtml.includes('id="subListSummary"'));
   assert.ok(subs.includes('class="sub-facts"'));
   assert.ok(subs.includes('class="sub-actions-primary"'));
-  assert.ok(subs.includes('class="sub-actions-secondary"'));
+  assert.ok(!subs.includes('class="sub-actions-secondary"'));
+  assert.ok(subs.includes('class="sub-overflow-menu" role="menu"'));
+  assert.ok(subs.includes('role="menuitem" data-act="edit"'));
+  assert.ok(subs.includes('role="menuitem" data-act="editraw"'));
+  assert.ok(subs.includes('role="menuitem" data-act="remove"'));
+  assert.ok(subs.includes("event.key === 'ArrowDown'"));
+  assert.ok(subs.includes("event.key === 'Escape'"));
+  assert.ok(subs.includes("document.addEventListener('mousedown'"));
   assert.ok(css.includes('#tab-subs .sub-item {'));
   assert.ok(css.includes('grid-template-columns: minmax(0, 1fr) auto'));
+  assert.ok(css.includes('.sub-overflow-menu[hidden]'));
+  assert.ok(css.includes('background: var(--menu-surface)'));
+  assert.ok(i18n.includes("'nav.subs': 'Profiles'"));
+  assert.ok(i18n.includes("'subs.title': 'Profiles'"));
+  assert.ok(!i18n.includes("'nav.subs': 'Configs'"));
 });
 
 test('label-control settings rows keep text inputs and selects aligned', () => {
@@ -3485,6 +3933,7 @@ test('heavy renderer data is bounded and released outside its active view', () =
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
   const nodes = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
   const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
+  const groups = fs.readFileSync(path.join(rendererDir, 'js', 'groups.js'), 'utf-8');
   const logs = fs.readFileSync(path.join(rendererDir, 'js', 'logs.js'), 'utf-8');
   const dialogHost = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
   assert.ok(main.includes('App.releaseNodes'));
@@ -3495,6 +3944,10 @@ test('heavy renderer data is bounded and released outside its active view', () =
   assert.ok(main.includes('App.releaseNodes({ cancelTests: false })'));
   assert.ok(rules.includes('ruleItems = []'));
   assert.ok(rules.includes('generation !== ruleLoadGeneration'));
+  assert.ok(groups.includes('generation !== groupLoadGeneration'));
+  assert.ok(main.includes('App.releasePolicyGroupCache'));
+  assert.ok(main.includes("previousTab === 'rules' && tab !== 'rules'"));
+  assert.ok(main.includes('App.releaseRuleCache();'));
   assert.ok(logs.includes('LOG_LIMIT = 120000'));
   assert.ok(!nodes.includes('for (const name of delays.keys())'));
   assert.ok(nodes.includes('api.applyAutoCandidate(bestName)'));
@@ -3558,7 +4011,7 @@ test('dashboard status cards expose current node latency and click actions', () 
   );
 });
 
-test('dashboard traffic chart is compact and tracks session totals with switch toggles', () => {
+test('dashboard traffic chart uses the 0.9.7 desktop height and tracks session totals with switch toggles', () => {
   const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
   const dashboard = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
   const css = readRendererCss();
@@ -3576,6 +4029,8 @@ test('dashboard traffic chart is compact and tracks session totals with switch t
   assert.ok(systemDialogs.includes('id="dialogCoreSource"'));
   assert.ok(systemDialogs.includes('id="dialogSmartSupport"'));
   assert.ok(systemDialogs.includes('source = $(\'#dialogCoreSource\').value'));
+  assert.ok(systemDialogs.includes('status.coreInstalled && status.kernelSmart'));
+  assert.ok(!systemDialogs.includes("const supported = $('#dialogCoreSource').value === 'custom'"));
   assert.ok(!systemDialogs.includes('settings.coreHint'));
   assert.ok(indexHtml.includes('id="openPanelBtn"'));
   assert.ok(indexHtml.includes('data-i18n="tools.panelHint"'));
@@ -3585,22 +4040,66 @@ test('dashboard traffic chart is compact and tracks session totals with switch t
   assert.ok(charts.includes("bindSeriesToggle(upToggle, 'up')"));
   assert.ok(charts.includes("bindSeriesToggle(downToggle, 'down')"));
   assert.ok(dashboard.includes('const visible = subs.slice(0, 2)'));
-  assert.ok(dashboard.includes("t('usage.more', hidden)"));
-  assert.ok(css.includes('height: 120px'));
+  assert.ok(dashboard.includes('const visible = subs.slice(0, 2)'));
+  assert.ok(!dashboard.includes("t('usage.more', hidden)"));
+  assert.ok(css.includes('height: 112px'));
   assert.ok(css.includes('.switch-track'));
   assert.ok(css.includes('grid-template-columns: repeat(2, minmax(0, 1fr))'));
 });
 
-test('dashboard insight modules follow their visual information density', () => {
+test('dashboard insight modules expose separate quality metrics and six recent events', () => {
+  const dashboard = fs.readFileSync(path.join(rendererDir, 'js', 'dashboard.js'), 'utf-8');
   const css = readRendererCss();
   const quickIndex = indexHtml.indexOf('class="panel dashboard-quick"');
   const qualityIndex = indexHtml.indexOf('class="panel dashboard-quality"');
   const eventsIndex = indexHtml.indexOf('class="panel dashboard-events"');
   assert.ok(quickIndex >= 0 && quickIndex < qualityIndex && qualityIndex < eventsIndex);
-  const insights = css.slice(css.indexOf('.dashboard-insights {'), css.indexOf('.dashboard-insights > .panel'));
-  assert.ok(insights.includes('"quick quick"'));
-  assert.ok(insights.includes('"quality events"'));
-  assert.ok(css.includes('grid-template-columns: repeat(4, minmax(0, 1fr))'));
+  const insightStart = css.indexOf('.dashboard-insights {');
+  const insights = css.slice(insightStart, css.indexOf('.dashboard-insights > .panel', insightStart));
+  assert.ok(insights.includes('"quick quality events"'));
+  for (const id of ['qualityLatency', 'qualityMeasured', 'qualityHealthy', 'qualityMode']) {
+    assert.ok(indexHtml.includes(`id="${id}"`));
+  }
+  assert.ok(indexHtml.includes('class="quality-metric"'));
+  assert.ok(!indexHtml.includes('id="qualitySummary"'));
+  assert.ok(dashboard.includes('.slice(-6)'));
+  assert.ok(css.includes('.quality-metrics'));
+});
+
+test('dashboard restores the 0.9.7 desktop spacing with a compact fallback', () => {
+  const dashboardCss = fs.readFileSync(path.join(rendererDir, 'styles', 'dashboard.css'), 'utf-8');
+  const surfacesCss = fs.readFileSync(path.join(rendererDir, 'styles', 'surfaces.css'), 'utf-8');
+  const polishCss = fs.readFileSync(path.join(rendererDir, 'styles', 'polish.css'), 'utf-8');
+  const insights = dashboardCss.slice(
+    dashboardCss.indexOf('.dashboard-insights {'),
+    dashboardCss.indexOf('.dashboard-insights > .panel'),
+  );
+  assert.ok(insights.includes('margin-top: 12px'));
+  assert.ok(insights.includes('gap: 14px'));
+  assert.ok(surfacesCss.includes('margin-bottom: 14px'));
+  assert.ok(surfacesCss.includes('height: 112px'));
+  assert.ok(polishCss.includes('--content-inset: 24px'));
+  assert.ok(polishCss.includes('height: 72px'));
+  assert.ok(polishCss.includes('margin-top: 12px'));
+});
+
+test('dashboard status content is vertically centered', () => {
+  const dashboardCss = fs.readFileSync(path.join(rendererDir, 'styles', 'dashboard.css'), 'utf-8');
+  const surfacesCss = fs.readFileSync(path.join(rendererDir, 'styles', 'surfaces.css'), 'utf-8');
+  assert.ok(surfacesCss.includes('justify-content: center'));
+  assert.ok(dashboardCss.includes('.card-route-main'));
+  assert.ok(dashboardCss.includes('.quality-metric {\n  display: flex'));
+});
+
+test('dashboard quick actions mirror the four-cell quality grid responsively', () => {
+  const dashboardCss = fs.readFileSync(path.join(rendererDir, 'styles', 'dashboard.css'), 'utf-8');
+  const polishCss = fs.readFileSync(path.join(rendererDir, 'styles', 'polish.css'), 'utf-8');
+  assert.ok(dashboardCss.includes('grid-template-rows: repeat(2, minmax(0, 1fr))'));
+  assert.ok(dashboardCss.includes('grid-template-columns: repeat(4, minmax(0, 1fr))'));
+  assert.ok(polishCss.includes('grid-template-rows: repeat(2, 46px)'));
+  assert.ok(polishCss.includes('@media (min-width: 721px) and (max-width: 939px)'));
+  assert.ok(polishCss.includes('grid-template-rows: repeat(4, minmax(38px, auto))'));
+  assert.ok(!polishCss.includes('.dashboard-action {\n    min-height: 0;\n    height: 100%'));
 });
 
 test('node latency updates invalidate the shared dashboard quality summary', () => {
@@ -3608,6 +4107,26 @@ test('node latency updates invalidate the shared dashboard quality summary', () 
   const mainJs = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
   assert.ok(nodesJs.includes("typeof App.renderDashboardQuality === 'function'"));
   assert.ok(mainJs.includes("} else if (tab === 'dashboard') {\n      App.renderDashboard();"));
+});
+
+test('background node quality updates patch visible rows without rebuilding the virtual list', () => {
+  const nodesJs = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const start = nodesJs.indexOf('async function refreshQualities()');
+  const end = nodesJs.indexOf('function isActiveNode', start);
+  const refresh = nodesJs.slice(start, end);
+  assert.ok(refresh.includes('scheduleVisibleNodeSignals()'));
+  assert.ok(!refresh.includes('renderNodeWindow()'), 'quality polling still rebuilds focused node cards');
+  assert.ok(refresh.includes('generation !== nodeLoadGeneration'));
+  assert.ok(nodesJs.includes("list.querySelectorAll('.node-item[data-node=\"1\"]')"));
+  assert.ok(nodesJs.includes('patchNodeSignals(row, row.dataset.name)'));
+});
+
+test('fresh manual latency wins over stale unavailable Smart quality', () => {
+  const nodesJs = fs.readFileSync(path.join(rendererDir, 'js', 'nodes.js'), 'utf-8');
+  const syncStart = nodesJs.indexOf('function syncDelayFromQuality');
+  const freshDelay = nodesJs.indexOf('Number.isFinite(value.displayDelay)', syncStart);
+  const unavailable = nodesJs.indexOf("value.level === 'unavailable'", syncStart);
+  assert.ok(syncStart >= 0 && freshDelay > syncStart && unavailable > freshDelay);
 });
 
 test('settings isolates Smart features before DNS and removes obsolete controls', () => {
@@ -3623,7 +4142,11 @@ test('settings isolates Smart features before DNS and removes obsolete controls'
   assert.ok(indexHtml.includes('id="setDnsOverride"'));
   assert.ok(indexHtml.includes('id="saveAllSettings"'));
   assert.ok(indexHtml.includes('id="settingsDirtyState"'));
+  assert.ok(indexHtml.includes('class="settings-savebar hidden"'));
+  assert.ok(!indexHtml.includes('id="checkConfigBtn"'));
+  assert.ok(indexHtml.includes('id="configCheckOpen"'));
   assert.ok(settings.includes("$('#saveAllSettings').addEventListener"));
+  assert.ok(settings.includes("bar.classList.toggle('hidden', !dirty)"));
   assert.ok(settings.includes('function settingsCandidate()'));
   assert.ok(settings.includes('function updateDirtyState()'));
   assert.ok(!indexHtml.includes('id="saveSettings"'));
@@ -3659,15 +4182,16 @@ test('dynamic first-paint regions reserve dimensions to limit layout shift', () 
   assert.ok(css.includes('#coreHint'));
   assert.ok(css.includes('#usageList'));
   assert.ok(css.includes('.card-value'));
-  assert.ok(css.includes('min-height: 28px'));
+  assert.ok(css.includes('min-height: 24px'));
 });
 
-test('light theme preserves Mica while keeping surfaces and text distinct', () => {
+test('Mica stays at the window layer while content surfaces remain legible', () => {
   const css = readRendererCss();
   assert.ok(css.includes('--bg: transparent'));
   assert.ok(css.includes('--sidebar: transparent'));
-  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.74)'));
-  assert.ok(css.includes('--raised-filter: blur(22px) saturate(1.16)'));
+  assert.ok(css.includes('--surface: rgba(255, 255, 255, 0.88)'));
+  assert.ok(!css.includes('--raised-filter'));
+  assert.ok(css.includes('--menu-surface: rgba(252, 252, 252, 0.96)'));
   assert.ok(!css.includes('--surface-filter'));
   assert.ok(css.includes('--text-faint: #68737f'));
   assert.ok(css.includes('--panel-shadow:'));
@@ -3677,20 +4201,21 @@ test('light theme preserves Mica while keeping surfaces and text distinct', () =
 test('language changes refresh enhanced select labels immediately', () => {
   const select = fs.readFileSync(path.join(rendererDir, 'js', 'select.js'), 'utf-8');
   const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
-  const rules = fs.readFileSync(path.join(rendererDir, 'js', 'rules.js'), 'utf-8');
+  const groups = fs.readFileSync(path.join(rendererDir, 'js', 'groups.js'), 'utf-8');
   const css = readRendererCss();
   const languageFlow = main.slice(
-    main.indexOf('function setLanguage(lang)'),
+    main.indexOf('function setLanguage(lang, options = {})'),
     main.indexOf('// ---------- Tab switching ----------')
   );
   assert.ok(select.includes('function refreshSelects('));
   assert.ok(select.includes('selectSync.get(select)'));
   assert.ok(languageFlow.includes('App.state.settings.language = lang'));
-  assert.ok(languageFlow.includes('App.refreshRuleGroupLabels()'));
-  assert.ok(rules.includes("source: t('rulegroups.targetSource')"));
-  assert.ok(rules.includes('App.refreshSelects(list)'));
-  assert.ok(languageFlow.indexOf('App.state.settings.language = lang') < languageFlow.indexOf('App.renderSettings()'));
-  assert.ok(languageFlow.indexOf('App.renderSettings()') < languageFlow.indexOf('App.refreshSelects()'));
+  assert.ok(languageFlow.includes('App.refreshPolicyGroupLabels()'));
+  assert.ok(groups.includes("source: t('rulegroups.targetSource')"));
+  assert.ok(groups.includes('renderPolicyGroups(groupInfo, { preserveScroll: true })'));
+  assert.ok(!groups.includes('<select'));
+  assert.ok(languageFlow.indexOf('App.state.settings.language = lang') < languageFlow.indexOf('App.renderSettings('));
+  assert.ok(languageFlow.indexOf('App.renderSettings(') < languageFlow.indexOf('App.refreshSelects()'));
   const selectElement = { value: 'zh' };
   let mirroredLanguage = null;
   let refreshedRuleGroups = 0;
@@ -3706,7 +4231,7 @@ test('language changes refresh enhanced select labels immediately', () => {
       renderMode: noop,
       renderUsage: noop,
       renderCoreStatus: noop,
-      refreshRuleGroupLabels: () => { refreshedRuleGroups++; },
+      refreshPolicyGroupLabels: () => { refreshedRuleGroups++; },
       refreshSelects: () => { mirroredLanguage = selectElement.value; },
     },
     setLang: noop,
@@ -3728,16 +4253,17 @@ test('secondary panels use a real transient native material window', () => {
   const dialogCss = fs.readFileSync(path.join(rendererDir, 'dialog', 'dialog.css'), 'utf-8');
   const dialogMain = fs.readFileSync(path.join(rendererDir, 'dialog', 'main.js'), 'utf-8');
   const host = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'dialog-window.js'), 'utf-8');
-  const menus = css.slice(css.indexOf('.ui-select-menu,\n.node-context-menu {'), css.indexOf('.ui-select-menu {', css.indexOf('.ui-select-menu,\n.node-context-menu {')));
-  const contextMenu = css.slice(css.indexOf('.node-context-menu {', css.indexOf('.node-context-menu {') + 1), css.indexOf('.node-context-menu.hidden'));
-  assert.ok(css.includes('--menu-surface: rgb(252, 252, 252)'));
+  const menuRule = '.ui-select-menu,\n.node-context-menu,\n.sub-overflow-menu {';
+  const menus = css.slice(css.indexOf(menuRule), css.indexOf('.ui-select-menu {', css.indexOf(menuRule)));
+  const contextStart = css.indexOf('.node-context-menu {');
+  const contextMenu = css.slice(contextStart, css.indexOf('.node-context-menu.hidden', contextStart));
+  assert.ok(css.includes('--menu-surface: rgba(252, 252, 252, 0.96)'));
   assert.ok(menus.includes('background: var(--menu-surface)'));
   assert.ok(menus.includes('border: 1px solid var(--menu-border)'));
   assert.ok(menus.includes('box-shadow: var(--menu-shadow)'));
   assert.ok(contextMenu.includes('z-index: 1200'));
   assert.ok(!contextMenu.includes('--surface-raised'), 'context menus must not expose content underneath');
-  assert.ok(css.includes('.toast {\n  -webkit-backdrop-filter: var(--raised-filter)'));
-  assert.ok(css.includes('backdrop-filter: var(--raised-filter)'));
+  assert.ok(!css.includes('backdrop-filter: var(--raised-filter)'));
   assert.ok(host.includes('parent,'));
   assert.ok(host.includes('modal: true'));
   assert.ok(host.includes('frame: false'));
@@ -3806,7 +4332,8 @@ test('main surfaces avoid diagonal highlights and repeated backdrop filters', ()
     assert.ok(!rule.includes('background-image: linear-gradient'));
   }
   for (const rule of [surfaces, card]) assert.ok(!rule.includes('backdrop-filter'));
-  const menus = css.slice(css.indexOf('.ui-select-menu,\n.node-context-menu {'), css.indexOf('.ui-select-menu {', css.indexOf('.ui-select-menu,\n.node-context-menu {')));
+  const menuRule = '.ui-select-menu,\n.node-context-menu,\n.sub-overflow-menu {';
+  const menus = css.slice(css.indexOf(menuRule), css.indexOf('.ui-select-menu {', css.indexOf(menuRule)));
   assert.ok(!menus.includes('backdrop-filter'));
 });
 
@@ -3854,6 +4381,71 @@ test('node test actions fit inside the fixed virtualized card height', () => {
   assert.ok(action.includes('padding-block: 2px'));
 });
 
+test('sidebar restores the 0.9.7 desktop width and preserves an accessible collapsed mode', () => {
+  const css = readRendererCss();
+  const main = fs.readFileSync(path.join(rendererDir, 'js', 'main.js'), 'utf-8');
+  const uiState = fs.readFileSync(path.join(rendererDir, 'js', 'ui-state.js'), 'utf-8');
+  assert.ok(indexHtml.includes('id="sidebarToggle"'));
+  assert.ok(indexHtml.includes('<span class="brand-heading">'));
+  assert.ok(indexHtml.includes('aria-expanded="true"'));
+  assert.ok(css.includes('--sidebar-width: 208px'));
+  assert.ok(css.includes('--sidebar-collapsed-width: 64px'));
+  assert.ok(css.includes('.app.sidebar-collapsed .sidebar'));
+  assert.ok(css.includes('.app.sidebar-collapsed .nav-item'));
+  assert.ok(indexHtml.includes('class="power-icon"'));
+  assert.ok(css.includes('.app.sidebar-collapsed .power-icon'));
+  assert.ok(main.includes('function applySidebarState('));
+  assert.ok(main.includes("toggle.setAttribute('aria-expanded', String(!compact))"));
+  assert.ok(main.includes('uiState.setSidebarCollapsed(compact)'));
+  assert.ok(uiState.includes('sidebarCollapsed: source.sidebarCollapsed === true'));
+  assert.ok(uiState.includes('get sidebarCollapsed()'));
+});
+
+test('compact traffic charts suppress the overlapping middle axis label', () => {
+  const charts = fs.readFileSync(path.join(rendererDir, 'js', 'charts.js'), 'utf-8');
+  assert.ok(charts.includes('const compactAxis = plotHeight < 48'));
+  assert.ok(charts.includes("if (!compactAxis || i !== 1)"));
+  assert.ok(charts.includes("const COMPACT_AXIS_FONT = '9px"));
+});
+
+test('renderer typography uses one shared size scale', () => {
+  const cssFiles = [
+    path.join(rendererDir, 'style.css'),
+    ...fs.readdirSync(path.join(rendererDir, 'styles')).filter((name) => name.endsWith('.css'))
+      .map((name) => path.join(rendererDir, 'styles', name)),
+    path.join(rendererDir, 'dialog', 'dialog.css'),
+  ];
+  const css = cssFiles.map((file) => fs.readFileSync(file, 'utf-8')).join('\n');
+  for (const token of [
+    '--font-micro', '--font-xs', '--font-caption', '--font-small', '--font-ui',
+    '--font-body', '--font-section-title', '--font-metric', '--font-page-title',
+  ]) assert.ok(css.includes(token), `missing typography token ${token}`);
+  assert.ok(!/font-size:\s*\d+(?:\.\d+)?px/.test(css), 'component font sizes must use typography tokens');
+  assert.ok(!/font:\s*\d+(?:\.\d+)?px/.test(css), 'font shorthands must use typography tokens');
+  assert.ok(css.includes('#tab-logs .commandbar-status'));
+  assert.ok(css.includes('.log-box {\n  font-size: var(--font-ui)'));
+});
+
+test('desktop typography keeps dense UI labels and hierarchy balanced', () => {
+  const css = fs.readFileSync(path.join(rendererDir, 'style.css'), 'utf-8');
+  assert.match(css, /--font-body:\s*13px;/);
+  assert.match(css, /--font-section-title:\s*15px;/);
+  assert.match(css, /--font-metric:\s*17px;/);
+  assert.match(css, /--font-page-title:\s*20px;/);
+});
+
+test('the main workspace is designed and regression-tested at 1280x800', () => {
+  const windowSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'window.js'), 'utf-8');
+  const visualSource = fs.readFileSync(path.join(__dirname, 'visual-regression.js'), 'utf-8');
+  assert.ok(windowSource.includes('width: 1280'));
+  assert.ok(windowSource.includes('height: 800'));
+  assert.ok(!indexHtml.includes('id="topCore"'));
+  assert.ok(indexHtml.includes('id="topProfile"'));
+  for (const tab of ['dashboard', 'configs', 'nodes-empty', 'groups', 'connections', 'tools', 'settings']) {
+    assert.ok(visualSource.includes(`${tab}-light-1280x800`));
+  }
+});
+
 console.log('\nGitHub release helper:');
 
 const github = require('../src/main/github');
@@ -3864,6 +4456,10 @@ test('compareTags orders semver, v-prefixed and date tags', () => {
   assert.strictEqual(github.compareTags('1.2.3', 'v1.2.3'), 0);
   assert.ok(github.compareTags('20250606', '20240101') > 0);
   assert.ok(github.compareTags('1.10', '1.9.9') > 0); // numeric, not lexicographic
+  assert.ok(github.compareTags('0.9.7', '0.9.7-rc.1') > 0);
+  assert.ok(github.compareTags('0.9.7-rc.1', '0.9.7-beta.10') > 0);
+  assert.ok(github.compareTags('0.9.7-beta.10', '0.9.7-beta.2') > 0);
+  assert.ok(github.compareTags('1.19.29-dart.2', '1.19.29-dart.1') > 0);
 });
 
 test('pickLatestTag skips prereleases and picks the newest stable', () => {
@@ -3888,7 +4484,7 @@ console.log('\nCore adapters and integrity:');
 
 const { getCoreAdapter, listCoreAdapters, normalizeCoreType } = require('../src/main/core-adapters');
 const { normalizeSha256, parseSha256Sums } = require('../src/main/integrity');
-const { OperationCoordinator } = require('../src/main/operation-coordinator');
+const { OperationCoordinator, runReversibleLiveMutation } = require('../src/main/operation-coordinator');
 const {
   addBundledComponents,
   releaseVersionFromTag,
@@ -3938,6 +4534,95 @@ test('release inputs keep prerelease versions and select only stable Dart cores'
   assert.throws(() => selectStableDartRelease(releases, '1.19.30'), /no stable Dart release/);
 });
 
+test('authoritative core release metadata never falls back to an unsigned synthesized asset', () => {
+  const adapter = getCoreAdapter('mihomo');
+  assert.strictEqual(adapter.releaseAsset('1.2.3', 'windows', 'amd64', { assets: [] }), null);
+  const fallback = adapter.releaseAsset('1.2.3', 'windows', 'amd64', null);
+  assert.ok(fallback && fallback.url.includes('/releases/download/v1.2.3/'));
+  assert.strictEqual(fallback.sha256, null);
+  const managerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-manager.js'), 'utf-8');
+  const guard = managerSource.indexOf('if (!asset.sha256)');
+  const download = managerSource.indexOf('await fetch.downloadWithFallback(asset.url', guard);
+  const execute = managerSource.indexOf('await this._extractCore(', guard);
+  assert.ok(guard >= 0 && guard < download && download < execute, 'unsigned core can reach download or execution');
+});
+
+test('core release asset selection prefers the generic build over CPU variants', () => {
+  const adapter = getCoreAdapter('mihomo');
+  const asset = (name) => ({
+    name,
+    browser_download_url: `https://example.test/${name}`,
+    digest: `sha256:${'a'.repeat(64)}`,
+  });
+  const canonical = 'mihomo-windows-amd64-v1.19.29.zip';
+  const release = {
+    assets: [
+      asset('mihomo-windows-amd64-v1-v1.19.29.zip'),
+      asset('mihomo-windows-amd64-go124-v1.19.29.zip'),
+      asset(canonical),
+      asset('mihomo-windows-amd64-compatible-v1.19.29.zip'),
+    ],
+  };
+  assert.strictEqual(
+    adapter.releaseAsset('1.19.29', 'windows', 'amd64', release, 'official').fileName,
+    canonical
+  );
+});
+
+test('Mihomo config checks reject zero-exit validation failures', () => {
+  const { mihomoConfigCheckPassed } = require('../src/main/core-manager');
+  assert.strictEqual(mihomoConfigCheckPassed(0, '', 'configuration file config.yaml test is successful'), true);
+  assert.strictEqual(
+    mihomoConfigCheckPassed(
+      0,
+      '',
+      'level=error msg="proxy group[1]: unsupported type: smart"\nconfiguration file config.yaml test failed'
+    ),
+    false
+  );
+  assert.strictEqual(mihomoConfigCheckPassed(1, '', 'test failed'), false);
+});
+
+test('Mihomo startup signals reject listener failures and confirm TUN readiness', () => {
+  const { mihomoStartupSignal } = require('../src/main/core-manager');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-manager.js'), 'utf-8');
+  assert.deepStrictEqual(
+    mihomoStartupSignal('INFO [TUN] Tun adapter listening at: Meta', true),
+    { tunReady: true }
+  );
+  assert.deepStrictEqual(
+    mihomoStartupSignal('ERROR Start TUN listening error: Access is denied', true),
+    { error: 'ERROR Start TUN listening error: Access is denied' }
+  );
+  assert.deepStrictEqual(
+    mihomoStartupSignal('ERROR External controller listen error: address already in use'),
+    { error: 'ERROR External controller listen error: address already in use' }
+  );
+  assert.strictEqual(mihomoStartupSignal('ERROR proxy provider failed to update', true), null);
+  assert.strictEqual(mihomoStartupSignal('ERROR Start TUN listening error: ignored', false), null);
+  assert.ok(source.includes('Promise.all(pendingPorts.map((port) => probeLocalPort(port)))'),
+    'independent startup port probes are still serialized');
+});
+
+test('generic settings updates cannot bypass the transactional mode endpoint', () => {
+  const { SETTING_KEYS, VALID_MODES, validateSettingsPatch } = require('../src/main/ipc-validation');
+  assert.strictEqual(SETTING_KEYS.has('clashMode'), false);
+  assert.deepStrictEqual(VALID_MODES, ['rule', 'global', 'direct', 'block']);
+  const dnsPatch = { dnsRemote: '2001:4860:4860::8888', dnsLocal: '223.5.5.5' };
+  const current = { mixedPort: 7890, clashApiPort: 9090 };
+  validateSettingsPatch(dnsPatch, current);
+  assert.deepStrictEqual(dnsPatch, {
+    dnsRemote: '2001:4860:4860::8888',
+    dnsLocal: '223.5.5.5',
+  });
+  validateSettingsPatch({ ruleOverrides: { AI: 'source', Local: 'direct' } }, current);
+  assert.throws(
+    () => validateSettingsPatch({ ruleOverrides: { AI: 'automatic' } }, current),
+    /invalid ruleOverrides/
+  );
+  assert.throws(() => validateSettingsPatch({ dnsRemote: 'not a host :' }, current), /invalid dnsRemote/);
+});
+
 test('core registry exposes Mihomo only', () => {
   assert.deepStrictEqual(listCoreAdapters().map((adapter) => adapter.id), ['mihomo']);
   assert.strictEqual(normalizeCoreType('mihomo'), 'mihomo');
@@ -3980,11 +4665,118 @@ test('operation coordinator supersedes stale work and closes atomically', () => 
   const first = coordinator.beginRemote('config', 'a');
   assert.doesNotThrow(() => coordinator.assertRemote('config', 'a', first));
   const second = coordinator.beginRemote('config', 'a');
+  assert.strictEqual(first.signal.aborted, true);
   assert.throws(() => coordinator.assertRemote('config', 'a', first), /superseded/);
   assert.doesNotThrow(() => coordinator.assertRemote('config', 'a', second));
   assert.strictEqual(coordinator.beginRemote('config', 'a', { background: true }), null);
   coordinator.close();
+  assert.strictEqual(second.signal.aborted, true);
   assert.throws(() => coordinator.assertOpen(), /shutting down/);
+});
+
+test('reversible live mutations restore ambiguous apply and persistence failures', async () => {
+  const events = [];
+  const applied = new Error('response timed out');
+  await assert.rejects(
+    runReversibleLiveMutation({
+      apply: async () => {
+        events.push('apply');
+        throw applied;
+      },
+      commit: async () => events.push('commit'),
+      rollback: async () => events.push('rollback'),
+    }),
+    (error) => error === applied
+  );
+  assert.deepStrictEqual(events, ['apply', 'rollback']);
+
+  events.length = 0;
+  await assert.rejects(
+    runReversibleLiveMutation({
+      apply: async () => events.push('apply'),
+      commit: async () => {
+        events.push('commit');
+        throw new Error('disk write failed');
+      },
+      rollback: async () => events.push('rollback'),
+    }),
+    /disk write failed/
+  );
+  assert.deepStrictEqual(events, ['apply', 'commit', 'rollback']);
+});
+
+test('reversible live mutations preserve the primary error when recovery fails', async () => {
+  const primary = new Error('live request failed');
+  const recovery = new Error('rollback failed');
+  await assert.rejects(
+    runReversibleLiveMutation({
+      apply: async () => { throw primary; },
+      commit: async () => {},
+      rollback: async () => { throw recovery; },
+    }),
+    (error) => error === primary && error.recoveryError === recovery
+  );
+});
+
+test('operation coordinator closeAndDrain waits for running channels and absorbs failures', async () => {
+  const coordinator = new OperationCoordinator();
+  const remote = coordinator.beginRemote('subscription', 'profile-a');
+  let releaseConfig;
+  let releaseRules;
+  let drainSettled = false;
+  const configGate = new Promise((resolve) => { releaseConfig = resolve; });
+  const rulesGate = new Promise((resolve) => { releaseRules = resolve; });
+  const configTask = coordinator.queue('config', async () => {
+    await configGate;
+    throw new Error('injected config failure');
+  });
+  const rulesTask = coordinator.queue('custom-rules', async () => {
+    await rulesGate;
+    return 'done';
+  });
+
+  // Let both operations enter their bodies before beginning shutdown.
+  await Promise.resolve();
+  const draining = coordinator.closeAndDrain().then(() => { drainSettled = true; });
+  assert.strictEqual(remote.signal.aborted, true);
+  assert.throws(
+    () => coordinator.beginRemote('subscription', 'profile-b'),
+    (error) => error && error.code === 'DART_SHUTDOWN'
+  );
+
+  releaseConfig();
+  await assert.rejects(configTask, /injected config failure/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(drainSettled, false, 'drain returned before every channel tail settled');
+
+  releaseRules();
+  assert.strictEqual(await rulesTask, 'done');
+  await draining;
+  assert.strictEqual(drainSettled, true);
+});
+
+test('operation coordinator drain rejects queued and newly submitted work without running it', async () => {
+  const coordinator = new OperationCoordinator();
+  let releaseRunning;
+  let queuedRan = false;
+  const runningGate = new Promise((resolve) => { releaseRunning = resolve; });
+  const running = coordinator.queue('config', () => runningGate);
+  const queued = coordinator.queue('config', () => {
+    queuedRan = true;
+  });
+
+  await Promise.resolve();
+  const draining = coordinator.closeAndDrain();
+  const late = coordinator.queue('late-channel', () => {
+    throw new Error('late operation ran');
+  });
+  await assert.rejects(late, (error) => error && error.code === 'DART_SHUTDOWN');
+
+  releaseRunning();
+  await running;
+  await assert.rejects(queued, (error) => error && error.code === 'DART_SHUTDOWN');
+  await draining;
+  assert.strictEqual(queuedRan, false);
 });
 
 test('release workflow pins actions and isolates write permission to publishing', () => {
@@ -4004,6 +4796,29 @@ test('release workflow pins actions and isolates write permission to publishing'
   assert.ok(coreDownloadStep && !coreDownloadStep[1].includes('GITHUB_TOKEN'));
   assert.ok(workflow.includes('release/SHA256SUMS.txt'));
   assert.ok(workflow.includes('release/sbom.cdx.json'));
+});
+
+test('main-process modules keep a directed dependency graph without require cycles', () => {
+  const mainDir = path.join(__dirname, '..', 'src', 'main');
+  const files = fs.readdirSync(mainDir).filter((name) => name.endsWith('.js'));
+  const graph = new Map(files.map((name) => {
+    const source = fs.readFileSync(path.join(mainDir, name), 'utf-8');
+    const deps = [...source.matchAll(/require\(['"]\.\/([^'"]+)['"]\)/g)]
+      .map((match) => match[1] + '.js')
+      .filter((dep) => files.includes(dep));
+    return [name, deps];
+  }));
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (name, chain = []) => {
+    if (visiting.has(name)) throw new Error('require cycle: ' + [...chain, name].join(' -> '));
+    if (visited.has(name)) return;
+    visiting.add(name);
+    for (const dep of graph.get(name) || []) visit(dep, [...chain, name]);
+    visiting.delete(name);
+    visited.add(name);
+  };
+  for (const name of files) visit(name);
 });
 
 console.log('\nUWP AppContainer:');
@@ -4075,6 +4890,21 @@ test('route targets normalize URLs, domains and IP literals', () => {
   assert.strictEqual(toolbox.normalizeTarget('1.1.1.1').ipVersion, 4);
   assert.strictEqual(toolbox.normalizeTarget('[2001:db8::1]').ipVersion, 6);
   assert.throws(() => toolbox.normalizeTarget('bad host'), /invalid/);
+});
+
+test('route inspection reports Mihomo GLOBAL instead of assuming the main selector', async () => {
+  const result = await toolbox.inspectRoute('1.1.1.1', {
+    state: { coreManager: { isRunning: () => false } },
+    core: {
+      buildCurrentConfigAsync: async () => ({
+        config: { rules: [] },
+        settings: { coreType: 'mihomo', clashMode: 'global', enableDnsOverride: false },
+      }),
+    },
+  });
+  assert.strictEqual(result.policy, 'GLOBAL');
+  assert.deepStrictEqual(result.chain, ['GLOBAL']);
+  assert.strictEqual(result.matchedRule.target, 'GLOBAL');
 });
 
 test('port input is deduplicated and bounded', () => {
@@ -4211,6 +5041,83 @@ test('legacy backups discard the retired subscription User-Agent preference', ()
   });
   assert.strictEqual(normalized.activeSub, 'profile-a');
   assert.ok(!Object.prototype.hasOwnProperty.call(normalized.subscriptions[0], 'userAgentMode'));
+});
+
+test('backups retain validated IP-ASN and text-mode local rules', () => {
+  const document = {
+    kind: 'dart-network-control-backup',
+    schemaVersion: 1,
+    appVersion: '0.9.8',
+    data: {
+      settings: {},
+      subscriptions: [],
+      activeSub: null,
+      selected: null,
+      customRuleSets: [],
+      localRules: [
+        { id: 'asn', mode: 'structured', matchType: 'ip_asn', values: ['13335'], target: 'proxy' },
+        { id: 'text', mode: 'text', rules: ['DOMAIN-SUFFIX,example.com,PROXY'] },
+      ],
+    },
+  };
+  assert.strictEqual(toolbox.validateBackupDocument(document).localRules.length, 2);
+  document.data.localRules[1].rules = ['IP-ASN,AS13335,PROXY'];
+  assert.throws(() => toolbox.validateBackupDocument(document), /local text rules are invalid/);
+});
+
+test('backups retain safe proxy providers and provider-only policy groups', () => {
+  const normalized = toolbox.validateBackupDocument({
+    kind: 'dart-network-control-backup',
+    schemaVersion: 1,
+    appVersion: '0.9.7',
+    data: {
+      settings: {},
+      subscriptions: [{
+        id: 'provider-profile',
+        name: 'Provider profile',
+        nodes: [],
+        clashProxyProviders: {
+          airport: { type: 'http', url: 'https://example.com/sub', path: './providers/airport.yaml' },
+        },
+        policyGroups: [{
+          name: 'Provider Group',
+          type: 'select',
+          providers: ['airport'],
+          includeAllProviders: false,
+        }],
+      }],
+      activeSub: 'provider-profile',
+      selected: null,
+      customRuleSets: [],
+      localRules: [],
+    },
+  });
+  const profile = normalized.subscriptions[0];
+  assert.strictEqual(profile.clashProxyProviders.airport.path, 'providers/airport.yaml');
+  assert.deepStrictEqual(profile.policyGroups[0].members, []);
+  assert.deepStrictEqual(profile.policyGroups[0].providers, ['airport']);
+});
+
+test('backup validation rejects provider group references that cannot be restored', () => {
+  assert.throws(() => toolbox.validateBackupDocument({
+    kind: 'dart-network-control-backup',
+    schemaVersion: 1,
+    appVersion: '0.9.8',
+    data: {
+      settings: {},
+      subscriptions: [{
+        id: 'provider-profile',
+        clashProxyProviders: {
+          airport: { type: 'http', url: 'https://example.com/sub' },
+        },
+        policyGroups: [{ name: 'Provider Group', type: 'select', providers: ['missing'] }],
+      }],
+      activeSub: 'provider-profile',
+      selected: null,
+      customRuleSets: [],
+      localRules: [],
+    },
+  }), /policy groups are invalid/);
 });
 
 test('package.json and package-lock.json agree on the version', () => {
@@ -4360,6 +5267,24 @@ test('store recovers a corrupt index and never deletes payloads without one', ()
   assert.deepStrictEqual(empty.listSubscriptions(), []);
   assert.ok(fs.existsSync(orphan), 'unrecoverable index corruption deleted orphaned profile data');
   assert.ok(fs.existsSync(path.join(dir, '.payload-recovery-needed')));
+});
+
+test('a successful post-recovery commit clears the orphan-preservation marker', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-recovery-marker-'));
+  const profileDir = path.join(dir, 'profiles');
+  fs.mkdirSync(profileDir, { recursive: true });
+  const orphan = path.join(profileDir, 'manual-recovery.json');
+  fs.writeFileSync(orphan, JSON.stringify({ nodes: [{ name: 'orphan' }] }), 'utf-8');
+  fs.writeFileSync(path.join(dir, 'config.json'), '{broken primary', 'utf-8');
+  fs.writeFileSync(path.join(dir, 'config.json.bak'), '{broken backup', 'utf-8');
+  const recovered = new Store(dir);
+  const marker = path.join(dir, '.payload-recovery-needed');
+  assert.ok(fs.existsSync(marker));
+  assert.ok(fs.existsSync(orphan));
+  recovered.set('lastRunning', true);
+  assert.ok(!fs.existsSync(marker), 'successful recovery commit left cleanup disabled forever');
+  new Store(dir);
+  assert.ok(!fs.existsSync(orphan), 'normal startup did not retire the now-unreferenced payload');
 });
 
 test('a valid backup remains usable when the corrupt primary cannot be repaired', () => {
@@ -4837,6 +5762,58 @@ test('bulk payload staging removes files when a later stage fails', () => {
   assert.deepStrictEqual(store.listCustomRuleSets(), []);
 });
 
+test('backup snapshot replacement commits every collection through one index transaction', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-snapshot-'));
+  const store = new Store(dir);
+  store.upsertSubscription({
+    id: 'old-profile', name: 'Old profile', nodes: [{ name: 'old-node' }], raw: 'old-raw',
+  });
+  store.upsertCustomRuleSet({
+    id: 'old-rules', name: 'Old rules', kind: 'inline', rules: [{ domain: ['old.example'] }],
+  });
+  store.updateSettings({ mixedPort: 7891 });
+  store.updateValues({ activeSub: 'old-profile', selected: 'old-node' });
+
+  const snapshot = {
+    subscriptions: [{
+      id: 'new-profile', name: 'New profile', nodes: [{ name: 'new-node' }], raw: 'new-raw',
+    }],
+    settings: { mixedPort: 17890 },
+    activeSub: 'new-profile',
+    selected: 'new-node',
+    customRuleSets: [{
+      id: 'new-rules', name: 'New rules', kind: 'inline', rules: [{ domain: ['new.example'] }],
+    }],
+    localRules: [{ type: 'DOMAIN', payload: 'local.example', proxy: 'DIRECT' }],
+  };
+
+  const originalWrite = store._writeConfigData;
+  store._writeConfigData = () => { throw new Error('simulated snapshot index failure'); };
+  assert.throws(() => store.replaceSnapshot(snapshot), /simulated snapshot index failure/);
+  store._writeConfigData = originalWrite;
+  const unchanged = new Store(dir);
+  assert.strictEqual(unchanged.get('activeSub'), 'old-profile');
+  assert.strictEqual(unchanged.get('selected'), 'old-node');
+  assert.strictEqual(unchanged.getSubscription('old-profile').nodes[0].name, 'old-node');
+  assert.strictEqual(unchanged.getCustomRuleSet('old-rules').rules[0].domain[0], 'old.example');
+
+  let indexWrites = 0;
+  const writeOnce = unchanged._writeConfigData;
+  unchanged._writeConfigData = function countSnapshotCommit(data) {
+    indexWrites += 1;
+    return writeOnce.call(this, data);
+  };
+  unchanged.replaceSnapshot(snapshot);
+  assert.strictEqual(indexWrites, 1);
+  const replaced = new Store(dir);
+  assert.strictEqual(replaced.get('activeSub'), 'new-profile');
+  assert.strictEqual(replaced.get('selected'), 'new-node');
+  assert.strictEqual(replaced.getSettings().mixedPort, 17890);
+  assert.strictEqual(replaced.getSubscription('new-profile', { includeRaw: true }).raw, 'new-raw');
+  assert.strictEqual(replaced.getCustomRuleSet('new-rules').rules[0].domain[0], 'new.example');
+  assert.strictEqual(replaced.get('localRules')[0].payload, 'local.example');
+});
+
 test('payload backups self-heal corrupt primaries and startup removes orphan stages', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-store-'));
   const store = new Store(dir);
@@ -4956,6 +5933,43 @@ test('system proxy polling reads all registry values with one reg.exe query', ()
   assert.ok(!implementation.includes("'/v'"));
 });
 
+test('system proxy cleanup never treats a registry query failure as success', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'proxy.js'), 'utf-8');
+  const start = source.indexOf('async function disableSystemProxyIfOurs');
+  const end = source.indexOf('function disableSystemProxySync', start);
+  const implementation = source.slice(start, end);
+  assert.ok(implementation.includes('const current = await readProxyRegistrySnapshot()'));
+  assert.ok(!implementation.includes('catch (_)'));
+  assert.ok(!implementation.includes('return false;\n    }'));
+});
+
+test('core stop clears the owned system proxy before terminating the listener', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  const start = source.indexOf('async function stopCoreNow');
+  const end = source.indexOf('let proxyGuard = null', start);
+  const implementation = source.slice(start, end);
+  const release = implementation.indexOf('await releaseOwnedSystemProxy()');
+  const stop = implementation.indexOf('await state.coreManager.stop()');
+  assert.ok(release >= 0 && release < stop, 'core listener stops before the system proxy is verified clear');
+  assert.ok(implementation.includes('Keeping\n        // the old runtime alive'));
+});
+
+test('shutdown disables the owned proxy before waiting for background transactions', () => {
+  const core = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  const start = core.indexOf('async function cleanup()');
+  const end = core.indexOf('/** Restart the core', start);
+  const implementation = core.slice(start, end);
+  const disable = implementation.indexOf('proxy.disableSystemProxySyncIfOurs(shutdownProxyServer)');
+  const drain = implementation.indexOf('await operations.closeAndDrain()');
+  assert.ok(disable >= 0 && disable < drain, 'shutdown waits before clearing the system proxy');
+
+  const index = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf-8');
+  const fatalStart = index.indexOf('function handleFatalError');
+  const fatalEnd = index.indexOf("process.on('uncaughtException'", fatalStart);
+  const fatal = index.slice(fatalStart, fatalEnd);
+  assert.ok(fatal.indexOf('proxy.disableSystemProxySyncIfOurs(ownedServer)') < fatal.indexOf('setImmediate(async () =>'));
+});
+
 test('interrupted system proxy recovery only accepts the exact saved registry state', () => {
   const proxy = require('../src/main/proxy');
   const restore = {
@@ -4994,25 +6008,64 @@ test('system proxy ownership is persisted before the first registry mutation', (
   );
 });
 
-test('Windows TUN lifecycle owns Dart names and removes legacy adapters', () => {
+test('Windows TUN lifecycle removes only Dart-owned adapters', () => {
   const tun = require('../src/main/tun-adapter');
   assert.strictEqual(tun.TUN_DEVICE_NAME, 'Dart');
   assert.strictEqual(tun.TUN_DISPLAY_NAME, 'Dart Tunnel');
   const cleanup = tun.cleanupScript();
-  for (const name of ['tun0', 'Meta', 'Dart', 'Dart Tunnel']) assert.ok(cleanup.includes(`'${name}'`));
-  assert.ok(cleanup.includes("$connection -eq 'tun0'"));
-  assert.ok(cleanup.includes("$description -match 'sing-tun'"));
+  for (const name of ['Dart', 'Dart Tunnel']) assert.ok(cleanup.includes(`'${name}'`));
+  for (const name of ['tun0', 'Meta']) assert.ok(!cleanup.includes(`'${name}'`));
+  assert.ok(!cleanup.includes("$connection -eq 'tun0'"));
+  assert.ok(cleanup.includes('return $description -match $pattern'));
   assert.ok(cleanup.includes('pnputil.exe'));
   assert.ok(tun.renameScript().includes("Rename-NetAdapter"));
 });
 
 test('elevated TUN auto-start preserves silent startup', () => {
-  const { buildTaskXml } = require('../src/main/auto-launch');
+  const { buildTaskXml, taskXmlMatches } = require('../src/main/auto-launch');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'auto-launch.js'), 'utf-8');
   const visible = buildTaskXml('C:\\Program Files\\Dart & Tools\\Dart.exe', 'PC\\Blake', false);
   const silent = buildTaskXml('C:\\Program Files\\Dart & Tools\\Dart.exe', 'PC\\Blake', true);
+  const elevated = buildTaskXml('C:\\Program Files\\Dart.exe', 'PC\\Blake', true, true);
   assert.ok(!visible.includes('<Arguments>'));
   assert.ok(silent.includes('<Arguments>--hidden</Arguments>'));
   assert.ok(silent.includes('Dart &amp; Tools'));
+  assert.ok(visible.includes('<RunLevel>LeastPrivilege</RunLevel>'));
+  assert.ok(elevated.includes('<RunLevel>HighestAvailable</RunLevel>'));
+  assert.ok(visible.includes('<Priority>4</Priority>'));
+  assert.ok(visible.includes('<StartWhenAvailable>true</StartWhenAvailable>'));
+  assert.ok(!visible.includes('<Delay>'), 'logon task has an intentional startup delay');
+  assert.strictEqual(taskXmlMatches(visible, 'C:\\Program Files\\Dart & Tools\\Dart.exe'), true);
+  assert.strictEqual(taskXmlMatches(silent, 'C:\\Program Files\\Dart & Tools\\Dart.exe', true), true);
+  assert.strictEqual(taskXmlMatches(elevated, 'C:\\Program Files\\Dart.exe', true, true), true);
+  assert.strictEqual(taskXmlMatches(visible.replace('<Enabled>true</Enabled>', '<Enabled>false</Enabled>'),
+    'C:\\Program Files\\Dart & Tools\\Dart.exe'), false, 'disabled task was accepted');
+  assert.strictEqual(taskXmlMatches(visible, 'C:\\Program Files\\Old Dart\\Dart.exe'), false,
+    'task targeting an old install was accepted');
+  assert.strictEqual(taskXmlMatches(silent, 'C:\\Program Files\\Dart & Tools\\Dart.exe', false), false,
+    'stale hidden arguments were accepted');
+  assert.ok(source.includes('async function reconcileWindows(enable, silent)'));
+  assert.ok(source.includes("execFile('schtasks.exe'"));
+  assert.ok(source.includes("'/xml'"));
+  assert.ok(source.includes('const existing = !interactive && taskMatches(silent, elevated)'));
+  assert.ok(source.includes('let removed = deleteTask(false)'));
+  assert.ok(source.includes('interactive) removed = deleteTask(true)'));
+});
+
+test('core startup caches binary capabilities and overlaps independent cold probes', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  assert.ok(source.includes("KERNEL_SMART_CACHE_KEY = 'kernelSmartCapabilityCache'"));
+  assert.ok(source.includes('readPersistedKernelSmartCapability(probeKey, resolvedCoreType)'));
+  const start = source.indexOf('async function startCoreNow');
+  const end = source.indexOf('// Self-heal for installs', start);
+  const implementation = source.slice(start, end);
+  assert.ok(implementation.includes('const [, smartMeta] = await Promise.all(['));
+  assert.ok(implementation.includes('getCoreAdapter(coreType).prepareStart(state.coreManager)'));
+  assert.ok(implementation.includes('resolveKernelSmart(coreType)'));
+
+  const index = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf-8');
+  assert.ok(index.includes('core.reconcileAutoLaunch(settings.autoLaunch, settings.silentStart)'));
+  assert.ok(!index.includes('core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);'));
 });
 
 test('system DNS diagnostics use the OS resolver path', () => {
@@ -5026,6 +6079,9 @@ test('system DNS diagnostics use the OS resolver path', () => {
 });
 
 test('mihomo geodata validation cache survives restarts and follows core changes', () => {
+  const adapter = getCoreAdapter('mihomo');
+  assert.ok(!adapter.geoDataFiles.includes('.mihomo-geodata-validation.json'));
+  assert.ok(adapter.geoDataCacheFiles.includes('.mihomo-geodata-validation.json'));
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-'));
   const { CoreManager } = require('../src/main/core-manager');
   const mgr = new CoreManager({ runtimeDir: dir, coreType: 'mihomo' });
@@ -5049,6 +6105,88 @@ test('mihomo geodata validation cache survives restarts and follows core changes
   assert.strictEqual(mgr.mihomoGeoDataReady(), true, 'cached validation avoids spawning the fake core');
   fs.appendFileSync(bin, '-updated');
   assert.notStrictEqual(mgr._mihomoGeoDataKey(coreDir, bin), key, 'a core update invalidates the cache key');
+});
+
+test('core binary discovery avoids repeated synchronous disk scans and invalidates after updates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-core-path-cache-'));
+  const { CoreManager } = require('../src/main/core-manager');
+  const mgr = new CoreManager({ runtimeDir: dir, coreType: 'mihomo' });
+  const bin = path.join(
+    mgr.ensureCoreDir('mihomo'),
+    process.platform === 'win32' ? 'mihomo.exe' : 'mihomo'
+  );
+  fs.writeFileSync(bin, 'fake-core');
+  mgr.invalidateVersionCache();
+
+  const originalExistsSync = fs.existsSync;
+  let checks = 0;
+  fs.existsSync = function countedExistsSync(file) {
+    checks += 1;
+    return originalExistsSync.call(this, file);
+  };
+  try {
+    assert.strictEqual(mgr.resolveBinaryPath('mihomo'), bin);
+    const firstChecks = checks;
+    assert.strictEqual(mgr.resolveBinaryPath('mihomo'), bin);
+    assert.strictEqual(checks, firstChecks, 'cached path still scanned the filesystem');
+    mgr.invalidateVersionCache();
+    assert.strictEqual(mgr.resolveBinaryPath('mihomo'), bin);
+    assert.ok(checks > firstChecks, 'core update did not invalidate binary discovery');
+  } finally {
+    fs.existsSync = originalExistsSync;
+  }
+});
+
+test('staged ASN databases receive MMDB validation before installation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dart-asn-mmdb-'));
+  const { CoreManager } = require('../src/main/core-manager');
+  const mgr = new CoreManager({ runtimeDir: dir, coreType: 'mihomo' });
+  const staged = path.join(dir, '.ASN.mmdb.tmp');
+  const content = Buffer.alloc(4096);
+  for (let i = 0; i < content.length; i++) content[i] = (i * 17 + 11) & 0xff;
+  fs.writeFileSync(staged, content);
+  assert.strictEqual(mgr._validGeoFile(staged, 'ASN.mmdb'), false);
+  Buffer.from('MaxMind.com').copy(content, content.length - 32);
+  fs.writeFileSync(staged, content);
+  assert.strictEqual(mgr._validGeoFile(staged, 'ASN.mmdb'), true);
+});
+
+test('runtime GeoData updates require release digests and keep derived cache outside rollback', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-manager.js'), 'utf-8');
+  const update = source.slice(
+    source.indexOf('async _updateMihomoGeoData'),
+    source.indexOf('_coalesceGeoUpdate(', source.indexOf('async _updateMihomoGeoData'))
+  );
+  assert.ok(update.includes('assetSha256(asset)'));
+  assert.ok(update.includes('GeoData release has no verifiable asset'));
+  const installer = source.slice(
+    source.indexOf('async _downloadAndInstallGeoFiles'),
+    source.indexOf('updateMihomoGeoData(', source.indexOf('async _downloadAndInstallGeoFiles'))
+  );
+  assert.ok(installer.includes('await verifyFileSha256(tmp, item.sha256, item.file)'));
+  const adapter = getCoreAdapter('mihomo');
+  assert.ok(adapter.geoDataFiles.includes('ASN.mmdb'));
+  assert.ok(adapter.ruleSetItems.some((item) => item.file === 'ASN.mmdb'));
+  assert.ok(update.includes("file === 'ASN.mmdb' ? 'GeoLite2-ASN.mmdb'"));
+  assert.ok(!adapter.geoDataFiles.some((file) => adapter.geoDataCacheFiles.includes(file)));
+});
+
+test('GeoData updates dispatch through the active core adapter', async () => {
+  const calls = [];
+  const manager = {
+    updateMihomoGeoData(onProgress, proxyPort) {
+      calls.push({ onProgress, proxyPort });
+      return Promise.resolve('/runtime/mihomo');
+    },
+  };
+  const onProgress = () => {};
+  const result = await getCoreAdapter('mihomo').updateGeoData(manager, onProgress, 7890);
+  assert.strictEqual(result, '/runtime/mihomo');
+  assert.deepStrictEqual(calls, [{ onProgress, proxyPort: 7890 }]);
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'core-control.js'), 'utf-8');
+  assert.ok(source.includes('getCoreAdapter(coreType).updateGeoData(state.coreManager, onProgress, proxyPort)'));
+  assert.ok(!source.includes('state.coreManager.updateGeoData('));
 });
 
 test('retired core cleanup is isolated, idempotent, and preserves Mihomo files', () => {

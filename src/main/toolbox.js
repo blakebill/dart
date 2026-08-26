@@ -10,6 +10,13 @@ const { execFile } = require('child_process');
 
 const { getCoreAdapter } = require('./core-adapters');
 const fetch = require('./fetch');
+const { MAX_PROXY_PROVIDERS, normalizeProxyProviders } = require('./proxy-providers');
+const {
+  VALID_MATCH_TYPES: VALID_LOCAL_MATCH_TYPES,
+  localRuleMode,
+  normalizeTextRules,
+  validateValues: validateLocalRuleValues,
+} = require('./local-rules');
 
 const MAX_ERROR_TEXT = 16 * 1024;
 const MAX_CONFIG_PREVIEW = 180 * 1024;
@@ -46,6 +53,17 @@ function queueDiagnostic(operation) {
   const task = diagnosticModeQueue.then(operation);
   diagnosticModeQueue = task.catch(() => {});
   return task;
+}
+
+async function alignDiagnosticGlobalSelector(context) {
+  if (typeof context.core.alignGlobalSelector === 'function') {
+    await context.core.alignGlobalSelector();
+    return;
+  }
+  const global = await context.core.clashApi('GET', '/proxies/GLOBAL');
+  if (!global || global.now !== APP_PROXY_GROUP) {
+    await context.core.clashApi('PUT', '/proxies/GLOBAL', { name: APP_PROXY_GROUP });
+  }
 }
 
 async function setDiagnosticMode(context, mode) {
@@ -94,6 +112,9 @@ function withDiagnosticMode(context, mode, operation) {
       /* PATCH below still works on cores that omit mode from GET /configs. */
     }
     const changedMode = runtimeMode !== mode;
+    // A legacy runtime may have Mihomo's implicit GLOBAL selector parked on
+    // DIRECT. Diagnostics must exercise the same main selector as the UI.
+    if (mode === 'global') await alignDiagnosticGlobalSelector(context);
     if (changedMode) {
       try {
         await setDiagnosticMode(context, mode);
@@ -140,22 +161,37 @@ async function withMihomoGlobalSelector(context, operation) {
   return withTemporarySelector(context, path, previous, target, operation);
 }
 
-async function restoreTemporarySelector(context, path, previous, target) {
+async function restoreTemporarySelector(context, path, previous, target, selectionRevision = null) {
   // Do not overwrite a user selection made from another panel while the
   // diagnostic was running; only undo the temporary value we still own.
+  if (
+    selectionRevision !== null &&
+    typeof context.core.getSelectionRevision === 'function' &&
+    context.core.getSelectionRevision() !== selectionRevision
+  ) return false;
   const current = await context.core.clashApi('GET', path);
   if (current && current.now === target) {
+    if (
+      selectionRevision !== null &&
+      typeof context.core.getSelectionRevision === 'function' &&
+      context.core.getSelectionRevision() !== selectionRevision
+    ) return false;
     await context.core.clashApi('PUT', path, { name: previous });
+    return true;
   }
+  return false;
 }
 
 async function withTemporarySelector(context, path, previous, target, operation) {
   if (previous === target) return operation();
+  const selectionRevision = typeof context.core.getSelectionRevision === 'function'
+    ? context.core.getSelectionRevision()
+    : null;
   try {
     await context.core.clashApi('PUT', path, { name: target });
   } catch (error) {
     try {
-      await restoreTemporarySelector(context, path, previous, target);
+      await restoreTemporarySelector(context, path, previous, target, selectionRevision);
     } catch (restoreError) {
       error.restoreError = restoreError;
     }
@@ -170,7 +206,7 @@ async function withTemporarySelector(context, path, previous, target, operation)
     throw error;
   } finally {
     try {
-      await restoreTemporarySelector(context, path, previous, target);
+      await restoreTemporarySelector(context, path, previous, target, selectionRevision);
     } catch (restoreError) {
       if (operationError) operationError.restoreError = restoreError;
       else throw restoreError;
@@ -367,7 +403,7 @@ async function resolveHost(target) {
 
 function modePolicy(mode) {
   if (mode === 'direct') return 'DIRECT';
-  if (mode === 'global') return '🚀 Proxy';
+  if (mode === 'global') return 'GLOBAL';
   if (mode === 'block') return 'REJECT';
   return null;
 }
@@ -1106,6 +1142,9 @@ function validateBackupDocument(document) {
   const ids = new Set();
   let nodeCount = 0;
   let policyMemberCount = 0;
+  let providerCount = 0;
+  let providerRefCount = 0;
+  const normalizedProviders = new Map();
   for (const sub of subscriptions) {
     if (!isPlainObject(sub) || typeof sub.id !== 'string' || !sub.id || sub.id.length > 256 || ids.has(sub.id)) {
       throw new Error('backup contains an invalid or duplicate config id');
@@ -1116,20 +1155,49 @@ function validateBackupDocument(document) {
       nodeCount += sub.nodes.length;
       if (nodeCount > 100000 || sub.nodes.some((node) => !isPlainObject(node))) throw new Error('backup config nodes are invalid');
     }
+    if (sub.clashProxyProviders !== undefined && !isPlainObject(sub.clashProxyProviders)) {
+      throw new Error('backup config proxy providers are invalid');
+    }
+    const rawProviders = sub.clashProxyProviders || {};
+    if (Object.keys(rawProviders).length > MAX_PROXY_PROVIDERS) {
+      throw new Error('backup config proxy providers are invalid');
+    }
+    const providers = normalizeProxyProviders(rawProviders);
+    // A backup is an explicit restore boundary: unlike legacy store repair,
+    // do not silently turn malformed provider definitions into an apparently
+    // usable provider-only profile.
+    if (Object.keys(providers).length !== Object.keys(rawProviders).length) {
+      throw new Error('backup config proxy providers are invalid');
+    }
+    providerCount += Object.keys(providers).length;
+    if (providerCount > 10000) throw new Error('backup config proxy providers are invalid');
+    normalizedProviders.set(sub.id, providers);
     if (sub.policyGroups !== undefined) {
       if (!Array.isArray(sub.policyGroups) || sub.policyGroups.length > 10000) {
         throw new Error('backup config policy groups are invalid');
       }
+      const providerNames = new Set(Object.keys(providers));
       for (const group of sub.policyGroups) {
+        const members = group && group.members === undefined ? [] : group && group.members;
+        const providerRefs = group && group.providers === undefined ? [] : group && group.providers;
         if (
           !isPlainObject(group) || typeof group.name !== 'string' ||
           !['select', 'url-test', 'fallback', 'load-balance'].includes(group.type) ||
-          !Array.isArray(group.members) || group.members.some((member) => typeof member !== 'string')
+          !Array.isArray(members) || members.some((member) => typeof member !== 'string') ||
+          !Array.isArray(providerRefs) || providerRefs.some((provider) => (
+            typeof provider !== 'string' || !providerNames.has(provider)
+          )) ||
+          ['includeAll', 'includeAllProxies', 'includeAllProviders'].some(
+            (key) => group[key] !== undefined && typeof group[key] !== 'boolean'
+          )
         ) {
           throw new Error('backup config policy groups are invalid');
         }
-        policyMemberCount += group.members.length;
-        if (policyMemberCount > 100000) throw new Error('backup config policy groups are invalid');
+        policyMemberCount += members.length;
+        providerRefCount += providerRefs.length;
+        if (policyMemberCount > 100000 || providerRefCount > 100000) {
+          throw new Error('backup config policy groups are invalid');
+        }
       }
     }
   }
@@ -1152,18 +1220,43 @@ function validateBackupDocument(document) {
       throw new Error('backup contains an invalid or duplicate local rule id');
     }
     localIds.add(item.id);
-    if (item.matchType !== undefined && !['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name'].includes(item.matchType)) {
-      throw new Error('backup local rule type is invalid');
+    if (item.mode !== undefined && !['structured', 'text'].includes(item.mode)) {
+      throw new Error('backup local rule editor mode is invalid');
     }
-    if (item.target !== undefined && !['proxy', 'direct', 'reject'].includes(item.target)) throw new Error('backup local rule target is invalid');
-    if (item.values !== undefined && (!Array.isArray(item.values) || item.values.length > 100000 || item.values.some((value) => typeof value !== 'string'))) {
-      throw new Error('backup local rule values are invalid');
+    if (localRuleMode(item) === 'text') {
+      try {
+        normalizeTextRules(item.rules);
+      } catch (_) {
+        throw new Error('backup local text rules are invalid');
+      }
+    } else {
+      if (item.matchType !== undefined && !VALID_LOCAL_MATCH_TYPES.includes(item.matchType)) {
+        throw new Error('backup local rule type is invalid');
+      }
+      if (item.target !== undefined && !['proxy', 'direct', 'reject'].includes(item.target)) throw new Error('backup local rule target is invalid');
+      if (item.values !== undefined && (!Array.isArray(item.values) || item.values.length > 100000 || item.values.some((value) => typeof value !== 'string'))) {
+        throw new Error('backup local rule values are invalid');
+      }
+      if (item.matchType !== undefined && item.values !== undefined) {
+        try {
+          validateLocalRuleValues(item.matchType, item.values);
+        } catch (_) {
+          throw new Error('backup local rule values are invalid');
+        }
+      }
     }
   }
   const activeSub = ids.has(data.activeSub) ? data.activeSub : subscriptions[0] ? subscriptions[0].id : null;
   const normalizedSubscriptions = subscriptions.map((sub) => {
     const normalized = { ...sub };
     delete normalized.userAgentMode;
+    normalized.clashProxyProviders = normalizedProviders.get(sub.id) || {};
+    if (Array.isArray(normalized.policyGroups)) {
+      normalized.policyGroups = normalized.policyGroups.map((group) => ({
+        ...group,
+        members: Array.isArray(group.members) ? group.members : [],
+      }));
+    }
     return normalized;
   });
   return {
@@ -1178,11 +1271,15 @@ function validateBackupDocument(document) {
 
 function backupSummary(document, normalized) {
   const nodeCount = normalized.subscriptions.reduce((count, sub) => count + (Array.isArray(sub.nodes) ? sub.nodes.length : Number(sub.nodeCount) || 0), 0);
+  const providerCount = normalized.subscriptions.reduce((count, sub) => (
+    count + Object.keys(sub.clashProxyProviders || {}).length
+  ), 0);
   return {
     appVersion: String(document.appVersion || ''),
     createdAt: String(document.createdAt || ''),
     configs: normalized.subscriptions.length,
     nodes: nodeCount,
+    providers: providerCount,
     remoteRules: normalized.customRuleSets.length,
     localRules: normalized.localRules.length,
     coreType: 'mihomo',

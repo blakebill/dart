@@ -14,4 +14,5 @@
   for (const [selector, type] of launchers) {
     document.querySelector(selector).addEventListener('click', () => App.openDialog(type));
   }
+  App.registerRendererModule('toolbox');
 })();

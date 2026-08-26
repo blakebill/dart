@@ -21,16 +21,32 @@ const {
 const core = require('./core-control');
 const { isWindowsAdmin, relaunchElevated, promptRestartForTun } = require('./admin');
 const { AppUpdateController } = require('./app-update-controller');
+const { BackupController } = require('./backup-controller');
+const { buildDiagnosticBundle } = require('./diagnostic-bundle');
+const {
+  getSharedProfileHistory,
+  profileUpdateDialogOptions,
+  profileUpdateSummary,
+  runProfileMutationTransaction,
+} = require('./profile-history');
 const { getCoreAdapter } = require('./core-adapters');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
+const appRouting = require('./app-routing');
 const { notify } = require('./notify');
 const toolbox = require('./toolbox');
 const dialogWindows = require('./dialog-window');
 const { registerConnectionsIpc } = require('./connections-ipc');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 const { detectNodeRegion, nodeRegionSummary, normalizeSmartRegions } = require('./node-region');
+const {
+  VALID_MATCH_TYPES: VALID_LOCAL_MATCH_TYPES,
+  localRuleMode,
+  normalizeTextRules,
+  normalizeValues: normalizeLocalRuleValues,
+  validateValues: validateLocalRuleValues,
+} = require('./local-rules');
 const validation = require('./ipc-validation');
 const {
   CORE_CONFIG_SETTINGS,
@@ -47,6 +63,11 @@ const {
   validateSettingsPatch,
 } = validation;
 
+const profileHistory = getSharedProfileHistory({
+  getDirectory: () => state.store && state.store.dir,
+  log: sendLog,
+});
+
 function senderWindow(event) {
   const sender = event && event.sender;
   const win = sender && BrowserWindow.fromWebContents(sender);
@@ -56,13 +77,22 @@ function senderWindow(event) {
   return win;
 }
 
-async function rollbackSettingsAfterFailure(previous, wasRunning, originalError) {
+async function restorePreviousRuntime(wasRunning, forceRestart = false) {
+  if (!wasRunning) return;
+  if (state.coreManager.isRunning()) {
+    if (forceRestart) await core.restartCore();
+  } else {
+    await core.startCore();
+  }
+}
+
+async function rollbackSettingsAfterFailure(previous, wasRunning, originalError, forceRestart = false) {
   try {
     state.store.updateSettings(previous);
     state.coreManager.setCoreType('mihomo');
     try { require('./window').applyNativeThemeSource(); } catch (_) {}
     try { core.applyAutoLaunch(previous.autoLaunch, previous.silentStart); } catch (_) {}
-    if (wasRunning && !state.coreManager.isRunning()) await core.startCore();
+    await restorePreviousRuntime(wasRunning, forceRestart);
     sendStatus();
   } catch (recoveryError) {
     originalError.recoveryError = recoveryError;
@@ -76,7 +106,7 @@ async function rollbackProfileSelection(previousActive, previousSelected, wasRun
     if (restore) await restore();
     state.store.set('activeSub', previousActive);
     state.store.set('selected', previousSelected);
-    if (wasRunning && !state.coreManager.isRunning()) await core.startCore();
+    await restorePreviousRuntime(wasRunning, true);
     sendStatus();
   } catch (recoveryError) {
     originalError.recoveryError = recoveryError;
@@ -87,14 +117,16 @@ async function rollbackProfileSelection(previousActive, previousSelected, wasRun
 
 async function rollbackMutationAfterFailure(restore, wasRunning, originalError, label) {
   let recoveryError = null;
+  let stateRestored = false;
   try {
     await restore();
+    stateRestored = true;
   } catch (error) {
     recoveryError = error;
   }
-  if (wasRunning && !state.coreManager.isRunning()) {
+  if (wasRunning && stateRestored) {
     try {
-      await core.startCore();
+      await restorePreviousRuntime(true, true);
     } catch (error) {
       if (!recoveryError) recoveryError = error;
     }
@@ -107,7 +139,31 @@ async function rollbackMutationAfterFailure(restore, wasRunning, originalError, 
   throw originalError;
 }
 
-let pendingBackup = null;
+/** Commit Store + optional live restart before replacing the rollback target. */
+async function applyProfileVersionChange(previous, next, options = {}) {
+  const shouldRestart = !!options.shouldRestart;
+  const wasRunning = !!options.wasRunning;
+  return runProfileMutationTransaction({
+    history: profileHistory,
+    previous,
+    apply: async () => {
+      state.store.upsertSubscription(next);
+      if (options.reschedule) core.rescheduleAutoUpdate();
+      return next;
+    },
+    verify: shouldRestart ? () => core.restartIfRunning() : null,
+    rollback: async () => {
+      state.store.upsertSubscription(previous);
+      if (options.reschedule) core.rescheduleAutoUpdate();
+      if (shouldRestart) {
+        if (state.coreManager.isRunning()) await core.restartIfRunning();
+        else if (wasRunning) await core.startCore();
+      }
+      sendStatus();
+    },
+  });
+}
+
 let appUpdateController = null;
 let coreUpdateTask = null;
 
@@ -130,23 +186,16 @@ async function writeAtomicText(file, text) {
   }
 }
 
-async function readBackupDocument(file) {
-  const stat = await fs.promises.stat(file);
-  if (!stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error('backup is not a file or exceeds 64 MB');
-  const text = await fs.promises.readFile(file, 'utf-8');
-  const document = JSON.parse(text);
-  return {
-    document,
-    normalized: toolbox.validateBackupDocument(document),
-    digest: crypto.createHash('sha256').update(text).digest('hex'),
-  };
-}
-
 function subscriptionResult(sub) {
+  const providers = sub && (sub.clashProxyProviders || sub.proxyProviders);
   return {
     id: sub.id,
     name: sub.name || '',
     nodeCount: Array.isArray(sub.nodes) ? sub.nodes.length : Math.max(0, Number(sub.nodeCount) || 0),
+    providerCount: providers && typeof providers === 'object'
+      ? Object.keys(providers).length
+      : Math.max(0, Number(sub.providerCount) || 0),
+    canRollback: profileHistory.has(sub.id),
   };
 }
 
@@ -173,6 +222,7 @@ function mergeFetchedSubscription(latest, result, { replaceRaw = false } = {}) {
     format: result.format,
     clashRules: result.rules || [],
     clashRuleProviders: result.ruleProviders || {},
+    clashProxyProviders: result.proxyProviders || {},
     userInfo: result.userInfo || null,
     updatedAt: Date.now(),
     configHash: subscription.configFingerprint(result),
@@ -209,12 +259,18 @@ function nodeResult(node) {
       ? 'TLS'
       : '';
   const result = {
+    id: typeof node.id === 'string' && node.id ? node.id.slice(0, 128) : name,
     name,
     type,
     security,
     region: detectNodeRegion(node),
     isNode: true,
   };
+  if (node.providerNode && typeof node.provider === 'string') {
+    result.provider = nodeMetaToken(node.provider, 256);
+    result.providerNode = true;
+    if (typeof node.alive === 'boolean') result.alive = node.alive;
+  }
   const cipher = nodeMetaToken(node.cipher);
   if (type === 'ss' && cipher) {
     result.cipher = cipher;
@@ -250,6 +306,8 @@ function registerIpc() {
         updatedAt: s.updatedAt || 0,
         userInfo: s.userInfo || null,
         nodeCount: s.nodeCount || 0,
+        providerCount: s.providerCount || 0,
+        canRollback: profileHistory.has(s.id),
       })),
       settings: state.store.getSettings(),
       selected: state.store.get('selected'),
@@ -269,20 +327,23 @@ function registerIpc() {
     return true;
   });
 
-  ipcMain.handle('nodes:get', () => {
+  ipcMain.handle('nodes:get', async () => {
     const activeSub = core.getActiveSubId();
-    const active = activeSub ? core.getActiveSubscription() : null;
+    const inventory = activeSub
+      ? await core.getActiveNodeInventory()
+      : { nodes: [], providerStatus: { configured: 0, ready: 0, loading: 0, state: 'none' } };
     return {
       activeSub,
-      nodes: active && Array.isArray(active.nodes) ? active.nodes.map(nodeResult).filter(Boolean) : [],
+      nodes: Array.isArray(inventory.nodes) ? inventory.nodes.map(nodeResult).filter(Boolean) : [],
+      providerStatus: inventory.providerStatus,
     };
   });
 
-  ipcMain.handle('node:regions', () => {
-    const active = core.getActiveSubscription();
+  ipcMain.handle('node:regions', async () => {
+    const inventory = await core.getActiveNodeInventory();
     const settings = state.store.getSettings();
     const selected = normalizeSmartRegions(settings.smartRegions);
-    const regions = nodeRegionSummary((active && active.nodes) || []);
+    const regions = nodeRegionSummary(inventory.nodes || []);
     const available = new Set(regions.map((item) => item.code));
     for (const code of selected) {
       if (!available.has(code)) regions.push({ code, count: 0 });
@@ -297,8 +358,8 @@ function registerIpc() {
   ipcMain.handle('sub:add', async (_e, { name, url }) => {
     reqUrl(url, 'url');
     const result = await subscription.fetchSubscription(url, sendLog);
-    if (!result.nodes.length) {
-      throw new Error('no nodes parsed (format: ' + result.format + ')');
+    if (!subscription.hasUsableProxySource(result)) {
+      throw new Error('no usable proxies or proxy providers parsed (format: ' + result.format + ')');
     }
     const sub = {
       id: crypto.randomUUID(),
@@ -309,6 +370,7 @@ function registerIpc() {
       policyGroups: result.policyGroups || [],
       clashRules: result.rules || [],
       clashRuleProviders: result.ruleProviders || {},
+      clashProxyProviders: result.proxyProviders || {},
       raw: result.raw || '',
       autoUpdateMinutes: 0,
       userInfo: result.userInfo || null,
@@ -328,10 +390,11 @@ function registerIpc() {
   });
 
   // Update a specific subscription.
-  ipcMain.handle('sub:update', async (_e, { id }) => {
+  ipcMain.handle('sub:update', async (event, { id }) => {
     reqStr(id, 'id');
     const sub = state.store.getSubscription(id);
     if (!sub) throw new Error('config not found');
+    if (!sub.url) throw new Error('local profiles do not have a remote update URL');
     const token = core.beginRemoteUpdate('subscription', id);
     const sourceUrl = sub.url;
     try {
@@ -339,38 +402,89 @@ function registerIpc() {
       const result = await subscription.fetchSubscription(
         sourceUrl,
         sendLog,
-        { proxyPort }
+        { proxyPort, signal: token.signal }
       );
-      if (!result.nodes.length) {
-        throw new Error('no nodes parsed (format: ' + result.format + ')');
+      if (!subscription.hasUsableProxySource(result)) {
+        throw new Error('no usable proxies or proxy providers parsed (format: ' + result.format + ')');
+      }
+      const previewNext = mergeFetchedSubscription(sub, result);
+      const preview = profileUpdateSummary(sub, previewNext);
+      if (preview.configChanged) {
+        const settings = state.store.getSettings();
+        const { response } = await dialog.showMessageBox(
+          senderWindow(event),
+          profileUpdateDialogOptions(sub.name, preview, {
+            language: settings.language,
+            restart: id === core.getActiveSubId() && state.coreManager.isRunning(),
+          })
+        );
+        if (response !== 0) return { cancelled: true, preview };
       }
       return await core.queueConfigMutation(async () => {
         const latest = currentSubscriptionForUpdate(id, sourceUrl, token);
         const next = mergeFetchedSubscription(latest, result);
         const configChanged = (latest.configHash || subscription.configFingerprint(latest)) !== next.configHash;
         const shouldRestart = configChanged && id === core.getActiveSubId();
-        const previous = shouldRestart ? state.store.getSubscription(id, { includeRaw: true }) : null;
+        const previous = configChanged ? state.store.getSubscription(id, { includeRaw: true }) : null;
         const wasRunning = shouldRestart && state.coreManager.isRunning();
-        state.store.upsertSubscription(next);
-        // Apply the active profile's new node list to a running core; otherwise
-        // the Clash API keeps serving outbounds the UI no longer shows.
-        if (shouldRestart) {
-          try {
-            await core.restartIfRunning();
-          } catch (error) {
-            return rollbackMutationAfterFailure(
-              () => state.store.upsertSubscription(previous),
-              wasRunning,
-              error,
-              'config after update failure'
-            );
-          }
+        if (previous) {
+          await applyProfileVersionChange(previous, next, { shouldRestart, wasRunning });
+        } else {
+          state.store.upsertSubscription(next);
         }
-        return subscriptionResult(next);
+        return { ...subscriptionResult(next), preview };
       });
     } finally {
       core.finishRemoteUpdate('subscription', id, token);
     }
+  });
+
+  ipcMain.handle('sub:rollback', async (event, { id }) => {
+    reqStr(id, 'id');
+    const summary = state.store.getSubscription(id);
+    if (!summary) throw new Error('config not found');
+    if (!profileHistory.has(id)) throw new Error('no previous profile version is available');
+    const english = state.store.getSettings().language === 'en';
+    const { response } = await dialog.showMessageBox(senderWindow(event), {
+      type: 'question',
+      title: english ? 'Restore Previous Profile' : '恢复上一版本',
+      message: english ? `Restore the previous version of “${summary.name || 'Profile'}”?` : `恢复“${summary.name || '配置'}”的上一版本？`,
+      detail: english
+        ? 'The current version will be preserved, so this action can be undone by restoring again.'
+        : '当前版本会被保留，因此恢复后可再次执行恢复来撤销。',
+      buttons: english ? ['Restore', 'Cancel'] : ['恢复', '取消'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response !== 0) return { cancelled: true };
+    return core.queueConfigMutation(async () => {
+      const current = state.store.getSubscription(id, { includeRaw: true });
+      if (!current) throw new Error('config not found');
+      const entry = await profileHistory.load(id);
+      if (!entry || !entry.profile || !subscription.hasUsableProxySource(entry.profile)) {
+        throw new Error('no previous profile version is available');
+      }
+      const restored = {
+        ...entry.profile,
+        id,
+        updatedAt: Date.now(),
+        autoUpdateLastAttemptAt: Date.now(),
+      };
+      const configChanged = (current.configHash || subscription.configFingerprint(current)) !==
+        (restored.configHash || subscription.configFingerprint(restored));
+      const shouldRestart = configChanged && id === core.getActiveSubId();
+      const wasRunning = shouldRestart && state.coreManager.isRunning();
+      core.cancelRemoteUpdate('subscription', id);
+      try {
+        await applyProfileVersionChange(current, restored, { shouldRestart, wasRunning });
+        return subscriptionResult(restored);
+      } finally {
+        // The restored/current versions may use different update intervals.
+        // Schedule only after the transaction has reached its final state.
+        core.rescheduleAutoUpdate();
+      }
+    });
   });
 
   ipcMain.handle('sub:remove', (_e, { id }) => core.queueConfigMutation(async () => {
@@ -401,6 +515,7 @@ function registerIpc() {
       }
     }
     core.rescheduleAutoUpdate();
+    await profileHistory.remove(id);
     return true;
   }));
 
@@ -455,9 +570,11 @@ function registerIpc() {
         fetched = await subscription.fetchSubscription(
           requestedUrl,
           sendLog,
-          { proxyPort }
+          { proxyPort, signal: token.signal }
         );
-        if (!fetched.nodes.length) throw new Error('no nodes parsed from the selected subscription format');
+        if (!subscription.hasUsableProxySource(fetched)) {
+          throw new Error('no usable proxies or proxy providers parsed from the selected subscription format');
+        }
       }
       return await core.queueConfigMutation(async () => {
         const latest = currentSubscriptionForUpdate(id, sourceUrl, token);
@@ -467,25 +584,17 @@ function registerIpc() {
         const configChanged = !!fetched &&
           (latest.configHash || subscription.configFingerprint(latest)) !== sub.configHash;
         const shouldRestart = configChanged && sub.id === core.getActiveSubId();
-        const previous = shouldRestart ? state.store.getSubscription(id, { includeRaw: true }) : null;
+        const previous = configChanged ? state.store.getSubscription(id, { includeRaw: true }) : null;
         const wasRunning = shouldRestart && state.coreManager.isRunning();
-        state.store.upsertSubscription(sub);
-        core.rescheduleAutoUpdate();
-        // A URL change replaced the node list — apply it if this is the live profile.
-        if (shouldRestart) {
-          try {
-            await core.restartIfRunning();
-          } catch (error) {
-            return rollbackMutationAfterFailure(
-              () => {
-                state.store.upsertSubscription(previous);
-                core.rescheduleAutoUpdate();
-              },
-              wasRunning,
-              error,
-              'config after edit failure'
-            );
-          }
+        if (previous) {
+          await applyProfileVersionChange(previous, sub, {
+            shouldRestart,
+            wasRunning,
+            reschedule: true,
+          });
+        } else {
+          state.store.upsertSubscription(sub);
+          core.rescheduleAutoUpdate();
         }
         return subscriptionResult(sub);
       });
@@ -497,9 +606,9 @@ function registerIpc() {
   // Import from pasted text (Clash YAML or share links).
   ipcMain.handle('sub:import', async (_e, { name, content }) => {
     reqConfigText(content);
-    const result = subscription.parseSubscriptionContent(content);
-    if (!result.nodes.length) {
-      throw new Error('no nodes parsed (format: ' + result.format + ')');
+    const result = await subscription.parseSubscriptionContentAsync(content);
+    if (!subscription.hasUsableProxySource(result)) {
+      throw new Error('no usable proxies or proxy providers parsed (format: ' + result.format + ')');
     }
     const sub = {
       id: crypto.randomUUID(),
@@ -510,6 +619,7 @@ function registerIpc() {
       policyGroups: result.policyGroups || [],
       clashRules: result.rules || [],
       clashRuleProviders: result.ruleProviders || {},
+      clashProxyProviders: result.proxyProviders || {},
       raw: String(content || ''),
       autoUpdateMinutes: 0,
       userInfo: null,
@@ -538,9 +648,9 @@ function registerIpc() {
   ipcMain.handle('sub:saveRaw', async (_e, { id, content }) => {
     reqStr(id, 'id');
     reqConfigText(content);
-    const result = subscription.parseSubscriptionContent(content);
-    if (!result.nodes.length) {
-      throw new Error('no nodes parsed (format: ' + result.format + ')');
+    const result = await subscription.parseSubscriptionContentAsync(content);
+    if (!subscription.hasUsableProxySource(result)) {
+      throw new Error('no usable proxies or proxy providers parsed (format: ' + result.format + ')');
     }
     return core.queueConfigMutation(async () => {
       const previous = state.store.getSubscription(id, { includeRaw: true });
@@ -552,6 +662,7 @@ function registerIpc() {
         format: result.format,
         clashRules: result.rules || [],
         clashRuleProviders: result.ruleProviders || {},
+        clashProxyProviders: result.proxyProviders || {},
         raw: String(content),
         userInfo: null,
         updatedAt: Date.now(),
@@ -562,20 +673,17 @@ function registerIpc() {
       // A manual source edit is authoritative. Invalidate an older network
       // refresh before committing so its late response cannot overwrite this.
       core.cancelRemoteUpdate('subscription', id);
-      state.store.upsertSubscription(sub);
-      if (configChanged && sub.id === core.getActiveSubId()) {
-        try {
-          await core.restartIfRunning();
-        } catch (error) {
-          return rollbackMutationAfterFailure(
-            () => state.store.upsertSubscription(previous),
-            wasRunning,
-            error,
-            'config after raw edit failure'
-          );
-        }
+      if (configChanged) {
+        const shouldRestart = sub.id === core.getActiveSubId();
+        await applyProfileVersionChange(previous, sub, { shouldRestart, wasRunning });
+      } else {
+        state.store.upsertSubscription(sub);
       }
-      return { nodeCount: result.nodes.length, format: result.format };
+      return {
+        nodeCount: result.nodes.length,
+        providerCount: Object.keys(result.proxyProviders || {}).length,
+        format: result.format,
+      };
     });
   });
 
@@ -638,7 +746,7 @@ function registerIpc() {
       try {
         await core.restartIfRunning();
       } catch (error) {
-        return rollbackSettingsAfterFailure(previous, wasRunning, error);
+        return rollbackSettingsAfterFailure(previous, wasRunning, error, true);
       }
     }
     // When theme changes, tell the renderer the effective scheme after
@@ -682,9 +790,9 @@ function registerIpc() {
   ipcMain.handle('node:autoCandidate', async (_e, { name }) => {
     reqStr(name, 'name');
     if (!state.coreManager.isRunning()) throw new Error('core not running');
-    const active = core.getActiveSubscription();
+    const inventory = await core.getActiveNodeInventory();
     const validNames = new Set(
-      ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean)
+      (inventory.nodes || []).map((node) => node && node.name).filter(Boolean)
     );
     if (!validNames.has(name)) throw new Error('node is not part of the active config');
     return core.applyMeasuredAutoCandidate(name);
@@ -733,25 +841,24 @@ function registerIpc() {
 
   ipcMain.handle('node:select', async (_e, { name }) => {
     reqStr(name, 'name');
-    const active = core.getActiveSubscription();
+    const inventory = await core.getActiveNodeInventory();
     const validNames = new Set([
       '♻️ Auto',
       '🧠 Smart',
       '🛟 Fallback',
-      ...((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean),
+      ...(inventory.nodes || []).map((node) => node && node.name).filter(Boolean),
     ]);
     if (!validNames.has(name)) throw new Error('node is not part of the active config');
-    if (state.coreManager.isRunning()) {
-      try {
-        await core.setClashSelector(name);
-      } catch (e) {
-        // A 400 here means the running core's selector does not contain this
-        // node (its config predates the current profile/node list).
+    try {
+      return await core.selectManagedNode(name);
+    } catch (e) {
+      // A 400 here means the running core's selector does not contain this
+      // node (its config predates the current profile/node list).
+      if (e.selectionStage === 'live') {
         throw new Error(`${e.message} — the running core does not have this node; restart the core to apply the current profile`);
       }
+      throw e;
     }
-    state.store.set('selected', name);
-    return name;
   });
 
   // Routing rules: live rules from the Clash API when the core is running,
@@ -900,14 +1007,16 @@ function registerIpc() {
     updatedAt: c.updatedAt || 0, error: c.error || null,
   });
   ipcMain.handle('customrs:list', () => state.store.listCustomRuleSets().map(sanitizeCrs));
-  ipcMain.handle('customrs:add', (_e, { name, url, format, target }) => core.queueCustomRuleMutation(async () => {
+  ipcMain.handle('customrs:add', async (_e, { name, url, format, target }) => {
     reqUrl(url, 'url');
     const fmt = format ? reqEnum(format, VALID_CRS_FORMATS, 'format') : core.detectCustomRuleSetFormat(url);
     const tgt = target ? reqEnum(target, VALID_TARGETS, 'target') : 'proxy';
     let c = { id: crypto.randomUUID(), name: name || url, url, format: fmt, target: tgt, enabled: true };
+    const token = core.beginRemoteUpdate('rule-set', c.id);
     try {
-      c = await core.processCustomRuleSet(c);
-      return await core.queueConfigMutation(async () => {
+      c = await core.processCustomRuleSet(c, { signal: token.signal });
+      return await core.queueCustomRuleMutation(() => core.queueConfigMutation(async () => {
+        core.assertRemoteUpdate('rule-set', c.id, token);
         let committed = false;
         const wasRunning = state.coreManager.isRunning();
         try {
@@ -927,12 +1036,12 @@ function registerIpc() {
           try { restore(); } catch (recoveryError) { error.recoveryError = recoveryError; }
           throw error;
         }
-      });
-    } catch (error) {
-      throw error;
+      }));
+    } finally {
+      core.finishRemoteUpdate('rule-set', c.id, token);
     }
-  }));
-  ipcMain.handle('customrs:edit', (_e, payload) => core.queueCustomRuleMutation(async () => {
+  });
+  ipcMain.handle('customrs:edit', async (_e, payload) => {
     const { id, name, url, format, target, enabled, autoUpdateMinutes } = payload;
     reqStr(id, 'id');
     if (url !== undefined) reqUrl(url, 'url');
@@ -962,9 +1071,10 @@ function registerIpc() {
       if (reprocess) {
         processedRule = await core.processCustomRuleSet(c, {
           beforeCommit: () => currentRuleSetForUpdate(id, sourceKey, token),
+          signal: token.signal,
         });
       }
-      return await core.queueConfigMutation(async () => {
+      return await core.queueCustomRuleMutation(() => core.queueConfigMutation(async () => {
         const latest = currentRuleSetForUpdate(id, sourceKey, token);
         const desired = { ...latest };
         if (name !== undefined) desired.name = name;
@@ -993,14 +1103,12 @@ function registerIpc() {
           try { restore(); } catch (recoveryError) { error.recoveryError = recoveryError; }
           throw error;
         }
-      });
-    } catch (error) {
-      throw error;
+      }));
     } finally {
       if (token) core.finishRemoteUpdate('rule-set', id, token);
     }
-  }));
-  ipcMain.handle('customrs:refresh', (_e, { id }) => core.queueCustomRuleMutation(async () => {
+  });
+  ipcMain.handle('customrs:refresh', async (_e, { id }) => {
     reqStr(id, 'id');
     const current = state.store.getCustomRuleSet(id);
     if (!current) throw new Error('rule-set not found');
@@ -1009,8 +1117,9 @@ function registerIpc() {
     try {
       const processed = await core.processCustomRuleSet(current, {
         beforeCommit: () => currentRuleSetForUpdate(id, sourceKey, token),
+        signal: token.signal,
       });
-      return await core.queueConfigMutation(async () => {
+      return await core.queueCustomRuleMutation(() => core.queueConfigMutation(async () => {
         const latest = currentRuleSetForUpdate(id, sourceKey, token);
         const c = core.mergeProcessedCustomRuleSet(latest, processed);
         const wasRunning = state.coreManager.isRunning();
@@ -1030,13 +1139,11 @@ function registerIpc() {
           try { restore(); } catch (recoveryError) { error.recoveryError = recoveryError; }
           throw error;
         }
-      });
-    } catch (error) {
-      throw error;
+      }));
     } finally {
       core.finishRemoteUpdate('rule-set', id, token);
     }
-  }));
+  });
   ipcMain.handle('customrs:remove', (_e, { id }) => core.queueCustomRuleMutation(async () => {
     return core.queueConfigMutation(async () => {
       reqStr(id, 'id');
@@ -1063,23 +1170,49 @@ function registerIpc() {
     });
   }));
 
-  // Local rules (user-added domain/ip_cidr/... -> proxy/direct/reject).
-  const VALID_MATCH = ['domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'process_name'];
-  const normValues = (v) =>
-    (Array.isArray(v) ? v : String(v || '').split(/[\r\n,]+/))
-      .map((s) => String(s).trim())
-      .filter(Boolean);
-  const sanitizeLr = (lr) => ({
-    id: lr.id, name: lr.name || '', matchType: lr.matchType,
-    values: lr.values || [], target: lr.target || 'proxy', enabled: lr.enabled !== false,
-  });
+  // Local rules: structured fields or validated complete Mihomo rule lines.
+  const sanitizeLr = (lr) => {
+    const mode = localRuleMode(lr);
+    return mode === 'text'
+      ? {
+          id: lr.id,
+          name: lr.name || '',
+          mode,
+          rules: Array.isArray(lr.rules) ? lr.rules : [],
+          enabled: lr.enabled !== false,
+        }
+      : {
+          id: lr.id,
+          name: lr.name || '',
+          mode,
+          matchType: lr.matchType,
+          values: Array.isArray(lr.values) ? lr.values : [],
+          target: lr.target || 'proxy',
+          enabled: lr.enabled !== false,
+        };
+  };
   ipcMain.handle('localrules:list', () => (state.store.get('localRules') || []).map(sanitizeLr));
-  ipcMain.handle('localrules:add', (_e, { name, matchType, values, target }) => core.queueConfigMutation(async () => {
-    if (!VALID_MATCH.includes(matchType)) throw new Error('invalid rule type');
-    const vals = normValues(values);
-    if (!vals.length) throw new Error('no rule values provided');
-    const tgt = target ? reqEnum(target, VALID_TARGETS, 'target') : 'proxy';
-    const lr = { id: crypto.randomUUID(), name: name || '', matchType, values: vals, target: tgt, enabled: true };
+  ipcMain.handle('localrules:apps', (_event, request = {}) => {
+    if (request.force !== undefined && typeof request.force !== 'boolean') throw new Error('invalid force flag');
+    return appRouting.listRunningApplications({ force: request.force === true });
+  });
+  ipcMain.handle('localrules:add', (_e, payload = {}) => core.queueConfigMutation(async () => {
+    const mode = payload.mode === undefined ? 'structured' : reqEnum(payload.mode, ['structured', 'text'], 'editor mode');
+    let lr;
+    if (mode === 'text') {
+      lr = {
+        id: crypto.randomUUID(),
+        name: payload.name || '',
+        mode,
+        rules: normalizeTextRules(payload.rules),
+        enabled: true,
+      };
+    } else {
+      const matchType = reqEnum(payload.matchType, VALID_LOCAL_MATCH_TYPES, 'rule type');
+      const values = validateLocalRuleValues(matchType, payload.values);
+      const target = payload.target ? reqEnum(payload.target, VALID_TARGETS, 'target') : 'proxy';
+      lr = { id: crypto.randomUUID(), name: payload.name || '', mode, matchType, values, target, enabled: true };
+    }
     const previous = state.store.get('localRules') || [];
     const wasRunning = state.coreManager.isRunning();
     state.store.set('localRules', [...previous, lr]);
@@ -1095,7 +1228,8 @@ function registerIpc() {
     }
     return sanitizeLr(lr);
   }));
-  ipcMain.handle('localrules:edit', (_e, { id, name, matchType, values, target, enabled }) => core.queueConfigMutation(async () => {
+  ipcMain.handle('localrules:edit', (_e, payload = {}) => core.queueConfigMutation(async () => {
+    const { id, name, matchType, values, target, rules, enabled } = payload;
     reqStr(id, 'id');
     if (enabled !== undefined && typeof enabled !== 'boolean') throw new Error('invalid enabled flag');
     const previous = state.store.get('localRules') || [];
@@ -1104,18 +1238,34 @@ function registerIpc() {
     if (idx < 0) throw new Error('local rule not found');
     const lr = { ...list[idx] };
     if (name !== undefined) lr.name = name;
-    if (matchType !== undefined) {
-      if (!VALID_MATCH.includes(matchType)) throw new Error('invalid rule type');
-      lr.matchType = matchType;
+    const previousMode = localRuleMode(lr);
+    const mode = payload.mode === undefined ? previousMode : reqEnum(payload.mode, ['structured', 'text'], 'editor mode');
+    if (mode === 'text') {
+      if (rules !== undefined) lr.rules = normalizeTextRules(rules);
+      else if (previousMode !== 'text') throw new Error('no text rules provided');
+      lr.mode = 'text';
+      delete lr.matchType;
+      delete lr.values;
+      delete lr.target;
+    } else {
+      const nextMatchType = matchType !== undefined ? matchType : lr.matchType;
+      if (!VALID_LOCAL_MATCH_TYPES.includes(nextMatchType)) throw new Error('invalid rule type');
+      const nextValues = values !== undefined
+        ? validateLocalRuleValues(nextMatchType, values)
+        : validateLocalRuleValues(nextMatchType, normalizeLocalRuleValues(lr.values));
+      const nextTarget = target !== undefined
+        ? reqEnum(target, VALID_TARGETS, 'target')
+        : reqEnum(lr.target || 'proxy', VALID_TARGETS, 'target');
+      lr.mode = 'structured';
+      lr.matchType = nextMatchType;
+      lr.values = nextValues;
+      lr.target = nextTarget;
+      delete lr.rules;
     }
-    if (values !== undefined) {
-      lr.values = normValues(values);
-      if (!lr.values.length) throw new Error('no rule values provided');
-    }
-    if (target !== undefined) lr.target = reqEnum(target, VALID_TARGETS, 'target');
     if (enabled !== undefined) lr.enabled = enabled;
     list[idx] = lr;
-    const configChanged = [matchType, values, target, enabled].some((value) => value !== undefined);
+    const configChanged = [payload.mode, matchType, values, target, rules, enabled]
+      .some((value) => value !== undefined);
     const wasRunning = state.coreManager.isRunning();
     state.store.set('localRules', list);
     if (configChanged) {
@@ -1182,100 +1332,40 @@ function registerIpc() {
     return result.filePath;
   });
 
-  ipcMain.handle('tools:backupExport', async (event) => {
-    const backup = toolbox.buildBackup(state.store, app.getVersion());
-    const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const result = await dialog.showSaveDialog(dialogWindows.ownerWindow(event), {
-      title: 'Export Dart backup',
-      defaultPath: `Dart-backup-${stamp}.json`,
-      filters: [{ name: 'Dart backup', extensions: ['json'] }],
+  ipcMain.handle('tools:diagnosticBundle', async (event) => {
+    const win = senderWindow(event);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const result = await dialog.showSaveDialog(win, {
+      title: 'Export Dart diagnostic bundle',
+      defaultPath: `dart-diagnostics-${stamp}.json`,
+      filters: [{ name: 'Dart diagnostic bundle', extensions: ['json'] }],
     });
     if (result.canceled || !result.filePath) return null;
-    await writeAtomicText(result.filePath, JSON.stringify(backup, null, 2));
+    const document = await buildDiagnosticBundle({
+      appVersion: app.getVersion(),
+      core,
+      getRecentLogs,
+      state,
+      toolbox,
+      toolContext,
+      userData: app.getPath('userData'),
+    });
+    await writeAtomicText(result.filePath, JSON.stringify(document, null, 2));
     return result.filePath;
   });
 
-  ipcMain.handle('tools:backupSelect', async (event) => {
-    const result = await dialog.showOpenDialog(dialogWindows.ownerWindow(event), {
-      title: 'Select Dart backup',
-      properties: ['openFile'],
-      filters: [{ name: 'Dart backup', extensions: ['json'] }],
-    });
-    if (result.canceled || !result.filePaths || !result.filePaths[0]) return null;
-    const file = result.filePaths[0];
-    const { document, normalized, digest } = await readBackupDocument(file);
-    const token = crypto.randomUUID();
-    const summary = toolbox.backupSummary(document, normalized);
-    pendingBackup = { token, file, digest, expiresAt: Date.now() + 10 * 60 * 1000 };
-    return { token, fileName: path.basename(file), summary };
-  });
-
-  ipcMain.handle('tools:backupRestore', async (_e, { token }) => {
-    reqStr(token, 'backup token');
-    if (!pendingBackup || pendingBackup.token !== token || pendingBackup.expiresAt < Date.now()) {
-      pendingBackup = null;
-      throw new Error('backup selection expired; select the file again');
-    }
-    if (state.coreManager.isCoreDownloadInProgress()) {
-      throw new Error('wait for the core update to finish before restoring a backup');
-    }
-    const selected = pendingBackup;
-    const loaded = await readBackupDocument(selected.file);
-    if (loaded.digest !== selected.digest) {
-      pendingBackup = null;
-      throw new Error('backup file changed after selection; select it again');
-    }
-    const restored = loaded.normalized;
-    const currentSettings = state.store.getSettings();
-    const knownSettings = new Set(Object.keys(currentSettings));
-    restored.settings = Object.fromEntries(
-      Object.entries(restored.settings).filter(([key]) => knownSettings.has(key))
-    );
-    validateSettingsPatch(restored.settings, currentSettings);
-
-    return core.queueCustomRuleMutation(() => core.queueConfigMutation(async () => {
-      const before = toolbox.validateBackupDocument(toolbox.buildBackup(state.store, app.getVersion()));
-      const wasRunning = state.coreManager.isRunning();
-      core.cancelAllRemoteUpdates();
-      if (wasRunning) await core.stopCore(true);
-      const apply = (data) => {
-        state.store.set('subscriptions', data.subscriptions);
-        state.store.updateSettings(data.settings);
-        state.store.set('activeSub', data.activeSub);
-        state.store.set('selected', data.selected);
-        state.store.set('customRuleSets', data.customRuleSets);
-        state.store.set('localRules', data.localRules);
-      };
-      const activate = (data) => {
-        apply(data);
-        const settings = state.store.getSettings();
-        state.coreManager.setCoreType(settings.coreType);
-        core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
-        core.rescheduleAutoUpdate();
-      };
-      try {
-        activate(restored);
-        // Also invalidate a manual update that may have started while the backup
-        // data was being written. Any later request starts against restored data.
-        core.cancelAllRemoteUpdates();
-      } catch (error) {
-        core.cancelAllRemoteUpdates();
-        pendingBackup = null;
-        try {
-          activate(before);
-          if (wasRunning) await core.startCore();
-        } catch (recoveryError) {
-          error.recoveryError = recoveryError;
-        }
-        throw error;
-      }
-
-      pendingBackup = null;
-      sendToMain('subs:changed');
-      sendStatus();
-      return { restored: true, stoppedCore: wasRunning, summary: toolbox.backupSummary({ appVersion: app.getVersion(), createdAt: new Date().toISOString() }, restored) };
-    }));
-  });
+  new BackupController({
+    app,
+    core,
+    dialog,
+    dialogWindows,
+    sendStatus,
+    sendToMain,
+    state,
+    toolbox,
+    validateSettingsPatch,
+    profileHistory,
+  }).register(ipcMain);
 
   // UWP loopback exemption tool (Windows). Listing is unprivileged; applying
   // changes needs admin rights.
@@ -1346,7 +1436,7 @@ function registerIpc() {
       try {
         await core.restartIfRunning();
       } catch (error) {
-        return rollbackSettingsAfterFailure(previous, wasRunning, error);
+        return rollbackSettingsAfterFailure(previous, wasRunning, error, true);
       }
     }
     return { enabled: !!enable, settings: state.store.getSettings() };
@@ -1402,6 +1492,8 @@ function registerIpc() {
     const target = path.join(state.coreManager.ensureCoreDir(coreType), state.coreManager.binNameFor(coreType));
     let restartAfterInstall = false;
     let backup = null;
+    let installStarted = false;
+    let targetExistedBeforeInstall = false;
     let installedPath = null;
     let installError = null;
     try {
@@ -1419,12 +1511,14 @@ function registerIpc() {
             if (state.coreManager.getCoreType() !== selectedCoreType) {
               throw new Error('core type changed during update; retry the update');
             }
+            installStarted = true;
+            targetExistedBeforeInstall = fs.existsSync(target);
             if (coreType === selectedCoreType && state.coreManager.isRunning()) {
               restartAfterInstall = true;
               sendLog('[gui] stopping core to install the update...');
               await core.stopCore(undefined, { allowDuringCoreUpdate: true });
             }
-            if (fs.existsSync(target)) {
+            if (targetExistedBeforeInstall) {
               backup = uniqueSibling(target, 'update-backup');
               fs.copyFileSync(target, backup);
               if (process.platform !== 'win32') fs.chmodSync(backup, fs.statSync(target).mode);
@@ -1451,6 +1545,16 @@ function registerIpc() {
         sendLog('[gui] failed to restore the previous core after install error: ' + recoveryError.message);
       }
     }
+    if (installError && installStarted && !targetExistedBeforeInstall && fs.existsSync(target)) {
+      try {
+        fs.unlinkSync(target);
+        state.coreManager.invalidateVersionCache();
+        sendLog('[gui] removed an incomplete runtime core override after the update failed');
+      } catch (recoveryError) {
+        installError.recoveryError = installError.recoveryError || recoveryError;
+        sendLog('[gui] failed to remove the incomplete core after update error: ' + recoveryError.message);
+      }
+    }
 
     let restartError = null;
     if (restartAfterInstall && !state.coreManager.isRunning()) {
@@ -1465,6 +1569,11 @@ function registerIpc() {
     let rolledBack = false;
     if (installedPath && restartError) {
       try {
+        // startCore() may fail after the new process became live. Never replace
+        // its executable or claim rollback while that process still survives.
+        if (state.coreManager.isRunning()) {
+          await core.stopCore(undefined, { allowDuringCoreUpdate: true });
+        }
         if (backup && fs.existsSync(backup)) {
           replaceFileSync(backup, target);
           backup = null;
@@ -1526,7 +1635,18 @@ function registerIpc() {
     return dir;
   });
 
-  ipcMain.handle('core:status', () => coreStatusInfo());
+  ipcMain.handle('core:status', async () => {
+    const status = await coreStatusInfo();
+    const capability = status.coreInstalled
+      ? await core.resolveKernelSmart(status.coreType)
+      : { kernelSmart: false, kernelSmartMode: false, detection: 'unavailable' };
+    return {
+      ...status,
+      kernelSmart: !!capability.kernelSmart,
+      kernelSmartMode: !!capability.kernelSmartMode,
+      kernelSmartDetection: capability.detection || 'unknown',
+    };
+  });
 
   // Open the folder that holds the core binary in the OS file manager.
   ipcMain.handle('core:openFolder', async () => {

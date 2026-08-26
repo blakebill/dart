@@ -19,13 +19,16 @@ const {
   extractRuleGroups,
   coreSupportsKernelSmart,
   prepareSourcePolicyGroups,
+  effectiveRuleGroupOverrides,
   applySourceGroupSelections,
   sourceGroupPickOptions,
   sourcePicksForWiredGroup,
 } = require('./converter');
 const { normalizePolicyGroups } = require('./policy-groups');
+const { buildLocalRuleLines } = require('./local-rules');
 const { getCoreAdapter, normalizeCoreType } = require('./core-adapters');
 const { ManagedAutoSelection } = require('./managed-auto-selection');
+const { ManagedSelectionCoordinator } = require('./managed-selection-coordinator');
 const {
   CALIBRATION_OPTION_KEYS,
   SmartSelectionModel,
@@ -35,8 +38,11 @@ const {
 const { SmartProbeSignalWeights, buildSmartProbeFamilies } = require('./smart-probe-signals');
 const { createSmartShadowService } = require('./smart-shadow-service');
 const { KernelDialFeedback } = require('./kernel-dial-feedback');
-const { OperationCoordinator } = require('./operation-coordinator');
+const { OperationCoordinator, runReversibleLiveMutation } = require('./operation-coordinator');
+const { SmartModelStore, contextStorageKey } = require('./smart-model-store');
 const { createAutoLaunchService } = require('./auto-launch');
+const { ConnectionSnapshotService } = require('./connection-snapshot-service');
+const { getSharedProfileHistory, runProfileMutationTransaction } = require('./profile-history');
 const crypto = require('crypto');
 const subscription = require('./subscription');
 const proxy = require('./proxy');
@@ -44,6 +50,11 @@ const fetch = require('./fetch');
 const { cleanupTunAdapters, syncTunDisplayName } = require('./tun-adapter');
 const { buildDelayApiPath, selectAutoTestBatch, selectSmartTestBatch } = require('./delay');
 const { smartRegionMembers } = require('./node-region');
+const {
+  normalizeProxyProviders,
+  runtimeProviderInventory,
+  unavailableProviderFiles,
+} = require('./proxy-providers');
 const os = require('os');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 
@@ -58,6 +69,14 @@ const { uniqueSibling, replaceFileSync } = require('./file-utils');
 // tests) instead of opening a fresh TCP connection each time.
 const clashAgent = new http.Agent({ keepAlive: true, maxSockets: 16, maxFreeSockets: 2 });
 const MAX_CLASH_RESPONSE_BYTES = 32 * 1024 * 1024;
+const connectionSnapshots = new ConnectionSnapshotService({
+  load: () => clashApi('GET', '/connections'),
+  ttlMs: 750,
+});
+const profileHistory = getSharedProfileHistory({
+  getDirectory: () => state.store && state.store.dir,
+  log: sendLog,
+});
 const APP_PROXY_GROUP = '🚀 Proxy';
 const AUTO_PROXY_GROUP = '♻️ Auto';
 const SMART_PROXY_GROUP = '🧠 Smart';
@@ -91,6 +110,8 @@ let lastKernelSmartMeta = {
   kernelSmartMode: false,
 };
 const kernelSmartProbeCache = new Map();
+const KERNEL_SMART_CACHE_KEY = 'kernelSmartCapabilityCache';
+const KERNEL_SMART_CACHE_SCHEMA = 1;
 let tunWasActive = false;
 let tunAdaptersClean = false;
 const operations = new OperationCoordinator();
@@ -133,6 +154,9 @@ function cancelRemoteUpdate(scope, id) {
 
 function cancelAllRemoteUpdates() {
   operations.cancelAllRemote();
+  if (state.coreManager && typeof state.coreManager.cancelGeoUpdates === 'function') {
+    state.coreManager.cancelGeoUpdates();
+  }
 }
 
 function responseLatch(resolve, reject) {
@@ -215,6 +239,40 @@ async function disableOwnedSystemProxy(server) {
     server,
     restore ? { restore, restoreInterrupted: true } : {}
   );
+}
+
+/** Release Dart's Windows proxy ownership, with a last-resort blocking clear. */
+async function releaseOwnedSystemProxy() {
+  const persisted = persistedSystemProxyOwnership();
+  if (!state.systemProxyOn && !persisted) return false;
+  const server = state.systemProxyServer || persisted;
+  if (!server) throw new Error('system proxy ownership endpoint is missing');
+  try {
+    // A false result means the registry was successfully inspected and no
+    // active Dart-owned proxy remained. Query failures reject instead.
+    await disableOwnedSystemProxy(server);
+  } catch (error) {
+    sendLog('[gui] failed to disable system proxy: ' + error.message);
+    if (!proxy.disableSystemProxySyncIfOurs(server)) {
+      sendLog('[gui] retained system proxy ownership so cleanup can retry');
+      throw error;
+    }
+    sendLog('[gui] cleared the system proxy using the synchronous fallback');
+  }
+  let ownershipCleared = false;
+  try {
+    ownershipCleared = forgetSystemProxyOwnership(server);
+  } catch (error) {
+    // The registry is already safe. Retaining a stale recovery record is
+    // preferable to reporting a dead proxy as active.
+    sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
+  }
+  // A newer start may have acquired another endpoint while an unexpected-exit
+  // cleanup was queued. Never erase that newer run's in-memory ownership.
+  if (!ownershipCleared && state.systemProxyServer && state.systemProxyServer !== server) return true;
+  state.systemProxyOn = false;
+  state.systemProxyServer = null;
+  return true;
 }
 
 /** Persist ownership + restore data before the first registry write. */
@@ -306,31 +364,6 @@ function mergeProcessedCustomRuleSet(latest, processed) {
   if (Object.prototype.hasOwnProperty.call(processed, 'rule')) next.rule = processed.rule;
   if (Object.prototype.hasOwnProperty.call(processed, 'rules')) next.rules = processed.rules;
   return next;
-}
-
-function restoreAutoUpdatedSubscription(snapshot, applied) {
-  const latest = state.store.getSubscription(snapshot.id, { includeRaw: true });
-  if (
-    !latest ||
-    latest.url !== applied.sourceUrl ||
-    latest.updatedAt !== applied.updatedAt ||
-    subscription.configFingerprint(latest) !== applied.configHash
-  ) {
-    throw new Error('config changed again before auto-update rollback');
-  }
-  state.store.upsertSubscription({
-    ...latest,
-    nodes: snapshot.nodes || [],
-    policyGroups: snapshot.policyGroups || [],
-    format: snapshot.format || 'unknown',
-    clashRules: snapshot.clashRules || [],
-    clashRuleProviders: snapshot.clashRuleProviders || {},
-    userInfo: Object.prototype.hasOwnProperty.call(snapshot, 'userInfo') ? snapshot.userInfo : null,
-    configHash: snapshot.configHash || subscription.configFingerprint(snapshot),
-    updatedAt: snapshot.updatedAt || 0,
-    autoUpdateLastAttemptAt: Date.now(),
-    raw: Object.prototype.hasOwnProperty.call(snapshot, 'raw') ? snapshot.raw : '',
-  });
 }
 
 function snapshotFile(target, suffix) {
@@ -460,6 +493,30 @@ function persistLastRunning(value) {
 // node profiles dominated main-process time; cache by a cheap store fingerprint.
 let activeSubscriptionCache = null;
 
+const PROVIDER_RUNTIME_TTL_MS = 5_000;
+let providerRuntimeCache = null;
+let providerRuntimeRevision = 0;
+
+function emptyProviderStatus(configured = 0, stateName = 'stopped') {
+  return {
+    configured,
+    ready: 0,
+    loading: configured,
+    nodeCount: 0,
+    collisionCount: 0,
+    collisions: [],
+    providers: [],
+    state: configured ? stateName : 'none',
+  };
+}
+
+function invalidateProviderRuntimeCache() {
+  providerRuntimeCache = null;
+  providerRuntimeRevision += 1;
+  smartIdentityCache = { subscription: null, providerRevision: -1, identities: new Map() };
+  smartProbeFamilyCache = { subscription: null, providerRevision: -1, families: new Map() };
+}
+
 function activeSubscriptionFingerprint(sub) {
   if (!sub) return '';
   return [
@@ -469,6 +526,9 @@ function activeSubscriptionFingerprint(sub) {
     Array.isArray(sub.nodes) ? sub.nodes.length : -1,
     Array.isArray(sub.policyGroups) ? sub.policyGroups.length : -1,
     Array.isArray(sub.clashRules) ? sub.clashRules.length : -1,
+    sub.clashProxyProviders && typeof sub.clashProxyProviders === 'object'
+      ? Object.keys(sub.clashProxyProviders).length
+      : -1,
   ].join('\0');
 }
 
@@ -501,26 +561,30 @@ function getActiveSubscription() {
     profileMigrated = true;
     const source = state.store.getSubscription(id, { includeRaw: true });
     const parsed = source && source.raw ? subscription.parseSubscriptionContent(source.raw) : null;
-    if (parsed && parsed.nodes.length) {
+    if (parsed && subscription.hasUsableProxySource(parsed)) {
       sub = {
         ...sub,
         nodes: parsed.nodes,
         policyGroups: parsed.policyGroups || [],
         clashRules: parsed.rules || [],
         clashRuleProviders: parsed.ruleProviders || {},
+        clashProxyProviders: parsed.proxyProviders || {},
       };
     } else {
       sub.policyGroups = [];
     }
   }
   const nodes = subscription.uniqueNodeNames(sub.nodes);
-  const policyGroups = normalizePolicyGroups(sub.policyGroups, nodes);
+  const proxyProviders = normalizeProxyProviders(sub.clashProxyProviders || {});
+  const policyGroups = normalizePolicyGroups(sub.policyGroups, nodes, proxyProviders);
   const nodesChanged = nodes.length !== sub.nodes.length ||
     nodes.some((node, index) => node.name !== (sub.nodes[index] && sub.nodes[index].name));
   const groupsChanged = JSON.stringify(policyGroups) !== JSON.stringify(sub.policyGroups);
-  if (profileMigrated || nodesChanged || groupsChanged || !sub.configHash) {
+  const providersChanged = JSON.stringify(proxyProviders) !== JSON.stringify(sub.clashProxyProviders || {});
+  if (profileMigrated || nodesChanged || groupsChanged || providersChanged || !sub.configHash) {
     sub.nodes = nodes;
     sub.policyGroups = policyGroups;
+    sub.clashProxyProviders = proxyProviders;
     sub.configHash = subscription.configFingerprint(sub);
     try {
       state.store.upsertSubscription(sub);
@@ -546,25 +610,101 @@ function activeSubData() {
     groups: (sub && sub.policyGroups) || [],
     rules: (sub && sub.clashRules) || [],
     providers: (sub && sub.clashRuleProviders) || {},
+    proxyProviders: (sub && sub.clashProxyProviders) || {},
   };
+}
+
+function cachedProviderNodesForActiveProfile() {
+  const profileId = getActiveSubId() || '';
+  return providerRuntimeCache && providerRuntimeCache.profileId === profileId
+    ? providerRuntimeCache.nodes
+    : [];
+}
+
+function activeNodeEntriesForRuntime() {
+  const active = getActiveSubscription();
+  return [
+    ...((active && active.nodes) || []),
+    ...cachedProviderNodesForActiveProfile(),
+  ];
+}
+
+/**
+ * Resolve provider nodes from Mihomo itself. Dart never downloads provider
+ * URLs and never persists the API payload; only bounded name/type metadata is
+ * retained briefly for node cards and selection validation.
+ */
+async function getActiveNodeInventory({ force = false } = {}) {
+  const active = getActiveSubscription();
+  const profileId = getActiveSubId() || '';
+  const inlineNodes = (active && active.nodes) || [];
+  const proxyProviders = normalizeProxyProviders(active && active.clashProxyProviders || {});
+  const configured = Object.keys(proxyProviders).length;
+  if (!configured) {
+    if (providerRuntimeCache) invalidateProviderRuntimeCache();
+    return { nodes: inlineNodes, providerStatus: emptyProviderStatus(0, 'none') };
+  }
+  if (!state.coreManager.isRunning()) {
+    return { nodes: inlineNodes, providerStatus: emptyProviderStatus(configured, 'stopped') };
+  }
+  const now = Date.now();
+  if (
+    !force && providerRuntimeCache && providerRuntimeCache.profileId === profileId &&
+    providerRuntimeCache.configHash === (active.configHash || '') && providerRuntimeCache.expires > now
+  ) {
+    return {
+      nodes: [...inlineNodes, ...providerRuntimeCache.nodes],
+      providerStatus: providerRuntimeCache.status,
+    };
+  }
+  try {
+    const response = await clashApi('GET', '/providers/proxies');
+    const inventory = runtimeProviderInventory(proxyProviders, response, inlineNodes, profileId);
+    inventory.status.state = inventory.status.loading ? 'loading' : 'ready';
+    const signature = JSON.stringify(inventory.nodes.map((node) => [node.id, node.type, node.alive]));
+    const previousSignature = providerRuntimeCache && providerRuntimeCache.profileId === profileId
+      ? providerRuntimeCache.signature
+      : null;
+    providerRuntimeCache = {
+      profileId,
+      configHash: active.configHash || '',
+      nodes: inventory.nodes,
+      status: inventory.status,
+      signature,
+      expires: now + PROVIDER_RUNTIME_TTL_MS,
+    };
+    if (signature !== previousSignature) providerRuntimeRevision += 1;
+    return { nodes: [...inlineNodes, ...inventory.nodes], providerStatus: inventory.status };
+  } catch (error) {
+    if (providerRuntimeCache && providerRuntimeCache.profileId === profileId) {
+      const status = {
+        ...providerRuntimeCache.status,
+        state: 'error',
+        error: String(error && error.message || error || 'Mihomo provider API unavailable').slice(0, 512),
+      };
+      return { nodes: [...inlineNodes, ...providerRuntimeCache.nodes], providerStatus: status };
+    }
+    return {
+      nodes: inlineNodes,
+      providerStatus: {
+        ...emptyProviderStatus(configured, 'error'),
+        state: 'error',
+        error: String(error && error.message || error || 'Mihomo provider API unavailable').slice(0, 512),
+      },
+    };
+  }
 }
 
 /** Turn a stored local rule into Mihomo rule lines. */
 function buildLocalRuleObject(lr) {
-  const vals = (lr.values || [])
-    .map((v) => String(v).trim())
-    .filter((value) => value && !/[\r\n,]/.test(value));
-  if (!vals.length || !lr.matchType) return null;
-  const type = {
-    domain: 'DOMAIN',
-    domain_suffix: 'DOMAIN-SUFFIX',
-    domain_keyword: 'DOMAIN-KEYWORD',
-    ip_cidr: 'IP-CIDR',
-    process_name: 'PROCESS-NAME',
-  }[lr.matchType];
-  if (!type) return null;
-  const target = lr.target === 'direct' ? 'DIRECT' : lr.target === 'reject' ? 'REJECT' : APP_PROXY_GROUP;
-  return vals.map((value) => `${type},${value},${target}`);
+  try {
+    const lines = buildLocalRuleLines(lr, APP_PROXY_GROUP);
+    return lines.length ? lines : null;
+  } catch (_) {
+    // Legacy/corrupt records must not prevent the remaining configuration from
+    // starting. New writes are validated by the IPC boundary.
+    return null;
+  }
 }
 
 /** Convert legacy stored route objects into Mihomo rule lines. */
@@ -600,11 +740,12 @@ function collectCustomRules() {
 }
 
 /** Download + convert one custom rule-set, returning the processed record. */
-async function processCustomRuleSet(c, { beforeCommit } = {}) {
+async function processCustomRuleSet(c, { beforeCommit, signal } = {}) {
   const proxyPort = currentProxyPort();
   const format = normalizeCustomRuleSetFormat(c.format, c.url);
   const { body } = await fetch.getBufferWithFallback(c.url, {
     proxyPort,
+    signal,
     maxBytes: 32 * 1024 * 1024,
     headers: { 'User-Agent': 'clash-verge/v2.0.2' },
   });
@@ -640,6 +781,45 @@ function kernelSmartProbeKey(coreType, coreVersion) {
   }
 }
 
+function readPersistedKernelSmartCapability(key, coreType) {
+  if (!state.store || !key) return null;
+  const cached = state.store.get(KERNEL_SMART_CACHE_KEY);
+  if (
+    !cached ||
+    cached.schema !== KERNEL_SMART_CACHE_SCHEMA ||
+    cached.key !== key ||
+    cached.coreType !== coreType ||
+    typeof cached.kernelSmart !== 'boolean' ||
+    typeof cached.kernelSmartMode !== 'boolean' ||
+    (cached.kernelSmartMode && !cached.kernelSmart) ||
+    !(cached.version === null || typeof cached.version === 'string')
+  ) return null;
+  return {
+    coreType,
+    version: cached.version,
+    kernelSmart: cached.kernelSmart,
+    kernelSmartMode: cached.kernelSmartMode,
+    detection: 'probe',
+  };
+}
+
+function persistKernelSmartCapability(key, meta) {
+  if (!state.store || !key || !meta) return;
+  try {
+    state.store.set(KERNEL_SMART_CACHE_KEY, {
+      schema: KERNEL_SMART_CACHE_SCHEMA,
+      key,
+      coreType: meta.coreType,
+      version: meta.version,
+      kernelSmart: !!meta.kernelSmart,
+      kernelSmartMode: !!meta.kernelSmartMode,
+    });
+  } catch (_) {
+    // Capability probing still succeeded for this run; persistence is only a
+    // startup optimization.
+  }
+}
+
 async function probeKernelSmart(coreType, coreVersion) {
   const fallback = coreSupportsKernelSmart(coreType, coreVersion);
   if (
@@ -651,10 +831,20 @@ async function probeKernelSmart(coreType, coreVersion) {
   const cached = kernelSmartProbeCache.get(key);
   if (cached) return cached;
   const operation = state.coreManager.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, true))
-    .then(() => ({ supported: true, mode: true, detection: 'probe' }))
-    .catch(() => state.coreManager.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, false))
-      .then(() => ({ supported: true, mode: false, detection: 'probe' }))
-      .catch(() => ({ supported: false, mode: false, detection: 'probe' })));
+    .then(() => ({ supported: true, mode: true, detection: 'probe', cacheable: true }))
+    .catch((modeError) => state.coreManager.checkConfigFor(coreType, kernelSmartProbeConfig(coreType, false))
+      .then(() => ({ supported: true, mode: false, detection: 'probe', cacheable: true }))
+      .catch((smartError) => ({
+        supported: false,
+        mode: false,
+        detection: 'probe',
+        // Only cache a negative result when both checks reached Mihomo and
+        // were rejected as invalid config. Timeouts/spawn failures retry next
+        // launch instead of disabling kernel Smart indefinitely.
+        cacheable: [modeError, smartError].every((error) =>
+          /^config validation failed:/i.test(String(error && error.message || error || ''))
+        ),
+      })));
   if (kernelSmartProbeCache.size >= 16) {
     kernelSmartProbeCache.delete(kernelSmartProbeCache.keys().next().value);
   }
@@ -665,6 +855,12 @@ async function probeKernelSmart(coreType, coreVersion) {
 /** Resolve type: smart support from the binary itself, not its release suffix. */
 async function resolveKernelSmart(coreType = null) {
   const resolvedCoreType = normalizeCoreType(coreType || state.coreManager.getCoreType());
+  const probeKey = kernelSmartProbeKey(resolvedCoreType, null);
+  const persisted = readPersistedKernelSmartCapability(probeKey, resolvedCoreType);
+  if (persisted) {
+    lastKernelSmartMeta = persisted;
+    return lastKernelSmartMeta;
+  }
   let coreVersion = state.coreManager.peekCoreVersion(resolvedCoreType);
   if (coreVersion == null && state.coreManager.isCoreInstalled(resolvedCoreType)) {
     try {
@@ -683,6 +879,7 @@ async function resolveKernelSmart(coreType = null) {
     kernelSmartMode,
     detection: capability.detection,
   };
+  if (capability.cacheable !== false) persistKernelSmartCapability(probeKey, lastKernelSmartMeta);
   return lastKernelSmartMeta;
 }
 
@@ -692,9 +889,29 @@ function buildCurrentConfig(coreType = null, options = {}) {
     ? { ...storedSettings, coreType: normalizeCoreType(coreType) }
     : storedSettings;
   // Use only the active subscription's nodes (profiles are not merged).
-  const { nodes: allNodes, groups: allGroups, rules: allRules, providers } = activeSubData();
-  if (allNodes.length === 0) {
+  const {
+    nodes: allNodes,
+    groups: allGroups,
+    rules: allRules,
+    providers,
+    proxyProviders,
+  } = activeSubData();
+  if (allNodes.length === 0 && !Object.keys(proxyProviders).length) {
     throw new Error('No nodes available. Add a config first.');
+  }
+  const unavailableFiles = unavailableProviderFiles(
+    proxyProviders,
+    state.coreManager.coreDir('mihomo')
+  );
+  if (unavailableFiles.length) {
+    const examples = unavailableFiles.slice(0, 3)
+      .map((item) => `${item.name} (${item.path})`)
+      .join(', ');
+    const remainder = unavailableFiles.length > 3 ? ` and ${unavailableFiles.length - 3} more` : '';
+    throw new Error(
+      `Local proxy-provider file is unavailable in Mihomo's data directory: ${examples}${remainder}. ` +
+      'Copy the file there first, or use an http/inline provider.'
+    );
   }
   // Built-in rules mode: ignore the subscription's own Clash rules (which often
   // route nearly everything through the proxy) and fall back to the app's clean
@@ -744,6 +961,7 @@ function buildCurrentConfig(coreType = null, options = {}) {
     clashRules,
     policyGroups,
     ruleProviders: providers,
+    proxyProviders,
     enableIpv6: settings.enableIpv6,
     enableDnsOverride: settings.enableDnsOverride,
     dnsRemote: settings.dnsRemote,
@@ -772,7 +990,7 @@ async function buildCurrentConfigAsync(coreType = null) {
     coreType || state.store.getSettings().coreType || state.coreManager.getCoreType()
   );
   const meta = await resolveKernelSmart(resolved);
-  return buildCurrentConfig(resolved, meta);
+  return buildCurrentConfig(resolved, { ...meta, coreVersion: meta.version });
 }
 
 /** Build the route info (rules + rule-sets) from the current config, without running. */
@@ -801,7 +1019,8 @@ function ruleGroupInfo() {
   }
   const data = activeSubData();
   const groups = extractRuleGroups(data.rules);
-  const policyGroups = prepareSourcePolicyGroups(data.groups, data.nodes);
+  const policyGroups = prepareSourcePolicyGroups(data.groups, data.nodes, data.proxyProviders);
+  const effectiveOverrides = effectiveRuleGroupOverrides(policyGroups, settings.ruleOverrides);
   const wired = applySourceGroupSelections(
     policyGroups,
     data.nodes,
@@ -823,18 +1042,22 @@ function ruleGroupInfo() {
     return group && (group.type === 'select' || group.type === 'selector');
   });
   const defaults = {};
+  const normalizedSelections = {};
   const picksByGroup = {};
   for (const name of selectableTargets) {
     const group = byName.get(name);
-    if (group && group.default) defaults[name] = group.default;
     picksByGroup[name] = sourcePicksForWiredGroup(group);
+    if (group && group.default && picksByGroup[name].includes(group.default)) {
+      defaults[name] = group.default;
+      normalizedSelections[name] = group.default;
+    }
   }
   return {
     groups,
     sourceTargets,
     selectableTargets,
-    overrides: settings.ruleOverrides || {},
-    selections: settings.ruleGroupSelections || {},
+    overrides: effectiveOverrides,
+    selections: normalizedSelections,
     pickOptions: sourceGroupPickOptions(data.nodes, policyGroups),
     picksByGroup,
     defaults,
@@ -886,13 +1109,24 @@ async function setRuleGroupSelection(groupName, outbound) {
 
 async function startCoreNow() {
   assertLifecycleOpen();
+  connectionSnapshots.invalidate();
+  invalidateProviderRuntimeCache();
   // A fast manual Start can otherwise race the startup stale-proxy cleanup:
   // the cleanup may observe and disable the freshly enabled local proxy.
   if (staleProxyHealPromise) await staleProxyHealPromise;
   assertLifecycleOpen();
   const coreType = state.coreManager.getCoreType();
-  await getCoreAdapter(coreType).prepareStart(state.coreManager);
-  const { config, settings } = await buildCurrentConfigAsync(coreType);
+  // GeoData validation and the one-time binary capability probe are
+  // independent child processes. Run them together on a cold start; subsequent
+  // starts reuse their fingerprint-bound caches and skip both probes.
+  const [, smartMeta] = await Promise.all([
+    getCoreAdapter(coreType).prepareStart(state.coreManager),
+    resolveKernelSmart(coreType),
+  ]);
+  const { config, settings } = buildCurrentConfig(coreType, {
+    ...smartMeta,
+    coreVersion: smartMeta.version,
+  });
   if (settings.enableTun && !(await isWindowsAdmin())) {
     if (await ensureAdminForTun()) return; // relaunching elevated
   }
@@ -902,6 +1136,24 @@ async function startCoreNow() {
   assertLifecycleOpen();
   await state.coreManager.start(config);
   kernelDialFeedback.reset();
+  const active = getActiveSubscription();
+  const configuredProviders = Object.keys(active && active.clashProxyProviders || {}).length;
+  if (configuredProviders) {
+    try {
+      const inventory = await getActiveNodeInventory({ force: true });
+      const selected = state.store.get('selected');
+      if (
+        selected &&
+        inventory.nodes.some((node) => node && node.providerNode && node.name === selected)
+      ) {
+        await clashApi('PUT', '/proxies/' + encodeURIComponent(APP_PROXY_GROUP), { name: selected });
+      }
+    } catch (error) {
+      // Provider loading and restoring a provider-backed selection are
+      // advisory; the generated Auto selector remains a usable default.
+      sendLog('[gui] provider inventory is not ready yet: ' + error.message);
+    }
+  }
   tunWasActive = !!settings.enableTun;
   if (tunWasActive) {
     tunAdaptersClean = false;
@@ -938,13 +1190,16 @@ async function startCoreNow() {
 // does not restart the running core.
 const geodataFetchTried = {};
 const backgroundFetchKeys = new Set();
+function updateGeoDataForCore(coreType, onProgress, proxyPort) {
+  return getCoreAdapter(coreType).updateGeoData(state.coreManager, onProgress, proxyPort);
+}
+
 function maybeFetchGeodata() {
   const key = state.coreManager.getCoreType();
   if (geodataFetchTried[key] || geoDataReady()) return;
   geodataFetchTried[key] = true;
   const proxyPort = currentProxyPort();
-  state.coreManager
-    .updateGeoData(() => {}, proxyPort)
+  updateGeoDataForCore(key, () => {}, proxyPort)
     .then(() => sendLog('[gui] geodata fetched; restart to enable CN direct routing'))
     .catch((e) => {
       geodataFetchTried[key] = false; // let a later start retry
@@ -964,37 +1219,32 @@ async function stopCoreNow(remember, { preserveSystemProxyIntent = false } = {})
   // Mark the stop as intentional so the exit handler doesn't fire a "core
   // crashed" notification for a stop/restart we initiated.
   state.coreStopping = true;
-  delayRequestCache.clear();
-  delayResultCache.clear();
-  stopManagedAutoSelection();
-  stopTrafficStream();
   stopProxyGuard();
   const persistedOwnedProxy = persistedSystemProxyOwnership();
   const hadOwnedProxy = state.systemProxyOn || !!persistedOwnedProxy;
   // Restarts must re-assert a manually enabled system proxy; explicit Stop must
   // not leave a resume intent that would surprise the user on the next Start.
   pendingSystemProxyResume = !!(preserveSystemProxyIntent && hadOwnedProxy);
-  if (state.systemProxyOn || persistedOwnedProxy) {
-    const ownedServer = state.systemProxyServer || persistedOwnedProxy;
-    let released = true;
-    try {
-      if (ownedServer) await disableOwnedSystemProxy(ownedServer);
-      else sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
-    } catch (e) {
-      sendLog('[gui] failed to disable system proxy: ' + e.message);
-      released = !!ownedServer && proxy.disableSystemProxySyncIfOurs(ownedServer);
-      if (released) sendLog('[gui] cleared the system proxy using the synchronous fallback');
-      else sendLog('[gui] retained system proxy ownership so shutdown can retry cleanup');
-    }
-    if (released) {
-      try { forgetSystemProxyOwnership(ownedServer); } catch (error) {
-        sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
-      }
-      state.systemProxyOn = false;
-      state.systemProxyServer = null;
-    }
-  }
   try {
+    if (hadOwnedProxy) {
+      try {
+        await releaseOwnedSystemProxy();
+      } catch (error) {
+        // Never stop the listener while Windows may still point at it. Keeping
+        // the old runtime alive is safer than leaving a dead localhost proxy.
+        pendingSystemProxyResume = false;
+        if (state.coreManager.isRunning() && state.systemProxyOn) {
+          startProxyGuard(state.store.getSettings().mixedPort);
+        }
+        throw error;
+      }
+    }
+    connectionSnapshots.invalidate();
+    invalidateProviderRuntimeCache();
+    delayRequestCache.clear();
+    delayResultCache.clear();
+    stopManagedAutoSelection();
+    stopTrafficStream();
     await state.coreManager.stop();
     kernelDialFeedback.reset();
     if (tunWasActive) tunAdaptersClean = await cleanupTunAdapters(sendLog);
@@ -1100,17 +1350,15 @@ function setSystemProxyEnabled(enable) {
       if (enabled) startProxyGuard(port);
     } else {
       stopProxyGuard();
-      const ownedServer = state.systemProxyServer || persistedSystemProxyOwnership();
       pendingSystemProxyResume = false;
-      if (ownedServer) await disableOwnedSystemProxy(ownedServer);
-      else if (state.systemProxyOn) {
-        sendLog('[gui] system proxy ownership endpoint is missing; left the current OS proxy unchanged');
+      try {
+        await releaseOwnedSystemProxy();
+      } catch (error) {
+        if (state.coreManager.isRunning() && state.systemProxyOn) {
+          startProxyGuard(state.store.getSettings().mixedPort);
+        }
+        throw error;
       }
-      try { forgetSystemProxyOwnership(ownedServer); } catch (error) {
-        sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
-      }
-      state.systemProxyOn = false;
-      state.systemProxyServer = null;
     }
     sendStatus();
     return state.systemProxyOn;
@@ -1118,11 +1366,21 @@ function setSystemProxyEnabled(enable) {
 }
 
 async function cleanup() {
+  // Close the admission gate first. Remote downloads are aborted immediately,
+  // while config/rule transactions that already entered their bodies are
+  // allowed to finish or roll back before dependent services and the core are
+  // torn down.
   operations.close();
+  managedSelectionCoordinator.close();
   stopManagedAutoSelection();
-  smartShadowService.close();
-  if (typeof state.cancelPendingUpdates === 'function') {
-    await state.cancelPendingUpdates();
+  stopProxyGuard();
+  // Prevent accepted work from re-enabling the proxy while shutdown drains.
+  // Clearing ProxyEnable now is the safety action; stopCore below still gets a
+  // chance to restore the complete pre-Dart registry snapshot.
+  proxy.beginShutdown();
+  const shutdownProxyServer = state.systemProxyServer || persistedSystemProxyOwnership();
+  if (shutdownProxyServer && proxy.disableSystemProxySyncIfOurs(shutdownProxyServer)) {
+    sendLog('[gui] disabled the system proxy before draining shutdown work');
   }
   if (autoUpdateTimer) {
     clearInterval(autoUpdateTimer);
@@ -1136,7 +1394,16 @@ async function cleanup() {
     clearInterval(geoTimer);
     geoTimer = null;
   }
-  proxy.beginShutdown();
+  if (typeof state.cancelPendingUpdates === 'function') {
+    await state.cancelPendingUpdates();
+  }
+  await operations.closeAndDrain();
+  // A transaction finishing during the drain may have restarted the core and
+  // its samplers. Quiesce them again only after the last persisted mutation is
+  // settled.
+  stopManagedAutoSelection();
+  smartModelStore.close();
+  smartShadowService.close();
   await stopCore(undefined, { allowDuringCoreUpdate: true });
   clashAgent.destroy();
 }
@@ -1174,6 +1441,12 @@ async function restartIfRunning() {
     }
   });
   return restartPromise;
+}
+
+/** Rebuild a running core, or bring it back if the failed rebuild stopped it. */
+async function restoreCoreAfterRollback() {
+  if (state.coreManager.isRunning()) await restartIfRunning();
+  else await startCore();
 }
 
 function delayResultKey(name, contextKey = smartSelectionContextKey(), testUrl = null) {
@@ -1254,7 +1527,7 @@ function ensureSmartModelContext() {
   const key = smartSelectionContextKey();
   smartSelectionModel.setMode(state.store.getSettings().smartMode);
   if (smartSelectionModel.contextKey !== key) {
-    smartSelectionModel.clear(key);
+    smartModelStore.switchContext(contextStorageKey(key), key);
     appliedSmartIdentities = null;
     connectionFeedbackTracker.reset();
   }
@@ -1265,6 +1538,7 @@ function ensureSmartModelContext() {
     appliedSmartIdentities = identities;
   }
   smartSelectionModel.setNetworkKey(networkFingerprint());
+  smartModelStore.touch();
   ensureSmartShadowContext(key);
 }
 
@@ -1402,8 +1676,7 @@ function testNodeDelay(name, options = {}) {
 /** Smart quality grades for the active profile's nodes (UI badge). */
 function smartNodeQualities() {
   ensureSmartModelContext();
-  const sub = getActiveSubscription();
-  const names = ((sub && sub.nodes) || []).map((node) => node && node.name).filter(Boolean);
+  const names = activeNodeEntriesForRuntime().map((node) => node && node.name).filter(Boolean);
   return smartSelectionModel.qualities(names);
 }
 
@@ -1472,11 +1745,15 @@ function clashApi(method, apiPath, body) {
 }
 
 const smartSelectionModel = new SmartSelectionModel();
+const smartModelStore = new SmartModelStore(smartSelectionModel, {
+  getDirectory: () => state.store && state.store.dir,
+  log: sendLog,
+});
 const connectionFeedbackTracker = new ConnectionFeedbackTracker();
 const smartProbeSignalWeights = new SmartProbeSignalWeights();
 const kernelDialFeedback = new KernelDialFeedback();
-let smartIdentityCache = { subscription: null, identities: new Map() };
-let smartProbeFamilyCache = { subscription: null, families: new Map() };
+let smartIdentityCache = { subscription: null, providerRevision: -1, identities: new Map() };
+let smartProbeFamilyCache = { subscription: null, providerRevision: -1, families: new Map() };
 let appliedSmartIdentities = null;
 
 function smartSelectionContextKey() {
@@ -1536,29 +1813,37 @@ function observeSmartShadowConnection(event, now = Date.now()) {
 
 function activeSmartNodeIdentities() {
   const active = getActiveSubscription();
-  if (smartIdentityCache.subscription === active) return smartIdentityCache.identities;
+  if (
+    smartIdentityCache.subscription === active &&
+    smartIdentityCache.providerRevision === providerRuntimeRevision
+  ) return smartIdentityCache.identities;
   const identities = new Map();
   const duplicates = new Map();
-  for (const node of (active && active.nodes) || []) {
+  for (const node of activeNodeEntriesForRuntime()) {
     if (!node || typeof node.name !== 'string' || !node.name) continue;
-    const base = subscription.nodeFingerprint(node) || node.name;
+    const base = node.providerNode
+      ? `proxy-provider:${node.provider || ''}:${node.name}`
+      : subscription.nodeFingerprint(node) || node.name;
     const occurrence = (duplicates.get(base) || 0) + 1;
     duplicates.set(base, occurrence);
     identities.set(node.name, occurrence === 1 ? base : `${base}:${occurrence}`);
   }
-  smartIdentityCache = { subscription: active, identities };
+  smartIdentityCache = { subscription: active, providerRevision: providerRuntimeRevision, identities };
   return identities;
 }
 
 function activeSmartProbeFamilies() {
   const active = getActiveSubscription();
-  if (smartProbeFamilyCache.subscription === active) return smartProbeFamilyCache.families;
-  const nodes = (active && active.nodes) || [];
+  if (
+    smartProbeFamilyCache.subscription === active &&
+    smartProbeFamilyCache.providerRevision === providerRuntimeRevision
+  ) return smartProbeFamilyCache.families;
+  const nodes = activeNodeEntriesForRuntime();
   const families = buildSmartProbeFamilies(
     nodes,
     nodes.map((node) => node && node.name).filter(Boolean)
   );
-  smartProbeFamilyCache = { subscription: active, families };
+  smartProbeFamilyCache = { subscription: active, providerRevision: providerRuntimeRevision, families };
   return families;
 }
 
@@ -1624,15 +1909,14 @@ async function harvestConnectionFeedback() {
   connectionFeedbackTracker.setIgnoreHosts(extraIgnore);
   const nodeNames = configuredManagedGroupNames(SMART_PROXY_GROUP);
   const dialResult = await harvestKernelDialFeedback(nodeNames, contextKey);
-  let data;
+  let connections;
   try {
-    data = await clashApi('GET', '/connections');
+    connections = await connectionSnapshots.smartFeedback();
   } catch (_) {
     return (dialResult.events || []).length;
   }
   if (smartSelectionContextKey() !== contextKey) return 0;
   connectionFeedbackTracker.setNodeNames(nodeNames);
-  const connections = Array.isArray(data && data.connections) ? data.connections : [];
   let events = connectionFeedbackTracker.ingest(connections, Date.now());
   // A custom kernel reports the actual dial failure directly. Keep traffic and
   // completed-connection evidence, but avoid counting the heuristic short-life
@@ -1705,8 +1989,7 @@ function getManagedNodeOverrideInfo() {
 
 /** Candidate names implied by the current profile and Smart region scope. */
 function configuredManagedGroupNames(group) {
-  const active = getActiveSubscription();
-  const entries = ((active && active.nodes) || [])
+  const entries = activeNodeEntriesForRuntime()
     .filter((node) => node && typeof node.name === 'string' && node.name);
   const names = entries.map((node) => node.name);
   if (group !== SMART_PROXY_GROUP) return names;
@@ -1715,7 +1998,15 @@ function configuredManagedGroupNames(group) {
 }
 
 function managedOverrideEligible(name, group) {
-  return configuredManagedGroupNames(group).includes(name);
+  if (configuredManagedGroupNames(group).includes(name)) return true;
+  // Keep a persisted provider pin until the live group's `all` list can be
+  // checked. A just-started provider may not yet be present in the short API
+  // inventory cache even though Mihomo is still loading it.
+  const active = getActiveSubscription();
+  return !!(
+    state.coreManager.isRunning() && active &&
+    Object.keys(active.clashProxyProviders || {}).length
+  );
 }
 
 /** Resolve pin for a specific managed group (Auto or Smart). */
@@ -1752,9 +2043,11 @@ async function setManagedNodeOverride(name) {
   const profileId = getActiveSubId() || '';
   const active = getActiveSubscription();
   const validNames = new Set(
-    ((active && active.nodes) || []).map((node) => node && node.name).filter(Boolean)
+    activeNodeEntriesForRuntime().map((node) => node && node.name).filter(Boolean)
   );
-  if (!validNames.has(name)) throw new Error('node is not part of the active config');
+  if (!validNames.has(name) && !Object.keys(active && active.clashProxyProviders || {}).length) {
+    throw new Error('node is not part of the active config');
+  }
   const group = await resolveOuterManagedGroup();
   if ((getActiveSubId() || '') !== profileId) throw new Error('active config changed');
   if (!managedOverrideEligible(name, group)) {
@@ -1964,6 +2257,12 @@ const managedSmartSelection = new ManagedAutoSelection({
   selectionModel: smartSelectionModel,
   resolveOverride: (names) => resolveManagedOverrideForGroup(SMART_PROXY_GROUP, names),
   testDelay: (name, options) => testNodeDelayDual(name, options),
+  filterNames: (names) => {
+    const byName = new Map(activeNodeEntriesForRuntime().map((node) => [node && node.name, node]));
+    const entries = names.map((name) => byName.get(name) || { name });
+    const settings = state.store ? state.store.getSettings() : {};
+    return smartRegionMembers(entries, names, settings.smartRegions);
+  },
   getIntervalMs: ({ active }) => {
     if (!active) return MANAGED_IDLE_INTERVAL_MS;
     return smartActiveIntervalMs();
@@ -2119,12 +2418,53 @@ function startManagedAutoSelection() {
   void syncManagedSelectionSchedulers().catch(() => null);
 }
 
-/** Switch the outer proxy selector live via the Clash API. */
-async function setClashSelector(name) {
+/** Switch the outer proxy selector live and realign managed schedulers. */
+async function applyClashSelector(name) {
+  // Invalidate a scheduler sync that started before this user transaction.
+  managedSelectionSyncRevision += 1;
   const result = await managedAutoSelection.setOuterSelector(name);
+  // A sync may have started while the API PUT was pending. Its GET can describe
+  // the former selector, so invalidate it before reading the applied value.
+  managedSelectionSyncRevision += 1;
   const forceRefresh = (name === AUTO_PROXY_GROUP || name === SMART_PROXY_GROUP) ? name : null;
   await syncManagedSelectionSchedulers({ forceRefresh });
   return result;
+}
+
+const managedSelectionCoordinator = new ManagedSelectionCoordinator(async (name) => {
+  const previous = state.store.get('selected');
+  const running = state.coreManager.isRunning();
+  if (!running) {
+    state.store.set('selected', name);
+    return name;
+  }
+  return runReversibleLiveMutation({
+    apply: async () => {
+      try {
+        await applyClashSelector(name);
+      } catch (error) {
+        error.selectionStage = 'live';
+        throw error;
+      }
+    },
+    commit: () => {
+      state.store.set('selected', name);
+      return name;
+    },
+    rollback: async () => {
+      if (previous && previous !== name && state.coreManager.isRunning()) {
+        await applyClashSelector(previous);
+      }
+    },
+  });
+});
+
+function selectManagedNode(name) {
+  return managedSelectionCoordinator.select(name);
+}
+
+function getSelectionRevision() {
+  return managedSelectionCoordinator.getRevision();
 }
 
 /**
@@ -2134,6 +2474,15 @@ async function setClashSelector(name) {
 let modeRevision = 0;
 function modeChangeNeedsRestart(coreType, currentMode, nextMode) {
   return getCoreAdapter(coreType).modeChangeNeedsRestart(currentMode, nextMode);
+}
+
+async function alignGlobalSelector() {
+  const global = await clashApi('GET', '/proxies/GLOBAL');
+  const previous = global && typeof global.now === 'string' ? global.now : null;
+  if (previous !== APP_PROXY_GROUP) {
+    await clashApi('PUT', '/proxies/GLOBAL', { name: APP_PROXY_GROUP });
+  }
+  return previous;
 }
 
 function setProxyMode(mode) {
@@ -2147,13 +2496,19 @@ function setProxyMode(mode) {
       try {
         await restartIfRunning();
       } catch (error) {
-        state.store.updateSettings({ clashMode: previous });
-        // restartIfRunning stops the old core before starting the rebuilt
-        // config. If the new mode fails validation/startup, restore the old
-        // mode and bring that known-good configuration back online.
-        if (!state.coreManager.isRunning()) {
+        let preferenceRestored = false;
+        try {
+          state.store.updateSettings({ clashMode: previous });
+          preferenceRestored = true;
+        } catch (recoveryError) {
+          error.recoveryError = recoveryError;
+        }
+        // A late post-start failure can happen after the new core is already
+        // live. Rebuild from the restored preference either way so the
+        // running mode and durable mode cannot diverge.
+        if (preferenceRestored) {
           try {
-            await startCore();
+            await restoreCoreAfterRollback();
           } catch (recoveryError) {
             error.recoveryError = recoveryError;
             sendLog('[gui] failed to restore the previous proxy mode: ' + recoveryError.message);
@@ -2162,8 +2517,40 @@ function setProxyMode(mode) {
         throw error;
       }
     } else {
-      if (running) await clashApi('PATCH', '/configs', { mode });
-      state.store.updateSettings({ clashMode: mode });
+      if (running) {
+        let previousGlobal = null;
+        await runReversibleLiveMutation({
+          apply: async () => {
+            // Configs started before this version use Mihomo's generated
+            // GLOBAL selector. Pin it before enabling global mode so a live
+            // switch cannot unexpectedly route through DIRECT.
+            if (mode === 'global') {
+              previousGlobal = await alignGlobalSelector();
+            }
+            await clashApi('PATCH', '/configs', { mode });
+          },
+          commit: () => state.store.updateSettings({ clashMode: mode }),
+          rollback: async () => {
+            if (!state.coreManager.isRunning()) return;
+            let recoveryError = null;
+            try {
+              await clashApi('PATCH', '/configs', { mode: previous });
+            } catch (error) {
+              recoveryError = error;
+            }
+            if (mode === 'global' && previousGlobal && previousGlobal !== APP_PROXY_GROUP) {
+              try {
+                await clashApi('PUT', '/proxies/GLOBAL', { name: previousGlobal });
+              } catch (error) {
+                if (!recoveryError) recoveryError = error;
+              }
+            }
+            if (recoveryError) throw recoveryError;
+          },
+        });
+      } else {
+        state.store.updateSettings({ clashMode: mode });
+      }
     }
     modeRevision += 1;
     refreshTray();
@@ -2205,8 +2592,6 @@ async function runAutoUpdateTick() {
   const epoch = operations.remoteEpoch;
   const subs = state.store.listSubscriptions();
   let changed = false;
-  let activeConfigChanged = false;
-  let activeConfigRollback = null;
   for (const sub of subs) {
     if (epoch !== operations.remoteEpoch) return;
     const mins = parseInt(sub.autoUpdateMinutes || 0, 10);
@@ -2221,9 +2606,10 @@ async function runAutoUpdateTick() {
         const proxyPort = current.updateViaProxy ? currentProxyPort() : 0;
         const r = await subscription.fetchSubscription(sourceUrl, sendLog, {
           proxyPort,
+          signal: token.signal,
         });
-        if (!r.nodes.length) throw new Error('no nodes parsed from the updated config');
-        const applied = await queueConfigMutation(() => {
+        if (!subscription.hasUsableProxySource(r)) throw new Error('no usable proxy source parsed from the updated config');
+        const applied = await queueConfigMutation(async () => {
           assertRemoteUpdate('subscription', sub.id, token);
           const latest = state.store.getSubscription(current.id);
           if (!latest || latest.url !== sourceUrl) return null;
@@ -2238,13 +2624,34 @@ async function runAutoUpdateTick() {
             format: r.format,
             clashRules: r.rules || [],
             clashRuleProviders: r.ruleProviders || {},
+            clashProxyProviders: r.proxyProviders || {},
             userInfo: r.userInfo || null,
             updatedAt,
             autoUpdateLastAttemptAt: updatedAt,
             configHash: nextHash,
           };
           if (r.raw) next.raw = r.raw;
-          state.store.upsertSubscription(next);
+          if (configChanged) {
+            const shouldRestart = next.id === getActiveSubId();
+            const wasRunning = shouldRestart && state.coreManager.isRunning();
+            await runProfileMutationTransaction({
+              history: profileHistory,
+              previous,
+              apply: async () => state.store.upsertSubscription(next),
+              verify: shouldRestart ? () => restartIfRunning() : null,
+              rollback: async () => {
+                state.store.upsertSubscription(previous);
+                if (shouldRestart) {
+                  if (state.coreManager.isRunning()) await restartIfRunning();
+                  else if (wasRunning) await startCore();
+                }
+                sendToMain('subs:changed');
+                sendLog('[gui] restored the previous config after an automatic update failure');
+              },
+            });
+          } else {
+            state.store.upsertSubscription(next);
+          }
           return { next, previous, configChanged, updatedAt, nextHash };
         });
         if (!applied) {
@@ -2252,13 +2659,6 @@ async function runAutoUpdateTick() {
           continue;
         }
         changed = true;
-        if (applied.configChanged && applied.next.id === getActiveSubId()) {
-          activeConfigChanged = true;
-          activeConfigRollback = {
-            snapshot: applied.previous,
-            applied: { sourceUrl, updatedAt: applied.updatedAt, configHash: applied.nextHash },
-          };
-        }
         sendLog('[gui] auto-updated config: ' + applied.next.name);
       } catch (e) {
         try {
@@ -2285,39 +2685,6 @@ async function runAutoUpdateTick() {
   }
   if (changed) {
     sendToMain('subs:changed');
-    // The live profile's node list changed: restart so the core serves the
-    // same outbounds the UI shows (custom rule-set auto-update already does
-    // this; subscriptions must too, or selection/delay tests start failing).
-    if (activeConfigChanged) {
-      await queueConfigMutation(async () => {
-        // A user may have switched profiles while the download was in flight.
-        // The updated profile is no longer live, so no restart is needed.
-        if (!activeConfigRollback || getActiveSubId() !== activeConfigRollback.snapshot.id) return;
-        try {
-          await restartIfRunning();
-        } catch (error) {
-          let recoveryError = null;
-          try {
-            restoreAutoUpdatedSubscription(activeConfigRollback.snapshot, activeConfigRollback.applied);
-            sendToMain('subs:changed');
-            sendLog('[gui] restored the previous active config after an auto-update restart failure');
-          } catch (restoreError) {
-            recoveryError = restoreError;
-          }
-          if (!state.coreManager.isRunning()) {
-            try {
-              await startCore();
-            } catch (startError) {
-              if (!recoveryError) recoveryError = startError;
-            }
-          }
-          if (recoveryError) {
-            error.recoveryError = recoveryError;
-            sendLog('[gui] failed to recover from the config auto-update error: ' + recoveryError.message);
-          }
-        }
-      });
-    }
   }
 
   // Custom rule-sets on a schedule: re-download + convert, then restart the
@@ -2330,26 +2697,31 @@ async function runAutoUpdateTick() {
     if (epoch !== operations.remoteEpoch) return;
     const mins = parseInt(c.autoUpdateMinutes || 0, 10);
     if (c.enabled !== false && c.url && autoUpdateDue(c, mins)) {
-      await queueCustomRuleMutation(async () => {
-        const token = beginRemoteUpdate('rule-set', c.id, { background: true });
-        if (!token) return;
-        let sourceKey = customRuleSetSourceKey(c);
-        let rollback = null;
-        let committed = false;
-        try {
-          const current = state.store.getCustomRuleSet(c.id);
-          if (!current || current.enabled === false || !current.url) return;
-          sourceKey = customRuleSetSourceKey(current);
-          rollback = snapshotCustomRuleSetUpdate(current);
-          const assertCurrent = () => {
-            assertRemoteUpdate('rule-set', c.id, token);
-            const latest = state.store.getCustomRuleSet(c.id);
-            if (!latest || customRuleSetSourceKey(latest) !== sourceKey) {
-              throw new Error('rule-set changed while auto-update was in progress');
-            }
-            return latest;
-          };
-          const processed = await processCustomRuleSet(current, { beforeCommit: assertCurrent });
+      const token = beginRemoteUpdate('rule-set', c.id, { background: true });
+      if (!token) continue;
+      let sourceKey = customRuleSetSourceKey(c);
+      let rollback = null;
+      let committed = false;
+      const assertCurrent = () => {
+        assertRemoteUpdate('rule-set', c.id, token);
+        const latest = state.store.getCustomRuleSet(c.id);
+        if (!latest || customRuleSetSourceKey(latest) !== sourceKey) {
+          throw new Error('rule-set changed while auto-update was in progress');
+        }
+        return latest;
+      };
+      try {
+        const current = state.store.getCustomRuleSet(c.id);
+        if (!current || current.enabled === false || !current.url) continue;
+        sourceKey = customRuleSetSourceKey(current);
+        rollback = snapshotCustomRuleSetUpdate(current);
+        // Network I/O deliberately stays outside the rule mutation queue so a
+        // slow source cannot block edits/removals of unrelated rule-sets.
+        const processed = await processCustomRuleSet(current, {
+          beforeCommit: assertCurrent,
+          signal: token.signal,
+        });
+        await queueCustomRuleMutation(() => {
           const updated = mergeProcessedCustomRuleSet(assertCurrent(), processed);
           updated.autoUpdateLastAttemptAt = updated.updatedAt;
           state.store.upsertCustomRuleSet(updated);
@@ -2358,36 +2730,37 @@ async function runAutoUpdateTick() {
           committed = true;
           crsChanged = true;
           sendLog('[gui] auto-updated rule-set: ' + c.name);
-        } catch (e) {
-          try {
+        });
+      } catch (e) {
+        try {
+          await queueCustomRuleMutation(() => {
             assertRemoteUpdate('rule-set', c.id, token);
             const latest = state.store.getCustomRuleSet(c.id);
             if (!latest || customRuleSetSourceKey(latest) !== sourceKey) {
-              sendLog('[gui] discarded stale rule-set auto-update: ' + c.name);
-              return;
+              throw new Error('rule-set changed while auto-update was in progress');
             }
             state.store.upsertCustomRuleSet({
               id: latest.id,
               autoUpdateLastAttemptAt: Date.now(),
               error: String(e.message || e).slice(0, 500),
             });
-          } catch (_) {
-            sendLog('[gui] discarded stale rule-set auto-update: ' + c.name);
-            return;
-          }
-          sendLog('[gui] rule-set auto-update failed for ' + c.name + ': ' + e.message);
-        } finally {
-          if (!committed && rollback) {
-            try {
-              restoreCustomRuleSetUpdateFile(rollback);
-              discardCustomRuleSetUpdateSnapshot(rollback);
-            } catch (restoreError) {
-              sendLog('[gui] failed to restore a remote-rule file after update error: ' + restoreError.message);
-            }
-          }
-          finishRemoteUpdate('rule-set', c.id, token);
+          });
+        } catch (_) {
+          sendLog('[gui] discarded stale rule-set auto-update: ' + c.name);
+          continue;
         }
-      });
+        sendLog('[gui] rule-set auto-update failed for ' + c.name + ': ' + e.message);
+      } finally {
+        if (!committed && rollback) {
+          try {
+            restoreCustomRuleSetUpdateFile(rollback);
+            discardCustomRuleSetUpdateSnapshot(rollback);
+          } catch (restoreError) {
+            sendLog('[gui] failed to restore a remote-rule file after update error: ' + restoreError.message);
+          }
+        }
+        finishRemoteUpdate('rule-set', c.id, token);
+      }
     }
   }
   if (crsChanged) {
@@ -2398,8 +2771,10 @@ async function runAutoUpdateTick() {
         await restartIfRunning();
       } catch (error) {
         let recoveryError = null;
+        let rulesRestored = false;
         try {
           restoreAutoUpdatedCustomRuleSets(crsRollbacks);
+          rulesRestored = true;
           sendToMain('dialog:changed', { scope: 'rules' });
           sendLog('[gui] restored previous remote rules after an auto-update restart failure');
         } catch (restoreError) {
@@ -2408,9 +2783,9 @@ async function runAutoUpdateTick() {
           // For an actual I/O failure, preserve the backup as the last good copy.
           discardSnapshots = restoreError.code === 'DART_UPDATE_SUPERSEDED';
         }
-        if (!state.coreManager.isRunning()) {
+        if (rulesRestored && !operations.closing) {
           try {
-            await startCore();
+            await restoreCoreAfterRollback();
           } catch (startError) {
             if (!recoveryError) recoveryError = startError;
           }
@@ -2495,7 +2870,7 @@ async function refreshGeoData(onProgress = () => {}) {
   const successKey = 'geoUpdatedAt_' + coreType.replace(/[^a-z0-9]/gi, '');
   const snapshots = snapshotGeoData(coreType);
   try {
-    const dir = await state.coreManager.updateGeoData(onProgress, currentProxyPort());
+    const dir = await updateGeoDataForCore(coreType, onProgress, currentProxyPort());
     markGeoDataApplied(snapshots);
     if (
       !operations.closing &&
@@ -2506,19 +2881,21 @@ async function refreshGeoData(onProgress = () => {}) {
         await restartIfRunning();
       } catch (error) {
         let recoveryError = null;
+        let geoDataRestored = false;
         try {
           restoreGeoData(snapshots);
+          geoDataRestored = true;
           sendLog('[gui] restored previous geodata after an update restart failure');
         } catch (restoreError) {
           recoveryError = restoreError;
         }
         if (
           !operations.closing &&
-          !state.coreManager.isRunning() &&
+          geoDataRestored &&
           state.coreManager.getCoreType() === coreType
         ) {
           try {
-            await startCore();
+            await restoreCoreAfterRollback();
           } catch (startError) {
             if (!recoveryError) recoveryError = startError;
           }
@@ -2585,6 +2962,10 @@ function applyAutoLaunch(enable, silent, options) {
   return autoLaunch.apply(enable, silent, options);
 }
 
+function reconcileAutoLaunch(enable, silent) {
+  return autoLaunch.reconcile(enable, silent);
+}
+
 /**
  * Startup safety net: if a previous run exited uncleanly (crash, force-kill, or
  * a shutdown too fast for cleanup), the Windows system proxy can be left
@@ -2638,6 +3019,7 @@ module.exports = {
   currentProxyPort,
   enableOwnedSystemProxy,
   disableOwnedSystemProxy,
+  releaseOwnedSystemProxy,
   persistedSystemProxyOwnership,
   forgetSystemProxyOwnership,
   beginRemoteUpdate,
@@ -2649,6 +3031,7 @@ module.exports = {
   queueCustomRuleMutation,
   getActiveSubId,
   getActiveSubscription,
+  getActiveNodeInventory,
   activeSubData,
   buildLocalRuleObject,
   splitInlineRule,
@@ -2683,8 +3066,11 @@ module.exports = {
   harvestConnectionFeedback,
   applyMeasuredAutoCandidate,
   clashApi,
-  setClashSelector,
+  connectionSnapshots,
+  selectManagedNode,
+  getSelectionRevision,
   setProxyMode,
+  alignGlobalSelector,
   getModeRevision,
   modeChangeNeedsRestart,
   rescheduleAutoUpdate,
@@ -2692,5 +3078,6 @@ module.exports = {
   checkGeoUpdate,
   startGeoAutoUpdate,
   applyAutoLaunch,
+  reconcileAutoLaunch,
   healStaleSystemProxy,
 };

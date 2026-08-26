@@ -2,7 +2,7 @@
 // Connections tab controller. The controller itself has no dependency on the
 // global App namespace; the compatibility adapter at the bottom wires it in.
 (function () {
-  const VIRTUAL_CONNECTION_ROW_HEIGHT = 62;
+  const VIRTUAL_CONNECTION_ROW_HEIGHT = 58;
   const VIRTUAL_OVERSCAN = 7;
   const CONNECTION_LABELS = Object.freeze({
     direct: 'Direct',
@@ -14,6 +14,44 @@
     match: 'Match',
     pass: 'Pass',
   });
+
+  function routeCategory(connection) {
+    const chains = Array.isArray(connection && connection.chains) ? connection.chains : [];
+    const tokens = [connection && connection.rule, ...chains]
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean);
+    if (tokens.some((value) => /^(?:reject(?:-drop)?|block)$/.test(value))) return 'reject';
+    if (tokens.some((value) => value === 'direct')) return 'direct';
+    return 'proxy';
+  }
+
+  function connectionSearchText(connection) {
+    const metadata = connection && connection.metadata || {};
+    const chains = Array.isArray(connection && connection.chains) ? connection.chains : [];
+    const host = metadata.host || metadata.destinationIP || '';
+    return [
+      metadata.host,
+      metadata.destinationIP,
+      metadata.destinationPort,
+      host && metadata.destinationPort ? `${host}:${metadata.destinationPort}` : '',
+      metadata.network,
+      connection && connection.rule,
+      chains.slice().reverse().join(' → '),
+      ...chains,
+    ].map((value) => String(value || '').toLocaleLowerCase()).join('\n');
+  }
+
+  function filterConnections(connections, filters = {}) {
+    const query = String(filters.query || '').trim().toLocaleLowerCase();
+    const network = String(filters.network || '').trim().toLowerCase();
+    const route = String(filters.route || '').trim().toLowerCase();
+    return (Array.isArray(connections) ? connections : []).filter((connection) => {
+      const metadata = connection && connection.metadata || {};
+      if (network && String(metadata.network || '').toLowerCase() !== network) return false;
+      if (route && routeCategory(connection) !== route) return false;
+      return !query || connectionSearchText(connection).includes(query);
+    });
+  }
 
   function createConnectionsController(deps) {
     const {
@@ -31,11 +69,14 @@
       nextFrame,
       onLoaded = () => {},
     } = deps;
+    let allConnectionItems = [];
     let connectionItems = [];
+    let lastSnapshot = null;
     let connectionsRequest = null;
     let connectionsGeneration = 0;
     let renderQueued = false;
     let pollTimer = null;
+    let filterTimer = null;
     let active = false;
     let viewVisible = false;
     let activationGeneration = 0;
@@ -72,6 +113,11 @@
       pollTimer = null;
     }
 
+    function stopFilter() {
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = null;
+    }
+
     function schedulePoll(delay = 3000) {
       stopPoll();
       if (!usable()) return;
@@ -96,6 +142,58 @@
       return CONNECTION_LABELS[text.toLowerCase()] || text;
     }
 
+    function currentFilters() {
+      return {
+        query: elements.search ? elements.search.value : '',
+        network: elements.network ? elements.network.value : '',
+        route: elements.route ? elements.route.value : '',
+      };
+    }
+
+    function filtersActive(filters = currentFilters()) {
+      return !!(String(filters.query || '').trim() || filters.network || filters.route);
+    }
+
+    function updateFilterControls(filters, count) {
+      const enabled = filtersActive(filters);
+      if (elements.reset) elements.reset.classList.toggle('hidden', !enabled);
+      if (elements.closeFiltered) {
+        elements.closeFiltered.classList.toggle('hidden', !enabled);
+        elements.closeFiltered.disabled = !enabled || count < 1;
+      }
+    }
+
+    function renderStats(data, filters) {
+      const total = Number.isFinite(data.totalConnections)
+        ? data.totalConnections
+        : allConnectionItems.length;
+      if (filtersActive(filters)) {
+        elements.stats.textContent = t(
+          'conns.filteredStats',
+          connectionItems.length,
+          allConnectionItems.length,
+          total,
+          fmtBytes(data.up),
+          fmtBytes(data.down)
+        );
+      } else if (total > allConnectionItems.length) {
+        elements.stats.textContent = t(
+          'conns.limitedStats',
+          allConnectionItems.length,
+          total,
+          fmtBytes(data.up),
+          fmtBytes(data.down)
+        );
+      } else {
+        elements.stats.textContent = t(
+          'conns.stats',
+          total,
+          fmtBytes(data.up),
+          fmtBytes(data.down)
+        );
+      }
+    }
+
     function connRowInner(connection) {
       const metadata = connection.metadata || {};
       const host = metadata.host || metadata.destinationIP || '';
@@ -108,14 +206,20 @@
       const networkHtml = network
         ? `<span class="conn-net${networkClass}">${escapeHtml(network)}</span>`
         : '';
+      const targetHtml = target
+        ? `<button type="button" class="conn-host conn-filter-link" data-conn-filter="${escapeHtml(target)}" title="${escapeHtml(t('conns.filterByTarget'))}">${escapeHtml(target)}</button>`
+        : '<span class="conn-host">—</span>';
+      const chainsHtml = chains
+        ? `<button type="button" class="conn-chains conn-filter-link" data-conn-filter="${escapeHtml(chains)}" title="${escapeHtml(t('conns.filterByNode'))}">${escapeHtml(chains)}</button>`
+        : '<span class="conn-chains"></span>';
       const closeHtml = connection.id
         ? `<button type="button" class="conn-close" data-id="${escapeHtml(connection.id)}" aria-label="${escapeHtml(t('conns.close') + ': ' + target)}" title="${escapeHtml(t('conns.close'))}">×</button>`
         : '';
       return (
         `<div class="conn-main">` +
-        `<span class="conn-host">${escapeHtml(target)}</span>` +
+        targetHtml +
         `<span class="conn-sub">${networkHtml}<span class="sub-meta">${escapeHtml(connectionLabel(connection.rule))}</span></span></div>` +
-        `<div class="conn-right"><span class="conn-chains">${escapeHtml(chains)}</span>` +
+        `<div class="conn-right">${chainsHtml}` +
         `<span class="sub-meta conn-traffic">↑ ${fmtBytes(connection.upload || 0)} · ↓ ${fmtBytes(connection.download || 0)}</span></div>${closeHtml}`
       );
     }
@@ -146,14 +250,26 @@
 
     function render(data = {}) {
       const allConnections = Array.isArray(data.connections) ? data.connections : [];
-      elements.stats.textContent = t(
-        'conns.stats',
-        Number.isFinite(data.totalConnections) ? data.totalConnections : allConnections.length,
-        fmtBytes(data.up),
-        fmtBytes(data.down)
-      );
+      if (data.error) {
+        lastSnapshot = null;
+        allConnectionItems = [];
+        connectionItems = [];
+        updateFilterControls(currentFilters(), 0);
+        elements.stats.textContent = '—';
+        ui.renderEmptyState(elements.list, {
+          iconClass: 'connection-empty-icon',
+          title: t('conns.loadFailed'),
+          actionLabel: t('conns.retry'),
+          actionName: 'retry-connections',
+        });
+        return;
+      }
+      lastSnapshot = data;
+      allConnectionItems = allConnections;
       if (!data.running || allConnections.length === 0) {
         connectionItems = [];
+        updateFilterControls(currentFilters(), 0);
+        renderStats(data, currentFilters());
         ui.renderEmptyState(elements.list, {
           iconClass: 'connection-empty-icon',
           title: t('conns.empty'),
@@ -162,9 +278,37 @@
         });
         return;
       }
+      applyFilters();
+    }
+
+    function applyFilters({ resetScroll = false } = {}) {
+      const filters = currentFilters();
+      if (!lastSnapshot) {
+        updateFilterControls(filters, 0);
+        return;
+      }
+      connectionItems = filterConnections(allConnectionItems, filters);
+      updateFilterControls(filters, connectionItems.length);
+      renderStats(lastSnapshot, filters);
+      if (resetScroll) elements.list.scrollTop = 0;
+      if (!connectionItems.length && filtersActive(filters) && allConnectionItems.length) {
+        ui.renderEmptyState(elements.list, {
+          iconClass: 'connection-empty-icon',
+          title: t('conns.filteredEmpty'),
+          actionLabel: t('conns.resetFilters'),
+          actionName: 'reset-connection-filters',
+        });
+        return;
+      }
       elements.list.classList.remove('is-empty');
-      connectionItems = allConnections;
       renderWindow();
+    }
+
+    function resetFilters() {
+      if (elements.search) elements.search.value = '';
+      if (elements.network) elements.network.value = '';
+      if (elements.route) elements.route.value = '';
+      applyFilters({ resetScroll: true });
     }
 
     async function load() {
@@ -199,8 +343,12 @@
     }
 
     function clear() {
+      stopFilter();
       connectionsGeneration++;
+      lastSnapshot = null;
+      allConnectionItems = [];
       connectionItems = [];
+      updateFilterControls(currentFilters(), 0);
       elements.list.classList.remove('is-empty');
       elements.list.textContent = '';
       elements.stats.textContent = '';
@@ -242,8 +390,23 @@
     }
 
     elements.list.addEventListener('click', async (event) => {
+      if (event.target.closest('[data-ui-action="retry-connections"]')) {
+        load();
+        return;
+      }
       if (event.target.closest('[data-ui-action="open-dashboard"]')) {
         router.go('dashboard');
+        return;
+      }
+      if (event.target.closest('[data-ui-action="reset-connection-filters"]')) {
+        resetFilters();
+        return;
+      }
+      const filterLink = event.target.closest('.conn-filter-link');
+      if (filterLink && filterLink.dataset.connFilter && elements.search) {
+        elements.search.value = filterLink.dataset.connFilter;
+        applyFilters({ resetScroll: true });
+        elements.search.focus();
         return;
       }
       const button = event.target.closest('.conn-close');
@@ -264,6 +427,19 @@
       }
     });
     elements.list.addEventListener('scroll', queueRender);
+    if (elements.search) {
+      elements.search.addEventListener('input', () => {
+        stopFilter();
+        filterTimer = setTimeout(() => {
+          filterTimer = null;
+          applyFilters({ resetScroll: true });
+        }, 80);
+      });
+    }
+    for (const control of [elements.network, elements.route]) {
+      if (control) control.addEventListener('change', () => applyFilters({ resetScroll: true }));
+    }
+    if (elements.reset) elements.reset.addEventListener('click', resetFilters);
     window.addEventListener('resize', () => {
       if (isActive()) queueRender();
     });
@@ -277,6 +453,27 @@
         // invoke() already surfaced the error.
       }
     });
+    if (elements.closeFiltered) elements.closeFiltered.addEventListener('click', async () => {
+      if (!api || !filtersActive()) return;
+      const ids = [...new Set(connectionItems.map((connection) => connection.id).filter(Boolean))];
+      if (!ids.length) return;
+      elements.closeFiltered.disabled = true;
+      try {
+        let result;
+        if (typeof api.closeConnections === 'function') {
+          result = await invoke(api.closeConnections, ids);
+        } else if (typeof api.closeConnection === 'function') {
+          await Promise.all(ids.map((id) => invoke(api.closeConnection, id)));
+          result = { closed: ids.length };
+        }
+        notify(t('conns.closedFiltered', result && Number.isFinite(result.closed) ? result.closed : ids.length));
+        load();
+      } catch (_) {
+        // invoke() already surfaced the error.
+      } finally {
+        updateFilterControls(currentFilters(), connectionItems.length);
+      }
+    });
 
     return Object.freeze({ activate, deactivate, load, clear, render });
   }
@@ -288,6 +485,11 @@
       list: App.$('#connList'),
       stats: App.$('#connStats'),
       closeAll: App.$('#connClose'),
+      search: App.$('#connFilter'),
+      network: App.$('#connNetworkFilter'),
+      route: App.$('#connRouteFilter'),
+      reset: App.$('#connResetFilters'),
+      closeFiltered: App.$('#connCloseFiltered'),
     },
     ui: App.ui,
     router: App.router,
@@ -306,9 +508,11 @@
   });
 
   App.factories.createConnectionsController = createConnectionsController;
+  App.factories.filterConnections = filterConnections;
   App.loadConnections = controller.load;
   App.clearConnections = controller.clear;
   App.renderConnections = controller.render;
   App.activateConnections = controller.activate;
   App.deactivateConnections = controller.deactivate;
+  App.registerRendererModule('conns');
 })();

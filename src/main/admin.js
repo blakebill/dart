@@ -4,6 +4,13 @@ const { app, dialog } = require('electron');
 
 const { state, isDev, sendLog } = require('./state');
 
+let elevatedRelaunchCleanup = null;
+
+function setElevatedRelaunchCleanup(cleanup) {
+  if (typeof cleanup !== 'function') throw new Error('elevated relaunch cleanup must be a function');
+  elevatedRelaunchCleanup = cleanup;
+}
+
 /** Windows administrator detection and elevated relaunch (needed for TUN). */
 
 const ADMIN_ROLE_SCRIPT = [
@@ -79,6 +86,9 @@ function relaunchElevated() {
   if (process.platform !== 'win32') {
     return { ok: false, error: 'only supported on Windows' };
   }
+  if (!elevatedRelaunchCleanup) {
+    return { ok: false, error: 'application shutdown coordinator is not ready' };
+  }
   const { spawnSync } = require('child_process');
   const exe = process.execPath;
   // In dev, execPath is electron.exe and it needs both the app directory and the
@@ -100,7 +110,7 @@ function relaunchElevated() {
   // core and restore OS networking before releasing the lock and exiting.
   setImmediate(async () => {
     try {
-      await require('./core-control').cleanup();
+      await elevatedRelaunchCleanup();
     } catch (error) {
       sendLog('[gui] cleanup before elevated relaunch failed: ' + error.message);
     } finally {
@@ -156,5 +166,6 @@ module.exports = {
   relaunchElevated,
   promptRestartForTun,
   ensureAdminForTun,
+  setElevatedRelaunchCleanup,
   buildElevatedHandoffScript,
 };

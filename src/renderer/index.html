@@ -11,17 +11,19 @@
     <!-- Sets data-theme before the stylesheet loads, so first paint matches the
          saved theme (no dark→light flash). Must precede the stylesheet link. -->
     <script src="theme-init.js"></script>
-    <link rel="stylesheet" href="style.css?v=51" />
-    <link rel="stylesheet" href="styles/surfaces.css?v=3" />
-    <link rel="stylesheet" href="styles/dashboard.css?v=1" />
-    <link rel="stylesheet" href="styles/controls.css?v=1" />
-    <link rel="stylesheet" href="styles/lists.css?v=3" />
-    <link rel="stylesheet" href="styles/workspaces.css?v=11" />
-    <link rel="stylesheet" href="styles/logs.css?v=1" />
-    <link rel="stylesheet" href="styles/configs.css?v=1" />
-    <link rel="stylesheet" href="styles/tools.css?v=1" />
-    <link rel="stylesheet" href="styles/motion.css?v=3" />
-    <link rel="stylesheet" href="styles/polish.css?v=3" />
+    <link rel="stylesheet" href="style.css?v=59" />
+    <link rel="stylesheet" href="styles/surfaces.css?v=9" />
+    <link rel="stylesheet" href="styles/dashboard.css?v=9" />
+    <link rel="stylesheet" href="styles/controls.css?v=4" />
+    <link rel="stylesheet" href="styles/lists.css?v=6" />
+    <link rel="stylesheet" href="styles/groups.css?v=4" />
+    <link rel="stylesheet" href="styles/workspaces.css?v=18" />
+    <link rel="stylesheet" href="styles/connections.css?v=1" />
+    <link rel="stylesheet" href="styles/logs.css?v=2" />
+    <link rel="stylesheet" href="styles/configs.css?v=6" />
+    <link rel="stylesheet" href="styles/tools.css?v=2" />
+    <link rel="stylesheet" href="styles/motion.css?v=6" />
+    <link rel="stylesheet" href="styles/polish.css?v=13" />
   </head>
   <body>
     <div class="app">
@@ -52,19 +54,25 @@
         <div class="logo">
           <span class="logo-dot"></span>
           <span class="brand-copy">
-            <span class="logo-text">Dart</span>
+            <span class="brand-heading">
+              <span class="logo-text">Dart</span>
+              <span class="version-stack">
+                <span class="app-version" id="appVersion"></span>
+                <span class="version-new hidden" id="versionNew">NEW</span>
+              </span>
+            </span>
             <span class="brand-caption">NETWORK CONTROL</span>
           </span>
-          <span class="version-stack">
-            <span class="app-version" id="appVersion"></span>
-            <span class="version-new hidden" id="versionNew">NEW</span>
-          </span>
+          <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-expanded="true" data-i18n-aria-label="nav.collapseSidebar">
+            <span class="sidebar-toggle-icon" aria-hidden="true"></span>
+          </button>
         </div>
         <nav class="nav" role="tablist" aria-orientation="vertical" data-i18n-aria-label="nav.label">
           <span id="navIndicator" class="nav-indicator" aria-hidden="true"></span>
           <button id="nav-dashboard" class="nav-item active" type="button" role="tab" aria-selected="true" aria-controls="tab-dashboard" tabindex="0" data-tab="dashboard" data-i18n="nav.dashboard">概览</button>
           <button id="nav-subs" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-subs" tabindex="-1" data-tab="subs" data-i18n="nav.subs">配置</button>
           <button id="nav-nodes" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-nodes" tabindex="-1" data-tab="nodes" data-i18n="nav.nodes">节点</button>
+          <button id="nav-groups" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-groups" tabindex="-1" data-tab="groups" data-i18n="nav.groups">策略组</button>
           <button id="nav-rules" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-rules" tabindex="-1" data-tab="rules" data-i18n="nav.rules">规则</button>
           <button id="nav-conns" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-conns" tabindex="-1" data-tab="conns" data-i18n="nav.conns">连接</button>
           <button id="nav-tools" class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="tab-tools" tabindex="-1" data-tab="tools" data-i18n="nav.tools">工具</button>
@@ -90,7 +98,10 @@
             <span id="statusDot" class="status-dot off" aria-hidden="true"></span>
             <span id="statusText" role="status" aria-live="polite" aria-atomic="true" data-i18n="status.stopped">已停止</span>
           </div>
-          <button id="powerBtn" class="power-btn" data-i18n="power.start">启动</button>
+          <button id="powerBtn" class="power-btn">
+            <span class="power-icon" aria-hidden="true"></span>
+            <span id="powerLabel" data-i18n="power.start">启动</span>
+          </button>
         </div>
       </aside>
 
@@ -100,10 +111,6 @@
             <strong id="topbarTitle" data-i18n="dash.title">概览</strong>
           </div>
           <div class="runtime-strip">
-            <div class="runtime-item">
-              <span data-i18n="settings.currentCore">当前运行内核</span>
-              <b id="topCore">Mihomo</b>
-            </div>
             <div class="runtime-item runtime-profile">
               <span data-i18n="subs.title">配置</span>
               <b id="topProfile">-</b>
@@ -163,7 +170,7 @@
 
           <div class="dash-split">
             <div class="panel dash-control">
-              <h2 data-i18n="dash.mode">代理模式</h2>
+              <h2 data-i18n="dash.connectionControl">连接控制</h2>
               <div class="row mode-switch" role="group" data-i18n-aria-label="dash.mode">
                 <button class="btn mode-btn" type="button" aria-pressed="false" data-mode="rule" data-i18n="mode.rule">规则</button>
                 <button class="btn mode-btn" type="button" aria-pressed="false" data-mode="global" data-i18n="mode.global">全局</button>
@@ -193,7 +200,6 @@
               <div class="dashboard-panel-head">
                 <div>
                   <h2 id="quickTitle" data-i18n="dash.quickActions">快速操作</h2>
-                  <p class="dashboard-panel-subtitle" data-i18n="dash.quickActionsHint">常用维护与诊断入口</p>
                 </div>
               </div>
               <div class="dashboard-action-grid">
@@ -216,7 +222,6 @@
               <div class="dashboard-panel-head">
                 <div>
                   <h2 id="qualityTitle" data-i18n="dash.networkQuality">网络质量</h2>
-                  <p class="dashboard-panel-subtitle" data-i18n="dash.networkQualityHint">基于当前延迟与已测速节点生成</p>
                 </div>
                 <span id="qualityBadge" class="quality-badge is-unknown" data-i18n="dash.qualityUnknown">等待数据</span>
               </div>
@@ -244,7 +249,6 @@
               <div class="dashboard-panel-head">
                 <div>
                   <h2 id="eventsTitle" data-i18n="dash.recentEvents">运行事件</h2>
-                  <p class="dashboard-panel-subtitle" data-i18n="dash.recentEventsHint">最近的重要状态与异常记录</p>
                 </div>
                 <button id="dashViewLogs" class="btn compact" type="button" data-i18n="dash.viewLogs">查看日志</button>
               </div>
@@ -252,6 +256,19 @@
                 <p class="dashboard-empty" data-i18n="dash.noEvents">暂无重要事件</p>
               </div>
             </section>
+          </div>
+        </section>
+
+        <!-- Policy groups -->
+        <section class="tab canvas-page live-workspace" id="tab-groups" role="tabpanel" aria-labelledby="nav-groups" tabindex="-1" hidden>
+          <h1 data-i18n="nav.groups">策略组</h1>
+          <div class="workspace-section policy-groups-section">
+            <div class="row">
+              <h2 data-i18n="rulegroups.section">策略组</h2>
+              <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
+            </div>
+            <p class="hint" data-i18n="rulegroups.hint"></p>
+            <div id="ruleGroupList" class="sub-list"></div>
           </div>
         </section>
 
@@ -269,39 +286,47 @@
             <p class="hint" data-i18n="rules.hint"></p>
             <div id="ruleList" class="rule-list is-empty"></div>
           </div>
-          <div class="workspace-section rule-compact-section">
-            <div class="row">
-              <h2 data-i18n="rulegroups.section">策略组</h2>
-              <button id="ruleGroupRefresh" class="btn" data-i18n="rules.refresh">刷新</button>
+          <div class="workspace-section rule-management-section">
+            <div class="row rule-management-head">
+              <h2 data-i18n="rulemanager.title">规则管理</h2>
+              <div id="ruleManagerTabs" class="row mode-switch rule-management-tabs" role="tablist" data-i18n-aria-label="rulemanager.title">
+                <button id="ruleManagerLocalTab" type="button" class="btn primary" role="tab" aria-selected="true" aria-controls="localRuleManager" tabindex="0" data-rule-manager-view="local" data-i18n="rulemanager.localTab">本地</button>
+                <button id="ruleManagerRemoteTab" type="button" class="btn" role="tab" aria-selected="false" aria-controls="remoteRuleManager" tabindex="-1" data-rule-manager-view="remote" data-i18n="rulemanager.remoteTab">远程</button>
+              </div>
             </div>
-            <p class="hint" data-i18n="rulegroups.hint"></p>
-            <div id="ruleGroupList" class="sub-list"></div>
-          </div>
-          <div class="workspace-section rule-compact-section">
-            <div class="row">
-              <h2 data-i18n="localrules.section">本地规则</h2>
-              <button id="lrAdd" class="btn primary" data-i18n="localrules.add">添加本地规则</button>
+            <p class="hint" data-i18n="rulemanager.hint"></p>
+            <div id="localRuleManager" class="rule-manager-pane" role="tabpanel" aria-labelledby="ruleManagerLocalTab">
+              <div class="rule-manager-pane-head">
+                <div>
+                  <h3 data-i18n="localrules.section">本地规则</h3>
+                  <p class="hint" data-i18n="localrules.hint"></p>
+                </div>
+                <button id="lrAdd" class="btn primary" data-i18n="localrules.add">添加本地规则</button>
+              </div>
+              <div id="lrList" class="sub-list"></div>
             </div>
-            <p class="hint" data-i18n="localrules.hint"></p>
-            <div id="lrList" class="sub-list"></div>
-          </div>
-          <div class="workspace-section rule-remote-section">
-            <h2 data-i18n="customrs.title">远程规则</h2>
-            <p class="hint section-intro" data-i18n="customrs.hint"></p>
-            <div class="form-row remote-rule-form">
-              <label class="sr-only" for="crsName" data-i18n="customrs.namePh">名称</label>
-              <input id="crsName" class="input" data-i18n-ph="customrs.namePh" />
-              <label class="sr-only" for="crsUrl" data-i18n="customrs.urlPh">远程规则链接</label>
-              <input id="crsUrl" class="input grow" data-i18n-ph="customrs.urlPh" />
-              <label class="sr-only" for="crsTarget" data-i18n="localrules.target">目标</label>
-              <select id="crsTarget" class="input small">
-                <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
-                <option value="direct" data-i18n="customrs.targetDirect">直连</option>
-                <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
-              </select>
-              <button id="crsAdd" class="btn primary" data-i18n="customrs.add">添加</button>
+            <div id="remoteRuleManager" class="rule-manager-pane" role="tabpanel" aria-labelledby="ruleManagerRemoteTab" hidden>
+              <div class="rule-manager-pane-head">
+                <div>
+                  <h3 data-i18n="customrs.title">远程规则</h3>
+                  <p class="hint" data-i18n="customrs.hint"></p>
+                </div>
+              </div>
+              <div class="form-row remote-rule-form">
+                <label class="sr-only" for="crsName" data-i18n="customrs.namePh">名称</label>
+                <input id="crsName" class="input" data-i18n-ph="customrs.namePh" />
+                <label class="sr-only" for="crsUrl" data-i18n="customrs.urlPh">远程规则链接</label>
+                <input id="crsUrl" class="input grow" data-i18n-ph="customrs.urlPh" />
+                <label class="sr-only" for="crsTarget" data-i18n="localrules.target">目标</label>
+                <select id="crsTarget" class="input small">
+                  <option value="proxy" data-i18n="customrs.targetProxy">代理</option>
+                  <option value="direct" data-i18n="customrs.targetDirect">直连</option>
+                  <option value="reject" data-i18n="customrs.targetReject">拒绝</option>
+                </select>
+                <button id="crsAdd" class="btn primary" data-i18n="customrs.add">添加</button>
+              </div>
+              <div id="crsList" class="sub-list"></div>
             </div>
-            <div id="crsList" class="sub-list"></div>
           </div>
         </section>
 
@@ -309,10 +334,27 @@
         <section class="tab live-workspace" id="tab-conns" role="tabpanel" aria-labelledby="nav-conns" tabindex="-1" hidden>
           <h1 data-i18n="nav.conns">连接</h1>
           <div class="live-data-surface">
-            <div class="row workspace-commandbar">
-              <span class="commandbar-status grow" id="connStats"></span>
+            <div class="row workspace-commandbar conn-commandbar">
+              <label class="sr-only" for="connFilter" data-i18n="conns.searchPh">搜索域名、IP 或节点...</label>
+              <input id="connFilter" class="input grow" data-i18n-ph="conns.searchPh" autocomplete="off" />
+              <label class="sr-only" for="connNetworkFilter" data-i18n="conns.networkFilter">网络类型</label>
+              <select id="connNetworkFilter" class="input compact" data-i18n-aria-label="conns.networkFilter">
+                <option value="" data-i18n="conns.networkAll">全部网络</option>
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+              </select>
+              <label class="sr-only" for="connRouteFilter" data-i18n="conns.routeFilter">路由类型</label>
+              <select id="connRouteFilter" class="input compact" data-i18n-aria-label="conns.routeFilter">
+                <option value="" data-i18n="conns.routeAll">全部路由</option>
+                <option value="direct" data-i18n="conns.routeDirect">直连</option>
+                <option value="proxy" data-i18n="conns.routeProxy">代理</option>
+                <option value="reject" data-i18n="conns.routeReject">拒绝</option>
+              </select>
+              <button id="connResetFilters" class="btn compact hidden" data-i18n="conns.resetFilters">重置</button>
+              <button id="connCloseFiltered" class="btn danger hidden" data-i18n="conns.closeFiltered" disabled>关闭筛选结果</button>
               <button id="connClose" class="btn danger" data-i18n="conns.closeAll">关闭全部</button>
             </div>
+            <div class="conn-status-strip"><span class="commandbar-status" id="connStats"></span></div>
             <div id="connList" class="conn-list" role="list" data-i18n-aria-label="nav.conns"></div>
           </div>
         </section>
@@ -431,7 +473,7 @@
                 <h2 id="toolGroupConfig" data-i18n="tools.groupConfig">配置维护</h2>
                 <p data-i18n="tools.groupConfigHint">检查和备份应用配置。</p>
               </div>
-              <div class="tool-list tool-list-two">
+              <div class="tool-list">
                 <div class="setting-row tool-card" data-tool="config">
                   <div class="setting-label"><span id="toolConfigLabel" data-i18n="toolbox.configTitle">配置检查器</span><span class="hint" data-i18n="toolbox.configRowHint"></span></div>
                   <button id="configCheckOpen" class="btn" aria-labelledby="toolConfigLabel configCheckOpen" data-i18n="tools.open">打开</button>
@@ -439,6 +481,10 @@
                 <div class="setting-row tool-card" data-tool="backup">
                   <div class="setting-label"><span id="toolBackupLabel" data-i18n="toolbox.backupTitle">备份与恢复</span><span class="hint" data-i18n="toolbox.backupRowHint"></span></div>
                   <button id="backupOpen" class="btn" aria-labelledby="toolBackupLabel backupOpen" data-i18n="tools.open">打开</button>
+                </div>
+                <div class="setting-row tool-card" data-tool="support-bundle">
+                  <div class="setting-label"><span id="toolBundleLabel" data-i18n="toolbox.bundleTitle">诊断包</span><span class="hint" data-i18n="toolbox.bundleRowHint">运行检查并导出脱敏日志。</span></div>
+                  <button id="diagnosticBundleExport" class="btn" aria-labelledby="toolBundleLabel diagnosticBundleExport" data-i18n="toolbox.bundleExport">导出</button>
                 </div>
               </div>
             </section>
@@ -502,7 +548,7 @@
               </div>
             </div>
             <div class="setting-row">
-              <span data-i18n="settings.geoData">GeoData</span>
+              <span class="setting-row-title" data-i18n="settings.geoData">GeoData</span>
               <button id="geoManageBtn" class="btn" data-i18n="settings.manageGeo">管理</button>
             </div>
             <div id="downloadProgress" class="progress hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-i18n-aria-label="settings.downloadProgress"><div class="bar"></div></div>
@@ -634,13 +680,12 @@
             </div>
           </div>
           </div>
-          <div class="settings-savebar">
+          <div class="settings-savebar hidden" aria-live="polite">
             <div class="settings-save-state">
               <span class="settings-save-dot" aria-hidden="true"></span>
-              <span id="settingsDirtyState" data-i18n="settings.allSaved">所有设置均已保存</span>
+              <span id="settingsDirtyState" data-i18n="settings.unsaved">有未保存的修改</span>
             </div>
             <div class="row">
-              <button id="checkConfigBtn" class="btn" data-i18n="settings.check">校验当前配置</button>
               <button id="saveAllSettings" class="btn primary" data-i18n="settings.save" disabled>保存设置</button>
             </div>
           </div>

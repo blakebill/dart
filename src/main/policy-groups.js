@@ -17,6 +17,11 @@ function cleanName(value) {
   return name && name.length <= 256 && !/[\r\n,]/.test(name) ? name : '';
 }
 
+function boundedText(value, max = 2048) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text && text.length <= max && !/[\r\n\0]/.test(text) ? text : '';
+}
+
 function uniqueNames(values, limit = Number.MAX_SAFE_INTEGER) {
   const result = [];
   const seen = new Set();
@@ -95,6 +100,7 @@ function canonicalGroup(group, memberLimit = MAX_GROUP_MEMBERS) {
     name: cleanName(group && group.name),
     type: normalizedType(group && group.type),
     members: uniqueNames(group && group.members, memberLimit),
+    providers: uniqueNames(group && (group.providers || group.use), MAX_POLICY_GROUPS),
   };
   const defaultMember = cleanName(group && group.default);
   const url = safeHttpUrl(group && group.url);
@@ -103,6 +109,12 @@ function canonicalGroup(group, memberLimit = MAX_GROUP_MEMBERS) {
   const timeout = positiveNumber(group && group.timeout);
   const tolerance = nonNegativeNumber(group && group.tolerance);
   const strategy = String(group && group.strategy || '').trim().toLowerCase();
+  const filter = boundedText(group && group.filter);
+  const excludeFilter = boundedText(group && (group.excludeFilter || group['exclude-filter']));
+  const excludeType = boundedText(group && (group.excludeType || group['exclude-type']), 512);
+  const expectedStatus = boundedText(group && (group.expectedStatus || group['expected-status']), 128);
+  const emptyFallback = cleanName(group && (group.emptyFallback || group['empty-fallback']));
+  const icon = boundedText(group && group.icon, 2048);
   if (defaultMember) result.default = defaultMember;
   if (url) result.url = url;
   if (interval !== undefined) result.interval = interval;
@@ -111,11 +123,28 @@ function canonicalGroup(group, memberLimit = MAX_GROUP_MEMBERS) {
   if (tolerance !== undefined) result.tolerance = tolerance;
   if (group && typeof group.lazy === 'boolean') result.lazy = group.lazy;
   if (group && typeof group.interrupt === 'boolean') result.interrupt = group.interrupt;
+  if (group && typeof group.disableUdp === 'boolean') result.disableUdp = group.disableUdp;
+  else if (group && typeof group['disable-udp'] === 'boolean') result.disableUdp = group['disable-udp'];
+  if (group && typeof group.includeAll === 'boolean') result.includeAll = group.includeAll;
+  else if (group && typeof group['include-all'] === 'boolean') result.includeAll = group['include-all'];
+  if (group && typeof group.includeAllProxies === 'boolean') result.includeAllProxies = group.includeAllProxies;
+  else if (group && typeof group['include-all-proxies'] === 'boolean') result.includeAllProxies = group['include-all-proxies'];
+  if (group && typeof group.includeAllProviders === 'boolean') result.includeAllProviders = group.includeAllProviders;
+  else if (group && typeof group['include-all-providers'] === 'boolean') result.includeAllProviders = group['include-all-providers'];
+  if (group && typeof group.hidden === 'boolean') result.hidden = group.hidden;
+  if (filter) result.filter = filter;
+  if (excludeFilter) result.excludeFilter = excludeFilter;
+  if (excludeType) result.excludeType = excludeType;
+  if (expectedStatus) result.expectedStatus = expectedStatus;
+  if (emptyFallback) result.emptyFallback = emptyFallback;
+  if (icon) result.icon = icon;
+  const maxFailedTimes = positiveNumber(group && (group.maxFailedTimes || group['max-failed-times']));
+  if (maxFailedTimes !== undefined) result.maxFailedTimes = maxFailedTimes;
   if (LOAD_BALANCE_STRATEGIES.has(strategy)) result.strategy = strategy;
   return result;
 }
 
-function pruneInvalidGroups(groups, nodeNames) {
+function pruneInvalidGroups(groups, nodeNames, providerNames) {
   const names = new Set(groups.map((group) => group.name));
   const reverseRefs = new Map([...names].map((name) => [name, []]));
   const valid = new Set();
@@ -139,6 +168,13 @@ function pruneInvalidGroups(groups, nodeNames) {
   });
 
   for (const group of prepared) {
+    const hasProviderMembers = group.providers.some((name) => providerNames.has(name));
+    const includesNodes = (group.includeAll || group.includeAllProxies) && nodeNames.size > 0;
+    const includesProviders = (group.includeAll || group.includeAllProviders) && providerNames.size > 0;
+    if (hasProviderMembers || includesNodes || includesProviders) {
+      valid.add(group.name);
+      queue.push(group.name);
+    }
     for (const member of group.members) {
       if (member === 'direct' || member === 'reject' || nodeNames.has(member)) {
         if (!valid.has(group.name)) {
@@ -205,9 +241,12 @@ function breakReferenceCycles(groups) {
 }
 
 /** Validate group names/members and break reference cycles before generation. */
-function normalizePolicyGroups(input, nodes = []) {
+function normalizePolicyGroups(input, nodes = [], providers = []) {
   const nodeValues = Array.isArray(nodes) ? nodes : [];
   const nodeNames = new Set(uniqueNames(nodeValues.map((node) => typeof node === 'string' ? node : node && node.name)));
+  const providerNames = new Set(uniqueNames(
+    Array.isArray(providers) ? providers : Object.keys(providers && typeof providers === 'object' ? providers : {})
+  ));
   const used = new Set();
   const groups = [];
   let remainingMembers = MAX_POLICY_MEMBERS;
@@ -216,23 +255,36 @@ function normalizePolicyGroups(input, nodes = []) {
   for (let index = 0; index < inputLimit && groups.length < MAX_POLICY_GROUPS && remainingMembers > 0; index += 1) {
     const group = canonicalGroup(values[index], Math.min(MAX_GROUP_MEMBERS, remainingMembers));
     if (
-      !group.name || !group.type || !group.members.length ||
+      !group.name || !group.type ||
+      (!group.members.length && !group.providers.length && !group.includeAll && !group.includeAllProxies && !group.includeAllProviders) ||
       RESERVED_NAMES_LOWER.has(group.name.toLowerCase()) || nodeNames.has(group.name) || used.has(group.name)
     ) continue;
     used.add(group.name);
     groups.push(group);
+    group.providers = group.providers.filter((name) => providerNames.has(name));
+    if (
+      !group.members.length && !group.providers.length &&
+      !(group.includeAll && (nodeNames.size || providerNames.size)) &&
+      !(group.includeAllProxies && nodeNames.size) &&
+      !(group.includeAllProviders && providerNames.size)
+    ) {
+      groups.pop();
+      used.delete(group.name);
+      continue;
+    }
     remainingMembers -= group.members.length;
   }
 
-  const pruned = pruneInvalidGroups(groups, nodeNames);
-  return pruneInvalidGroups(breakReferenceCycles(pruned), nodeNames).map((group) => {
+  const pruned = pruneInvalidGroups(groups, nodeNames, providerNames);
+  return pruneInvalidGroups(breakReferenceCycles(pruned), nodeNames, providerNames).map((group) => {
     const normalized = { ...group };
     if (normalized.default && !normalized.members.includes(normalized.default)) delete normalized.default;
+    if (!normalized.providers.length) delete normalized.providers;
     return normalized;
   });
 }
 
-function clashPolicyGroups(input, nodes = []) {
+function clashPolicyGroups(input, nodes = [], providers = []) {
   const nodeValues = Array.isArray(nodes) ? nodes : [];
   const nodeNames = uniqueNames(nodeValues.map((node) => typeof node === 'string' ? node : node && node.name));
   const values = Array.isArray(input) ? input.slice(0, MAX_POLICY_GROUP_INPUTS) : [];
@@ -241,16 +293,29 @@ function clashPolicyGroups(input, nodes = []) {
     type: group && group.type,
     members: [
       ...(group && Array.isArray(group.proxies) ? group.proxies : []),
-      ...filteredNodeNames(group, nodeNames),
     ],
+    providers: group && group.use,
     url: group && group.url,
     interval: group && group.interval,
     timeout: group && group.timeout,
     tolerance: group && group.tolerance,
     lazy: group && group.lazy,
     strategy: group && group.strategy,
+    interrupt: group && group.interrupt,
+    disableUdp: group && group['disable-udp'],
+    includeAll: group && group['include-all'],
+    includeAllProxies: group && group['include-all-proxies'],
+    includeAllProviders: group && group['include-all-providers'],
+    filter: group && group.filter,
+    excludeFilter: group && group['exclude-filter'],
+    excludeType: group && group['exclude-type'],
+    expectedStatus: group && group['expected-status'],
+    emptyFallback: group && group['empty-fallback'],
+    maxFailedTimes: group && group['max-failed-times'],
+    hidden: group && group.hidden,
+    icon: group && group.icon,
   }));
-  return normalizePolicyGroups(groups, nodeNames);
+  return normalizePolicyGroups(groups, nodeNames, providers);
 }
 
 function mihomoPolicyGroups(groups, defaultUrl, defaults = {}) {
@@ -262,6 +327,19 @@ function mihomoPolicyGroups(groups, defaultUrl, defaults = {}) {
       return member;
     });
     const output = { name: group.name, type, proxies: members };
+    if (group.providers && group.providers.length) output.use = group.providers.slice();
+    if (group.includeAll !== undefined) output['include-all'] = !!group.includeAll;
+    if (group.includeAllProxies !== undefined) output['include-all-proxies'] = !!group.includeAllProxies;
+    if (group.includeAllProviders !== undefined) output['include-all-providers'] = !!group.includeAllProviders;
+    if (group.filter) output.filter = group.filter;
+    if (group.excludeFilter) output['exclude-filter'] = group.excludeFilter;
+    if (group.excludeType) output['exclude-type'] = group.excludeType;
+    if (group.expectedStatus) output['expected-status'] = group.expectedStatus;
+    if (group.emptyFallback) output['empty-fallback'] = group.emptyFallback;
+    if (group.maxFailedTimes !== undefined) output['max-failed-times'] = group.maxFailedTimes;
+    if (group.disableUdp !== undefined) output['disable-udp'] = !!group.disableUdp;
+    if (group.hidden !== undefined) output.hidden = !!group.hidden;
+    if (group.icon) output.icon = group.icon;
     if (type !== 'select') {
       output.url = group.url || defaultUrl;
       output.interval = group.interval || defaults.interval;

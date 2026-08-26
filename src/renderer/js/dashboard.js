@@ -89,10 +89,6 @@
     setSwitch($('#quickProxy'), proxyOn, !st.running && !proxyOn);
     setSwitch($('#quickTun'), !!(App.state.settings && App.state.settings.enableTun));
 
-    const topCore = $('#topCore');
-    if (topCore) {
-      topCore.textContent = st.coreName || 'Mihomo';
-    }
     const topProfile = $('#topProfile');
     if (topProfile) {
       const profileName = active ? active.name : '-';
@@ -138,9 +134,14 @@
     $('#statusDot').className = 'status-dot ' + (st.running ? 'on' : 'off');
     const dot = document.querySelector('.logo-dot');
     if (dot) dot.classList.toggle('running', !!st.running);
-    $('#statusText').textContent = st.running ? t('status.running') : t('status.stopped');
+    const statusText = st.running ? t('status.running') : t('status.stopped');
+    $('#statusText').textContent = statusText;
+    const statusLine = document.querySelector('.status-line');
+    if (statusLine) statusLine.title = statusText;
     const pb = $('#powerBtn');
-    pb.textContent = st.running ? t('power.stop') : t('power.start');
+    const powerText = st.running ? t('power.stop') : t('power.start');
+    $('#powerLabel').textContent = powerText;
+    pb.title = powerText;
     pb.classList.toggle('running', !!st.running);
     renderDashboard();
   }
@@ -226,7 +227,6 @@
   function renderUsageOthers(subs) {
     if (!subs.length) return '';
     const visible = subs.slice(0, 2);
-    const hidden = Math.max(0, subs.length - visible.length);
     let html = `<div class="usage-others-label">${escapeHtml(t('usage.others'))}</div><div class="usage-others">`;
     for (const s of visible) {
       const o = usageStats(s);
@@ -244,7 +244,6 @@
         </div>`;
     }
     html += '</div>';
-    if (hidden) html += `<div class="usage-more">${escapeHtml(t('usage.more', hidden))}</div>`;
     return html;
   }
 
@@ -362,6 +361,10 @@
     try {
       const data = api && api.getConnectionSummary ? await api.getConnectionSummary() : null;
       if (generation !== dashboardConnectionGeneration || App.currentTab !== 'dashboard') return data;
+      if (data && data.error) {
+        value.textContent = '—';
+        return data;
+      }
       const count = data && Number.isFinite(data.totalConnections) ? data.totalConnections : 0;
       value.textContent = String(Math.max(0, count));
       return data;
@@ -433,9 +436,17 @@
   $('#dashTestAll').addEventListener('click', (event) => {
     dashboardButtonAction(event.currentTarget, async () => {
       await App.ensureTabModules('nodes');
-      if (App.testAllNodes) await App.testAllNodes();
-      renderDashboardQuality();
-      await loadDashboardEvents();
+      try {
+        if (App.testAllNodes) await App.testAllNodes();
+        renderDashboardQuality();
+        await loadDashboardEvents();
+      } finally {
+        // Dashboard needs only the bounded delay cache. Do not retain a large
+        // hidden node payload merely because this shortcut loaded nodes.js.
+        if (App.currentTab !== 'nodes' && App.releaseNodes) {
+          App.releaseNodes({ cancelTests: false });
+        }
+      }
     });
   });
 
@@ -464,7 +475,10 @@
   const THEME_ORDER = ['system', 'light', 'dark'];
   function renderThemeLabel() {
     const span = $('#themeLabel');
-    if (span) span.textContent = t('theme.' + (App.themePref || 'system'));
+    if (!span) return;
+    const label = t('theme.' + (App.themePref || 'system'));
+    span.textContent = label;
+    $('#themeBtn').title = label;
   }
   $('#themeBtn').addEventListener('click', async () => {
     const cur = App.themePref || App.state.settings.theme || 'system';

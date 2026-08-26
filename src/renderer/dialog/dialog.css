@@ -49,7 +49,7 @@ body.native-dialog-body {
 .native-dialog-titlebar strong {
   min-width: 0;
   overflow: hidden;
-  font-size: 15px;
+  font-size: var(--font-section-title);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -63,7 +63,7 @@ body.native-dialog-body {
   border-radius: 0;
   background: transparent;
   color: var(--text);
-  font: 22px/1 "Segoe UI Variable", "Segoe UI", sans-serif;
+  font: var(--font-window-control)/1 "Segoe UI Variable", "Segoe UI", sans-serif;
   cursor: pointer;
   transition: color var(--motion-fast), background-color var(--motion-fast);
   -webkit-app-region: no-drag;
@@ -154,6 +154,34 @@ body.native-dialog-body {
   margin-top: 14px;
 }
 
+.local-rule-editor-mode-row .mode-switch {
+  width: min(100%, 260px);
+}
+
+.local-rule-editor-mode-row .mode-switch .btn {
+  flex: 1;
+}
+
+.local-rule-editor-pane > .setting-row > .input,
+.local-rule-editor-pane > .setting-row > .ui-select {
+  width: min(100%, 260px);
+  max-width: 260px;
+  flex: 0 1 260px;
+}
+
+.local-rule-editor-pane.hidden {
+  display: none;
+}
+
+.local-rule-text-hint {
+  margin: 0 0 10px;
+}
+
+.local-rule-textarea {
+  min-height: 230px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
 /*
  * Main-window toasts sit bottom-right. In dialogs that would cover the footer
  * action row (Update / Apply / Close), anchor just above .dialog-footer's
@@ -185,7 +213,7 @@ body.native-dialog-body .toast {
   flex-direction: column;
   gap: 5px;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: var(--font-ui);
 }
 
 .dialog-feature-detail {

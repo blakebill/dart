@@ -140,4 +140,5 @@
     $('#crsList').textContent = '';
     if (releaseRuleCache) releaseRuleCache();
   };
+  App.registerRendererModule('rulesets');
 })();

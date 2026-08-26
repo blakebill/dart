@@ -44,7 +44,13 @@
   }
 
   function focusInitial(dialogWindow) {
-    if (dialogWindow) dialogWindow.focus({ preventScroll: true });
+    if (!dialogWindow) return;
+    const active = document.activeElement;
+    // Initializers may deliberately focus their primary input immediately
+    // after setView(). Do not steal that focus on the next animation frame.
+    if (!active || active === document.body || active === dialogWindow) {
+      dialogWindow.focus({ preventScroll: true });
+    }
   }
 
   function footer(buttons = '') {

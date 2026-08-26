@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { uniqueSibling, replaceFileSync } = require('./file-utils');
 const { normalizeSmartRegions } = require('./node-region');
 
-const PROFILE_FIELDS = ['nodes', 'policyGroups', 'clashRules', 'clashRuleProviders'];
+const PROFILE_FIELDS = ['nodes', 'policyGroups', 'clashRules', 'clashRuleProviders', 'clashProxyProviders'];
 const LEGACY_PROFILE_FIELDS = [...PROFILE_FIELDS, 'raw'];
 const RULESET_FIELDS = ['rule', 'rules'];
 const LEGACY_DEFAULT_TEST_URL = 'https://www.gstatic.com/generate_204';
@@ -471,6 +471,10 @@ class Store {
     if (files.rawFile) metadata.rawFile = files.rawFile;
     const nodes = payload && Array.isArray(payload.nodes) ? payload.nodes : null;
     metadata.nodeCount = nodes ? nodes.length : Math.max(0, Number(sub && sub.nodeCount) || 0);
+    const proxyProviders = payload && payload.clashProxyProviders;
+    metadata.providerCount = proxyProviders && typeof proxyProviders === 'object' && !Array.isArray(proxyProviders)
+      ? Object.keys(proxyProviders).length
+      : Math.max(0, Number(sub && sub.providerCount) || 0);
     return metadata;
   }
 
@@ -484,8 +488,9 @@ class Store {
   }
 
   _publicMetadata(meta, includeCount = false) {
-    const { dataFile, rawFile, nodeCount, ...publicMeta } = meta || {};
+    const { dataFile, rawFile, nodeCount, providerCount, ...publicMeta } = meta || {};
     if (includeCount) publicMeta.nodeCount = Math.max(0, Number(nodeCount) || 0);
+    if (includeCount) publicMeta.providerCount = Math.max(0, Number(providerCount) || 0);
     return publicMeta;
   }
 
@@ -553,6 +558,19 @@ class Store {
   _commitData(nextData) {
     this._writeConfigData(nextData);
     this.data = nextData;
+    // A corruption marker protects orphan payloads while the user decides how
+    // to recover. Once a new state has been committed successfully, keeping the
+    // marker forever only disables normal payload retirement and leaks every
+    // later version. Existing recovery files remain until the next collection
+    // finalization or startup cleanup; the successful index is authoritative.
+    if (this._preserveOrphanPayloads) {
+      try {
+        fs.unlinkSync(this.recoveryMarker);
+        this._preserveOrphanPayloads = false;
+      } catch (error) {
+        if (error.code === 'ENOENT') this._preserveOrphanPayloads = false;
+      }
+    }
   }
 
   _readJsonPayload(dir, fileName, digestMap) {
@@ -753,14 +771,17 @@ class Store {
             this._rawDigests.set(rawFile, this._digest(raw));
           }
           changed = true;
-        } else if (!Number.isFinite(normalized.nodeCount)) {
+        } else if (!Number.isFinite(normalized.nodeCount) || !Number.isFinite(normalized.providerCount)) {
           payload = this._profileForMeta(normalized, false);
           changed = true;
         }
         if (!rawFile) rawFile = this._currentRawFile(normalized);
         const meta = this._subscriptionMetadata(normalized, payload, { dataFile, rawFile });
         metadata.push(meta);
-        if (normalized.dataFile !== meta.dataFile || normalized.rawFile !== meta.rawFile || normalized.nodeCount !== meta.nodeCount) {
+        if (
+          normalized.dataFile !== meta.dataFile || normalized.rawFile !== meta.rawFile ||
+          normalized.nodeCount !== meta.nodeCount || normalized.providerCount !== meta.providerCount
+        ) {
           changed = true;
         }
       }
@@ -963,11 +984,10 @@ class Store {
     this._retireFile(this.profileDir, rawFile, null);
   }
 
-  _replaceSubscriptions(items) {
+  _stageSubscriptionReplacement(items) {
     const incoming = Array.isArray(items) ? items : [];
     if (!this._profileStorageEnabled) {
-      this._commitData({ ...this.data, subscriptions: incoming });
-      return;
+      return { metadata: incoming, stages: [], fallback: true };
     }
 
     const currentById = new Map((this.data.subscriptions || []).map((meta) => [meta.id, meta]));
@@ -1013,7 +1033,6 @@ class Store {
         stage.meta = meta;
         metadata.push(meta);
       }
-      this._commitData({ ...this.data, subscriptions: metadata });
     } catch (error) {
       for (const stage of stages) {
         this._discardStage(this.profileDir, stage.profileStage);
@@ -1021,7 +1040,20 @@ class Store {
       }
       throw error;
     }
+    return { metadata, stages, fallback: false };
+  }
 
+  _discardSubscriptionReplacement(plan) {
+    if (!plan || plan.fallback) return;
+    for (const stage of plan.stages) {
+      this._discardStage(this.profileDir, stage.profileStage);
+      this._discardStage(this.profileDir, stage.rawStage);
+    }
+  }
+
+  _finalizeSubscriptionReplacement(plan) {
+    if (!plan || plan.fallback) return;
+    const { metadata, stages } = plan;
     this._profileCache.clear();
     for (const stage of stages) {
       this._profileDigests.set(stage.profileStage.file, stage.profileStage.digest);
@@ -1036,6 +1068,17 @@ class Store {
     this._cleanupPayloadDir(this.profileDir, active, ['json', 'raw']);
     this._pruneDigests(this._profileDigests, active);
     this._pruneDigests(this._rawDigests, active);
+  }
+
+  _replaceSubscriptions(items) {
+    const plan = this._stageSubscriptionReplacement(items);
+    try {
+      this._commitData({ ...this.data, subscriptions: plan.metadata });
+    } catch (error) {
+      this._discardSubscriptionReplacement(plan);
+      throw error;
+    }
+    this._finalizeSubscriptionReplacement(plan);
   }
 
   listCustomRuleSets() {
@@ -1127,11 +1170,10 @@ class Store {
     }
   }
 
-  _replaceCustomRuleSets(items) {
+  _stageCustomRuleSetReplacement(items) {
     const incoming = Array.isArray(items) ? items : [];
     if (!this._ruleStorageEnabled) {
-      this._commitData({ ...this.data, customRuleSets: incoming });
-      return;
+      return { metadata: incoming, stages: [], fallback: true };
     }
     const currentById = new Map((this.data.customRuleSets || []).map((meta) => [meta.id, meta]));
     const metadata = [];
@@ -1164,12 +1206,21 @@ class Store {
         stage.meta = meta;
         metadata.push(meta);
       }
-      this._commitData({ ...this.data, customRuleSets: metadata });
     } catch (error) {
       for (const stage of stages) this._discardStage(this.ruleSetDir, stage.payloadStage);
       throw error;
     }
+    return { metadata, stages, fallback: false };
+  }
 
+  _discardCustomRuleSetReplacement(plan) {
+    if (!plan || plan.fallback) return;
+    for (const stage of plan.stages) this._discardStage(this.ruleSetDir, stage.payloadStage);
+  }
+
+  _finalizeCustomRuleSetReplacement(plan) {
+    if (!plan || plan.fallback) return;
+    const { metadata, stages } = plan;
     for (const stage of stages) {
       if (stage.payloadStage) this._ruleDigests.set(stage.payloadStage.file, stage.payloadStage.digest);
       if (stage.current) this._retireFile(this.ruleSetDir, stage.current.payloadFile, stage.meta.payloadFile || null);
@@ -1177,6 +1228,45 @@ class Store {
     const active = new Set(metadata.map((meta) => meta.payloadFile).filter(Boolean));
     this._cleanupPayloadDir(this.ruleSetDir, active, ['json']);
     this._pruneDigests(this._ruleDigests, active);
+  }
+
+  _replaceCustomRuleSets(items) {
+    const plan = this._stageCustomRuleSetReplacement(items);
+    try {
+      this._commitData({ ...this.data, customRuleSets: plan.metadata });
+    } catch (error) {
+      this._discardCustomRuleSetReplacement(plan);
+      throw error;
+    }
+    this._finalizeCustomRuleSetReplacement(plan);
+  }
+
+  /** Replace a complete backup snapshot with one atomic index commit. */
+  replaceSnapshot(snapshot) {
+    if (!isRecord(snapshot)) throw new Error('store snapshot must be an object');
+    let subscriptions;
+    let customRuleSets;
+    try {
+      subscriptions = this._stageSubscriptionReplacement(snapshot.subscriptions);
+      customRuleSets = this._stageCustomRuleSetReplacement(snapshot.customRuleSets);
+      const nextData = {
+        ...this.data,
+        subscriptions: subscriptions.metadata,
+        settings: { ...this.getSettings(), ...(isRecord(snapshot.settings) ? snapshot.settings : {}) },
+        activeSub: snapshot.activeSub || null,
+        selected: typeof snapshot.selected === 'string' ? snapshot.selected : null,
+        customRuleSets: customRuleSets.metadata,
+        localRules: Array.isArray(snapshot.localRules) ? snapshot.localRules : [],
+      };
+      this._commitData(nextData);
+    } catch (error) {
+      this._discardSubscriptionReplacement(subscriptions);
+      this._discardCustomRuleSetReplacement(customRuleSets);
+      throw error;
+    }
+    this._finalizeSubscriptionReplacement(subscriptions);
+    this._finalizeCustomRuleSetReplacement(customRuleSets);
+    return true;
   }
 
   get(key) {

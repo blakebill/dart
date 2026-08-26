@@ -12,6 +12,10 @@ const {
   nodeToClashProxy,
   buildMihomoConfig,
   extractRuleGroups,
+  effectiveRuleGroupOverrides,
+  applySourceGroupSelections,
+  sourceGroupPickOptions,
+  sourcePicksForWiredGroup,
 } = require('../src/main/converter');
 const {
   parseSubscriptionContent,
@@ -190,6 +194,131 @@ test('node -> Mihomo proxy', () => {
   assert.strictEqual(proxy['ws-opts'].path, '/path');
 });
 
+test('native Mihomo proxies round-trip unsupported types and extension fields losslessly', () => {
+  const source = [
+    'proxies:',
+    '  - name: Native Trojan',
+    '    type: trojan',
+    '    server: trojan.example.com',
+    '    port: 443',
+    '    password: secret',
+    '    dialer-proxy: Relay',
+    '    udp-over-tcp: true',
+    '    smux:',
+    '      enabled: true',
+    '      protocol: h2mux',
+    '  - name: Native WireGuard',
+    '    type: wireguard',
+    '    server: wg.example.com',
+    '    port: 51820',
+    '    ip: 172.16.0.2',
+    '    private-key: private-value',
+    '    public-key: public-value',
+    '    reserved: [1, 2, 3]',
+  ].join('\n');
+  const parsed = parseSubscriptionContent(source);
+  assert.strictEqual(parsed.nodes.length, 2);
+  assert.strictEqual(parsed.nodes[1].type, 'wireguard');
+  const config = buildMihomoConfig(parsed.nodes);
+  const trojan = config.proxies.find((proxy) => proxy.name === 'Native Trojan');
+  const wireguard = config.proxies.find((proxy) => proxy.name === 'Native WireGuard');
+  assert.strictEqual(trojan['dialer-proxy'], 'Relay');
+  assert.strictEqual(trojan['udp-over-tcp'], true);
+  assert.deepStrictEqual({ ...trojan.smux }, { enabled: true, protocol: 'h2mux' });
+  assert.strictEqual(wireguard.type, 'wireguard');
+  assert.strictEqual(wireguard['private-key'], 'private-value');
+  assert.strictEqual(wireguard['public-key'], 'public-value');
+  assert.deepStrictEqual(wireguard.reserved, [1, 2, 3]);
+});
+
+test('provider-only Mihomo profiles preserve providers and provider-backed groups', () => {
+  const source = [
+    'proxy-providers:',
+    '  airport:',
+    '    type: http',
+    '    url: https://example.com/subscription?token=secret',
+    '    path: ./proxy_providers/airport.yaml',
+    '    interval: 3600',
+    '    header:',
+    '      Authorization: [Bearer secret]',
+    '    health-check:',
+    '      enable: true',
+    '      url: https://www.gstatic.com/generate_204',
+    '      interval: 300',
+    '    override:',
+    '      udp: true',
+    'proxy-groups:',
+    '  - name: Provider Group',
+    '    type: select',
+    '    use: [airport]',
+    '    include-all-providers: false',
+    '    filter: "(?i)hk|hong kong"',
+    'rules:',
+    '  - MATCH,Provider Group',
+  ].join('\n');
+  const parsed = parseSubscriptionContent(source);
+  assert.strictEqual(parsed.format, 'clash');
+  assert.deepStrictEqual(parsed.nodes, []);
+  assert.strictEqual(parsed.proxyProviders.airport.path, 'proxy_providers/airport.yaml');
+  assert.deepStrictEqual(parsed.proxyProviders.airport.header.Authorization, ['Bearer secret']);
+  assert.strictEqual(parsed.proxyProviders.airport['health-check'].enable, true);
+  assert.deepStrictEqual(parsed.policyGroups[0], {
+    name: 'Provider Group',
+    type: 'select',
+    members: [],
+    providers: ['airport'],
+    includeAllProviders: false,
+    filter: '(?i)hk|hong kong',
+  });
+
+  const config = buildMihomoConfig(parsed.nodes, {
+    proxyProviders: parsed.proxyProviders,
+    policyGroups: parsed.policyGroups,
+    clashRules: parsed.rules,
+    hasGeoData: false,
+  });
+  assert.deepStrictEqual(config.proxies, []);
+  assert.strictEqual(config['proxy-providers'].airport.url, 'https://example.com/subscription?token=secret');
+  assert.ok(config['proxy-groups'].find((group) => group.name === '🚀 Proxy').use.includes('airport'));
+  assert.ok(config['proxy-groups'].find((group) => group.name === '♻️ Auto').use.includes('airport'));
+  assert.ok(config['proxy-groups'].find((group) => group.name === '🧠 Smart').use.includes('airport'));
+  assert.ok(config['proxy-groups'].find((group) => group.name === '🛟 Fallback').use.includes('airport'));
+  const sourceGroup = config['proxy-groups'].find((group) => group.name === 'Provider Group');
+  assert.deepStrictEqual(sourceGroup.use, ['airport']);
+  assert.strictEqual(sourceGroup['include-all-providers'], false);
+  assert.strictEqual(sourceGroup.filter, '(?i)hk|hong kong');
+});
+
+test('proxy-provider paths stay inside Mihomo HomeDir', () => {
+  const parsed = parseSubscriptionContent([
+    'proxy-providers:',
+    '  remote:',
+    '    type: http',
+    '    url: https://example.com/sub',
+    '    path: ../../outside.yaml',
+    '  local:',
+    '    type: file',
+    '    path: C:\\Windows\\secret.yaml',
+    'proxy-groups:',
+    '  - {name: P, type: select, use: [remote]}',
+  ].join('\n'));
+  assert.deepStrictEqual(Object.keys(parsed.proxyProviders), ['remote']);
+  assert.ok(!Object.prototype.hasOwnProperty.call(parsed.proxyProviders.remote, 'path'));
+});
+
+test('proxy providers affect config fingerprints', () => {
+  const base = { nodes: [], policyGroups: [] };
+  const first = configFingerprint({
+    ...base,
+    proxyProviders: { p: { type: 'http', url: 'https://a.example/sub' } },
+  });
+  const second = configFingerprint({
+    ...base,
+    proxyProviders: { p: { type: 'http', url: 'https://b.example/sub' } },
+  });
+  assert.notStrictEqual(first, second);
+});
+
 test('full config for Mihomo keeps Clash semantics', () => {
   const { nodes } = clashParser.parseClashConfig(clashYaml);
   const cfg = buildMihomoConfig(nodes, {
@@ -221,6 +350,19 @@ test('full config for Mihomo keeps Clash semantics', () => {
   assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,openai.com,🚀 Proxy'));
   assert.ok(cfg.rules.includes('DOMAIN,example.cn,DIRECT'));
   assert.strictEqual(cfg.rules[cfg.rules.length - 1], 'MATCH,🚀 Proxy');
+});
+
+test('Mihomo Global mode always follows the Dart main selector', () => {
+  const { nodes } = clashParser.parseClashConfig(clashYaml);
+  const config = buildMihomoConfig(nodes, { clashMode: 'global' });
+  const global = config['proxy-groups'].find((group) => group.name === 'GLOBAL');
+  assert.deepStrictEqual(global, {
+    name: 'GLOBAL',
+    type: 'select',
+    proxies: ['🚀 Proxy'],
+  });
+  assert.strictEqual(config['proxy-groups'].filter((group) => group.name === 'GLOBAL').length, 1);
+  assert.strictEqual(config.mode, 'global');
 });
 
 test('Mihomo fallback skips GEOIP when GeoData is unavailable', () => {
@@ -357,6 +499,83 @@ test('policy-group normalization removes invalid and cyclic references', () => {
   assert.deepStrictEqual(groups.map((group) => group.name), ['A', 'B']);
   assert.deepStrictEqual(groups[0].members, ['B']);
   assert.deepStrictEqual(groups[1].members, ['node']);
+});
+
+test('policy-group outbound picks keep Dart selectors and hide redundant source roles', () => {
+  const [wired] = applySourceGroupSelections([{
+    name: 'AI',
+    type: 'select',
+    members: ['PROXY', '🧩 Proxies', '🎯 Direct', '🌐 GLOBAL', 'REJECT', 'node'],
+  }], ['node']);
+  const expected = ['♻️ Auto', '🧠 Smart', '🛟 Fallback', 'node'];
+  assert.deepStrictEqual(wired.members, expected);
+  assert.deepStrictEqual(sourcePicksForWiredGroup(wired), expected);
+  assert.deepStrictEqual(sourceGroupPickOptions(['node'], [{
+    members: ['🚀 Proxy', 'PROXY', '🧩 Proxies', '🎯 Direct', '🌐 GLOBAL', 'REJECT'],
+  }]), expected);
+});
+
+test('policy groups infer generic source defaults without overriding explicit user intent', () => {
+  const groups = [
+    { name: 'Direct Group', type: 'select', members: ['🎯 Direct', 'node'] },
+    { name: 'Reject Group', type: 'select', members: ['🛑 REJECT', 'node'] },
+    { name: 'Proxy Group', type: 'select', members: ['🌐 GLOBAL', 'node'] },
+    { name: 'Node Group', type: 'select', members: ['node'] },
+    { name: 'Fallback Group', type: 'fallback', members: ['direct', 'node'] },
+  ];
+  assert.deepStrictEqual(effectiveRuleGroupOverrides(groups), {
+    'Direct Group': 'direct',
+    'Reject Group': 'reject',
+    'Proxy Group': 'proxy',
+  });
+  assert.deepStrictEqual(effectiveRuleGroupOverrides(groups, {
+    'Direct Group': 'source',
+    'Node Group': 'direct',
+  }), {
+    'Direct Group': 'source',
+    'Reject Group': 'reject',
+    'Proxy Group': 'proxy',
+    'Node Group': 'direct',
+  });
+});
+
+test('policy-group direct defaults rewrite matching rules to DIRECT automatically', () => {
+  const nodes = [{ name: 'node', type: 'trojan', server: 'example.com', port: 443, password: 'p' }];
+  const config = buildMihomoConfig(nodes, {
+    clashRules: ['DOMAIN-SUFFIX,lan.example,Local Choice', 'MATCH,Remote Choice'],
+    policyGroups: [
+      { name: 'Local Choice', type: 'select', members: ['direct', 'node'] },
+      { name: 'Remote Choice', type: 'select', members: ['node'] },
+    ],
+    hasGeoData: false,
+  });
+  assert.ok(config.rules.includes('DOMAIN-SUFFIX,lan.example,DIRECT'));
+  assert.strictEqual(config.rules.at(-1), 'MATCH,Remote Choice');
+});
+
+test('policy-group overrides rewrite ordinary and final Mihomo rule targets', () => {
+  const nodes = [{ name: 'node', type: 'trojan', server: 'example.com', port: 443, password: 'p' }];
+  const base = {
+    clashRules: ['DOMAIN-SUFFIX,video.example,Streaming', 'MATCH,Final'],
+    policyGroups: [
+      { name: 'Streaming', type: 'select', members: ['node'] },
+      { name: 'Final', type: 'select', members: ['node'] },
+    ],
+    hasGeoData: false,
+  };
+  const targets = {
+    proxy: '🚀 Proxy',
+    direct: 'DIRECT',
+    reject: 'REJECT',
+  };
+  for (const [override, target] of Object.entries(targets)) {
+    const config = buildMihomoConfig(nodes, {
+      ...base,
+      ruleOverrides: { Streaming: override, Final: override },
+    });
+    assert.ok(config.rules.includes(`DOMAIN-SUFFIX,video.example,${target}`));
+    assert.strictEqual(config.rules.at(-1), `MATCH,${target}`);
+  }
 });
 
 test('deep policy-group graphs are bounded and normalized without recursion', () => {

@@ -38,7 +38,7 @@
 .conn-host {
   display: block;
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--font-ui);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -47,7 +47,7 @@
 .sub-meta {
   overflow: hidden;
   color: var(--text-dim);
-  font-size: 10px;
+  font-size: var(--font-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -140,7 +140,7 @@
   background: var(--accent-soft);
   content: "\E774";
   font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
-  font-size: 17px;
+  font-size: var(--font-metric);
   line-height: 38px;
 }
 
@@ -236,7 +236,7 @@
   padding: 2px 6px;
   border-radius: 999px;
   border: 1px solid transparent;
-  font-size: 10px;
+  font-size: var(--font-xs);
   font-weight: 700;
   line-height: 1.1;
   white-space: nowrap;
@@ -380,7 +380,7 @@
   min-height: 19px;
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 9px;
+  font-size: var(--font-micro);
   font-weight: 700;
   white-space: nowrap;
 }
@@ -484,7 +484,7 @@
   overflow: hidden;
   color: var(--text);
   font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 11px;
+  font-size: var(--font-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
   user-select: text;
@@ -554,7 +554,7 @@
   max-width: 100%;
   overflow: hidden;
   color: var(--text-dim);
-  font-size: 10px;
+  font-size: var(--font-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

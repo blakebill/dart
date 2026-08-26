@@ -26,7 +26,7 @@
   padding: 17px 18px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 68%, transparent);
+  background: var(--surface);
   box-shadow: var(--panel-shadow);
 }
 
@@ -75,6 +75,7 @@
   min-height: 104px;
   flex-direction: column;
   align-items: stretch;
+  justify-content: center;
   padding: 17px 18px 16px 20px;
   text-align: left;
 }
@@ -99,13 +100,18 @@
 button.card {
   font: inherit;
   color: inherit;
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--card-accent, var(--accent)) 5%, transparent), transparent 50%),
+    var(--surface);
   cursor: pointer;
   transition: border-color var(--motion-standard), background-color var(--motion-standard), box-shadow var(--motion-standard), transform var(--motion-fast);
 }
 
 button.card:hover {
   border-color: color-mix(in srgb, var(--card-accent, var(--accent)) 35%, var(--border));
-  background: color-mix(in srgb, var(--card-accent, var(--accent)) 5%, var(--surface-hover));
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--card-accent, var(--accent)) 10%, transparent), transparent 50%),
+    color-mix(in srgb, var(--card-accent, var(--accent)) 5%, var(--surface-hover));
   box-shadow: var(--shadow);
   transform: translateY(-1px);
 }
@@ -123,7 +129,7 @@ button.card:focus-visible {
   margin-bottom: 6px;
   overflow: hidden;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--font-caption);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -133,7 +139,7 @@ button.card:focus-visible {
   min-height: 28px;
   overflow: hidden;
   color: var(--text);
-  font-size: 20px;
+  font-size: var(--font-metric);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
@@ -144,7 +150,7 @@ button.card:focus-visible {
   margin-top: auto;
   padding-top: 8px;
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: var(--font-caption);
 }
 
 .card-value.delay-good { color: var(--green); }
@@ -178,7 +184,7 @@ button.card:focus-visible {
   display: flex;
   gap: 16px;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--font-small);
 }
 
 .traffic-stat {
@@ -238,7 +244,7 @@ button.card:focus-visible {
   gap: 14px;
   margin-top: 8px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: var(--font-caption);
 }
 
 .traffic-total {
@@ -265,7 +271,7 @@ button.card:focus-visible {
 .workspace-commandbar {
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  background: var(--surface);
   box-shadow: var(--panel-shadow);
 }
 
@@ -289,13 +295,18 @@ button.card:focus-visible {
 }
 
 .traffic-panel {
-  background:
-    linear-gradient(145deg, color-mix(in srgb, var(--teal) 5%, transparent), transparent 44%),
-    var(--surface);
+  margin-bottom: var(--space-3);
+  padding: 14px 16px;
+  background: var(--surface);
 }
 
 #usagePanel {
   min-height: 152px;
+}
+
+.dash-split > .panel,
+.dashboard-insights > .panel {
+  padding: 14px 16px;
 }
 
 .dash-control > h2 {
@@ -303,8 +314,8 @@ button.card:focus-visible {
 }
 
 .switch-list {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -343,7 +354,7 @@ button.card:focus-visible {
 
 .switch-text {
   min-width: 0;
-  font-size: 13px;
+  font-size: var(--font-ui);
   font-weight: 600;
 }
 
@@ -453,7 +464,7 @@ button.card:focus-visible {
   border-radius: 4px;
   color: var(--accent);
   background: var(--accent-soft);
-  font-size: 10px;
+  font-size: var(--font-xs);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -468,7 +479,7 @@ button.card:focus-visible {
 .usage-pct {
   flex: none;
   color: var(--text);
-  font-size: 20px;
+  font-size: var(--font-page-title);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
@@ -479,7 +490,7 @@ button.card:focus-visible {
   align-items: center;
   gap: 8px 12px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: var(--font-caption);
 }
 
 .usage-expire.is-warn {
@@ -507,7 +518,7 @@ button.card:focus-visible {
 .usage-others-label {
   margin: 12px 0 6px;
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: var(--font-caption);
   font-weight: 600;
 }
 
@@ -520,7 +531,7 @@ button.card:focus-visible {
 .usage-more {
   margin-top: 8px;
   color: var(--text-faint);
-  font-size: 10px;
+  font-size: var(--font-xs);
   text-align: right;
 }
 
@@ -532,7 +543,7 @@ button.card:focus-visible {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 4px;
-  font-size: 12px;
+  font-size: var(--font-small);
 }
 
 .usage-bar {

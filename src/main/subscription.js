@@ -5,6 +5,8 @@ const clashParser = require('./parsers/clash');
 const linkParser = require('./parsers/share-link');
 const { clashPolicyGroups } = require('./policy-groups');
 const fetch = require('./fetch');
+const { hasProxyProviders } = require('./proxy-providers');
+const { parseSubscriptionContentAsync: parseContentAsync } = require('./subscription-parser-service');
 const MAX_SUBSCRIPTION_BYTES = 32 * 1024 * 1024;
 const MAX_PROFILE_EDIT_FORMAT_BYTES = 4 * 1024 * 1024;
 const USER_INFO_FIELDS = new Set(['upload', 'download', 'total', 'expire']);
@@ -83,7 +85,16 @@ function configFingerprint(value) {
   updateFingerprint(hash, source.policyGroups || source.groups || []);
   updateFingerprint(hash, source.clashRules || source.rules || []);
   updateFingerprint(hash, source.clashRuleProviders || source.ruleProviders || {});
+  updateFingerprint(hash, source.clashProxyProviders || source.proxyProviders || {});
   return hash.digest('hex');
+}
+
+function hasUsableProxySource(value) {
+  return !!(
+    value &&
+    ((Array.isArray(value.nodes) && value.nodes.length > 0) ||
+      hasProxyProviders(value.clashProxyProviders || value.proxyProviders))
+  );
 }
 
 /**
@@ -135,20 +146,29 @@ function maybeBase64Decode(text) {
  */
 function parseSubscriptionContent(content) {
   const text = String(content || '').trim();
-  if (!text) return { nodes: [], groups: [], policyGroups: [], format: 'empty' };
+  if (!text) return { nodes: [], groups: [], policyGroups: [], proxyProviders: {}, format: 'empty' };
   const decodedText = maybeBase64Decode(text);
   const candidates = decodedText ? [text, decodedText] : [text];
 
   // Clash YAML first. The cheap "proxies:" check gates the YAML load, and the
   // parse result is reused for detection + conversion (one parse, not two).
   for (const candidate of candidates) {
-    if (/proxies\s*:/.test(candidate)) {
+    if (/^\s*(?:proxies|proxy-providers)\s*:/m.test(candidate)) {
       try {
         const r = clashParser.parseClashConfig(candidate);
         if (r.isClash) {
           const nodes = uniqueNodeNames(r.nodes);
-          const policyGroups = clashPolicyGroups(r.groups, nodes);
-          return { nodes, groups: policyGroups, policyGroups, rules: r.rules, ruleProviders: r.ruleProviders, format: 'clash' };
+          const proxyProviders = r.proxyProviders || {};
+          const policyGroups = clashPolicyGroups(r.groups, nodes, proxyProviders);
+          return {
+            nodes,
+            groups: policyGroups,
+            policyGroups,
+            rules: r.rules,
+            ruleProviders: r.ruleProviders,
+            proxyProviders,
+            format: 'clash',
+          };
         }
       } catch (e) {
         /* not valid YAML; fall through to the link parser */
@@ -159,24 +179,37 @@ function parseSubscriptionContent(content) {
   // Share links / base64 subscription
   const nodes = uniqueNodeNames(linkParser.parseSubscriptionLinks(text));
   if (nodes.length > 0) {
-    return { nodes, groups: [], policyGroups: [], rules: [], format: 'links' };
+    return { nodes, groups: [], policyGroups: [], rules: [], proxyProviders: {}, format: 'links' };
   }
 
   // Fallback: try parsing as Clash again (some configs without a proxies: comment)
   for (const candidate of candidates) {
     try {
-      const { nodes: cn, groups, rules, ruleProviders } = clashParser.parseClashConfig(candidate);
-      if (cn.length > 0) {
+      const { nodes: cn, groups, rules, ruleProviders, proxyProviders = {} } = clashParser.parseClashConfig(candidate);
+      if (cn.length > 0 || hasProxyProviders(proxyProviders)) {
         const normalizedNodes = uniqueNodeNames(cn);
-        const policyGroups = clashPolicyGroups(groups, normalizedNodes);
-        return { nodes: normalizedNodes, groups: policyGroups, policyGroups, rules, ruleProviders, format: 'clash' };
+        const policyGroups = clashPolicyGroups(groups, normalizedNodes, proxyProviders);
+        return {
+          nodes: normalizedNodes,
+          groups: policyGroups,
+          policyGroups,
+          rules,
+          ruleProviders,
+          proxyProviders,
+          format: 'clash',
+        };
       }
     } catch (e) {
       /* ignore */
     }
   }
 
-  return { nodes: [], groups: [], policyGroups: [], rules: [], format: 'unknown' };
+  return { nodes: [], groups: [], policyGroups: [], rules: [], proxyProviders: {}, format: 'unknown' };
+}
+
+/** Keep small inputs synchronous; parse large YAML/base64 profiles off the main thread. */
+function parseSubscriptionContentAsync(content, options = {}) {
+  return parseContentAsync(content, parseSubscriptionContent, options);
 }
 
 function formatSubscriptionForEditing(content) {
@@ -234,6 +267,7 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
       const r = await fetch.getBufferWithFallback(url, {
         proxyPort,
         log,
+        signal: opts.signal,
         maxBytes: MAX_SUBSCRIPTION_BYTES,
         headers: { 'User-Agent': ua, Accept: '*/*' },
       });
@@ -252,12 +286,13 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
       continue;
     }
     const body = res.body || '';
-    const result = parseSubscriptionContent(body);
+    const result = await parseSubscriptionContentAsync(body, { signal: opts.signal });
     result.userInfo = parseUserInfo(res.headers);
     result.raw = body;
     const ct = res.headers['content-type'] || '';
-    log(`[sub] UA="${ua}" len=${body.length} type="${ct}" format=${result.format} nodes=${result.nodes.length}`);
-    if (result.nodes.length > 0) {
+    const providerCount = Object.keys(result.proxyProviders || {}).length;
+    log(`[sub] UA="${ua}" len=${body.length} type="${ct}" format=${result.format} nodes=${result.nodes.length} providers=${providerCount}`);
+    if (hasUsableProxySource(result)) {
       if (!expectedFormat || result.format === expectedFormat) return result;
       const rank = subscriptionFormatRank(result.format, expectedFormat);
       if (rank > fallbackRank) {
@@ -269,19 +304,21 @@ async function fetchSubscription(url, log = () => {}, opts = {}) {
     }
     // Help diagnose airports that return an empty/notice config: show a snippet.
     const snippet = body.replace(/\s+/g, ' ').slice(0, 200);
-    log(`[sub] no usable nodes; body starts: ${snippet}`);
+    log(`[sub] no usable proxies or proxy providers; body starts: ${snippet}`);
     last = result;
   }
   if (usableFallback) return usableFallback;
   if (last && last.error) throw new Error(last.error);
-  return last || { nodes: [], groups: [], policyGroups: [], rules: [], format: 'unknown' };
+  return last || { nodes: [], groups: [], policyGroups: [], rules: [], proxyProviders: {}, format: 'unknown' };
 }
 
 module.exports = {
   fetchSubscription,
   parseSubscriptionContent,
+  parseSubscriptionContentAsync,
   parseUserInfo,
   configFingerprint,
+  hasUsableProxySource,
   nodeFingerprint,
   formatSubscriptionForEditing,
   uniqueNodeNames,

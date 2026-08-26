@@ -7,12 +7,17 @@ This is an independent project and is not affiliated with or endorsed by Mihomo 
 ## Highlights
 
 - Run either the official Mihomo release or the Dart customized Mihomo build.
-- Import Clash YAML, Base64 subscriptions, and supported share links.
+- Import Clash YAML, Base64 subscriptions, supported share links, and native
+  Mihomo profiles backed entirely by `proxy-providers`.
 - Generate and validate Mihomo YAML before starting the core.
 - Use system proxy or administrator-assisted TUN mode.
 - Choose Manual, Auto, Fallback, or Smart node selection.
-- Inspect connections, traffic, logs, routing rules, DNS paths, and runtime health.
-- Update profiles, remote Clash rule lists, GeoData, the core, and the app in place.
+- Search and filter a bounded live connection view, then close one or all
+  matching connections without retaining the full runtime payload in the UI.
+- Preview profile updates, restore the previous version, and update remote
+  Clash rule lists, GeoData, the core, and the app in place.
+- Export a redacted diagnostic bundle and create process-based routing rules
+  from currently running Windows applications.
 - Keep the local controller protected with a per-run secret bound to loopback.
 
 ## Requirements
@@ -71,21 +76,29 @@ src/main/core-manager.js       Core process, downloads, paths, and GeoData
 src/main/core-adapters.js      Mihomo runtime capabilities and release assets
 src/main/converter.js          Mihomo YAML configuration generation
 src/main/core-control.js       Lifecycle, selection, routing, and controller API
+src/main/operation-coordinator.js  Cancellation and mutation ordering
+src/main/backup-controller.js  Atomic backup selection, restore, and rollback
 src/main/subscription.js       Clash/share-link profile ingestion
+src/main/subscription-parser-service.js  Off-main-thread parsing for large profiles
+src/main/proxy-providers.js    Native Mihomo provider validation and inventory
+src/main/connection-snapshot-service.js  Bounded shared connection projections
+src/main/profile-history.js    Private, bounded one-version profile rollback
+src/main/diagnostic-bundle.js  Redacted local support bundle generation
 src/main/smart-selection.js    Long-term Smart selection model
+src/main/smart-model-store.js  Bounded, versioned Smart history persistence
 src/renderer/                  Desktop UI
 scripts/download-core.js       Reproducible Mihomo bundle acquisition
 ```
 
 ## Smart selection
 
-Smart makes a stable long-term choice from latency, jitter, failures, connection feedback, signal decay, and network changes. The customized Mihomo Smart group can provide per-connection failover, while the GUI remains responsible for the long-term preferred node. Auto remains available as the simpler lowest-latency strategy.
+Smart makes a stable long-term choice from latency, jitter, failures, connection feedback, signal decay, and network changes. Its bounded local history survives app restarts. The customized Mihomo Smart group can provide per-connection failover, while the GUI remains responsible for the long-term preferred node. Auto remains available as the simpler lowest-latency strategy.
 
 ## Security and privacy
 
 - The controller listens on `127.0.0.1` and uses a randomly generated secret for every app run.
 - Profile credentials remain local unless the user explicitly exports a generated configuration.
-- Core and GeoData downloads are checked against release SHA-256 metadata when available.
+- Core and GeoData downloads must match trusted release SHA-256 metadata; installation fails closed when a digest is unavailable.
 - Subscription requests use Mihomo/Clash-compatible User-Agent values only.
 - No telemetry is implemented by Dart.
 

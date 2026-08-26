@@ -70,6 +70,15 @@
     },
   });
   App.factories = {};
+  const rendererModules = new Set();
+  App.registerRendererModule = function registerRendererModule(name) {
+    if (typeof name !== 'string' || !/^[a-z][a-z0-9-]*$/i.test(name)) {
+      throw new Error('invalid renderer module name');
+    }
+    rendererModules.add(name);
+    return name;
+  };
+  App.hasRendererModule = (name) => rendererModules.has(name);
   // Session-only latency results keyed by node name. Profile changes clear this
   // map in main.js; closing the renderer naturally discards it without I/O.
   // Values: number (ms) | 'timeout' | 'testing'.
@@ -90,16 +99,34 @@
       return Promise.reject(new Error('invalid renderer module'));
     }
     if (scriptLoads.has(src)) return scriptLoads.get(src);
+    let script;
     const load = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
+      script = document.createElement('script');
       script.src = src;
       script.async = false;
       script.dataset.rendererModule = src;
-      script.addEventListener('load', () => resolve(), { once: true });
-      script.addEventListener('error', () => reject(new Error('failed to load renderer module: ' + src)), { once: true });
+      let runtimeError = null;
+      const onRuntimeError = (event) => {
+        const filename = String(event && event.filename || '');
+        if (filename && filename.replace(/\\/g, '/').endsWith('/' + src)) {
+          runtimeError = event.error || new Error(event.message || 'renderer module execution failed');
+        }
+      };
+      const cleanup = () => window.removeEventListener('error', onRuntimeError, true);
+      window.addEventListener('error', onRuntimeError, true);
+      script.addEventListener('load', () => {
+        cleanup();
+        if (runtimeError) reject(runtimeError);
+        else resolve();
+      }, { once: true });
+      script.addEventListener('error', () => {
+        cleanup();
+        reject(new Error('failed to load renderer module: ' + src));
+      }, { once: true });
       document.head.appendChild(script);
     }).catch((error) => {
       scriptLoads.delete(src);
+      if (script && script.isConnected) script.remove();
       throw error;
     });
     scriptLoads.set(src, load);
@@ -108,6 +135,14 @@
 
   App.loadScripts = async function loadScripts(sources) {
     for (const src of sources) await App.loadScript(src);
+  };
+
+  App.invalidateRendererScripts = function invalidateRendererScripts(sources) {
+    const stale = new Set(Array.isArray(sources) ? sources : [sources]);
+    for (const src of stale) scriptLoads.delete(src);
+    for (const script of document.querySelectorAll('script[data-renderer-module]')) {
+      if (stale.has(script.dataset.rendererModule)) script.remove();
+    }
   };
 
   function toast(msg, isErr = false) {

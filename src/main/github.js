@@ -16,13 +16,47 @@ const fetch = require('./fetch');
  * the tag when the lookup came from the fallback path.
  */
 
-/** Compare two dotted version/tag strings numerically; >0 when a>b. */
+function parseTag(value) {
+  const text = String(value || '').trim().replace(/^v/i, '');
+  const match = text.match(/^(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+  if (!match) return null;
+  return {
+    core: match[1].split('.').map((part) => Number(part)),
+    prerelease: match[2] ? match[2].split('.') : [],
+  };
+}
+
+function compareIdentifier(left, right) {
+  const leftNumeric = /^\d+$/.test(left);
+  const rightNumeric = /^\d+$/.test(right);
+  if (leftNumeric && rightNumeric) return Number(left) - Number(right);
+  if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+  return left === right ? 0 : left < right ? -1 : 1;
+}
+
+/** SemVer-aware comparison, with `-dart.N` treated as a stable downstream build. */
 function compareTags(a, b) {
-  const parse = (v) => String(v).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pa = parse(a);
-  const pb = parse(b);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+  const left = parseTag(a);
+  const right = parseTag(b);
+  if (!left || !right) return String(a).localeCompare(String(b), undefined, { numeric: true });
+  for (let i = 0; i < Math.max(left.core.length, right.core.length); i++) {
+    const difference = (left.core[i] || 0) - (right.core[i] || 0);
+    if (difference) return difference;
+  }
+
+  const leftDart = /^dart$/i.test(left.prerelease[0] || '');
+  const rightDart = /^dart$/i.test(right.prerelease[0] || '');
+  if (!left.prerelease.length || !right.prerelease.length) {
+    if (!left.prerelease.length && !right.prerelease.length) return 0;
+    if (leftDart || rightDart) return leftDart ? 1 : -1;
+    return left.prerelease.length ? -1 : 1;
+  }
+  if (leftDart !== rightDart) return leftDart ? 1 : -1;
+  for (let i = 0; i < Math.max(left.prerelease.length, right.prerelease.length); i++) {
+    if (left.prerelease[i] === undefined) return -1;
+    if (right.prerelease[i] === undefined) return 1;
+    const difference = compareIdentifier(left.prerelease[i], right.prerelease[i]);
+    if (difference) return difference;
   }
   return 0;
 }

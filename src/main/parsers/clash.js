@@ -1,6 +1,7 @@
 'use strict';
 
 const yaml = require('js-yaml');
+const { normalizeProxyProviders } = require('../proxy-providers');
 
 /**
  * Clash config parser
@@ -11,6 +12,21 @@ const yaml = require('js-yaml');
  */
 
 /** Normalize a Clash proxy object into an internal node object. */
+function cloneMihomoValue(value, depth = 0) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (depth >= 24) throw new Error('Mihomo proxy nesting is too deep');
+  if (Array.isArray(value)) return value.map((item) => cloneMihomoValue(item, depth + 1));
+  if (!value || typeof value !== 'object') return undefined;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === '__proto__' || key === 'prototype' || key === 'constructor') continue;
+    const cloned = cloneMihomoValue(item, depth + 1);
+    if (cloned !== undefined) out[key] = cloned;
+  }
+  return out;
+}
+
 function normalizeClashProxy(p) {
   if (!p || !p.type) return null;
   const type = String(p.type).toLowerCase();
@@ -21,6 +37,9 @@ function normalizeClashProxy(p) {
     name: p.name,
     server,
     port,
+    // Mihomo is now the sole runtime. Keep its complete native object so
+    // fields unknown to the GUI remain lossless across import/update/build.
+    mihomoProxy: cloneMihomoValue(p),
   };
 
   switch (type) {
@@ -176,8 +195,10 @@ function normalizeClashProxy(p) {
       };
 
     default:
-      // Unknown type, skip.
-      return null;
+      return {
+        ...base,
+        type,
+      };
   }
 }
 
@@ -198,9 +219,10 @@ function parseClashConfig(content) {
     throw new Error('not a valid Clash config');
   }
 
-  const isClash = Array.isArray(doc.proxies);
+  const proxyProviders = normalizeProxyProviders(doc['proxy-providers']);
+  const isClash = Array.isArray(doc.proxies) || Object.keys(proxyProviders).length > 0;
   const nodes = [];
-  for (const p of isClash ? doc.proxies : []) {
+  for (const p of Array.isArray(doc.proxies) ? doc.proxies : []) {
     const node = normalizeClashProxy(p);
     if (node) nodes.push(node);
   }
@@ -209,7 +231,7 @@ function parseClashConfig(content) {
   const rules = Array.isArray(doc.rules) ? doc.rules : [];
   const ruleProviders = normalizeRuleProviders(doc['rule-providers']);
 
-  return { nodes, groups, rules, ruleProviders, isClash };
+  return { nodes, groups, rules, ruleProviders, proxyProviders, isClash };
 }
 
 /**
@@ -239,7 +261,7 @@ function normalizeRuleProviders(rp) {
 /** Whether the content is a Clash config (YAML containing a proxies field). */
 function isClashConfig(content) {
   const text = String(content);
-  if (!/proxies\s*:/.test(text)) return false;
+  if (!/^\s*(?:proxies|proxy-providers)\s*:/m.test(text)) return false;
   try {
     return parseClashConfig(text).isClash;
   } catch (e) {

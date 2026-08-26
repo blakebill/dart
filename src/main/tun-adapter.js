@@ -4,7 +4,7 @@ const { execFile } = require('child_process');
 
 const TUN_DEVICE_NAME = 'Dart';
 const TUN_DISPLAY_NAME = 'Dart Tunnel';
-const LEGACY_TUN_NAMES = ['tun0', 'Meta', TUN_DEVICE_NAME, TUN_DISPLAY_NAME];
+const OWNED_TUN_NAMES = [TUN_DEVICE_NAME, TUN_DISPLAY_NAME];
 const VIRTUAL_ADAPTER_PATTERN = 'sing-tun|wintun|mihomo|clash|meta|tun';
 let adapterQueue = Promise.resolve();
 let renameGeneration = 0;
@@ -44,7 +44,7 @@ function queueAdapterOperation(operation) {
 }
 
 function cleanupScript() {
-  const names = LEGACY_TUN_NAMES.map((name) => `'${name.replace(/'/g, "''")}'`).join(',');
+  const names = OWNED_TUN_NAMES.map((name) => `'${name.replace(/'/g, "''")}'`).join(',');
   return [
     "$ErrorActionPreference = 'Stop'",
     `$ownedNames = @(${names})`,
@@ -53,8 +53,6 @@ function cleanupScript() {
     '  $connection = [string]$_.NetConnectionID',
     '  $description = [string]$_.Name',
     '  if (-not $_.PNPDeviceID -or $ownedNames -notcontains $connection) { return $false }',
-    "  if ($connection -eq 'tun0') { return $description -match 'sing-tun' }",
-    "  if ($connection -eq 'Meta') { return $description -match 'mihomo|clash|meta' }",
     '  return $description -match $pattern',
     '})',
     '$failed = @()',
@@ -93,7 +91,7 @@ async function cleanupTunAdapters(log = () => {}) {
   return queueAdapterOperation(async () => {
     try {
       const removed = Number(await runPowerShell(cleanupScript())) || 0;
-      if (removed) log(`[gui] removed ${removed} stale Dart/legacy TUN adapter(s)`);
+      if (removed) log(`[gui] removed ${removed} stale Dart TUN adapter(s)`);
       return true;
     } catch (error) {
       log('[gui] stale TUN adapter cleanup failed (non-fatal): ' + error.message);

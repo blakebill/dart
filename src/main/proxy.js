@@ -211,12 +211,10 @@ function beginShutdown() {
 async function disableSystemProxyIfOurs(server, options = {}) {
   if (process.platform !== 'win32' || !server) return false;
   return queueProxyOperation(async () => {
-    let current;
-    try {
-      current = await readProxyRegistrySnapshot();
-    } catch (_) {
-      return false;
-    }
+    // A failed query is not evidence that the proxy is already clear. Let the
+    // caller retain ownership and use its synchronous safety fallback instead
+    // of silently forgetting a potentially active localhost proxy.
+    const current = await readProxyRegistrySnapshot();
     const owned = current.server.exists &&
       String(current.server.value).trim().toLowerCase() === String(server).trim().toLowerCase();
     // If the process died immediately after disabling ProxyEnable, ProxyServer

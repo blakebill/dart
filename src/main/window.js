@@ -80,8 +80,8 @@ function createWindow(startHidden = false) {
   applyNativeThemeSource();
 
   const mainWindow = new BrowserWindow({
-    width: 1040,
-    height: 720,
+    width: 1280,
+    height: 800,
     minWidth: 880,
     minHeight: 600,
     title: 'Dart Network Control',

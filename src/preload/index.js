@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('api', {
   // Subscriptions
   addSubscription: (payload) => ipcRenderer.invoke('sub:add', payload),
   updateSubscription: (payload) => ipcRenderer.invoke('sub:update', payload),
+  rollbackSubscription: (payload) => ipcRenderer.invoke('sub:rollback', payload),
   removeSubscription: (payload) => ipcRenderer.invoke('sub:remove', payload),
   editSubscription: (payload) => ipcRenderer.invoke('sub:edit', payload),
   importSubscription: (payload) => ipcRenderer.invoke('sub:import', payload),
@@ -80,6 +81,7 @@ contextBridge.exposeInMainWorld('api', {
   getConnectionSummary: () => ipcRenderer.invoke('connections:summary'),
   getConnections: () => ipcRenderer.invoke('connections:get'),
   closeAllConnections: () => ipcRenderer.invoke('connections:closeAll'),
+  closeConnections: (ids) => ipcRenderer.invoke('connections:closeMany', { ids }),
   closeConnection: (id) => ipcRenderer.invoke('connections:close', { id }),
   setMode: (mode) => ipcRenderer.invoke('mode:set', { mode }),
 
@@ -100,12 +102,14 @@ contextBridge.exposeInMainWorld('api', {
   inspectPorts: (payload) => ipcRenderer.invoke('tools:portCheck', payload),
   compareDns: (payload) => ipcRenderer.invoke('tools:dnsCompare', payload),
   saveToolReport: (payload) => ipcRenderer.invoke('tools:saveReport', payload),
+  exportDiagnosticBundle: () => ipcRenderer.invoke('tools:diagnosticBundle'),
   exportBackup: () => ipcRenderer.invoke('tools:backupExport'),
   selectBackup: () => ipcRenderer.invoke('tools:backupSelect'),
   restoreBackup: (payload) => ipcRenderer.invoke('tools:backupRestore', payload),
 
   // Local rules
   listLocalRules: () => ipcRenderer.invoke('localrules:list'),
+  listRunningApps: (force = false) => ipcRenderer.invoke('localrules:apps', { force: !!force }),
   addLocalRule: (payload) => ipcRenderer.invoke('localrules:add', payload),
   editLocalRule: (payload) => ipcRenderer.invoke('localrules:edit', payload),
   removeLocalRule: (payload) => ipcRenderer.invoke('localrules:remove', payload),

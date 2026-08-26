@@ -7,7 +7,7 @@
   const api = window.api;
   const { t } = window.i18n;
   const NODE_COLUMNS = 2;
-  const VIRTUAL_NODE_ROW_HEIGHT = 78;
+  const VIRTUAL_NODE_ROW_HEIGHT = 72;
   const VIRTUAL_OVERSCAN = 5;
   const NODE_TEST_CONCURRENCY = 8;
   const AUTO_GROUP = '♻️ Auto';
@@ -19,6 +19,8 @@
   let loadedNodeSub;
   let nodeLoad = null;
   let nodeLoadGeneration = 0;
+  let providerStatus = null;
+  let providerPollTimer = null;
   let testAllRun = null;
   const delayRequests = new Map();
   /** @type {Map<string, {grade:string,level:string,label?:string,score?:number|null}>} */
@@ -30,6 +32,8 @@
   let groupPollTimer = null;
   let currentNodeFrame = 0;
   let nodeWindowFrame = 0;
+  let nodeSignalsFrame = 0;
+  let nodeFilterTimer = null;
   let contextMenuEl = null;
   let contextMenuName = null;
   let contextMenuInvoker = null;
@@ -46,6 +50,23 @@
       groupPollTimer = null;
       refreshGroupSelections();
     }, 5000);
+  }
+
+  function scheduleProviderPoll() {
+    if (providerPollTimer) {
+      clearTimeout(providerPollTimer);
+      providerPollTimer = null;
+    }
+    if (
+      document.hidden || App.currentTab !== 'nodes' ||
+      !providerStatus || !providerStatus.configured ||
+      !(App.state.status && App.state.status.running)
+    ) return;
+    const pending = providerStatus.state === 'loading' || providerStatus.state === 'error';
+    providerPollTimer = setTimeout(() => {
+      providerPollTimer = null;
+      loadNodes({ force: true });
+    }, pending ? 5_000 : 30_000);
   }
 
   function currentNodeName() {
@@ -82,16 +103,21 @@
     if (groupRefresh && groupRefresh.profileId === profileId) return groupRefresh.promise;
     const token = {};
     const promise = (async () => {
-      let next = { proxy: null, auto: null, smart: null, fallback: null, override: null, overrideGroup: null };
+      let next;
       try {
         if (App.state.status && App.state.status.running) {
           next = await api.getGroupSelections(App.currentTab === 'nodes');
         } else if (api.getNodeOverride) {
+          next = { proxy: null, auto: null, smart: null, fallback: null, override: null, overrideGroup: null };
           const ov = await api.getNodeOverride();
           next.override = ov && ov.override || null;
           next.overrideGroup = ov && ov.group || null;
         }
-      } catch (_) {}
+      } catch (_) {
+        // A transient Clash API failure must not repaint the current node as
+        // empty. Keep the last confirmed selection and retry on the next poll.
+        return groupNow;
+      }
       if ((App.state.activeSub || null) !== profileId) return;
       next = {
         proxy: next && next.proxy || null,
@@ -121,7 +147,10 @@
     groupRefresh = { token, profileId, promise };
     return promise;
   }
-  document.addEventListener('visibilitychange', scheduleGroupPoll);
+  document.addEventListener('visibilitychange', () => {
+    scheduleGroupPoll();
+    scheduleProviderPoll();
+  });
   scheduleGroupPoll();
   window.addEventListener('resize', () => {
     renderCurrentNode();
@@ -211,6 +240,14 @@
 
   function releaseNodes({ cancelTests = true } = {}) {
     hideNodeContextMenu();
+    if (nodeFilterTimer) clearTimeout(nodeFilterTimer);
+    nodeFilterTimer = null;
+    if (nodeSignalsFrame) cancelAnimationFrame(nodeSignalsFrame);
+    nodeSignalsFrame = 0;
+    // Do not let a released request block an immediate reload if the user
+    // returns to the page before that older IPC call settles. Its generation
+    // check prevents it from publishing stale data.
+    qualityRefresh = null;
     qualities.clear();
     if (cancelTests) {
       for (const name of delayRequests.keys()) {
@@ -223,6 +260,9 @@
       if (testAllButton) testAllButton.disabled = false;
     }
     nodeLoadGeneration++;
+    if (providerPollTimer) clearTimeout(providerPollTimer);
+    providerPollTimer = null;
+    providerStatus = null;
     nodeLoad = null;
     nodeItems = [];
     loadedNodeSub = undefined;
@@ -239,10 +279,12 @@
     if (!options.force && loadedNodeSub === activeSub) {
       renderNodes();
       refreshQualities();
+      scheduleProviderPoll();
       return nodeItems;
     }
     if (!activeSub) {
       nodeItems = [];
+      providerStatus = null;
       loadedNodeSub = null;
       renderNodes();
       return nodeItems;
@@ -254,9 +296,13 @@
       const result = await api.getNodes();
       if (generation !== nodeLoadGeneration || (result.activeSub || null) !== (App.state.activeSub || null)) return [];
       nodeItems = Array.isArray(result.nodes) ? result.nodes : [];
+      providerStatus = result.providerStatus && typeof result.providerStatus === 'object'
+        ? result.providerStatus
+        : null;
       loadedNodeSub = result.activeSub || null;
       renderNodes();
       refreshQualities();
+      scheduleProviderPoll();
       return nodeItems;
     })().catch(() => {
       if (generation === nodeLoadGeneration) releaseNodes();
@@ -336,6 +382,17 @@
   /** Apply background Smart EWMA into the delay map so UI is not "label without ms". */
   function syncDelayFromQuality(name, value) {
     if (!name || !value || delays.get(name) === 'testing') return false;
+    // A fresh explicit/UI probe is the authoritative reachability result. Smart
+    // may intentionally keep its historical stability state at "unavailable"
+    // during recovery, but that must not turn a newly measured RTT into timeout.
+    if (Number.isFinite(value.displayDelay) && value.displayDelay > 0) {
+      const ms = Math.round(Number(value.displayDelay));
+      if (delays.get(name) !== ms) {
+        delays.set(name, ms);
+        return true;
+      }
+      return false;
+    }
     // A failed current observation must not keep painting a stale, possibly
     // green RTT beside the red "unavailable" stability label.
     if (value.level === 'unavailable' || value.failed) {
@@ -371,22 +428,47 @@
       else if (bottom) bottom.appendChild(qEl);
       else return;
     }
-    qEl.className = 'node-quality ' + info.kind;
-    qEl.title = info.title;
-    qEl.setAttribute('aria-label', info.title);
-    qEl.textContent = '';
-    qEl.appendChild(document.createTextNode(info.label));
+    const className = 'node-quality ' + info.kind;
+    if (qEl.className !== className) qEl.className = className;
+    if (qEl.title !== info.title) qEl.title = info.title;
+    if (qEl.getAttribute('aria-label') !== info.title) qEl.setAttribute('aria-label', info.title);
+    if (qEl.textContent !== info.label) qEl.textContent = info.label;
+  }
+
+  function patchNodeSignals(row, name) {
+    const delayEl = row && row.querySelector('.node-delay');
+    if (delayEl) {
+      const delay = delays.get(name);
+      const className = 'node-delay' + (delay !== undefined ? ' ' + delayClass(delay) : '');
+      const text = delayText(delay);
+      if (delayEl.className !== className) delayEl.className = className;
+      if (delayEl.textContent !== text) delayEl.textContent = text;
+    }
+    if (row) patchNodeQuality(row, name);
+  }
+
+  function scheduleVisibleNodeSignals() {
+    if (nodeSignalsFrame || document.hidden || App.currentTab !== 'nodes') return;
+    nodeSignalsFrame = requestAnimationFrame(() => {
+      nodeSignalsFrame = 0;
+      if (document.hidden || App.currentTab !== 'nodes') return;
+      const list = $('#nodeList');
+      for (const row of list.querySelectorAll('.node-item[data-node="1"]')) {
+        patchNodeSignals(row, row.dataset.name);
+      }
+    });
   }
 
   async function refreshQualities() {
     if (!api || !api.getNodeQualities) return;
     const profileId = App.state.activeSub || null;
     if (qualityRefresh && qualityRefresh.profileId === profileId) return qualityRefresh.promise;
+    const generation = nodeLoadGeneration;
     const token = {};
     const promise = (async () => {
       try {
         const map = await api.getNodeQualities();
-        if (App.state.activeSub !== profileId) return;
+        if (App.state.activeSub !== profileId || generation !== nodeLoadGeneration) return;
         let qualityChanged = false;
         let delayChanged = false;
         const next = new Map();
@@ -412,9 +494,7 @@
           if (typeof App.renderDashNodeCards === 'function') App.renderDashNodeCards();
           if (typeof App.renderDashboardQuality === 'function') App.renderDashboardQuality();
         }
-        if ((qualityChanged || delayChanged) && App.currentTab === 'nodes' && !document.hidden) {
-          renderNodeWindow();
-        }
+        if (qualityChanged || delayChanged) scheduleVisibleNodeSignals();
       } catch (_) {
         /* quality is advisory */
       } finally {
@@ -485,7 +565,7 @@
     return labels[key] || '';
   }
 
-  function nodeRowHtml(name, type, security, isNode, variant, cipher, transport, plugin, region, smartScope) {
+  function nodeRowHtml(name, type, security, isNode, variant, cipher, transport, plugin, region, smartScope, provider, id) {
     const active = isActiveNode(name);
     const smartExcluded = !!(
       isNode &&
@@ -522,6 +602,7 @@
           protocol === 'HTTPS' ? '' : security,
           transportLabel(transport),
           pluginLabel(plugin),
+          provider ? t('nodes.provider', provider) : '',
         ].filter(Boolean).join(' · ')
       : '';
     let metaHtml = details ? `<span class="sub-meta">${escapeHtml(details)}</span>` : '';
@@ -540,7 +621,7 @@
       ? `<button type="button" class="node-test-btn" data-name="${safeName}" aria-label="${escapeHtml(t('nodes.test') + ': ' + name)}">${t('nodes.test')}</button>`
       : '';
     const activeHtml = active ? `<span class="node-active">✓ ${t('nodes.active')}</span>` : '';
-    return `<div class="node-item${active ? ' active' : ''}${isNode ? ' has-test' : ''}${isOverride ? ' is-override' : ''}${smartExcluded ? ' smart-excluded' : ''}" role="listitem" data-name="${safeName}" data-node="${isNode ? '1' : '0'}">
+    return `<div class="node-item${active ? ' active' : ''}${isNode ? ' has-test' : ''}${isOverride ? ' is-override' : ''}${smartExcluded ? ' smart-excluded' : ''}" role="listitem" data-name="${safeName}" data-node-id="${escapeHtml(id || name)}" data-node="${isNode ? '1' : '0'}">
       <button type="button" class="node-select-btn" data-select-name="${safeName}" aria-pressed="${String(active)}">
       <span class="node-top">
         <span class="node-identity"><span class="node-name">${safeName}</span>${tagHtml}</span>
@@ -571,9 +652,17 @@
     const list = $('#nodeList');
     if (!list) return;
     if (!nodeRows.length) {
+      const hasProviders = providerStatus && providerStatus.configured > 0;
+      const providerTitle = hasProviders
+        ? providerStatus.state === 'error'
+          ? t('nodes.providersError')
+          : providerStatus.state === 'stopped'
+            ? t('nodes.providersStopped')
+            : t('nodes.providersLoading')
+        : t('nodes.empty');
       App.ui.renderEmptyState(list, {
         iconClass: 'node-empty-icon',
-        title: t('nodes.empty'),
+        title: providerTitle,
         actionLabel: t('nodes.openConfigs'),
         actionName: 'open-configs',
       });
@@ -598,7 +687,9 @@
         n.transport,
         n.plugin,
         n.region,
-        smartScope
+        smartScope,
+        n.provider,
+        n.id
       );
     }
     html += '</div>';
@@ -606,7 +697,17 @@
     if (afterRows) {
       html += `<div class="virtual-spacer" style="height:${afterRows * VIRTUAL_NODE_ROW_HEIGHT}px"></div>`;
     }
-    if (!filteredNodeCount) html += `<p class="hint rule-more">${t('nodes.empty')}</p>`;
+    if (!filteredNodeCount) {
+      let message = t('nodes.empty');
+      if (providerStatus && providerStatus.configured) {
+        message = providerStatus.state === 'error'
+          ? t('nodes.providersError')
+          : providerStatus.state === 'stopped'
+            ? t('nodes.providersStopped')
+            : t('nodes.providersLoading');
+      }
+      html += `<p class="hint rule-more">${escapeHtml(message)}</p>`;
+    }
     list.innerHTML = html;
   }
 
@@ -628,7 +729,10 @@
     nodeRows = App.state.activeSub
       ? [{ name: AUTO_GROUP }, { name: SMART_GROUP }, { name: FALLBACK_GROUP }, ...nodes]
       : [];
-    $('#nodeCount').textContent = t('nodes.count', nodes.length);
+    const providerCount = providerStatus && Number(providerStatus.configured) || 0;
+    $('#nodeCount').textContent = providerCount
+      ? t('nodes.countWithProviders', nodes.length, providerCount)
+      : t('nodes.count', nodes.length);
     renderNodeWindow();
   }
   $('#nodeList').addEventListener('click', (e) => {
@@ -820,13 +924,7 @@
       for (const n of dirtyDelays) {
         const row = list.querySelector(`.node-item[data-name="${CSS.escape(n)}"]`);
         if (!row) continue;
-        const el = row.querySelector('.node-delay');
-        if (el) {
-          const d = delays.get(n);
-          el.className = 'node-delay' + (d !== undefined ? ' ' + delayClass(d) : '');
-          el.textContent = delayText(d);
-        }
-        patchNodeQuality(row, n);
+        patchNodeSignals(row, n);
       }
       dirtyDelays.clear();
     });
@@ -933,7 +1031,6 @@
     }
   }
 
-  let nodeFilterTimer = null;
   $('#nodeFilter').addEventListener('input', () => {
     clearTimeout(nodeFilterTimer);
     nodeFilterTimer = setTimeout(() => {
@@ -962,4 +1059,5 @@
   App.refreshGroupSelections = refreshGroupSelections;
   App.testCurrentNodeDelay = testCurrentNodeDelay;
   App.testAllNodes = testAll;
+  App.registerRendererModule('nodes');
 })();

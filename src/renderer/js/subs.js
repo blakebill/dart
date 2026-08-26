@@ -8,17 +8,65 @@
   const { t, getLang } = window.i18n;
 
   let editingSubId = null;
+  let openActionMenu = null;
+  let openActionTrigger = null;
+
+  function actionMenuItems(menu) {
+    return menu ? [...menu.querySelectorAll('[role="menuitem"]:not(:disabled)')] : [];
+  }
+
+  function closeActionMenu(restoreFocus = false) {
+    const trigger = openActionTrigger;
+    if (openActionMenu) openActionMenu.hidden = true;
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    openActionMenu = null;
+    openActionTrigger = null;
+    if (restoreFocus && trigger && trigger.isConnected) trigger.focus();
+  }
+
+  function showActionMenu(trigger, focusLast = false) {
+    const menu = document.getElementById(trigger.getAttribute('aria-controls'));
+    if (!menu) return;
+    closeActionMenu(false);
+    openActionMenu = menu;
+    openActionTrigger = trigger;
+    menu.classList.remove('opens-up');
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    const menuRect = menu.getBoundingClientRect();
+    const triggerRect = trigger.getBoundingClientRect();
+    if (menuRect.bottom > window.innerHeight - 8 && triggerRect.top > menuRect.height + 8) {
+      menu.classList.add('opens-up');
+    }
+    const items = actionMenuItems(menu);
+    const target = focusLast ? items[items.length - 1] : items[0];
+    if (target) target.focus();
+  }
+
+  document.addEventListener('mousedown', (event) => {
+    if (!openActionMenu) return;
+    if (openActionMenu.contains(event.target) || openActionTrigger.contains(event.target)) return;
+    closeActionMenu(false);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && openActionMenu) {
+      event.preventDefault();
+      closeActionMenu(true);
+    }
+  });
 
   function renderSubs() {
     const list = $('#subList');
     const summary = $('#subListSummary');
+    closeActionMenu(false);
     list.innerHTML = '';
     if (summary) summary.textContent = t('subs.profileCount', App.state.subscriptions.length);
     if (App.state.subscriptions.length === 0) {
       list.innerHTML = `<p class="hint">${t('subs.empty')}</p>`;
       return;
     }
-    for (const sub of App.state.subscriptions) {
+    for (const [index, sub] of App.state.subscriptions.entries()) {
       const div = document.createElement('div');
       div.className = 'sub-item';
       let traffic = '';
@@ -40,11 +88,13 @@
       const isActive = sub.id === App.state.activeSub;
       if (isActive) div.classList.add('active');
       const id = escapeHtml(sub.id);
+      const menuId = `sub-actions-${index}`;
       const viaProxy = sub.updateViaProxy ? t('subs.viaProxyTag') : '';
       const actionLabel = (label) => escapeHtml(`${label}: ${sub.name}`);
       const nodeCount = Number.isFinite(sub.nodeCount) ? sub.nodeCount : (sub.nodes || []).length;
       const facts = [
         t('subs.nodes', nodeCount),
+        Number(sub.providerCount) > 0 ? t('subs.providers', sub.providerCount) : '',
         auInfo,
         viaProxy,
       ].filter(Boolean).map((fact) => `<span class="sub-fact">${escapeHtml(fact)}</span>`).join('');
@@ -53,6 +103,12 @@
           <div class="sub-usage-copy">${escapeHtml(traffic)}</div>
           ${usagePercent === null ? '' : `<div class="sub-usage-track" aria-hidden="true"><span style="width:${usagePercent.toFixed(2)}%"></span></div>`}
         </div>` : '';
+      const updateAction = sub.url
+        ? `<button type="button" class="btn primary-soft" data-act="update" data-id="${id}" aria-label="${actionLabel(t('subs.update'))}">${t('subs.update')}</button>`
+        : '';
+      const rollbackAction = sub.canRollback
+        ? `<button type="button" class="sub-menu-item" role="menuitem" data-act="rollback" data-id="${id}">${t('subs.rollback')}</button>`
+        : '';
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-title-line">
@@ -66,21 +122,56 @@
         <div class="sub-actions">
           <div class="sub-actions-primary">
             <button type="button" class="btn sub-activate-btn ${isActive ? 'success' : ''}" data-act="activate" data-id="${id}" aria-label="${actionLabel(isActive ? t('subs.enabled') : t('subs.enable'))}" ${isActive ? 'disabled' : ''}>${isActive ? t('subs.enabled') : t('subs.enable')}</button>
-            <button type="button" class="btn primary-soft" data-act="update" data-id="${id}" aria-label="${actionLabel(t('subs.update'))}">${t('subs.update')}</button>
-          </div>
-          <div class="sub-actions-secondary">
-            <button type="button" class="btn" data-act="edit" data-id="${id}" aria-label="${actionLabel(t('subs.edit'))}">${t('subs.edit')}</button>
-            <button type="button" class="btn" data-act="editraw" data-id="${id}" aria-label="${actionLabel(t('subs.editRaw'))}">${t('subs.editRaw')}</button>
-            <button type="button" class="btn danger-quiet" data-act="remove" data-id="${id}" aria-label="${actionLabel(t('subs.remove'))}">${t('subs.remove')}</button>
+            ${updateAction}
+            <div class="sub-overflow">
+              <button type="button" class="btn sub-more-btn" data-menu-toggle aria-haspopup="menu" aria-expanded="false" aria-controls="${menuId}" aria-label="${actionLabel(t('subs.moreActions'))}" title="${escapeHtml(t('subs.moreActions'))}"><span aria-hidden="true">⋯</span></button>
+              <div id="${menuId}" class="sub-overflow-menu" role="menu" aria-label="${actionLabel(t('subs.moreActions'))}" hidden>
+                <button type="button" class="sub-menu-item" role="menuitem" data-act="edit" data-id="${id}">${t('subs.edit')}</button>
+                <button type="button" class="sub-menu-item" role="menuitem" data-act="editraw" data-id="${id}">${t('subs.editRaw')}</button>
+                ${rollbackAction}
+                <button type="button" class="sub-menu-item is-danger" role="menuitem" data-act="remove" data-id="${id}">${t('subs.remove')}</button>
+              </div>
+            </div>
           </div>
         </div>`;
       list.appendChild(div);
     }
+    list.querySelectorAll('[data-menu-toggle]').forEach((trigger) => {
+      trigger.addEventListener('click', () => {
+        if (openActionTrigger === trigger) closeActionMenu(true);
+        else showActionMenu(trigger);
+      });
+      trigger.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+        event.preventDefault();
+        showActionMenu(trigger, event.key === 'ArrowUp');
+      });
+    });
+    list.querySelectorAll('.sub-overflow-menu').forEach((menu) => {
+      menu.addEventListener('keydown', (event) => {
+        const items = actionMenuItems(menu);
+        if (!items.length) return;
+        if (event.key === 'Tab') {
+          closeActionMenu(false);
+          return;
+        }
+        if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const current = Math.max(0, items.indexOf(document.activeElement));
+        let next = current;
+        if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = items.length - 1;
+        else if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+        else next = (current - 1 + items.length) % items.length;
+        items[next].focus();
+      });
+    });
     list.querySelectorAll('button[data-act]').forEach((b) => {
       b.addEventListener('click', async () => {
+        closeActionMenu(false);
         const id = b.dataset.id;
         const originalText = b.textContent;
-        const busy = b.dataset.act === 'activate' || b.dataset.act === 'update' || b.dataset.act === 'remove';
+        const busy = ['activate', 'update', 'rollback', 'remove'].includes(b.dataset.act);
         if (busy) {
           b.disabled = true;
           b.setAttribute('aria-busy', 'true');
@@ -91,8 +182,14 @@
             await App.refresh();
           } else if (b.dataset.act === 'update') {
             b.textContent = t('subs.updating');
-            await call(api.updateSubscription, { id });
+            const result = await call(api.updateSubscription, { id });
+            if (result && result.cancelled) return;
             toast(t('toast.subUpdated'));
+            await App.refresh();
+          } else if (b.dataset.act === 'rollback') {
+            const result = await call(api.rollbackSubscription, { id });
+            if (result && result.cancelled) return;
+            toast(t('toast.subRolledBack'));
             await App.refresh();
           } else if (b.dataset.act === 'edit') {
             openSubEdit(id);
@@ -179,4 +276,5 @@
   });
 
   App.renderSubs = renderSubs;
+  App.registerRendererModule('subs');
 })();

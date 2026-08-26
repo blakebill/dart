@@ -5,6 +5,8 @@
   const { $, toast, call } = App;
   const api = window.api;
   const { t, getLang } = window.i18n;
+  let settingsHydrated = false;
+  let settingsDirty = false;
 
   function changedSettingsPatch(candidate) {
     const current = App.state.settings || {};
@@ -36,11 +38,13 @@
 
   function updateDirtyState() {
     const dirty = Object.keys(changedSettingsPatch(settingsCandidate())).length > 0;
+    settingsDirty = dirty;
     const bar = $('.settings-savebar');
     const label = $('#settingsDirtyState');
     const button = $('#saveAllSettings');
     if (bar) bar.classList.toggle('is-dirty', dirty);
-    if (label) label.textContent = t(dirty ? 'settings.unsaved' : 'settings.allSaved');
+    if (bar) bar.classList.toggle('hidden', !dirty);
+    if (label) label.textContent = t('settings.unsaved');
     if (button) button.disabled = !dirty;
     return dirty;
   }
@@ -84,26 +88,33 @@
     }
   }
 
-  function renderSettings() {
+  function renderSettings(options = {}) {
     const s = App.state.settings || {};
+    // Language is saved immediately, but every other setting is an explicit
+    // draft until Save is pressed. Translating the page must not silently
+    // replace that draft with the last committed snapshot.
+    const hasDraft = settingsHydrated && settingsDirty;
+    const preserveDraft = options.force !== true && (options.preserveDraft === true || hasDraft);
+    const draft = preserveDraft ? settingsCandidate() : null;
+    const values = draft ? { ...s, ...draft, language: s.language } : s;
     let changed = false;
-    changed = setFieldValue($('#setMixedPort'), s.mixedPort) || changed;
-    changed = setFieldValue($('#setClashPort'), s.clashApiPort) || changed;
-    changed = setFieldValue($('#setLogLevel'), s.logLevel) || changed;
-    changed = setFieldValue($('#setAutoProxy'), !!s.autoSetSystemProxy, true) || changed;
-    changed = setFieldValue($('#setAutoLaunch'), !!s.autoLaunch, true) || changed;
-    changed = setFieldValue($('#setSilentStart'), !!s.silentStart, true) || changed;
-    changed = setFieldValue($('#setNotifications'), s.notifications !== false, true) || changed;
-    changed = setFieldValue($('#setIpv6'), !!s.enableIpv6, true) || changed;
-    changed = setFieldValue($('#setBuiltinRules'), !!s.useBuiltinRules, true) || changed;
-    changed = setFieldValue($('#setTestUrl'), s.testUrl || '') || changed;
-    changed = setFieldValue($('#setSmartMode'), s.smartMode || 'balanced') || changed;
-    changed = setFieldValue($('#setLanguage'), s.language || 'zh') || changed;
-    changed = setFieldValue($('#setDnsOverride'), !!s.enableDnsOverride, true) || changed;
-    changed = setFieldValue($('#setDnsRemote'), s.dnsRemote || '') || changed;
-    changed = setFieldValue($('#setDnsLocal'), s.dnsLocal || '') || changed;
-    changed = setFieldValue($('#setDnsStrategy'), s.dnsStrategy || 'prefer_ipv4') || changed;
-    syncDnsOverrideControls(!!s.enableDnsOverride);
+    changed = setFieldValue($('#setMixedPort'), values.mixedPort) || changed;
+    changed = setFieldValue($('#setClashPort'), values.clashApiPort) || changed;
+    changed = setFieldValue($('#setLogLevel'), values.logLevel) || changed;
+    changed = setFieldValue($('#setAutoProxy'), !!values.autoSetSystemProxy, true) || changed;
+    changed = setFieldValue($('#setAutoLaunch'), !!values.autoLaunch, true) || changed;
+    changed = setFieldValue($('#setSilentStart'), !!values.silentStart, true) || changed;
+    changed = setFieldValue($('#setNotifications'), values.notifications !== false, true) || changed;
+    changed = setFieldValue($('#setIpv6'), !!values.enableIpv6, true) || changed;
+    changed = setFieldValue($('#setBuiltinRules'), !!values.useBuiltinRules, true) || changed;
+    changed = setFieldValue($('#setTestUrl'), values.testUrl || '') || changed;
+    changed = setFieldValue($('#setSmartMode'), values.smartMode || 'balanced') || changed;
+    changed = setFieldValue($('#setLanguage'), values.language || 'zh') || changed;
+    changed = setFieldValue($('#setDnsOverride'), !!values.enableDnsOverride, true) || changed;
+    changed = setFieldValue($('#setDnsRemote'), values.dnsRemote || '') || changed;
+    changed = setFieldValue($('#setDnsLocal'), values.dnsLocal || '') || changed;
+    changed = setFieldValue($('#setDnsStrategy'), values.dnsStrategy || 'prefer_ipv4') || changed;
+    syncDnsOverrideControls(!!values.enableDnsOverride);
     const smartRegions = Array.isArray(s.smartRegions) ? s.smartRegions : [];
     const smartRegionsSummary = $('#smartRegionsSummary');
     if (smartRegionsSummary) {
@@ -113,6 +124,7 @@
     }
     // Enhanced selects only need a refresh when an underlying value actually moved.
     if (changed && App.refreshSelects && App.currentTab === 'settings') App.refreshSelects();
+    settingsHydrated = true;
     updateDirtyState();
   }
 
@@ -162,13 +174,13 @@
   $('#setLanguage').addEventListener('change', async (e) => {
     const lang = e.target.value;
     const previous = getLang();
-    App.setLanguage(lang);
+    App.setLanguage(lang, { preserveSettingsDraft: true });
     App.patchSettings({ language: lang });
     if (!api || !api.updateSettings) return;
     try {
       App.commitSettings(await call(api.updateSettings, { language: lang }));
     } catch (_) {
-      App.setLanguage(previous);
+      App.setLanguage(previous, { preserveSettingsDraft: true });
       App.patchSettings({ language: previous });
     } finally {
       updateDirtyState();
@@ -192,13 +204,6 @@
       updateDirtyState();
     }
   });
-  $('#checkConfigBtn').addEventListener('click', async () => {
-    try {
-      await call(api.checkConfig);
-      toast(t('settings.checkOk'));
-    } catch (_) {}
-  });
-
   $('#coreManageBtn').addEventListener('click', () => App.openDialog('core'));
   $('#geoManageBtn').addEventListener('click', () => App.openDialog('geodata'));
   $('#smartRegionsBtn').addEventListener('click', () => App.openDialog('smart-regions'));
@@ -211,4 +216,5 @@
   App.renderSettings = renderSettings;
   App.renderCoreStatus = renderCoreStatus;
   App.refreshCoreStatus = refreshCoreStatus;
+  App.registerRendererModule('settings');
 })();

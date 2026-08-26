@@ -17,13 +17,19 @@
   border: 0;
   border-radius: calc(var(--radius-control) - 3px);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--font-small);
   font-weight: 600;
   cursor: pointer;
   transition:
     color var(--motion-fast),
     background var(--motion-fast),
     box-shadow var(--motion-fast);
+}
+
+#tab-logs .commandbar-status {
+  color: var(--text);
+  font-size: var(--font-body);
+  font-weight: 600;
 }
 
 .log-level-btn:hover {

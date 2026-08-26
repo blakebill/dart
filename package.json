@@ -1,6 +1,6 @@
 {
   "name": "dart",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "description": "Native-feeling desktop network control for Windows",
   "main": "src/main/index.js",
   "author": "blakebill",
@@ -11,7 +11,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test": "node test/convert.test.js && node test/unit.test.js && node test/fetch.test.js && node test/main-smoke.test.js",
+    "test": "node test/convert.test.js && node test/unit.test.js && node test/features.test.js && node test/fetch.test.js && node test/main-smoke.test.js",
     "test:visual": "electron test/visual-regression.js",
     "test:visual:update": "electron test/visual-regression.js --update",
     "test:all": "npm test && npm run test:visual",

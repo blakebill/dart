@@ -145,13 +145,32 @@ const electronStub = {
 
 // Inject the stub before any main-process module resolves 'electron'.
 require.cache[require.resolve('electron')] = { exports: electronStub };
-// Outside a packaged Electron app process.resourcesPath does not exist.
-process.resourcesPath = tmpDir;
+// Outside a packaged Electron app process.resourcesPath does not exist. The
+// Electron-as-Node fallback exposes it as configurable but read-only.
+Object.defineProperty(process, 'resourcesPath', {
+  value: tmpDir,
+  configurable: true,
+});
 
 // Stub the subscription fetcher so handler-level tests need no network: each
 // URL yields one distinct node.
 const subscriptionPath = path.join(__dirname, '..', 'src', 'main', 'subscription.js');
 const subscriptionFetchCalls = [];
+const parseSubscriptionStub = (content) => {
+  if (/^\s*proxy-providers\s*:/m.test(String(content || ''))) {
+    return {
+      nodes: [],
+      policyGroups: [{ name: 'Provider Group', type: 'select', members: [], providers: ['airport'] }],
+      proxyProviders: {
+        airport: { type: 'http', url: 'https://provider.example/sub', interval: 3600 },
+      },
+      format: 'clash',
+      rules: ['MATCH,Provider Group'],
+      ruleProviders: {},
+    };
+  }
+  return { nodes: [], policyGroups: [], proxyProviders: {}, format: 'unknown', rules: [], ruleProviders: {} };
+};
 require.cache[require.resolve(subscriptionPath)] = {
   exports: {
     fetchSubscription: async (url, _log, options = {}) => {
@@ -161,11 +180,17 @@ require.cache[require.resolve(subscriptionPath)] = {
         policyGroups: [],
         format: 'links',
         rules: [],
+        proxyProviders: {},
         raw: 'stub',
         userInfo: null,
       };
     },
-    parseSubscriptionContent: () => ({ nodes: [], policyGroups: [], format: 'unknown', rules: [], raw: '' }),
+    parseSubscriptionContent: parseSubscriptionStub,
+    parseSubscriptionContentAsync: async (content) => parseSubscriptionStub(content),
+    hasUsableProxySource: (value) => !!(
+      value && ((Array.isArray(value.nodes) && value.nodes.length) ||
+        Object.keys(value.proxyProviders || value.clashProxyProviders || {}).length)
+    ),
     formatSubscriptionForEditing: (value, target) => `editable:${target}:${value}`,
     nodeFingerprint: (node) => JSON.stringify({
       type: node && node.type,
@@ -179,6 +204,7 @@ require.cache[require.resolve(subscriptionPath)] = {
       value.policyGroups || value.groups || [],
       value.clashRules || value.rules || [],
       value.clashRuleProviders || value.ruleProviders || {},
+      value.clashProxyProviders || value.proxyProviders || {},
     ]),
     uniqueNodeNames: (nodes) => nodes || [],
   },
@@ -234,6 +260,7 @@ async function main() {
   const unused = fromMain.filter((c) => !fromPreload.includes(c));
   assert.deepStrictEqual(missing, [], 'preload invokes channels with no main handler');
   assert.deepStrictEqual(unused, [], 'main registers channels the preload never invokes');
+  assert.ok(fromMain.includes('connections:closeMany'), 'filtered connection close IPC is missing');
 
   console.log(`✓ main process boots with ${fromMain.length} IPC handlers, all matching preload`);
 
@@ -331,6 +358,26 @@ async function main() {
   assert.doesNotThrow(() => stateModule.sendLog('[gui] renderer teardown race'));
   stateModule.state.mainWindow = activeWindow;
   console.log('✓ renderer teardown races cannot crash main-process logging');
+
+  const providerProfile = await handlers['sub:import'](windowEvent, {
+    name: 'Provider only',
+    content: [
+      'proxy-providers:',
+      '  airport:',
+      '    type: http',
+      '    url: https://provider.example/sub',
+      'proxy-groups:',
+      '  - {name: Provider Group, type: select, use: [airport]}',
+    ].join('\n'),
+  });
+  assert.strictEqual(providerProfile.nodeCount, 0);
+  assert.strictEqual(providerProfile.providerCount, 1);
+  const providerState = await handlers['app:getState']();
+  assert.strictEqual(providerState.subscriptions.find((item) => item.id === providerProfile.id).providerCount, 1);
+  const stoppedInventory = await handlers['nodes:get']();
+  assert.strictEqual(stoppedInventory.providerStatus.configured, 1);
+  assert.strictEqual(stoppedInventory.providerStatus.state, 'stopped');
+  console.log('✓ provider-only profiles import, persist and expose an explicit stopped state');
 
   await handlers['window:close'](windowEvent);
   assert.strictEqual(mainWindow.closed, true);

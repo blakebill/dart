@@ -1590,6 +1590,7 @@ class SmartSelectionModel {
           samples: 0,
           effectiveSamples: 0,
           failed: false,
+          displayDelay: null,
           ewma: null,
         };
         continue;
@@ -1600,8 +1601,11 @@ class SmartSelectionModel {
         state.cooldownUntil > now;
       const displayFresh = state.lastDisplayDelay > 0 &&
         now - state.lastDisplayDelay <= this.options.maxSampleAgeMs;
-      const ewma = displayFresh && validDelay(state.displayDelay)
+      const displayDelay = displayFresh && validDelay(state.displayDelay)
         ? Number(state.displayDelay)
+        : null;
+      const ewma = displayDelay != null
+        ? displayDelay
         : (validDelay(state.ewma) ? Number(state.ewma) : null);
       const effectiveSamples = Math.max(0, Number(state.effectiveSamples) || 0);
       const stabilitySamples = state.stabilitySamples === undefined
@@ -1613,6 +1617,7 @@ class SmartSelectionModel {
           samples: Math.round(effectiveSamples * 10) / 10,
           effectiveSamples,
           failed: true,
+          displayDelay,
           ewma,
         };
         continue;
@@ -1623,6 +1628,7 @@ class SmartSelectionModel {
           samples: Math.round(effectiveSamples * 10) / 10,
           effectiveSamples,
           failed: false,
+          displayDelay,
           ewma: null,
         };
         continue;
@@ -1634,6 +1640,7 @@ class SmartSelectionModel {
           samples: Math.round(effectiveSamples * 10) / 10,
           effectiveSamples,
           failed: false,
+          displayDelay,
           ewma,
         };
         continue;
@@ -1644,6 +1651,7 @@ class SmartSelectionModel {
         samples: Math.round(effectiveSamples * 10) / 10,
         effectiveSamples,
         failed: false,
+        displayDelay,
         ewma,
       };
     }

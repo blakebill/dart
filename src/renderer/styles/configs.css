@@ -1,7 +1,7 @@
 /* Configuration workspace */
 #tab-subs .config-add-section {
   border-color: color-mix(in srgb, var(--accent) 14%, var(--border));
-  background: color-mix(in srgb, var(--surface) 74%, transparent);
+  background: var(--surface);
 }
 
 .config-section-head {
@@ -50,7 +50,7 @@
 .config-field > label {
   overflow: hidden;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: var(--font-caption);
   font-weight: 600;
   line-height: 1.25;
   text-overflow: ellipsis;
@@ -86,15 +86,18 @@
 }
 
 #tab-subs .sub-item {
+  position: relative;
   display: grid;
   min-height: 112px;
   padding: 14px 15px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: stretch;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  align-items: center;
   gap: 18px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  background: color-mix(in srgb, var(--field) 62%, transparent);
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--accent) 5%, transparent), transparent 50%),
+    var(--field);
   transition: border-color var(--motion-standard), background-color var(--motion-standard), box-shadow var(--motion-standard);
 }
 
@@ -104,7 +107,9 @@
 
 #tab-subs .sub-item:hover {
   border-color: var(--border-strong);
-  background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
+  background:
+    radial-gradient(circle at 100% 0, color-mix(in srgb, var(--accent) 9%, transparent), transparent 50%),
+    var(--surface-hover);
   box-shadow: var(--panel-shadow);
 }
 
@@ -131,7 +136,7 @@
 #tab-subs .sub-name {
   min-width: 0;
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--font-body);
   font-weight: 600;
 }
 
@@ -149,7 +154,7 @@
   flex: none;
   color: var(--accent);
   background: var(--accent-soft);
-  font-size: 10px;
+  font-size: var(--font-xs);
   font-weight: 700;
 }
 
@@ -164,12 +169,12 @@
 .sub-fact {
   color: var(--text-dim);
   background: color-mix(in srgb, var(--surface-hover) 65%, transparent);
-  font-size: 10px;
+  font-size: var(--font-xs);
 }
 
 #tab-subs .sub-meta {
   margin-top: 7px;
-  font-size: 10px;
+  font-size: var(--font-xs);
   line-height: 1.4;
 }
 
@@ -181,7 +186,7 @@
 .sub-usage-copy {
   overflow: hidden;
   color: var(--text-dim);
-  font-size: 10px;
+  font-size: var(--font-xs);
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -204,24 +209,23 @@
 
 #tab-subs .sub-actions {
   display: flex;
-  min-width: 210px;
-  flex-direction: column;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 9px;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
 }
 
-.sub-actions-primary,
-.sub-actions-secondary {
+.sub-actions-primary {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 7px;
+  gap: 5px;
+  white-space: nowrap;
 }
 
 #tab-subs .sub-actions .btn {
   min-height: 32px;
   padding: 5px 10px;
+  font-size: var(--font-small);
 }
 
 #tab-subs .btn.primary-soft {
@@ -230,9 +234,71 @@
   background: var(--accent-soft);
 }
 
-#tab-subs .btn.danger-quiet {
-  color: var(--red);
+#tab-subs .sub-activate-btn.success:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.sub-overflow {
+  position: relative;
+  flex: none;
+}
+
+#tab-subs .sub-more-btn {
+  width: 30px;
+  min-width: 30px;
+  padding: 0;
+  justify-content: center;
+  font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+  font-size: var(--font-metric);
+  line-height: 1;
+}
+
+.sub-overflow-menu {
+  position: absolute;
+  z-index: 1200;
+  top: calc(100% + 5px);
+  right: 0;
+  width: max-content;
+  min-width: 176px;
+  padding: 4px;
+  border-radius: 8px;
+  transform-origin: top right;
+  animation: dropdownIn var(--motion-fast);
+}
+
+.sub-overflow-menu[hidden] {
+  display: none;
+}
+
+.sub-overflow-menu.opens-up {
+  top: auto;
+  bottom: calc(100% + 5px);
+  transform-origin: bottom right;
+}
+
+.sub-menu-item {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
   background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.sub-menu-item:hover,
+.sub-menu-item:focus-visible {
+  outline: none;
+  background: var(--surface-hover);
+}
+
+.sub-menu-item.is-danger {
+  color: var(--red);
 }
 
 #subEditPanel .setting-row > .input,
@@ -247,15 +313,6 @@
     grid-template-columns: minmax(140px, 0.62fr) minmax(260px, 1.38fr) auto;
   }
 
-  #tab-subs .sub-item {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  #tab-subs .sub-actions {
-    min-width: 0;
-    flex-direction: row;
-    align-items: center;
-  }
 }
 
 @media (max-width: 720px) {
@@ -276,9 +333,12 @@
   }
 
   #tab-subs .sub-actions,
-  .sub-actions-primary,
-  .sub-actions-secondary {
+  .sub-actions-primary {
     flex-wrap: wrap;
     justify-content: flex-start;
+  }
+
+  #tab-subs .sub-item {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -45,13 +45,17 @@ const adapters = {
       'geoip.dat',
       'geosite.dat',
       'country.mmdb',
+      'ASN.mmdb',
       'geodata-meta.json',
-      '.mihomo-geodata-validation.json',
     ],
+    // Derived from the binary + authoritative GeoData. It must never
+    // participate in update rollback fingerprints because prepareStart rewrites it.
+    geoDataCacheFiles: ['.mihomo-geodata-validation.json'],
     ruleSetItems: [
       { tag: 'geoip', file: 'geoip.dat' },
       { tag: 'geosite', file: 'geosite.dat' },
       { tag: 'country-mmdb', file: 'country.mmdb' },
+      { tag: 'asn-mmdb', file: 'ASN.mmdb' },
     ],
     exportDialog: {
       title: 'Export mihomo config',
@@ -133,16 +137,27 @@ const adapters = {
     },
     releaseAsset(version, goos, arch, release, source = 'custom') {
       const ext = goos === 'windows' ? 'zip' : 'gz';
+      const canonicalName = `mihomo-${goos}-${arch}-v${version}.${ext}`.toLowerCase();
       const candidates = findReleaseAsset(release, (asset) => {
         const lower = asset.fileName.toLowerCase();
         return /mihomo/i.test(asset.fileName) &&
           lower.includes(goos) &&
           lower.includes(arch) &&
           new RegExp(`\\.${ext}$`, 'i').test(asset.fileName);
-      }).sort((a, b) =>
-        Number(/compatible|go\d+/i.test(a.fileName)) - Number(/compatible|go\d+/i.test(b.fileName))
-      );
+      }).sort((a, b) => {
+        const rank = (asset) => {
+          const lower = asset.fileName.toLowerCase();
+          if (lower === canonicalName) return 0;
+          if (/compatible/i.test(lower)) return 2;
+          if (/(?:^|[-_])(?:go\d+|v[1-3])(?:[-_.]|$)/i.test(lower)) return 3;
+          return 1;
+        };
+        return rank(a) - rank(b);
+      });
       if (candidates[0]) return candidates[0];
+      // A successful release lookup is authoritative. Silently synthesizing a
+      // filename here can select a non-existent or unverifiable build.
+      if (release) return null;
       const fileName = `mihomo-${goos}-${arch}-v${version}.${ext}`;
       return {
         fileName,

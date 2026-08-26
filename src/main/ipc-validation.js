@@ -1,7 +1,9 @@
 'use strict';
 
+const net = require('net');
 
 const VALID_TARGETS = ['proxy', 'direct', 'reject'];
+const VALID_RULE_OVERRIDE_TARGETS = ['source', ...VALID_TARGETS];
 const MAX_RULE_GROUP_SELECTION_ENTRIES = 512;
 const VALID_CRS_FORMATS = ['clash'];
 const VALID_MODES = ['rule', 'global', 'direct', 'block'];
@@ -13,7 +15,7 @@ const MAX_AUTO_UPDATE_MINUTES = 365 * 24 * 60;
 const SETTING_KEYS = new Set([
   'mixedPort', 'clashApiPort', 'logLevel',
   'autoSetSystemProxy', 'autoLaunch', 'silentStart', 'notifications', 'enableIpv6',
-  'enableDnsOverride', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme', 'clashMode',
+  'enableDnsOverride', 'dnsRemote', 'dnsLocal', 'dnsStrategy', 'language', 'theme',
   'testUrl', 'smartMode', 'smartRegions',
   'useBuiltinRules', 'ruleOverrides', 'ruleGroupSelections', 'coreType',
 ]);
@@ -132,7 +134,6 @@ function validateSettingsPatch(patch, current) {
   }
   if ('language' in patch) reqEnum(patch.language, ['zh', 'en'], 'language');
   if ('theme' in patch) reqEnum(patch.theme, ['dark', 'light', 'system'], 'theme');
-  if ('clashMode' in patch) reqEnum(patch.clashMode, VALID_MODES, 'clashMode');
   if ('smartMode' in patch) reqEnum(patch.smartMode, VALID_SMART_MODES, 'smartMode');
   if ('smartRegions' in patch) {
     if (!Array.isArray(patch.smartRegions) || patch.smartRegions.length > 64) {
@@ -157,6 +158,10 @@ function validateSettingsPatch(patch, current) {
       !/^(?:(?:https|tls|quic|h3|http3|tcp|udp):\/\/)?[^/]+(?:\/\S*)?$/i.test(value)
     ) throw new Error('invalid ' + key);
     patch[key] = value;
+    // Mihomo accepts a bare IP as a UDP resolver. URL requires brackets around
+    // IPv6 literals, so recognize the unambiguous bare form before URL parsing
+    // instead of rejecting a value the diagnostics tool already supports.
+    if (net.isIP(value)) continue;
     const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `udp://${value}`);
     if (!parsed.hostname) throw new Error(`${key} must contain a host`);
   }
@@ -165,7 +170,9 @@ function validateSettingsPatch(patch, current) {
     if (!patch.ruleOverrides || typeof patch.ruleOverrides !== 'object' || Array.isArray(patch.ruleOverrides)) {
       throw new Error('invalid ruleOverrides');
     }
-    for (const value of Object.values(patch.ruleOverrides)) reqEnum(value, VALID_TARGETS, 'ruleOverrides');
+    for (const value of Object.values(patch.ruleOverrides)) {
+      reqEnum(value, VALID_RULE_OVERRIDE_TARGETS, 'ruleOverrides');
+    }
   }
   if ('ruleGroupSelections' in patch) {
     const selections = patch.ruleGroupSelections;

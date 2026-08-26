@@ -322,4 +322,5 @@
   App.setLogStreaming = setLogStreaming;
   App.setLogLevelFilter = setLogLevelFilter;
   App.renderLogEmptyState = renderLogEmptyState;
+  App.registerRendererModule('logs');
 })();

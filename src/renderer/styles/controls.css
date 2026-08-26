@@ -127,13 +127,9 @@ select[data-enhanced] {
   transform: rotate(180deg);
 }
 
-.toast {
-  -webkit-backdrop-filter: var(--raised-filter);
-  backdrop-filter: var(--raised-filter);
-}
-
 .ui-select-menu,
-.node-context-menu {
+.node-context-menu,
+.sub-overflow-menu {
   border: 1px solid var(--menu-border);
   color: var(--text);
   background: var(--menu-surface);
@@ -191,7 +187,7 @@ select[data-enhanced] {
   color: var(--text);
   background: var(--surface-raised);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--font-small);
   font-weight: 600;
   white-space: nowrap;
   transition: border-color var(--motion-standard), background-color var(--motion-standard), color var(--motion-standard), transform var(--motion-standard), box-shadow var(--motion-standard);
@@ -239,6 +235,43 @@ button:disabled {
   background: color-mix(in srgb, var(--red) 90%, white);
 }
 
+.power-icon {
+  display: none;
+}
+
+.app.sidebar-collapsed .power-btn {
+  display: grid;
+  padding: 0;
+  place-items: center;
+}
+
+.app.sidebar-collapsed #powerLabel {
+  display: none;
+}
+
+.app.sidebar-collapsed .power-icon {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+}
+
+.app.sidebar-collapsed .power-icon::before {
+  content: "\E768";
+  font-family: "Segoe MDL2 Assets", "Segoe Fluent Icons", sans-serif;
+  font-size: var(--font-ui);
+  line-height: 1;
+}
+
+.app.sidebar-collapsed .power-btn.running .power-icon::before {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border-radius: 1px;
+  background: currentColor;
+  content: "";
+}
+
 .btn.success {
   color: #07160d;
   border-color: var(--green);
@@ -265,7 +298,7 @@ button:disabled {
 .hint {
   margin-top: 8px;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: var(--font-small);
   line-height: 1.6;
 }
 
@@ -279,7 +312,7 @@ button:disabled {
   gap: 8px;
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--font-small);
 }
 
 input[type='checkbox'] {

@@ -16,6 +16,7 @@
     palette.textDim = get('--text-dim', '#98a2b3');
   }
   const AXIS_FONT = '10px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+  const COMPACT_AXIS_FONT = '9px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
   // Compact speed label for axes ("1.2M/s", "850K/s", "0") — narrower than the
   // full fmtBytes form, so it fits the Y gutter without clipping.
   function fmtRate(n) {
@@ -142,7 +143,9 @@
     // as a faint overlay just inside the left edge — no reserved gutter — and
     // time marks (X) along the bottom. A 1/s push cadence makes `size` ≈ secs.
     function drawOuterAxes(p, top) {
-      ctx.font = AXIS_FONT;
+      const plotHeight = p.y1 - p.y0;
+      const compactAxis = plotHeight < 48;
+      ctx.font = compactAxis ? COMPACT_AXIS_FONT : AXIS_FONT;
       ctx.strokeStyle = palette.border;
       for (let i = 0; i <= 2; i++) {
         const f = i / 2; // 0 (top) .. 1 (bottom)
@@ -155,13 +158,19 @@
         ctx.stroke();
         // Label sits inside the plot at the left, hugging its gridline: the top
         // one below its line, the rest above, so none clip the canvas edges.
-        ctx.globalAlpha = 0.75;
-        ctx.fillStyle = palette.textDim;
-        ctx.textAlign = 'left';
-        ctx.textBaseline = i === 0 ? 'top' : 'bottom';
-        ctx.fillText(fmtRate(top * (1 - f)), p.x0 + 3, gy + (i === 0 ? 2 : -2));
+        // A 48px-high compact chart has only ~22px of plot height. Keep its
+        // middle gridline, but omit the middle label so three 8–10px strings
+        // cannot overlap vertically.
+        if (!compactAxis || i !== 1) {
+          ctx.globalAlpha = 0.75;
+          ctx.fillStyle = palette.textDim;
+          ctx.textAlign = 'left';
+          ctx.textBaseline = i === 0 ? 'top' : 'bottom';
+          ctx.fillText(fmtRate(top * (1 - f)), p.x0 + 3, gy + (i === 0 ? 1 : -1));
+        }
       }
       ctx.globalAlpha = 0.75;
+      ctx.font = AXIS_FONT;
       ctx.textBaseline = 'bottom';
       const marks = [
         [p.x0, 'left', '-' + size + 's'],
@@ -179,7 +188,7 @@
     // bottom-right, drawn faintly inside the plot — for the compact sparkline.
     function drawInnerAxes(p, top) {
       ctx.fillStyle = palette.textDim;
-      ctx.font = '8px -apple-system, "Segoe UI", sans-serif';
+      ctx.font = COMPACT_AXIS_FONT;
       ctx.globalAlpha = 0.7;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'top';

@@ -14,6 +14,26 @@
 
   $('#uwpOpen').addEventListener('click', () => App.openDialog('uwp'));
 
+  $('#diagnosticBundleExport').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const previous = button.textContent;
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = window.i18n.t('toolbox.bundleCollecting');
+    try {
+      const file = await call(api.exportDiagnosticBundle);
+      if (file) App.toast(window.i18n.t('toolbox.bundleExported', file));
+    } catch (_) {
+      /* call() already displayed the failure */
+    } finally {
+      if (button.isConnected) {
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+        button.textContent = previous;
+      }
+    }
+  });
+
   document.querySelectorAll('#tab-tools .tool-card').forEach((card) => {
     card.addEventListener('click', (event) => {
       if (event.target.closest('button')) return;
@@ -21,4 +41,5 @@
       if (launcher && !launcher.disabled) launcher.click();
     });
   });
+  App.registerRendererModule('tools');
 })();

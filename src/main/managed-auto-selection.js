@@ -88,7 +88,11 @@ class ManagedAutoSelection {
       'GET',
       '/proxies/' + encodeURIComponent(this.options.autoGroup)
     );
-    const names = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
+    const rawNames = Array.isArray(group && group.all) ? group.all.filter(Boolean) : [];
+    const rawNameSet = new Set(rawNames);
+    const names = typeof this.options.filterNames === 'function'
+      ? this.options.filterNames(rawNames).filter((name) => rawNameSet.has(name))
+      : rawNames;
     if (!names.length) return null;
     // Optional real-path feedback (e.g. Clash /connections) before URL delay.
     if (typeof this.options.harvestFeedback === 'function') {

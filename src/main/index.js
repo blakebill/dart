@@ -64,8 +64,12 @@ const { registerIpc } = require('./ipc');
 const { notify } = require('./notify');
 const proxy = require('./proxy');
 const uwp = require('./uwp');
-const { isWindowsAdmin } = require('./admin');
+const { isWindowsAdmin, setElevatedRelaunchCleanup } = require('./admin');
 const { cleanupTunAdapters } = require('./tun-adapter');
+
+// Wire the one cross-cutting shutdown action explicitly. admin.js must not
+// require core-control.js back, which previously created a startup module cycle.
+setElevatedRelaunchCleanup(() => core.cleanup());
 
 function diagnosticDetail(value) {
   if (value && typeof value.stack === 'string') return value.stack;
@@ -176,6 +180,14 @@ function handleFatalError(kind, error) {
   if (fatalExitStarted) return;
   fatalExitStarted = true;
   app.isQuitting = true;
+  // The hard-exit timer below can fire before asynchronous cleanup reaches the
+  // core lifecycle. Clear an owned localhost proxy immediately so a fatal main
+  // process error cannot leave Windows pointing at a dead port.
+  try {
+    const ownedServer = state.systemProxyServer ||
+      (state.store && core.persistedSystemProxyOwnership());
+    if (ownedServer) proxy.disableSystemProxySyncIfOurs(ownedServer);
+  } catch (_) {}
   setImmediate(async () => {
     const hardExit = setTimeout(() => app.exit(1), 8000);
     try {
@@ -198,6 +210,9 @@ process.on('uncaughtException', (error) => handleFatalError('uncaught exception'
 process.on('unhandledRejection', (reason) => recordCrash('unhandled rejection', reason));
 
 let rendererRecoveryStarted = false;
+const rendererRecoveryAttempts = [];
+const RENDERER_RECOVERY_WINDOW_MS = 60_000;
+const RENDERER_RECOVERY_LIMIT = 3;
 app.on('render-process-gone', (_event, webContents, details) => {
   if (app.isQuitting || (details && details.reason === 'clean-exit')) return;
   recordCrash('renderer process gone', details);
@@ -208,6 +223,24 @@ app.on('render-process-gone', (_event, webContents, details) => {
     !webContents ||
     liveWebContents(win) !== webContents
   ) return;
+  const now = Date.now();
+  while (rendererRecoveryAttempts.length && now - rendererRecoveryAttempts[0] > RENDERER_RECOVERY_WINDOW_MS) {
+    rendererRecoveryAttempts.shift();
+  }
+  if (rendererRecoveryAttempts.length >= RENDERER_RECOVERY_LIMIT) {
+    recordCrash('renderer recovery suppressed after repeated crashes', details);
+    state.mainWindow = null;
+    try { destroyWindow(win, 'renderer-recovery-limit'); } catch (_) {}
+    const zh = !state.store || (state.store.getSettings().language || 'zh') === 'zh';
+    notify(
+      zh ? '界面恢复已暂停' : 'Interface recovery paused',
+      zh
+        ? '界面在一分钟内多次异常退出，请重新启动 Dart 并查看崩溃日志。'
+        : 'The interface exited repeatedly within one minute. Restart Dart and inspect the crash log.'
+    );
+    return;
+  }
+  rendererRecoveryAttempts.push(now);
   rendererRecoveryStarted = true;
   const restoreVisible = typeof win.isVisible !== 'function' || win.isVisible();
   state.mainWindow = null;
@@ -285,27 +318,14 @@ if (!gotLock) {
       coreType: settings.coreType,
       onLog: sendLog,
       onExit: (code, signal) => {
+        core.connectionSnapshots.invalidate();
         stopTrafficStream();
         core.stopProxyGuard();
         const ownedServer = state.systemProxyServer || core.persistedSystemProxyOwnership();
         if (state.systemProxyOn || ownedServer) {
           if (ownedServer) {
             // Prefer the owned restore path so ProxyOverride is put back after a crash.
-            const release = typeof core.disableOwnedSystemProxy === 'function'
-              ? core.disableOwnedSystemProxy(ownedServer)
-              : proxy.disableSystemProxyIfOurs(ownedServer);
-            release
-              .then(() => {
-                try { core.forgetSystemProxyOwnership(ownedServer); } catch (error) {
-                  sendLog('[gui] failed to clear persisted system proxy ownership: ' + error.message);
-                }
-                // A new core may have started while the registry operation was
-                // queued. Do not clear the ownership state of that newer run.
-                if (!state.coreManager.isRunning() && state.systemProxyServer === ownedServer) {
-                  state.systemProxyOn = false;
-                  state.systemProxyServer = null;
-                }
-              })
+            core.releaseOwnedSystemProxy()
               .catch((e) => {
                 // Keep ownership so a later Stop/Quit can retry instead of
                 // forgetting a dead proxy that may still be active in Windows.
@@ -342,12 +362,10 @@ if (!gotLock) {
     });
     beginSessionDiagnostics(settings.coreType);
     registerIpc();
-    // Sync the OS login-item state with the saved setting.
-    try {
-      core.applyAutoLaunch(settings.autoLaunch, settings.silentStart);
-    } catch (error) {
-      sendLog('[gui] failed to synchronize auto-launch at startup: ' + error.message);
-    }
+    // Repair the OS login item asynchronously. schtasks.exe can take seconds
+    // on a busy login session and must not block core auto-resume.
+    core.reconcileAutoLaunch(settings.autoLaunch, settings.silentStart)
+      .catch((error) => sendLog('[gui] failed to synchronize auto-launch at startup: ' + error.message));
     // Clear a system proxy left dangling by a previous exit (so the machine
     // isn't left offline during the boot -> app-start window). Runs concurrently
     // with window load; the auto-resume below awaits it so the clear can't race

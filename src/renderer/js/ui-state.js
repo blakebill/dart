@@ -4,15 +4,18 @@
   const App = window.App;
   const UI_STATE_KEY = 'dart-light-ui-state-v1';
   const RESTORABLE_TABS = new Set([
-    'dashboard', 'subs', 'nodes', 'rules', 'conns', 'tools', 'logs', 'settings',
+    'dashboard', 'subs', 'nodes', 'groups', 'rules', 'conns', 'tools', 'logs', 'settings',
   ]);
   const TAB_SCROLL_TARGETS = Object.freeze({
     nodes: ['nodeList'],
+    groups: ['ruleGroupList'],
     rules: ['ruleList'],
     conns: ['connList'],
     logs: ['logBox'],
   });
-  const FILTER_IDS = Object.freeze(['nodeFilter', 'ruleFilter']);
+  const FILTER_IDS = Object.freeze([
+    'nodeFilter', 'ruleFilter', 'connFilter', 'connNetworkFilter', 'connRouteFilter',
+  ]);
 
   function cleanUiState(value) {
     const source = value && typeof value === 'object' ? value : {};
@@ -40,7 +43,14 @@
         .filter((id) => typeof id === 'string' && /^[a-z][\w-]{0,63}$/i.test(id))
         .slice(0, 24)
       : [];
-    return { version: 1, tab, scroll, filters, expanded };
+    return {
+      version: 1,
+      tab,
+      scroll,
+      filters,
+      expanded,
+      sidebarCollapsed: source.sidebarCollapsed === true,
+    };
   }
 
   function createLightUiState({ document: doc, storage, getCurrentTab, isVisualTest }) {
@@ -130,8 +140,16 @@
       else pendingScrollRestore.add(tab);
     }
 
+    function setSidebarCollapsed(collapsed) {
+      state.sidebarCollapsed = collapsed === true;
+      scheduleSave();
+    }
+
     doc.addEventListener('scroll', scheduleSave, true);
     doc.addEventListener('input', (event) => {
+      if (FILTER_IDS.includes(event.target && event.target.id)) scheduleSave();
+    });
+    doc.addEventListener('change', (event) => {
       if (FILTER_IDS.includes(event.target && event.target.id)) scheduleSave();
     });
     doc.addEventListener('toggle', scheduleSave, true);
@@ -141,7 +159,9 @@
       scheduleSave,
       restoreControls,
       restoreScroll,
+      setSidebarCollapsed,
       get restoredTab() { return state.tab; },
+      get sidebarCollapsed() { return state.sidebarCollapsed; },
     });
   }
 

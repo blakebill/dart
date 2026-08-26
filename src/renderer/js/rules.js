@@ -18,10 +18,43 @@
   let rulesReady = false;
   let rulesLoading = null;
   let ruleLoadGeneration = 0;
+  let ruleFilterTimer = null;
   let localRulesReady = false;
   let localRulesLoading = null;
-  let ruleGroupsReady = false;
-  let ruleGroupsLoading = null;
+  let ruleManagerView = 'local';
+
+  function setRuleManagerView(view, { focus = false } = {}) {
+    if (view !== 'local' && view !== 'remote') return;
+    ruleManagerView = view;
+    $('#localRuleManager').hidden = view !== 'local';
+    $('#remoteRuleManager').hidden = view !== 'remote';
+    $('#ruleManagerTabs').querySelectorAll('[data-rule-manager-view]').forEach((button) => {
+      const selected = button.dataset.ruleManagerView === view;
+      button.classList.toggle('primary', selected);
+      button.setAttribute('aria-selected', String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      if (selected && focus) button.focus();
+    });
+    if (App.refreshSelects) {
+      App.refreshSelects(view === 'remote' ? $('#remoteRuleManager') : $('#localRuleManager'));
+    }
+  }
+
+  $('#ruleManagerTabs').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-rule-manager-view]');
+    if (button) setRuleManagerView(button.dataset.ruleManagerView);
+  });
+  $('#ruleManagerTabs').addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...$('#ruleManagerTabs').querySelectorAll('[data-rule-manager-view]')];
+    const current = Math.max(0, tabs.indexOf(event.target.closest('[data-rule-manager-view]')));
+    const index = event.key === 'Home' ? 0
+      : event.key === 'End' ? tabs.length - 1
+        : (current + (event.key === 'ArrowLeft' ? -1 : 1) + tabs.length) % tabs.length;
+    setRuleManagerView(tabs[index].dataset.ruleManagerView, { focus: true });
+  });
+  setRuleManagerView(ruleManagerView);
   function normalizeRules(data) {
     const live = data.live && data.live.length ? data.live : null;
     ruleSrc = live ? 'live' : 'config';
@@ -103,8 +136,12 @@
   }
 
   $('#ruleFilter').addEventListener('input', () => {
-    $('#ruleList').scrollTop = 0;
-    renderRules();
+    clearTimeout(ruleFilterTimer);
+    ruleFilterTimer = setTimeout(() => {
+      ruleFilterTimer = null;
+      $('#ruleList').scrollTop = 0;
+      renderRules();
+    }, 80);
   });
   let ruleScrollQueued = false;
   $('#ruleList').addEventListener('scroll', () => {
@@ -117,194 +154,13 @@
   });
   $('#ruleRefresh').addEventListener('click', () => loadRules({ force: true }));
 
-  // ---------- Subscription policy-group outbound overrides ----------
-  // Mode: select-outbound (source selector) | proxy | direct | reject.
-  // Source mode shows a second dropdown reusing the node list + app groups.
-  function pickOptionLabel(value) {
-    if (value === '🚀 Proxy') return t('rulegroups.followProxy');
-    if (value === 'direct' || value === 'DIRECT') return 'DIRECT';
-    if (value === 'reject' || value === 'REJECT') return 'REJECT';
-    return value;
-  }
-
-  function refreshRuleGroupLabels() {
-    const list = $('#ruleGroupList');
-    if (!list) return;
-    const labels = {
-      source: t('rulegroups.targetSource'),
-      proxy: t('customrs.targetProxy'),
-      direct: t('customrs.targetDirect'),
-      reject: t('customrs.targetReject'),
-    };
-    const empty = list.querySelector('.hint');
-    if (empty) empty.textContent = t('rulegroups.empty');
-    list.querySelectorAll('select[data-role="mode"] option').forEach((option) => {
-      if (labels[option.value]) option.textContent = labels[option.value];
-    });
-    list.querySelectorAll('select[data-role="mode"]').forEach((select) => {
-      select.setAttribute('aria-label', `${select.dataset.group}: ${t('localrules.target')}`);
-    });
-    list.querySelectorAll('select[data-role="pick"]').forEach((select) => {
-      select.setAttribute('aria-label', `${select.dataset.group}: ${t('rulegroups.pickOutbound')}`);
-      const proxyOpt = select.querySelector('option[value="🚀 Proxy"]');
-      if (proxyOpt) proxyOpt.textContent = t('rulegroups.followProxy');
-    });
-    if (App.refreshSelects) App.refreshSelects(list);
-  }
-
-  function syncPickVisibility(row, mode, selectable) {
-    const pick = row.querySelector('select[data-role="pick"]');
-    if (!pick) return;
-    const show = mode === 'source' && selectable;
-    pick.hidden = !show;
-    pick.disabled = !show;
-    const wrap = pick.closest('.rule-group-pick');
-    if (wrap) wrap.hidden = !show;
-  }
-
-  async function loadRuleGroups(options = {}) {
-    const list = $('#ruleGroupList');
-    if (!list) return;
-    if (options.force === false && ruleGroupsReady) return;
-    if (ruleGroupsLoading) return ruleGroupsLoading;
-    const generation = ruleLoadGeneration;
-    const request = (async () => {
-      let info;
-      try {
-        info = await api.getRuleGroups();
-      } catch (e) {
-        return;
-      }
-      if (generation !== ruleLoadGeneration) return;
-      const groups = info.groups || [];
-      const overrides = info.overrides || {};
-      const selections = info.selections || {};
-      const defaults = info.defaults || {};
-      const pickOptions = info.pickOptions || [];
-      const picksByGroup = info.picksByGroup || {};
-      if (!groups.length) {
-        list.innerHTML = `<p class="hint">${t('rulegroups.empty')}</p>`;
-        ruleGroupsReady = true;
-        return;
-      }
-      const opts = [
-        ['proxy', t('customrs.targetProxy')],
-        ['direct', t('customrs.targetDirect')],
-        ['reject', t('customrs.targetReject')],
-      ];
-      const sourceTargets = new Set(info.sourceTargets || []);
-      const selectableTargets = new Set(info.selectableTargets || []);
-      list.innerHTML = '';
-      for (const g of groups) {
-        const hasSourceTarget = sourceTargets.has(g);
-        const selectable = selectableTargets.has(g);
-        const groupOptions = hasSourceTarget
-          ? [['source', t('rulegroups.targetSource')], ...opts]
-          : opts;
-        const cur = overrides[g] || (hasSourceTarget ? 'source' : 'proxy');
-        const pickValue = selections[g] || defaults[g] || '🚀 Proxy';
-        const div = document.createElement('div');
-        div.className = 'sub-item rule-group-item';
-        const modeSel = groupOptions
-          .map(([v, label]) => `<option value="${v}"${v === cur ? ' selected' : ''}>${escapeHtml(label)}</option>`)
-          .join('');
-        let pickHtml = '';
-        if (selectable) {
-          // Per-group list (reject only when that group ships a reject strategy).
-          const groupPicks = picksByGroup[g] || pickOptions;
-          const options = groupPicks.includes(pickValue) ? groupPicks : [pickValue, ...groupPicks];
-          const pickOpts = options.map((value) => {
-            const selected = value === pickValue
-              || (pickValue === 'direct' && value === 'direct')
-              || (pickValue === 'reject' && value === 'reject')
-              ? ' selected' : '';
-            return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(pickOptionLabel(value))}</option>`;
-          }).join('');
-          pickHtml = `
-            <div class="rule-group-pick">
-              <select class="input small rule-group-pick-select" data-role="pick" data-group="${escapeHtml(g)}"
-                aria-label="${escapeHtml(g + ': ' + t('rulegroups.pickOutbound'))}">${pickOpts}</select>
-            </div>`;
-        }
-        div.innerHTML = `
-          <div class="sub-info">
-            <strong class="sub-name rule-group-name" title="${escapeHtml(g)}">${escapeHtml(g)}</strong>
-          </div>
-          <div class="sub-actions rule-group-actions">
-            <select class="input small" data-role="mode" data-group="${escapeHtml(g)}"
-              aria-label="${escapeHtml(g + ': ' + t('localrules.target'))}">${modeSel}</select>
-            ${pickHtml}
-          </div>`;
-        list.appendChild(div);
-        syncPickVisibility(div, cur, selectable);
-      }
-
-      list.querySelectorAll('select[data-role="mode"]').forEach((sel) => {
-        sel.addEventListener('change', async () => {
-          const next = { ...(info.overrides || {}) };
-          const g = sel.dataset.group;
-          if (sel.value === 'source') delete next[g];
-          else next[g] = sel.value;
-          sel.disabled = true;
-          try {
-            App.commitSettings(await call(api.updateSettings, { ruleOverrides: next }));
-            info.overrides = next;
-            const row = sel.closest('.rule-group-item');
-            syncPickVisibility(row, sel.value, selectableTargets.has(g));
-            if (App.refreshSelects) App.refreshSelects(row);
-            toast(t('settings.saved'));
-            rulesReady = false;
-            await loadRules({ force: true });
-          } catch (_) {
-            /* call() already showed the error */
-          } finally {
-            sel.disabled = false;
-          }
-        });
-      });
-
-      list.querySelectorAll('select[data-role="pick"]').forEach((sel) => {
-        sel.addEventListener('change', async () => {
-          const g = sel.dataset.group;
-          sel.disabled = true;
-          try {
-            const result = await call(api.setRuleGroupOutbound, g, sel.value);
-            if (result && result.settings) App.commitSettings(result.settings);
-            info.selections = {
-              ...(info.selections || {}),
-              [g]: sel.value,
-            };
-            // Running core may predate enriched selector members — rebuild once.
-            if (result && result.applied === false && App.state.status && App.state.status.running) {
-              try {
-                if (api.restartCore) await call(api.restartCore);
-              } catch (_) { /* call() already toasted */ }
-            }
-            toast(t('settings.saved'));
-          } catch (_) {
-            /* call() already showed the error */
-          } finally {
-            sel.disabled = false;
-          }
-        });
-      });
-
-      if (App.enhanceSelects) App.enhanceSelects(list);
-      ruleGroupsReady = true;
-    })().finally(() => {
-      if (ruleGroupsLoading === request) ruleGroupsLoading = null;
-    });
-    ruleGroupsLoading = request;
-    return request;
-  }
-  $('#ruleGroupRefresh').addEventListener('click', () => loadRuleGroups({ force: true }));
-
   // ---------- Local rules ----------
   const MATCH_LABELS = {
     domain: 'DOMAIN',
     domain_suffix: 'DOMAIN-SUFFIX',
     domain_keyword: 'DOMAIN-KEYWORD',
     ip_cidr: 'IP-CIDR',
+    ip_asn: 'IP-ASN',
     process_name: 'PROCESS-NAME',
   };
   async function loadLocalRules(options = {}) {
@@ -336,17 +192,19 @@
     }
     const tgt = { proxy: t('customrs.targetProxy'), direct: t('customrs.targetDirect'), reject: t('customrs.targetReject') };
     for (const it of items) {
-      const matchLabel = escapeHtml(MATCH_LABELS[it.matchType] || it.matchType || '');
-      const targetLabel = escapeHtml(tgt[it.target] || it.target || '');
+      const textMode = it.mode === 'text';
+      const matchLabel = escapeHtml(textMode ? t('localrules.textType') : (MATCH_LABELS[it.matchType] || it.matchType || ''));
+      const targetLabel = escapeHtml(textMode ? t('localrules.inlineTargets') : (tgt[it.target] || it.target || ''));
+      const count = textMode ? (it.rules || []).length : (it.values || []).length;
       const id = escapeHtml(it.id);
-      const itemName = it.name || MATCH_LABELS[it.matchType] || it.matchType || '';
+      const itemName = it.name || (textMode ? t('localrules.textType') : (MATCH_LABELS[it.matchType] || it.matchType || ''));
       const actionLabel = (label) => escapeHtml(`${label}: ${itemName}`);
       const div = document.createElement('div');
       div.className = 'sub-item';
       div.innerHTML = `
         <div class="sub-info">
           <div class="sub-name">${escapeHtml(itemName)}${it.enabled ? '' : ' · ⏸'}</div>
-          <div class="sub-meta">${matchLabel} · ${targetLabel} · ${t('localrules.count', (it.values || []).length)}</div>
+          <div class="sub-meta">${matchLabel} · ${targetLabel} · ${t('localrules.count', count)}</div>
         </div>
         <div class="sub-actions">
           <button type="button" class="btn" data-act="toggle" data-id="${id}" aria-label="${actionLabel(it.enabled ? t('customrs.disable') : t('customrs.enable'))}">${it.enabled ? t('customrs.disable') : t('customrs.enable')}</button>
@@ -385,39 +243,30 @@
   $('#lrAdd').addEventListener('click', () => App.openDialog('local-rule'));
 
   function invalidateRuleCaches() {
+    if (ruleFilterTimer) clearTimeout(ruleFilterTimer);
+    ruleFilterTimer = null;
     ruleLoadGeneration++;
     rulesLoading = null;
     localRulesLoading = null;
-    ruleGroupsLoading = null;
     rulesReady = false;
     localRulesReady = false;
-    ruleGroupsReady = false;
   }
 
   function releaseRuleCache() {
-    ruleLoadGeneration++;
-    rulesLoading = null;
-    localRulesLoading = null;
-    ruleGroupsLoading = null;
-    rulesReady = false;
-    localRulesReady = false;
-    ruleGroupsReady = false;
+    invalidateRuleCaches();
     ruleItems = [];
     visibleRuleItems = [];
     $('#ruleList').classList.remove('is-empty');
     $('#ruleList').textContent = '';
     $('#ruleCount').textContent = '';
     $('#lrList').textContent = '';
-    $('#ruleGroupList').textContent = '';
   }
 
   App.loadRules = loadRules;
   App.loadLocalRules = loadLocalRules;
-  App.loadRuleGroups = loadRuleGroups;
-  App.refreshRuleGroupLabels = refreshRuleGroupLabels;
   App.ensureRulesLoaded = () => loadRules({ force: false });
   App.ensureLocalRulesLoaded = () => loadLocalRules({ force: false });
-  App.ensureRuleGroupsLoaded = () => loadRuleGroups({ force: false });
   App.invalidateRuleCaches = invalidateRuleCaches;
   App.releaseRuleCache = releaseRuleCache;
+  App.registerRendererModule('rules');
 })();

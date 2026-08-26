@@ -281,6 +281,7 @@ module.exports = {
   healthSummary,
   importHealthSignals,
   observeHealthSignal,
+  normalizeSignalName,
   resetHealthSignals,
   retainHealthSignals,
 };

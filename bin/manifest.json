@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "components": [
+    {
+      "type": "application",
+      "name": "mihomo",
+      "version": "1.19.29-dart.18",
+      "repository": "https://github.com/blakebill/mihomo",
+      "license": "GPL-3.0-only",
+      "asset": "mihomo-windows-amd64-v1.19.29-dart.18.zip",
+      "assetSha256": "650e37b76f9608678b5c9c208c8a7053b11d9287aae42433e1c288c75b2204c2",
+      "binaryPath": "mihomo/mihomo.exe"
+    },
+    {
+      "type": "data",
+      "name": "meta-rules-dat-geoip",
+      "version": "latest",
+      "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+      "license": "GPL-3.0-only",
+      "asset": "geoip.dat",
+      "assetSha256": "6ba63d75f307d16a81ae09406ddcf2779fa75cb642d4aae59613370d62d33509",
+      "binaryPath": "mihomo/geoip.dat"
+    },
+    {
+      "type": "data",
+      "name": "meta-rules-dat-geosite",
+      "version": "latest",
+      "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+      "license": "GPL-3.0-only",
+      "asset": "geosite.dat",
+      "assetSha256": "ebe025201883b095a62c4b2d72e1477ec4f14a5afba132f1effe7651cb4921cf",
+      "binaryPath": "mihomo/geosite.dat"
+    },
+    {
+      "type": "data",
+      "name": "meta-rules-dat-country",
+      "version": "latest",
+      "repository": "https://github.com/MetaCubeX/meta-rules-dat",
+      "license": "GPL-3.0-only",
+      "asset": "country.mmdb",
+      "assetSha256": "80a846466123b76373bb2e9da1d27708a0c87e795d4650f60f82c7d179c8c9d0",
+      "binaryPath": "mihomo/country.mmdb"
+    }
+  ],
+  "files": [
+    {
+      "path": "mihomo/country.mmdb",
+      "size": 7903639,
+      "sha256": "80a846466123b76373bb2e9da1d27708a0c87e795d4650f60f82c7d179c8c9d0"
+    },
+    {
+      "path": "mihomo/geodata-meta.json",
+      "size": 126,
+      "sha256": "f8b7a0a0f75ef346e00f1acf508c68520d2cb21664f4b47a9504096549dd9cdc"
+    },
+    {
+      "path": "mihomo/geoip.dat",
+      "size": 17483060,
+      "sha256": "6ba63d75f307d16a81ae09406ddcf2779fa75cb642d4aae59613370d62d33509"
+    },
+    {
+      "path": "mihomo/geosite.dat",
+      "size": 4238038,
+      "sha256": "ebe025201883b095a62c4b2d72e1477ec4f14a5afba132f1effe7651cb4921cf"
+    },
+    {
+      "path": "mihomo/mihomo.exe",
+      "size": 47396352,
+      "sha256": "0803745e5b14232e2205a05c1212e381c9cb587330149dd4593c18b644008671"
+    }
+  ]
+}

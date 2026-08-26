@@ -34,12 +34,8 @@
     padding-left: 18px;
   }
 
-  .runtime-profile {
-    display: none;
-  }
-
   .runtime-strip {
-    min-width: 104px;
+    min-width: 170px;
   }
 
   .cards {
@@ -53,7 +49,7 @@
   }
 
   .card-value {
-    font-size: 17px;
+    font-size: var(--font-metric);
   }
 
   .card-hint {
@@ -94,7 +90,7 @@
     grid-template-columns: 1fr;
   }
 
-  #tab-rules > .rule-remote-section,
+  #tab-rules > .rule-management-section,
   #tab-rules > .rule-browser-section {
     grid-column: auto;
   }
@@ -145,12 +141,11 @@
     min-width: 0;
     padding-left: 6px;
     padding-right: 6px;
-    font-size: 12px;
+    font-size: var(--font-small);
   }
 
-  .quality-metrics,
-  .dashboard-event-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .switch-list {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .remote-rule-form,
@@ -240,7 +235,7 @@
 
   .card-value {
     min-height: 23px;
-    font-size: 18px;
+    font-size: var(--font-metric);
   }
 
   .card-hint {
@@ -332,7 +327,6 @@
     --surface-hover: rgb(62, 62, 66);
     --field: rgb(24, 24, 27);
     --menu-surface: rgb(42, 42, 45);
-    --raised-filter: none;
   }
 
   :root[data-theme='light'] {
@@ -369,13 +363,13 @@
     --on-accent: HighlightText;
     --shadow: none;
     --panel-shadow: none;
-    --raised-filter: none;
   }
 
   .panel,
   .card,
   .ui-select-menu,
   .node-context-menu,
+  .sub-overflow-menu,
   .toast,
   .native-dialog-window {
     box-shadow: none;

@@ -1,10 +1,13 @@
 'use strict';
 
 const {
-  MAX_IPC_CONNECTIONS,
-  recentConnections,
   reqBoolean,
 } = require('./ipc-validation');
+const {
+  ConnectionSnapshotService,
+  boundedCounter,
+  projectConnectionRows,
+} = require('./connection-snapshot-service');
 
 function pausedSnapshot(state) {
   return {
@@ -17,51 +20,11 @@ function pausedSnapshot(state) {
   };
 }
 
-function boundedCounter(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0
-    ? Math.min(Number.MAX_SAFE_INTEGER, number)
-    : 0;
-}
-
-function boundedText(value, max = 256) {
-  return typeof value === 'string' ? value.slice(0, max) : '';
-}
-
 function connectionRows(data) {
   const source = Array.isArray(data && data.connections) ? data.connections : [];
-  const sortKey = (value) => {
-    const connection = value && typeof value === 'object' ? value : {};
-    const id = typeof connection.id === 'string' && connection.id.length <= 1024
-      ? connection.id
-      : '';
-    return boundedText(connection.start, 128) + '\0' + id;
-  };
-  const connections = recentConnections(source, MAX_IPC_CONNECTIONS, sortKey).map((value) => {
-    const connection = value && typeof value === 'object' ? value : {};
-    const metadata = connection.metadata || {};
-    return {
-      id: typeof connection.id === 'string' && connection.id.length <= 1024
-        ? connection.id
-        : '',
-      start: boundedText(connection.start, 128),
-      upload: boundedCounter(connection.upload),
-      download: boundedCounter(connection.download),
-      rule: boundedText(connection.rule),
-      chains: Array.isArray(connection.chains)
-        ? connection.chains.slice(0, 16).map((item) => boundedText(item))
-        : [],
-      metadata: {
-        host: boundedText(metadata.host, 1024),
-        destinationIP: boundedText(metadata.destinationIP, 128),
-        destinationPort: boundedText(String(metadata.destinationPort || ''), 32),
-        network: boundedText(metadata.network, 32),
-      },
-    };
-  });
   return {
     running: true,
-    connections,
+    connections: projectConnectionRows(source),
     totalConnections: source.length,
     up: boundedCounter(data && data.uploadTotal),
     down: boundedCounter(data && data.downloadTotal),
@@ -83,6 +46,9 @@ function windowCanReceiveDetails(win, contents) {
 
 /** Own the detailed-connection visibility lease and its IPC surface. */
 function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
+  const snapshots = core.connectionSnapshots instanceof ConnectionSnapshotService
+    ? core.connectionSnapshots
+    : new ConnectionSnapshotService({ load: () => core.clashApi('GET', '/connections') });
   const views = new WeakMap();
   const observedWindows = new WeakSet();
 
@@ -92,6 +58,7 @@ function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
     // unchanged. This invalidates old requests if a prior release IPC was lost.
     const next = { visible, revision: previous.revision + 1 };
     views.set(contents, next);
+    if (previous.visible !== visible) snapshots.invalidate();
     return next;
   }
 
@@ -143,7 +110,7 @@ function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
     }
     if (!state.coreManager.isRunning()) return { running: false, totalConnections: 0 };
     try {
-      const data = await core.clashApi('GET', '/connections');
+      const data = await snapshots.summary();
       try {
         if (!windowCanReceiveDetails(requireMainWindow(event), event.sender)) {
           return { running: state.coreManager.isRunning(), paused: true, totalConnections: 0 };
@@ -153,7 +120,7 @@ function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
       }
       return {
         running: true,
-        totalConnections: Array.isArray(data.connections) ? data.connections.length : 0,
+        totalConnections: data.totalConnections,
       };
     } catch (error) {
       try {
@@ -178,11 +145,11 @@ function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
       return { running: false, connections: [], up: 0, down: 0 };
     }
     try {
-      const data = await core.clashApi('GET', '/connections');
+      const data = await snapshots.rendererRows();
       // A page switch can overtake the API response. Never clone stale rows
       // back into a Renderer that has already released the feature.
       if (!leaseIsCurrent(event, lease)) return pausedSnapshot(state);
-      return connectionRows(data);
+      return { running: true, ...data };
     } catch (error) {
       if (!leaseIsCurrent(event, lease)) return pausedSnapshot(state);
       return {
@@ -203,14 +170,62 @@ function registerConnectionsIpc({ ipcMain, state, core, requireMainWindow }) {
       /[\u0000-\u001f\u007f]/.test(id)
     ) throw new Error('invalid connection id');
     if (state.coreManager.isRunning()) {
-      await core.clashApi('DELETE', '/connections/' + encodeURIComponent(id));
+      try {
+        await core.clashApi('DELETE', '/connections/' + encodeURIComponent(id));
+      } finally {
+        snapshots.invalidate();
+      }
     }
     return true;
   });
 
+  ipcMain.handle('connections:closeMany', async (event, payload = {}) => {
+    requireMainWindow(event);
+    const input = payload && payload.ids;
+    if (!Array.isArray(input) || input.length < 1 || input.length > 300) {
+      throw new Error('invalid connection ids');
+    }
+    const ids = [...new Set(input)];
+    for (const id of ids) {
+      if (
+        typeof id !== 'string' || !id.trim() || id.length > 1024 ||
+        /[\u0000-\u001f\u007f]/.test(id)
+      ) throw new Error('invalid connection id');
+    }
+    if (!state.coreManager.isRunning()) return { closed: 0 };
+
+    let closed = 0;
+    const failures = [];
+    try {
+      // Keep the local API responsive when a filter matches many rows.
+      for (let offset = 0; offset < ids.length; offset += 8) {
+        const results = await Promise.allSettled(ids.slice(offset, offset + 8).map((id) => (
+          core.clashApi('DELETE', '/connections/' + encodeURIComponent(id))
+        )));
+        for (const result of results) {
+          if (result.status === 'fulfilled') closed += 1;
+          else failures.push(result.reason);
+        }
+      }
+    } finally {
+      snapshots.invalidate();
+    }
+    if (failures.length) {
+      const error = failures[0];
+      throw new Error(`failed to close ${failures.length} connection(s): ${error && error.message || error}`);
+    }
+    return { closed };
+  });
+
   ipcMain.handle('connections:closeAll', async (event) => {
     requireMainWindow(event);
-    if (state.coreManager.isRunning()) await core.clashApi('DELETE', '/connections');
+    if (state.coreManager.isRunning()) {
+      try {
+        await core.clashApi('DELETE', '/connections');
+      } finally {
+        snapshots.invalidate();
+      }
+    }
     return true;
   });
 }

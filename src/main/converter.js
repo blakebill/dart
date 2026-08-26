@@ -5,11 +5,13 @@ const {
   mihomoPolicyGroups,
 } = require('./policy-groups');
 const { smartRegionMembers } = require('./node-region');
+const { normalizeProxyProviders } = require('./proxy-providers');
 
 const AUTO_GROUP = '♻️ Auto';
 const SMART_GROUP = '🧠 Smart';
 const FALLBACK_GROUP = '🛟 Fallback';
 const APP_PROXY_GROUP = '🚀 Proxy';
+const GLOBAL_GROUP = 'GLOBAL';
 const DEFAULT_TEST_URL = 'http://www.gstatic.com/generate_204';
 const AUTO_TEST_INTERVAL_SECONDS = 60;
 const AUTO_TEST_TIMEOUT_MS = 5000;
@@ -19,7 +21,7 @@ function normalizeSmartMode(value) {
   return SMART_MODES.has(value) ? value : 'balanced';
 }
 
-const APP_SELECTOR_ANCHORS = [APP_PROXY_GROUP, AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP];
+const SOURCE_SELECTOR_ANCHORS = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP];
 
 function cleanOutboundName(value) {
   const name = typeof value === 'string' ? value.trim() : '';
@@ -53,23 +55,62 @@ function isBareRejectOutbound(name) {
   return !!(n && (n === 'reject' || n === 'REJECT' || n === 'REJECT-DROP' || /^reject(-drop)?$/i.test(n)));
 }
 
-function isPreferDirectOrRejectMember(name) {
-  const n = cleanOutboundName(name);
-  if (!n) return false;
-  if (isBareDirectOutbound(n)) return true;
-  if (isBareRejectOutbound(n)) return true;
-  return n.includes('直连') || n.includes('拦截') || n.includes('拒绝') || n.includes('广告')
-    || n.toLowerCase().includes('direct');
+const REDUNDANT_SOURCE_PICK_ROLES = new Set([
+  'proxy', 'proxies', 'direct', 'global', 'reject', 'reject-drop',
+]);
+const RULE_OVERRIDE_MODES = new Set(['source', 'proxy', 'direct', 'reject']);
+
+function sourcePickRole(name) {
+  return cleanOutboundName(name)
+    .replace(/^[^\p{L}\p{N}]+/u, '')
+    .replace(/[^\p{L}\p{N}]+$/u, '')
+    .toLowerCase();
 }
 
-/** Options that must not appear in the "选择出站" picker (bare direct / 全球直连-style). */
+/** Options superseded by Dart's own selectors or force-routing controls. */
 function isExcludedSourcePick(name) {
   const n = cleanOutboundName(name);
   if (!n) return true;
-  if (isBareDirectOutbound(n)) return true;
-  // Subscription "global direct" style labels — not the same as app 🚀 Proxy picks.
+  if (isBareDirectOutbound(n) || isBareRejectOutbound(n)) return true;
+  if (REDUNDANT_SOURCE_PICK_ROLES.has(sourcePickRole(n))) return true;
+  // Subscription "global direct" style labels are covered by the adjacent
+  // force-routing buttons and do not belong in the source-outbound picker.
   if (n.includes('直连')) return true;
   return false;
+}
+
+function inferredRuleGroupMode(group) {
+  const type = String(group && group.type || '').toLowerCase();
+  if (type && type !== 'select' && type !== 'selector') return 'source';
+  const candidate = cleanOutboundName(group && (group.default || (group.members || [])[0]));
+  if (!candidate) return 'source';
+  const role = sourcePickRole(candidate);
+  if (isBareDirectOutbound(candidate) || role === 'direct' || candidate.includes('直连')) return 'direct';
+  if (
+    isBareRejectOutbound(candidate) || role === 'reject' || role === 'reject-drop' ||
+    candidate.includes('拒绝') || candidate.includes('拦截')
+  ) return 'reject';
+  if (candidate === APP_PROXY_GROUP || role === 'proxy' || role === 'proxies' || role === 'global') {
+    return 'proxy';
+  }
+  return 'source';
+}
+
+/** Merge subscription intent with explicit user choices without persisting inferred state. */
+function effectiveRuleGroupOverrides(groups, explicitOverrides = null) {
+  const result = {};
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const name = cleanOutboundName(group && group.name);
+    const mode = inferredRuleGroupMode(group);
+    if (name && mode !== 'source') result[name] = mode;
+  }
+  if (explicitOverrides && typeof explicitOverrides === 'object' && !Array.isArray(explicitOverrides)) {
+    for (const [rawName, mode] of Object.entries(explicitOverrides)) {
+      const name = cleanOutboundName(rawName);
+      if (name && RULE_OVERRIDE_MODES.has(mode)) result[name] = mode;
+    }
+  }
+  return result;
 }
 
 /**
@@ -77,24 +118,23 @@ function isExcludedSourcePick(name) {
  * groups stay as real selectors so the UI can pick an outbound from the app
  * node list.
  */
-function prepareSourcePolicyGroups(policyGroups, nodeNames = []) {
-  return normalizePolicyGroups(policyGroups, nodeNames);
+function prepareSourcePolicyGroups(policyGroups, nodeNames = [], proxyProviders = []) {
+  return normalizePolicyGroups(policyGroups, nodeNames, proxyProviders);
 }
 
 /**
  * Expand each select-type source group so the Clash API / UI picker can choose
- * the app main selector, strategy groups, every node, or residual original
- * members (nested groups, direct, …). Applies persisted `ruleGroupSelections`.
+ * the strategy groups, every node, or residual original members. Generic
+ * proxy/direct/reject/global entries are handled by the adjacent mode buttons.
+ * Applies persisted `ruleGroupSelections`.
  *
- * Proxy-first groups default to 🚀 Proxy (follow the Nodes tab pick) when the
- * user has not chosen yet; prefer-direct groups keep their original first
- * member.
+ * Valid source defaults are retained; removed generic defaults fall back to Auto.
  */
 function applySourceGroupSelections(groups, nodeNames = [], selections = null) {
   const nodes = (Array.isArray(nodeNames) ? nodeNames : [])
     .map((value) => (typeof value === 'string' ? value : value && value.name))
     .map(cleanOutboundName)
-    .filter(Boolean);
+    .filter((name) => name && !isExcludedSourcePick(name));
   const picks = selections && typeof selections === 'object' && !Array.isArray(selections)
     ? selections
     : {};
@@ -102,23 +142,11 @@ function applySourceGroupSelections(groups, nodeNames = [], selections = null) {
     if (!group || (group.type !== 'select' && group.type !== 'selector')) return group;
     const original = uniqueOutboundNames(group.members);
     const firstOriginal = original[0] || '';
-    const preferDirect = !!(firstOriginal && isPreferDirectOrRejectMember(firstOriginal));
-    const hasReject = original.some((member) => isBareRejectOutbound(member));
-    // Drop bare direct / 全球直连-style entries from the selectable list, except
-    // keep bare `direct` when this group itself is prefer-direct (needs a default).
-    // Keep bare `reject` only when the subscription group already offered it.
-    const originalKept = original.filter((member) => {
-      if (isBareRejectOutbound(member)) return hasReject;
-      if (isBareDirectOutbound(member)) return preferDirect;
-      if (isExcludedSourcePick(member)) return false;
-      return true;
-    });
+    const originalKept = original.filter((member) => !isExcludedSourcePick(member));
     const members = uniqueOutboundNames([
-      ...APP_SELECTOR_ANCHORS,
+      ...SOURCE_SELECTOR_ANCHORS,
       ...originalKept,
       ...nodes,
-      ...(preferDirect ? ['direct'] : []),
-      ...(hasReject ? ['reject'] : []),
     ]);
     if (!members.length) return group;
 
@@ -131,15 +159,7 @@ function applySourceGroupSelections(groups, nodeNames = [], selections = null) {
     let chosen = saved && members.includes(norm(saved)) ? norm(saved) : '';
     if (!chosen) {
       const preferred = norm(cleanOutboundName(group.default) || original[0] || '');
-      if (preferred && isPreferDirectOrRejectMember(preferred) && members.includes(preferred)) {
-        chosen = preferred;
-      } else if (members.includes(APP_PROXY_GROUP)) {
-        chosen = APP_PROXY_GROUP;
-      } else if (preferred && members.includes(preferred)) {
-        chosen = preferred;
-      } else {
-        chosen = members[0];
-      }
+      chosen = preferred && members.includes(preferred) ? preferred : members[0];
     }
     // Put the active pick first so Mihomo (no selector default field) starts on it.
     const ordered = [chosen, ...members.filter((name) => name !== chosen)];
@@ -148,18 +168,15 @@ function applySourceGroupSelections(groups, nodeNames = [], selections = null) {
 }
 
 /**
- * UI picker list for one wired source group. Hides bare direct / 全球直连-style
- * labels; includes reject only when that group actually has a reject strategy.
+ * UI picker list for one wired source group. Generic routing roles are exposed
+ * by the adjacent mode buttons instead of being duplicated here.
  */
 function sourcePicksForWiredGroup(group) {
-  return uniqueOutboundNames(group && group.members || []).filter((name) => {
-    if (isBareDirectOutbound(name)) return false;
-    if (isExcludedSourcePick(name)) return false;
-    return true;
-  });
+  return uniqueOutboundNames(group && group.members || [])
+    .filter((name) => !isExcludedSourcePick(name));
 }
 
-/** Flat picker options (anchors + nodes + non-direct extras). Used as a fallback. */
+/** Flat picker options (strategy anchors + nodes + non-generic extras). */
 function sourceGroupPickOptions(nodes = [], groups = []) {
   const nodeNames = (Array.isArray(nodes) ? nodes : [])
     .map((value) => (typeof value === 'string' ? value : value && value.name))
@@ -175,10 +192,10 @@ function sourceGroupPickOptions(nodes = [], groups = []) {
     }
   }
   return uniqueOutboundNames([
-    ...APP_SELECTOR_ANCHORS,
+    ...SOURCE_SELECTOR_ANCHORS,
     ...nodeNames,
     ...extras,
-  ]).filter((name) => !isExcludedSourcePick(name) && !isBareRejectOutbound(name));
+  ]).filter((name) => !isExcludedSourcePick(name));
 }
 
 /**
@@ -204,6 +221,7 @@ function buildMihomoSmartGroup(proxyNames, opts = {}) {
     latencyUrl = DEFAULT_TEST_URL,
     smartMode = 'balanced',
   } = opts;
+  const providerNames = Array.isArray(opts.providerNames) ? opts.providerNames.filter(Boolean) : [];
   if (kernelSmart) {
     const group = {
       name: SMART_GROUP,
@@ -214,10 +232,13 @@ function buildMihomoSmartGroup(proxyNames, opts = {}) {
       timeout: AUTO_TEST_TIMEOUT_MS,
       lazy: true,
     };
+    if (providerNames.length) group.use = providerNames;
     if (kernelSmartMode) group.mode = normalizeSmartMode(smartMode);
     return group;
   }
-  return { name: SMART_GROUP, type: 'select', proxies: proxyNames };
+  const group = { name: SMART_GROUP, type: 'select', proxies: proxyNames };
+  if (providerNames.length) group.use = providerNames;
+  return group;
 }
 
 function cleanObject(obj) {
@@ -227,6 +248,16 @@ function cleanObject(obj) {
 /** Convert an internal node object back into a Clash/Mihomo proxy object. */
 function nodeToClashProxy(node) {
   if (!node || !node.type) return null;
+  if (node.mihomoProxy && typeof node.mihomoProxy === 'object' && !Array.isArray(node.mihomoProxy)) {
+    // Native Mihomo subscriptions are authoritative. Only the identity fields
+    // normalized by the app (notably collision-safe names) are overlaid.
+    return cleanObject({
+      ...node.mihomoProxy,
+      name: node.name,
+      server: node.server,
+      port: node.port,
+    });
+  }
   const base = { name: node.name, server: node.server, port: node.port };
   switch (node.type) {
     case 'ss':
@@ -715,6 +746,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     ruleOverrides = null,
     ruleGroupSelections = null,
     ruleProviders = {},
+    proxyProviders = {},
     enableIpv6 = true,
     enableTun = false,
     tunInterfaceName = 'Dart',
@@ -733,14 +765,18 @@ function buildMihomoConfig(nodes, opts = {}) {
     .filter((entry) => !!entry.proxy);
   const proxies = dedupeProxyNames(nodeEntries.map((entry) => entry.proxy));
   const proxyNames = proxies.map((p) => p.name);
-  if (!proxyNames.length) throw new Error('No supported proxy nodes are available.');
+  const mihomoProxyProviders = normalizeProxyProviders(proxyProviders);
+  const providerNames = Object.keys(mihomoProxyProviders);
+  if (!proxyNames.length && !providerNames.length) throw new Error('No supported proxy nodes are available.');
   const smartProxyNames = smartRegionMembers(
     nodeEntries.map((entry) => entry.node),
     proxyNames,
     opts.smartRegions
   );
+  const preparedSourceGroups = prepareSourcePolicyGroups(policyGroups, proxyNames, providerNames);
+  const effectiveOverrides = effectiveRuleGroupOverrides(preparedSourceGroups, ruleOverrides);
   const sourceGroups = applySourceGroupSelections(
-    prepareSourcePolicyGroups(policyGroups, proxyNames),
+    preparedSourceGroups,
     proxyNames,
     ruleGroupSelections
   );
@@ -749,9 +785,8 @@ function buildMihomoConfig(nodes, opts = {}) {
   const mihomoRuleProviders = normalizeMihomoRuleProviders(ruleProviders);
   const availableRuleProviders = new Set(Object.keys(mihomoRuleProviders));
   const latencyUrl = String(testUrl || '').trim() || DEFAULT_TEST_URL;
-  // Keep the main selector acyclic: 🚀 Proxy must not list source policy groups. Those groups
-  // already include 🚀 Proxy for "follow main selection"; nesting both ways is a
-  // cycle (Mihomo may accept it, but selection/routing becomes undefined).
+  // Keep the main selector small and acyclic: source policy groups remain rule
+  // targets and never become members of Dart's primary node selector.
   const proxyMembers = [AUTO_GROUP, SMART_GROUP, FALLBACK_GROUP, ...proxyNames, 'DIRECT'];
   const defaultProxy =
     selected && (proxyMembers.includes(selected) || selected === 'direct')
@@ -769,11 +804,13 @@ function buildMihomoConfig(nodes, opts = {}) {
   for (const name of proxyMembers) addManual(name);
 
   const autoGroup = { name: AUTO_GROUP, type: 'select', proxies: proxyNames };
+  if (providerNames.length) autoGroup.use = providerNames;
   const smartGroup = buildMihomoSmartGroup(smartProxyNames, {
     kernelSmart: !!opts.kernelSmart,
     kernelSmartMode: !!opts.kernelSmartMode,
     latencyUrl,
     smartMode: opts.smartMode,
+    providerNames,
   });
 
   const rules = [];
@@ -796,7 +833,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     for (const rule of privateDirect) rules.push(rule);
     for (const r of extraRules) {
       if (typeof r === 'string') {
-        const converted = clashRuleToMihomo(r, ruleOverrides, availableRuleProviders, availableTargets);
+        const converted = clashRuleToMihomo(r, effectiveOverrides, availableRuleProviders, availableTargets);
         if (converted && !/^MATCH,/i.test(converted)) rules.push(converted);
         continue;
       }
@@ -804,11 +841,11 @@ function buildMihomoConfig(nodes, opts = {}) {
     }
     for (const raw of flattenClashRules(clashRules)) {
       if (raw && typeof raw === 'object' && raw.logical === 'AND') {
-        const combined = andDescriptorToMihomoRule(raw, ruleOverrides, availableTargets);
+        const combined = andDescriptorToMihomoRule(raw, effectiveOverrides, availableTargets);
         if (combined) rules.push(combined);
         continue;
       }
-      const rule = clashRuleToMihomo(raw, ruleOverrides, availableRuleProviders, availableTargets);
+      const rule = clashRuleToMihomo(raw, effectiveOverrides, availableRuleProviders, availableTargets);
       if (!hasGeoData && /^(GEOIP|GEOSITE),/i.test(rule || '')) continue;
       if (/^MATCH,/i.test(rule || '')) finalRule = rule;
       else if (rule) rules.push(rule);
@@ -840,13 +877,28 @@ function buildMihomoConfig(nodes, opts = {}) {
     'geo-auto-update': false,
     proxies,
     'proxy-groups': [
-      { name: '🚀 Proxy', type: 'select', proxies: manualProxies },
+      {
+        name: '🚀 Proxy',
+        type: 'select',
+        proxies: manualProxies,
+        ...(providerNames.length ? { use: providerNames } : {}),
+      },
+      // Mihomo's global mode routes through the reserved GLOBAL selector and
+      // ignores every rule target. Defining it explicitly keeps Global aligned
+      // with the same Dart selection used by Rule mode instead of Mihomo's
+      // auto-generated selector (whose first candidate can be DIRECT).
+      {
+        name: GLOBAL_GROUP,
+        type: 'select',
+        proxies: [APP_PROXY_GROUP],
+      },
       autoGroup,
       smartGroup,
       {
         name: FALLBACK_GROUP,
         type: 'fallback',
         proxies: proxyNames,
+        ...(providerNames.length ? { use: providerNames } : {}),
         url: latencyUrl,
         interval: AUTO_TEST_INTERVAL_SECONDS,
         timeout: AUTO_TEST_TIMEOUT_MS,
@@ -912,6 +964,7 @@ function buildMihomoConfig(nodes, opts = {}) {
     if (externalUiDownloadUrl) config['external-ui-url'] = externalUiDownloadUrl;
   }
   if (availableRuleProviders.size) config['rule-providers'] = mihomoRuleProviders;
+  if (providerNames.length) config['proxy-providers'] = mihomoProxyProviders;
   return config;
 }
 
@@ -922,6 +975,7 @@ module.exports = {
   coreSupportsKernelSmart,
   buildMihomoSmartGroup,
   prepareSourcePolicyGroups,
+  effectiveRuleGroupOverrides,
   applySourceGroupSelections,
   sourceGroupPickOptions,
   sourcePicksForWiredGroup,

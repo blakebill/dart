@@ -12,13 +12,47 @@ const yaml = require('js-yaml');
 const fetch = require('./fetch');
 const github = require('./github');
 const { getCoreAdapter, hasCoreAdapter, normalizeCoreType } = require('./core-adapters');
-const { verifyFileSha256 } = require('./integrity');
+const { assetSha256, verifyFileSha256 } = require('./integrity');
 const { uniqueSibling, replaceFileSync, replaceFileBatchSync, writeJsonAtomicSync } = require('./file-utils');
 const { cleanupRetiredCoreArtifacts } = require('./retired-core-cleanup');
 
+// Status rendering, tray refreshes and startup capability checks can all ask
+// for the same binary path within one event burst. On Windows every existsSync
+// may cross Defender/filter drivers, so keep a deliberately short cache while
+// still noticing external installs/removals without requiring an app restart.
+const BINARY_PATH_CACHE_TTL_MS = 5_000;
+
 const CORE_START_MIN_ALIVE_MS = 600;
 const CORE_START_MAX_WAIT_MS = 8000;
+const CORE_TUN_START_MAX_WAIT_MS = 12000;
 const CORE_START_POLL_MS = 100;
+
+/**
+ * Mihomo 1.19.29 can print a failed `-t` result while still exiting with code
+ * zero. Treat its structured error/failure output as authoritative so feature
+ * probes and GeoData validation cannot accept an unusable configuration.
+ */
+function mihomoConfigCheckPassed(code, stdout = '', stderr = '') {
+  if (code !== 0) return false;
+  const output = `${stdout || ''}\n${stderr || ''}`;
+  return !/(?:\blevel=error\b|\btest failed\b|configuration file .* test failed)/i.test(output);
+}
+
+/** Extract the few startup log lines that describe a usable core boundary. */
+function mihomoStartupSignal(line, tunExpected = false) {
+  const text = stripAnsi(String(line || '')).trim();
+  if (!text) return null;
+  if (tunExpected && /\[TUN\]\s+Tun adapter listening at:/i.test(text)) {
+    return { tunReady: true };
+  }
+  if (
+    /(?:Start Mixed\(http\+socks\) server|External controller listen) error:/i.test(text) ||
+    (tunExpected && /Start TUN listening error:/i.test(text))
+  ) {
+    return { error: text };
+  }
+  return null;
+}
 
 /** TCP probe for a generated local proxy/controller port. */
 function probeLocalPort(port, timeoutMs = 250) {
@@ -41,6 +75,25 @@ function probeLocalPort(port, timeoutMs = 250) {
   });
 }
 
+function localControllerTarget(config) {
+  if (!config || typeof config !== 'object') return null;
+  const controller = config['external-controller'];
+  const rawController = String(controller || '').trim();
+  if (!rawController) return null;
+  try {
+    const url = new URL(rawController.startsWith(':')
+      ? `http://127.0.0.1${rawController}`
+      : rawController.includes('://') ? rawController : `http://${rawController}`);
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const port = Number(url.port);
+    if (!['127.0.0.1', 'localhost', '0.0.0.0', '::1', '::'].includes(host)) return null;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    return { host: (host === '0.0.0.0' || host === '::') ? '127.0.0.1' : host, port };
+  } catch (_) {
+    return null;
+  }
+}
+
 /** Local ports from a generated Mihomo config. */
 function listenPortsFromConfig(config) {
   if (!config || typeof config !== 'object') return [];
@@ -49,24 +102,29 @@ function listenPortsFromConfig(config) {
     const port = Number(value);
     if (Number.isInteger(port) && port > 0 && port <= 65535) ports.add(port);
   };
-  const mixed = Number(config['mixed-port']);
-  addPort(mixed);
-  const controller = config['external-controller'];
-  const rawController = String(controller || '').trim();
-  if (rawController) {
-    try {
-      const url = new URL(rawController.startsWith(':')
-        ? `http://127.0.0.1${rawController}`
-        : rawController.includes('://') ? rawController : `http://${rawController}`);
-      const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-      if (['127.0.0.1', 'localhost', '0.0.0.0', '::1', '::'].includes(host)) {
-        addPort(url.port);
-      }
-    } catch (_) {
-      /* Unix sockets and malformed custom endpoints are not TCP readiness probes. */
-    }
-  }
+  addPort(config['mixed-port']);
+  const controller = localControllerTarget(config);
+  if (controller) addPort(controller.port);
   return [...ports];
+}
+
+/** Read Mihomo's effective TUN state after the controller becomes reachable. */
+async function probeMihomoTun(config, timeoutMs = 400) {
+  const target = localControllerTarget(config);
+  if (!target) return null;
+  try {
+    const headers = config.secret ? { Authorization: `Bearer ${config.secret}` } : {};
+    const host = net.isIP(target.host) === 6 ? `[${target.host}]` : target.host;
+    const { body } = await fetch.getBuffer(`http://${host}:${target.port}/configs`, {
+      headers,
+      timeout: timeoutMs,
+      maxBytes: 256 * 1024,
+    });
+    const data = JSON.parse(body.toString('utf-8'));
+    return data && data.tun && typeof data.tun.enable === 'boolean' ? data.tun.enable : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // Matches ANSI CSI escape sequences (e.g. color codes like "\x1b[38;5;74m").
@@ -158,12 +216,13 @@ function runCapturedProcess(command, args, options = {}) {
   });
 }
 
-function mihomoGeoDataUrls(file) {
+function mihomoGeoDataUrls(file, ref = 'release') {
+  const sourceFile = file === 'ASN.mmdb' ? 'GeoLite2-ASN.mmdb' : file;
   return [
-    `https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${file}`,
-    `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
-    `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
-    `https://gcore.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}`,
+    `https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${sourceFile}`,
+    `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@${ref}/${sourceFile}`,
+    `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@${ref}/${sourceFile}`,
+    `https://gcore.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@${ref}/${sourceFile}`,
   ];
 }
 
@@ -199,7 +258,7 @@ function parseCoreVersion(output) {
   return match ? match[1] : null;
 }
 
-function validMihomoGeoFile(filePath, knownStat = null) {
+function validMihomoGeoFile(filePath, knownStat = null, expectedName = '') {
   try {
     const st = knownStat || fs.statSync(filePath);
     if (st.size < 1024) return false;
@@ -220,7 +279,8 @@ function validMihomoGeoFile(filePath, knownStat = null) {
     if (looksLikeTextError(head)) return false;
     if (sampleIsOneByte(head)) return false;
 
-    if (path.basename(filePath).toLowerCase() === 'country.mmdb') {
+    const logicalName = String(expectedName || path.basename(filePath)).toLowerCase();
+    if (['country.mmdb', 'asn.mmdb'].includes(logicalName)) {
       return tail.includes(Buffer.from('MaxMind.com'));
     }
     return true;
@@ -269,7 +329,9 @@ class CoreManager {
     this._coreDownloadPromise = null;
     this._coreDownloadController = null;
     this._geoUpdatePromises = new Map();
+    this._geoUpdateControllers = new Map();
     this._versionRequests = new Map();
+    this._binaryPathCache = new Map();
     this._fileValidationCache = new Map();
     this._mihomoValidationPromise = null;
     if (!fs.existsSync(this.runtimeDir)) {
@@ -297,12 +359,17 @@ class CoreManager {
     if (this._coreDownloadController) this._coreDownloadController.abort();
   }
 
+  cancelGeoUpdates() {
+    for (const controller of this._geoUpdateControllers.values()) controller.abort();
+  }
+
   waitForCoreDownload() {
     return this._coreDownloadPromise || Promise.resolve();
   }
 
   invalidateVersionCache() {
     this._versionCache = null;
+    this._binaryPathCache.clear();
   }
 
   getCoreType() {
@@ -362,6 +429,10 @@ class CoreManager {
    * over the bundled one (resourcesDir) so "Download core" can update it.
    */
   resolveBinaryPath(type = this.getCoreType()) {
+    type = normalizeCoreType(type);
+    const now = Date.now();
+    const cached = this._binaryPathCache.get(type);
+    if (cached && now < cached.expiresAt) return cached.path;
     const binName = this.binNameFor(type);
     const candidates = [
       path.join(this.coreDir(type), binName),
@@ -372,10 +443,12 @@ class CoreManager {
       path.join(this.runtimeDir, binName),
       ...this.resourceDirs(type).flatMap((d) => [path.join(d, binName), path.join(d, 'bin', binName)]),
     ].filter(Boolean);
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
-    }
-    return null;
+    const resolved = candidates.find((candidate) => fs.existsSync(candidate)) || null;
+    this._binaryPathCache.set(type, {
+      path: resolved,
+      expiresAt: now + BINARY_PATH_CACHE_TTL_MS,
+    });
+    return resolved;
   }
 
   resolveBundledBinaryPath(type = this.getCoreType()) {
@@ -476,17 +549,17 @@ class CoreManager {
     this._copyIfMissing(path.join(this.runtimeDir, 'mihomo' + exe), path.join(mihomoDir, 'mihomo' + exe));
     this._copyIfMissing(path.join(this.runtimeDir, 'config.yaml'), path.join(mihomoDir, 'config.yaml'));
     this._copyIfMissing(path.join(this.runtimeDir, 'mihomo-geodata-meta.json'), path.join(mihomoDir, 'geodata-meta.json'));
-    for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb']) {
+    for (const file of ['geoip.dat', 'geosite.dat', 'country.mmdb', 'ASN.mmdb']) {
       this._copyIfMissing(path.join(this.runtimeDir, file), path.join(mihomoDir, file), this._validGeoFile);
     }
   }
 
-  _validGeoFile(p) {
+  _validGeoFile(p, expectedName = '') {
     try {
       const stat = fs.statSync(p);
-      const cacheKey = `geo:${p}:${statFingerprint(stat)}`;
+      const cacheKey = `geo:${expectedName}:${p}:${statFingerprint(stat)}`;
       if (this._fileValidationCache.has(cacheKey)) return this._fileValidationCache.get(cacheKey);
-      const valid = validMihomoGeoFile(p, stat);
+      const valid = validMihomoGeoFile(p, stat, expectedName);
       this._rememberFileValidation(cacheKey, valid);
       return valid;
     } catch (_) {
@@ -591,8 +664,9 @@ class CoreManager {
       });
       if (result.error) throw result.error;
       if (typeof result.status !== 'number') throw new Error('mihomo validation process did not return an exit code');
-      const ok = result.status === 0;
-      const output = String(result.stderr || result.stdout || '').trim().split(/\r?\n/).slice(-3).join(' | ');
+      const ok = mihomoConfigCheckPassed(result.status, result.stdout, result.stderr);
+      const output = `${result.stdout || ''}\n${result.stderr || ''}`.trim()
+        .split(/\r?\n/).slice(-3).join(' | ');
       return this._rememberMihomoGeoValidation(dir, key, ok, output || null);
     } catch (e) {
       return this._rememberMihomoGeoValidation(dir, key, false, e, false);
@@ -728,8 +802,8 @@ class CoreManager {
       outputLimit: 2 * 1024 * 1024,
       cleanAnsi: true,
     }).then(({ code, stdout, stderr }) => {
-      const output = (stderr || stdout).trim();
-      if (code === 0) return { output };
+      const output = `${stdout || ''}\n${stderr || ''}`.trim();
+      if (mihomoConfigCheckPassed(code, stdout, stderr)) return { output };
       throw new Error('config validation failed: ' + output);
     });
   }
@@ -748,6 +822,7 @@ class CoreManager {
     }
     if (config) this.writeConfig(config);
     const probePorts = listenPortsFromConfig(config);
+    const tunExpected = !!(config && config.tun && config.tun.enable);
     for (const port of probePorts) {
       if (await probeLocalPort(port)) {
         throw new Error(`local port ${port} is already in use; stop the conflicting process before starting ${coreLabel}`);
@@ -768,11 +843,16 @@ class CoreManager {
     const decoders = { stdout: new StringDecoder('utf-8'), stderr: new StringDecoder('utf-8') };
     const startupLines = [];
     let startupConfirmed = false;
+    let startupFailure = null;
+    let tunReady = !tunExpected;
     const emitLogLine = (line) => {
       if (!line.trim()) return;
       if (!startupConfirmed) {
         startupLines.push(line.slice(0, 1000));
         if (startupLines.length > 8) startupLines.shift();
+        const signal = mihomoStartupSignal(line, tunExpected);
+        if (signal && signal.tunReady) tunReady = true;
+        if (signal && signal.error && !startupFailure) startupFailure = signal.error;
       }
       this.onLog(line);
     };
@@ -824,27 +904,39 @@ class CoreManager {
     // TCP. A fixed 600ms sleep alone misses slower bind/TUN failures that exit later.
     const startedAt = Date.now();
     const readyPorts = new Set();
+    const maxWaitMs = tunExpected ? CORE_TUN_START_MAX_WAIT_MS : CORE_START_MAX_WAIT_MS;
     while (true) {
       if (this.proc !== proc) {
         const detail = startupLines.slice(-4).join(' | ');
         throw new Error('core exited immediately after start' + (detail ? ': ' + detail : '; check the logs and config'));
       }
+      if (startupFailure) {
+        const error = new Error('core startup failed: ' + startupFailure);
+        try { await this.stop(); } catch (recoveryError) { error.recoveryError = recoveryError; }
+        throw error;
+      }
       const elapsed = Date.now() - startedAt;
-      for (const port of probePorts) {
-        if (!readyPorts.has(port) && await probeLocalPort(port)) readyPorts.add(port);
+      const pendingPorts = probePorts.filter((port) => !readyPorts.has(port));
+      if (pendingPorts.length) {
+        const results = await Promise.all(pendingPorts.map((port) => probeLocalPort(port)));
+        for (let index = 0; index < pendingPorts.length; index++) {
+          if (results[index]) readyPorts.add(pendingPorts[index]);
+        }
       }
       const portsReady = readyPorts.size === probePorts.length;
-      if (elapsed >= CORE_START_MIN_ALIVE_MS && portsReady) break;
-      if (elapsed >= CORE_START_MAX_WAIT_MS) {
-        if (!portsReady) {
-          try { await this.stop(); } catch (_) {}
-          const missing = probePorts.filter((port) => !readyPorts.has(port));
-          throw new Error(
-            `core process stayed up but local port${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ` +
-            'did not open; check the logs and config'
-          );
-        }
-        break;
+      if (portsReady && tunExpected && !tunReady) {
+        tunReady = await probeMihomoTun(config) === true;
+      }
+      if (elapsed >= CORE_START_MIN_ALIVE_MS && portsReady && tunReady) break;
+      if (elapsed >= maxWaitMs) {
+        const error = !portsReady
+          ? new Error(
+            `core process stayed up but local port${probePorts.length - readyPorts.size > 1 ? 's' : ''} ` +
+            `${probePorts.filter((port) => !readyPorts.has(port)).join(', ')} did not open; check the logs and config`
+          )
+          : new Error('core process stayed up but the TUN adapter did not become ready; check the logs and permissions');
+        try { await this.stop(); } catch (recoveryError) { error.recoveryError = recoveryError; }
+        throw error;
       }
       await new Promise((r) => setTimeout(r, CORE_START_POLL_MS));
     }
@@ -977,6 +1069,15 @@ class CoreManager {
     }
     const ver = tag.replace(/^v/, '');
     const asset = adapter.releaseAsset(ver, goos, arch, release, source);
+    if (!asset) {
+      throw new Error(`${coreLabel} ${tag} does not provide a supported ${goos}/${arch} release asset`);
+    }
+    if (!asset.sha256) {
+      throw new Error(
+        `cannot verify ${asset.fileName}: release metadata did not provide a SHA-256 digest; ` +
+        'retry when GitHub release metadata is reachable or keep the current core'
+      );
+    }
 
     const binDir = this.ensureCoreDir(coreType);
     const archivePath = path.join(binDir, asset.fileName);
@@ -990,12 +1091,8 @@ class CoreManager {
         log: (m) => this.onLog(m),
       });
       throwIfAborted(signal);
-      if (asset.sha256) {
-        const digest = await verifyFileSha256(archivePath, asset.sha256, asset.fileName);
-        this.onLog('[gui] core archive SHA-256 verified: ' + digest);
-      } else {
-        this.onLog('[gui] warning: upstream release metadata did not provide a core SHA-256 digest');
-      }
+      const digest = await verifyFileSha256(archivePath, asset.sha256, asset.fileName);
+      this.onLog('[gui] core archive SHA-256 verified: ' + digest);
       throwIfAborted(signal);
       this.onLog('[gui] Download complete, extracting...');
       if (beforeInstall) await beforeInstall();
@@ -1019,11 +1116,12 @@ class CoreManager {
   }
 
   async _downloadAndInstallGeoFiles(dir, files, options) {
-    const { proxyPort, onProgress, validator, updateLabel, successLabel } = options;
+    const { proxyPort, onProgress, validator, updateLabel, successLabel, signal } = options;
     const staged = [];
     let done = 0;
     try {
       for (const item of files) {
+        throwIfAborted(signal);
         const dest = path.join(dir, item.file);
         const tmp = uniqueSibling(dest, 'tmp');
         let accepted = false;
@@ -1033,18 +1131,29 @@ class CoreManager {
           try {
             await fetch.downloadWithFallback(url, tmp, {
               proxyPort,
+              signal,
               log: (message) => this.onLog(message),
               onProgress: (progress) => onProgress((done + progress) / files.length),
             });
           } catch (error) {
+            if (signal && signal.aborted) throw error;
             lastError = error;
             try { fs.unlinkSync(tmp); } catch (_) {}
             continue;
           }
-          if (!validator(tmp)) {
+          if (!validator(tmp, item.file)) {
             lastError = new Error('downloaded file failed validation (blocked or redirected)');
             try { fs.unlinkSync(tmp); } catch (_) {}
             continue;
+          }
+          if (item.sha256) {
+            try {
+              await verifyFileSha256(tmp, item.sha256, item.file);
+            } catch (error) {
+              lastError = error;
+              try { fs.unlinkSync(tmp); } catch (_) {}
+              continue;
+            }
           }
           this.onLog(`[gui] ${successLabel}: ${url}`);
           accepted = true;
@@ -1070,25 +1179,48 @@ class CoreManager {
   }
 
   updateMihomoGeoData(onProgress = () => {}, proxyPort = 0) {
-    return this._coalesceGeoUpdate('mihomo', () => this._updateMihomoGeoData(onProgress, proxyPort));
+    return this._coalesceGeoUpdate(
+      'mihomo',
+      (signal) => this._updateMihomoGeoData(onProgress, proxyPort, signal)
+    );
   }
 
-  async _updateMihomoGeoData(onProgress, proxyPort) {
+  async _updateMihomoGeoData(onProgress, proxyPort, signal) {
     const dir = this.ensureCoreDir('mihomo');
-    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb'].map((file) => ({
-      file,
-      urls: mihomoGeoDataUrls(file),
-    }));
+    const releaseInfo = await github.latestReleaseTag(
+      'MetaCubeX/meta-rules-dat',
+      proxyPort,
+      (message) => this.onLog(message),
+      { signal }
+    );
+    if (!releaseInfo.release) {
+      throw new Error('cannot verify GeoData: GitHub release metadata is unavailable');
+    }
+    const ref = String(releaseInfo.tag || '') || 'release';
+    const files = ['geoip.dat', 'geosite.dat', 'country.mmdb', 'ASN.mmdb'].map((file) => {
+      const assetName = file === 'ASN.mmdb' ? 'GeoLite2-ASN.mmdb' : file;
+      const asset = (releaseInfo.release.assets || []).find((candidate) => candidate.name === assetName);
+      const sha256 = assetSha256(asset);
+      if (!asset || !asset.browser_download_url || !sha256) {
+        throw new Error('GeoData release has no verifiable asset: ' + assetName);
+      }
+      return {
+        file,
+        sha256,
+        urls: [asset.browser_download_url, ...mihomoGeoDataUrls(file, ref).slice(1)],
+      };
+    });
     await this._downloadAndInstallGeoFiles(dir, files, {
       proxyPort,
       onProgress,
-      validator: (file) => this._validGeoFile(file),
+      validator: (file, expectedName) => this._validGeoFile(file, expectedName),
       updateLabel: 'Updating mihomo geodata',
       successLabel: 'mihomo geodata source OK',
+      signal,
     });
     const meta = this.geoMeta('mihomo');
     const updatedAt = Date.now();
-    for (const file of files) meta[file] = { updatedAt };
+    for (const item of files) meta[item.file] = { updatedAt };
     try {
       writeJsonAtomicSync(this.geoMetaPath('mihomo'), meta);
     } catch (_) {
@@ -1101,9 +1233,12 @@ class CoreManager {
   _coalesceGeoUpdate(type, factory) {
     const active = this._geoUpdatePromises.get(type);
     if (active) return active;
+    const controller = new AbortController();
+    this._geoUpdateControllers.set(type, controller);
     let tracked;
-    tracked = Promise.resolve().then(factory).finally(() => {
+    tracked = Promise.resolve().then(() => factory(controller.signal)).finally(() => {
       if (this._geoUpdatePromises.get(type) === tracked) this._geoUpdatePromises.delete(type);
+      if (this._geoUpdateControllers.get(type) === controller) this._geoUpdateControllers.delete(type);
     });
     this._geoUpdatePromises.set(type, tracked);
     return tracked;
@@ -1225,4 +1360,4 @@ class CoreManager {
   }
 }
 
-module.exports = { CoreManager };
+module.exports = { CoreManager, mihomoConfigCheckPassed, mihomoStartupSignal };

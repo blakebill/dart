@@ -93,7 +93,10 @@ belong in the accessible overflow menu.
 
 Run `npm run test:visual` to compare deterministic Electron captures with
 `test/visual-baselines`. Run `npm run test:visual:update` only after reviewing
-an intentional design change.
+an intentional design change. Committed pixel baselines are canonical captures
+from the pinned Windows Server 2025 runner. Use the `Refresh Visual Baselines`
+workflow to regenerate them; do not commit captures produced by another OS or
+graphics stack.
 
 Visual fixtures disable motion, use fixed state and never access user
 subscriptions or runtime data. Retina captures are normalized to logical

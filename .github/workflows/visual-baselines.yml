@@ -1,0 +1,54 @@
+name: Refresh Visual Baselines
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  capture-windows-2025:
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare visual test display
+        shell: powershell
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+          Write-Host "Visual baseline working area: $($area.Width)x$($area.Height)"
+          if ($area.Width -lt 1280 -or $area.Height -lt 800) {
+            throw "Visual baselines require a working area of at least 1280x800."
+          }
+
+      - name: Run functional tests
+        run: npm test
+
+      - name: Capture canonical baselines
+        run: npm run test:visual:update
+
+      - name: Upload canonical baselines
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dart-visual-baselines-windows-2025
+          path: test/visual-baselines/*.png
+          if-no-files-found: error
+          retention-days: 1

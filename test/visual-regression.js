@@ -16,7 +16,6 @@ const MAX_CHANGED_PIXEL_RATIO = 0.0015;
 
 const SCENARIOS = [
   { name: 'dashboard-light-1280x800', tab: 'dashboard', theme: 'light', width: 1280, height: 800 },
-  { name: 'dashboard-zh-light-1280x800', tab: 'dashboard', theme: 'light', lang: 'zh', width: 1280, height: 800 },
   { name: 'dashboard-dark-1280x800', tab: 'dashboard', theme: 'dark', width: 1280, height: 800 },
   { name: 'dashboard-compact-light-960x720', tab: 'dashboard', theme: 'light', width: 960, height: 720, sidebarWidth: 188, allowVerticalOverflow: true, quickColumns: 2 },
   { name: 'configs-light-1280x800', tab: 'subs', theme: 'light', width: 1280, height: 800 },

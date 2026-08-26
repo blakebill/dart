@@ -36,7 +36,9 @@ env:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # Pixel baselines are generated on the same pinned OS family. Do not move
+    # this back to windows-latest without refreshing the canonical captures.
+    runs-on: windows-2025
     permissions:
       contents: read
       actions: write # delete and upload build artifacts

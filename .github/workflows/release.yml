@@ -99,6 +99,17 @@ jobs:
             }
             core.info(`Deleted ${stale.length} old artifact(s).`);
 
+      - name: Prepare visual test display
+        shell: powershell
+        run: |
+          Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          Add-Type -AssemblyName System.Windows.Forms
+          $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+          Write-Host "Visual test working area: $($area.Width)x$($area.Height)"
+          if ($area.Width -lt 1280 -or $area.Height -lt 800) {
+            throw "Visual tests require a working area of at least 1280x800."
+          }
+
       - name: Run self-tests
         run: npm run test:all
 

@@ -558,9 +558,15 @@ class CoreManager {
     try {
       const stat = fs.statSync(p);
       const cacheKey = `geo:${expectedName}:${p}:${statFingerprint(stat)}`;
-      if (this._fileValidationCache.has(cacheKey)) return this._fileValidationCache.get(cacheKey);
+      // Download staging paths are reused and may be overwritten with the same
+      // byte length inside one filesystem timestamp tick. Never let an earlier
+      // validation result mask the newly downloaded content.
+      const cacheable = !expectedName;
+      if (cacheable && this._fileValidationCache.has(cacheKey)) {
+        return this._fileValidationCache.get(cacheKey);
+      }
       const valid = validMihomoGeoFile(p, stat, expectedName);
-      this._rememberFileValidation(cacheKey, valid);
+      if (cacheable) this._rememberFileValidation(cacheKey, valid);
       return valid;
     } catch (_) {
       return false;

@@ -4790,6 +4790,8 @@ test('release workflow pins actions and isolates write permission to publishing'
   assert.ok(workflow.includes('Dart releases must be published from blakebill/dart'));
   assert.ok(workflow.includes('INPUT_TAG: ${{ inputs.tag }}'));
   assert.ok(workflow.includes('release-metadata.js --version-from-tag "$TAG"'));
+  assert.ok(workflow.includes('Set-DisplayResolution -Width 1920 -Height 1080 -Force'));
+  assert.ok(workflow.includes('Visual tests require a working area of at least 1280x800.'));
   const versionStep = workflow.match(/- name: Sync package version to release tag([\s\S]*?)\n\s+- name:/);
   assert.ok(versionStep && !versionStep[1].includes('TAG="${{ inputs.tag }}"'));
   const coreDownloadStep = workflow.match(/- name: Download bundled Mihomo and GeoData([\s\S]*?)\n\s+- name:/);

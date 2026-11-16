@@ -23,11 +23,11 @@
     "dist:dir": "electron-builder --win --dir"
   },
   "dependencies": {
-    "js-yaml": "^5.2.1"
+    "js-yaml": "^5.5.0"
   },
   "devDependencies": {
-    "electron": "^43.0.0",
-    "electron-builder": "^26.15.3"
+    "electron": "^43.8.10",
+    "electron-builder": "^26.18.0"
   },
   "build": {
     "appId": "com.dart.app",

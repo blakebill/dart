@@ -95,6 +95,7 @@ function relaunchElevated() {
   // --dev marker. The elevated helper waits for this PID, so the old instance can
   // keep the single-instance lock until its core/proxy/TUN cleanup has completed.
   const launchArgs = isDev ? [process.cwd(), '--dev'] : [];
+  if (process.argv.includes('--hidden')) launchArgs.push('--hidden');
   const cmd = buildElevatedLauncherCommand(exe, launchArgs);
   sendLog('[gui] requesting an elevated relaunch with clean process handoff');
   const r = spawnSync('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', cmd], {

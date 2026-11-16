@@ -96,7 +96,7 @@ class FakeBrowserWindow extends EventEmitter {
 FakeBrowserWindow.instances = [];
 class FakeTray {
   setToolTip() {}
-  setContextMenu() {}
+  setContextMenu(menu) { this.menu = menu; }
   setImage() {}
   on() {}
 }
@@ -217,6 +217,9 @@ function preloadChannels() {
 }
 
 async function main() {
+  // Booting the test must never reconcile the host's real scheduled tasks.
+  const autoLaunch = require('../src/main/auto-launch');
+  autoLaunch.createAutoLaunchService = () => ({ apply() {}, reconcile: async () => {} });
   require(path.join(__dirname, '..', 'src', 'main', 'index.js'));
   // Boot continues in microtasks after the stubbed whenReady() resolves.
   await new Promise((resolve) => setImmediate(resolve));
@@ -266,6 +269,20 @@ async function main() {
 
   const mainWindow = FakeBrowserWindow.last;
   const windowEvent = { sender: mainWindow.webContents };
+  const secondLaunch = appListeners.get('second-instance')[0];
+  mainWindow.hide();
+  secondLaunch({}, ['Dart.exe', '--hidden']);
+  assert.strictEqual(mainWindow.shown, false);
+  secondLaunch({}, ['Dart.exe']);
+  assert.strictEqual(mainWindow.shown, true);
+  console.log('✓ silent duplicate launch stays hidden; manual launch reveals the window');
+  const { state, refreshTray } = require('../src/main/state');
+  for (const [language, text] of [['en', 'Show window'], ['zh', '显示窗口']]) {
+    state.store.updateSettings({ language });
+    refreshTray();
+    assert.ok(state.tray.menu.some((item) => item.label === text));
+  }
+  console.log('✓ tray menu follows the selected interface language');
   assert.strictEqual(await handlers['window:isMaximized'](windowEvent), false);
   assert.strictEqual(await handlers['window:toggleMaximize'](windowEvent), true);
   assert.strictEqual(await handlers['window:toggleMaximize'](windowEvent), false);

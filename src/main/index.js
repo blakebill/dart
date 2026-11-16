@@ -301,7 +301,10 @@ if (!gotLock) {
   app.quit();
 } else {
   let revealWhenReady = false;
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine = []) => {
+    // Background launches must not reveal an existing tray-only instance,
+    // including requests received before the store/window has initialized.
+    if (commandLine.includes('--hidden')) return;
     if (!state.store || (typeof app.isReady === 'function' && !app.isReady())) {
       revealWhenReady = true;
       return;

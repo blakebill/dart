@@ -23,9 +23,18 @@ function decodeXml(value) {
     .replace(/&amp;/gi, '&');
 }
 
-function taskXmlMatches(xml, executable, silent = false, elevated = false) {
+function taskXmlMatches(xml, executable, silent = false, elevated = false, users = []) {
   const source = String(xml || '');
   if (!source || /<Enabled>\s*false\s*<\/Enabled>/i.test(source)) return false;
+  if (users.length) {
+    const expected = users.map((user) => String(user).trim().toLowerCase());
+    for (const section of ['LogonTrigger', 'Principal']) {
+      const block = source.match(new RegExp(`<${section}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${section}>`, 'i'));
+      const identity = block && block[1].match(/<UserId>\s*([^<]+?)\s*<\/UserId>/i);
+      if (!identity || !expected.includes(decodeXml(identity[1]).trim().toLowerCase())) return false;
+    }
+    if (!/<LogonType>\s*InteractiveToken\s*<\/LogonType>/i.test(source)) return false;
+  }
   const command = source.match(/<Command>\s*([\s\S]*?)\s*<\/Command>/i);
   if (!command) return false;
   const decodedCommand = decodeXml(command[1]).trim();
@@ -69,6 +78,21 @@ function buildTaskXml(executable, user, silent = false, elevated = false) {
 }
 
 function createAutoLaunchService(options) {
+  let userIdentities;
+  function currentUsers() {
+    if (!userIdentities) {
+      userIdentities = [`${process.env.USERDOMAIN || process.env.COMPUTERNAME || ''}\\${process.env.USERNAME || ''}`];
+      // Task Scheduler may normalize account names to SIDs when exporting XML.
+      try {
+        const result = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
+          windowsHide: true, encoding: 'utf-8', timeout: 5000,
+        });
+        const sid = result.status === 0 && String(result.stdout).match(/S-1-\d+(?:-\d+)+/i);
+        if (sid) userIdentities.push(sid[0]);
+      } catch (_) { /* account-name comparison remains available */ }
+    }
+    return userIdentities;
+  }
   const setRunItem = (enable, silent) => options.app.setLoginItemSettings({
     openAtLogin: !!enable,
     openAsHidden: !!silent,
@@ -96,7 +120,7 @@ function createAutoLaunchService(options) {
         timeout: 5000,
       });
       return !result.error && result.status === 0 &&
-        taskXmlMatches(result.stdout, process.execPath, silent, elevated);
+        taskXmlMatches(result.stdout, process.execPath, silent, elevated, currentUsers());
     } catch (_) {
       return false;
     }
@@ -118,7 +142,7 @@ function createAutoLaunchService(options) {
 
   async function taskMatchesAsync(silent, elevated) {
     const result = await execSchtasksAsync(['/query', '/tn', AUTOSTART_TASK, '/xml']);
-    return result.ok && taskXmlMatches(result.stdout, process.execPath, silent, elevated);
+    return result.ok && taskXmlMatches(result.stdout, process.execPath, silent, elevated, currentUsers());
   }
 
   function runSchtasks(args, elevate) {
@@ -194,6 +218,15 @@ function createAutoLaunchService(options) {
         setRunItem(false);
         return;
       }
+      // Do not leave a stale task beside a new Run entry: both would launch.
+      if (taskExists()) {
+        let removed = deleteTask(false);
+        if (!removed && !options.isAdmin() && interactive) removed = deleteTask(true);
+        if (!removed) {
+          setRunItem(false);
+          throw new Error('auto-start needs repair: failed to remove the stale scheduled task');
+        }
+      }
       setRunItem(enable, silent);
       return;
     }
@@ -204,7 +237,10 @@ function createAutoLaunchService(options) {
       // fall back to UAC when Windows requires it.
       let removed = deleteTask(false);
       if (!removed && !options.isAdmin() && interactive) removed = deleteTask(true);
-      if (!removed && interactive) throw new Error('failed to remove the elevated auto-start task');
+      if (!removed) {
+        setRunItem(false, silent);
+        throw new Error('failed to remove the elevated auto-start task');
+      }
     }
     setRunItem(enable, silent);
   }
@@ -220,8 +256,14 @@ function createAutoLaunchService(options) {
         setRunItem(false);
         return;
       }
-      // A missing elevated task requires an explicit UAC action. Keep the Run
-      // fallback working without interrupting login with a prompt.
+      // Only use the Run fallback once a stale task has been removed.
+      // Login reconciliation must never prompt for elevation.
+      if (await runSchtasksAsync(['/query', '/tn', AUTOSTART_TASK])) {
+        if (!await runSchtasksAsync(['/delete', '/tn', AUTOSTART_TASK, '/f'])) {
+          setRunItem(false);
+          throw new Error('auto-start needs repair: failed to remove the stale scheduled task');
+        }
+      }
       setRunItem(true, silent);
       return;
     }
@@ -230,6 +272,10 @@ function createAutoLaunchService(options) {
     if (await runSchtasksAsync(['/query', '/tn', AUTOSTART_TASK])) {
       const removed = await runSchtasksAsync(['/delete', '/tn', AUTOSTART_TASK, '/f']);
       options.log('[gui] autostart task ' + (removed ? 'removed asynchronously' : 'async remove failed'));
+      if (!removed) {
+        setRunItem(false, silent);
+        throw new Error('failed to remove the elevated auto-start task');
+      }
     }
     setRunItem(false, silent);
   }

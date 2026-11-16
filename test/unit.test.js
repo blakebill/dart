@@ -6023,6 +6023,109 @@ test('Windows TUN lifecycle removes only Dart-owned adapters', () => {
   assert.ok(tun.renameScript().includes("Rename-NetAdapter"));
 });
 
+test('background second launches never reveal the window, even during cold startup', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/main/index.js'), 'utf8');
+  const start = source.indexOf('  let revealWhenReady = false;');
+  const end = source.indexOf('  app.whenReady()', start);
+  for (const ready of [false, true]) {
+    for (const hidden of [false, true]) {
+      let handler;
+      let shown = 0;
+      const context = {
+        app: { on: (_name, callback) => { handler = callback; }, isReady: () => ready },
+        state: { store: ready ? {} : null },
+        showMainWindow: () => { shown++; },
+      };
+      vm.createContext(context);
+      vm.runInContext(source.slice(start, end) + '\nglobalThis.reveal = () => revealWhenReady;', context);
+      handler({}, hidden ? ['Dart.exe', '--hidden'] : ['Dart.exe']);
+      assert.strictEqual(shown, ready && !hidden ? 1 : 0);
+      assert.strictEqual(context.reveal(), !ready && !hidden);
+    }
+  }
+});
+
+test('elevated relaunch preserves hidden intent for packaged and development launches', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/main/admin.js'), 'utf8');
+  const start = source.indexOf('  const launchArgs =');
+  const end = source.indexOf('  const cmd =', start);
+  for (const isDev of [false, true]) {
+    for (const hidden of [false, true]) {
+      const args = vm.runInNewContext(source.slice(start, end) + '\nlaunchArgs;', {
+        isDev, process: { cwd: () => 'D:\\Work Files\\Dart', argv: hidden ? ['Dart.exe', '--hidden'] : ['Dart.exe'] },
+      });
+      assert.deepStrictEqual(Array.from(args), [
+        ...(isDev ? ['D:\\Work Files\\Dart', '--dev'] : []), ...(hidden ? ['--hidden'] : []),
+      ]);
+    }
+  }
+});
+
+test('auto-start validates both logon and principal identities, including normalized SIDs', () => {
+  const { buildTaskXml, taskXmlMatches } = require('../src/main/auto-launch');
+  const exe = 'C:\\Dart\\Dart.exe';
+  const xml = buildTaskXml(exe, 'PC\\Alice', true);
+  const matches = (value) => taskXmlMatches(value, exe, true, false, ['pc\\alice', 'S-1-5-21-123-1001']);
+  assert.ok(matches(xml));
+  assert.ok(matches(xml.replaceAll('PC\\Alice', 'S-1-5-21-123-1001')));
+  assert.ok(!matches(xml.replace('PC\\Alice', 'PC\\Bob')));
+  assert.ok(!matches(xml.replaceAll('PC\\Alice', 'PC\\Bob')));
+  assert.ok(!matches(xml.replace('InteractiveToken', 'Password')));
+  assert.ok(!matches(xml.replace(/<LogonTrigger>[\s\S]*?<\/LogonTrigger>/, '')));
+});
+
+test('auto-start fallback removes stale tasks first and reports cleanup failures', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/main/auto-launch.js'), 'utf8');
+  for (const interactive of [false, true]) {
+    for (const removable of [false, true]) {
+      const calls = [];
+      const runItems = [];
+      const execute = (args) => {
+        calls.push(args[0]);
+        if (args[0] === '/query') return { status: 0, stdout: '<Task>stale</Task>' };
+        if (args[0] === '/delete') return { status: removable ? 0 : 1, stdout: '' };
+        return { status: 1, stdout: '' };
+      };
+      const context = {
+        module: { exports: {} },
+        process: { platform: 'win32', execPath: 'C:\\Dart.exe', pid: 123, env: { USERDOMAIN: 'PC', USERNAME: 'Alice' } },
+        require: (name) => {
+          if (name === 'child_process') return {
+            spawnSync: (_exe, args) => execute(args),
+            execFile: (_exe, args, _options, callback) => {
+              const result = execute(args);
+              callback(result.status ? new Error('denied') : null, result.stdout);
+            },
+          };
+          if (name === 'fs') return {
+            writeFileSync() {}, unlinkSync() {},
+            promises: { writeFile: async () => {}, unlink: async () => {} },
+          };
+          return require(name);
+        },
+      };
+      vm.runInNewContext(source, context);
+      const service = context.module.exports.createAutoLaunchService({
+        app: { setLoginItemSettings: (item) => { runItems.push(item.openAtLogin); } },
+        getSettings: () => ({ enableTun: false }), isAdmin: () => true, log() {},
+      });
+      const invoke = (enabled) => interactive
+        ? Promise.resolve().then(() => service.apply(enabled, true, { interactive: true }))
+        : service.reconcile(enabled, true);
+      if (removable) {
+        await invoke(true);
+        assert.deepStrictEqual(runItems, [true]);
+      } else {
+        await assert.rejects(invoke(true), /auto-start needs repair/);
+        assert.deepStrictEqual(runItems, [false]);
+        await assert.rejects(invoke(false), /failed to remove/);
+        assert.ok(runItems.every((enabled) => !enabled));
+      }
+      assert.ok(calls.includes('/delete'));
+    }
+  }
+});
+
 test('elevated TUN auto-start preserves silent startup', () => {
   const { buildTaskXml, taskXmlMatches } = require('../src/main/auto-launch');
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'auto-launch.js'), 'utf-8');

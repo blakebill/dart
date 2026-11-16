@@ -638,6 +638,30 @@ test('Mihomo config drops unusable providers and dangling RULE-SET rules', () =>
   assert.ok(!config.rules.some((rule) => /RULE-SET,(local|missing|bad-mrs|constructor),/.test(rule)));
 });
 
+test('Clash YAML accepts shared anchors and rejects alias bombs', () => {
+  const shared = [
+    'names: &names [HK, US]',
+    'proxies:',
+    '  - {name: HK, type: trojan, server: hk.example.com, port: 443, password: p}',
+    '  - {name: US, type: trojan, server: us.example.com, port: 443, password: p}',
+    'proxy-groups:',
+    '  - {name: PROXY, type: select, proxies: *names}',
+    '  - {name: AUTO, type: url-test, proxies: *names}',
+  ].join('\n');
+  const parsed = clashParser.parseClashConfig(shared);
+  assert.deepStrictEqual(parsed.groups[0].proxies, ['HK', 'US']);
+  assert.deepStrictEqual(parsed.groups[1].proxies, ['HK', 'US']);
+  assert.strictEqual(parsed.nodes.length, 2);
+
+  const bomb = ['anchor: &anchor 1', 'refs:']
+    .concat(Array.from({ length: clashParser.CLASH_YAML_MAX_ALIASES + 1 }, () => '  - *anchor'))
+    .join('\n');
+  assert.throws(
+    () => clashParser.parseClashConfig(bomb),
+    /Clash YAML parse failed: aliases exceeded maxAliases/,
+  );
+});
+
 test('rule-provider names cannot mutate the normalized object prototype', () => {
   const parsed = clashParser.parseClashConfig([
     'proxies: []',

@@ -202,6 +202,12 @@ function normalizeClashProxy(p) {
   }
 }
 
+// Remote profiles are untrusted. js-yaml leaves alias expansion unlimited
+// (maxAliases: -1). Real Clash documents only reuse a few anchors, even when
+// every group points at the same node list. CORE_SCHEMA is js-yaml 5's default
+// and does not enable YAML 1.1 merge keys.
+const CLASH_YAML_MAX_ALIASES = 100_000;
+
 /**
  * Parse Clash YAML content.
  * @returns {{ nodes: object[], groups: object[], rules: string[], isClash: boolean }}
@@ -211,7 +217,10 @@ function normalizeClashProxy(p) {
 function parseClashConfig(content) {
   let doc;
   try {
-    doc = yaml.load(content);
+    doc = yaml.load(content, {
+      schema: yaml.CORE_SCHEMA,
+      maxAliases: CLASH_YAML_MAX_ALIASES,
+    });
   } catch (e) {
     throw new Error('Clash YAML parse failed: ' + e.message);
   }
@@ -272,4 +281,5 @@ function isClashConfig(content) {
 module.exports = {
   parseClashConfig,
   isClashConfig,
+  CLASH_YAML_MAX_ALIASES,
 };

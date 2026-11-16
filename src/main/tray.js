@@ -51,28 +51,32 @@ function updateTrayMenu() {
     try { state.tray.setToolTip('Dart Network Control'); } catch (_) { /* tray gone */ }
   }
   const currentMode = (state.store && state.store.getSettings().clashMode) || 'rule';
+  const english = state.store && state.store.getSettings().language === 'en';
+  const label = (zh, en) => english ? en : zh;
   const menu = Menu.buildFromTemplate([
     { label: 'Dart Network Control', enabled: false },
     { type: 'separator' },
     {
-      label: running ? '● Running' : '○ Stopped',
+      label: running ? label('● 运行中', '● Running') : label('○ 已停止', '○ Stopped'),
       enabled: false,
     },
     {
-      label: running ? 'Stop' : 'Start',
+      label: running ? label('停止', 'Stop') : label('启动', 'Start'),
       click: async () => {
         try {
           await core.queueConfigMutation(() => running ? core.stopCore(true) : core.startCore());
         } catch (e) {
-          dialog.showErrorBox('Operation failed', e.message);
+          dialog.showErrorBox(label('操作失败', 'Operation failed'), e.message);
         }
       },
     },
     { type: 'separator' },
     {
-      label: 'Proxy mode',
+      label: label('代理模式', 'Proxy mode'),
       submenu: ['rule', 'global', 'direct', 'block'].map((m) => ({
-        label: { rule: 'Rule', global: 'Global', direct: 'Direct', block: 'Block' }[m],
+        label: (english
+          ? { rule: 'Rule', global: 'Global', direct: 'Direct', block: 'Block' }
+          : { rule: '规则', global: '全局', direct: '直连', block: '黑洞' })[m],
         type: 'radio',
         checked: currentMode === m,
         click: () => {
@@ -81,9 +85,9 @@ function updateTrayMenu() {
       })),
     },
     { type: 'separator' },
-    { label: 'Show window', click: showMainWindow },
+    { label: label('显示窗口', 'Show window'), click: showMainWindow },
     {
-      label: 'Quit',
+      label: label('退出', 'Quit'),
       click: async () => {
         app.isQuitting = true;
         try {

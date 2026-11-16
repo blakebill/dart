@@ -749,6 +749,7 @@ function registerIpc() {
         return rollbackSettingsAfterFailure(previous, wasRunning, error, true);
       }
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'language')) sendStatus();
     // When theme changes, tell the renderer the effective scheme after
     // themeSource is updated (matchMedia alone is stale until that runs).
     if (themeResolved) {
